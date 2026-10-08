@@ -1,0 +1,24 @@
+{
+  "format_version": 1,
+  "name": "1080p Full HD @ 30fps",
+  "description": "Standard HD delivery - 1920x1080, 30fps, 8+ Mbps",
+  "config": {
+    "target_width": 1920,
+    "target_height": 1080,
+    "target_fps": 30.0,
+    "fps_tolerance": 0.5,
+    "min_bitrate_mbps": 8,
+    "accepted_codecs": [
+      "h264",
+      "hevc",
+      "prores",
+      "dnxhd"
+    ],
+    "accepted_containers": [
+      "mov",
+      "mp4",
+      "mxf"
+    ],
+    "audio_required": true
+  }
+}

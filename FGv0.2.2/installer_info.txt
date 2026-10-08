@@ -1,0 +1,67 @@
+FrameGuard Desktop v0.5.4
+Video QA for XR Deliverables
+
+
+WHAT THIS INSTALLS
+
+  FrameGuard Desktop
+    Checks video files against your delivery specification and reports what
+    passed, what failed, and why. Scan a whole folder in one pass.
+    Failures sort first with critical issues (corruption, unreadable files)
+    ranked above minor ones.
+
+  FFmpeg and FFprobe
+    The video analysis engine. Bundled with this installer - no separate
+    download or setup required.
+
+  MediaInfo
+    Adds encoder and container detail to reports.
+
+  Delivery presets
+    4K UHD 30/60, 1080p 30, and 5.7K VR/360 profiles to start from. You can
+    save your own and share them with your team as .fg files.
+
+
+WHAT'S NEW IN v0.5.4
+
+  Stability
+    - Deep scans no longer crash on large or long files: scan parallelism
+      and memory use are bounded, cancellation stops promptly, and missing
+      tools report a clear message instead of an "Internal Error".
+    - Scan verdict banner clears on new files, navigation, and errors, and
+      clean results dismiss themselves; failures stay until you act on them.
+    - Results are severity-weighted: a corrupted file ranks above one with
+      only an off-spec frame rate.
+
+  This release corrects several issues that produced misleading scan results
+  in earlier versions (v0.5.2):
+
+    - Deep scan (black frames, freeze frames, silence) reported "no issues
+      found" on every file. These checks now work.
+    - Settings and presets had no effect on scans.
+    - Reports covering more than one file failed to generate.
+    - Files slightly under the bitrate target were reported as an internal
+      error rather than a bitrate warning.
+
+  If you signed off footage using an earlier version, it is worth re-scanning.
+
+
+BEFORE YOU INSTALL
+
+  Requirements
+    Windows 10 or Windows 11, 64-bit
+    4 GB RAM minimum, 8 GB recommended for large batches
+    500 MB free disk space
+
+  Close FrameGuard if it is currently running. Setup will prompt you if it
+  detects a running copy.
+
+
+PRIVACY
+
+  All processing happens on this computer. FrameGuard does not upload,
+  transmit, or share your video files or scan results.
+
+
+Developed by Jace Aleria
+TPG XR Studio, Meta Platforms

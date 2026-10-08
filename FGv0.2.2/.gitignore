@@ -1,0 +1,52 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.buildenv/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build output
+Output/
+*.exe
+*.dmg
+*.app/
+# Browser "download again" duplicates, e.g. "build (1)/", "dist (2)/"
+*(1)/
+*(2)/
+*(3)/
+frameguard/_build_stamp.json
+assets/frameguard.icns
+
+# OS
+.DS_Store
+._*
+.AppleDouble
+Thumbs.db
+desktop.ini
+
+# Tools cache (large binaries)
+tools_cache/
+
+# Crash logs (local only)
+frameguard_crash.log
+frameguard_error.log
+CrashLogs/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/

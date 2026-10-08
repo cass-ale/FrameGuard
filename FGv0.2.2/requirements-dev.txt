@@ -1,0 +1,6 @@
+# Development / CI dependencies (not needed to run FrameGuard)
+-r requirements.txt
+
+pytest>=8.0
+pyflakes>=3.0
+pyinstaller>=6.0,<7.0

@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "name": "4K UHD @ 60fps",
+  "description": "High frame rate 4K - 3840x2160, 60fps, 30+ Mbps",
+  "config": {
+    "target_width": 3840,
+    "target_height": 2160,
+    "target_fps": 60.0,
+    "fps_tolerance": 0.5,
+    "min_bitrate_mbps": 30,
+    "accepted_codecs": [
+      "h264",
+      "hevc",
+      "prores"
+    ],
+    "accepted_containers": [
+      "mov",
+      "mp4",
+      "mxf"
+    ],
+    "audio_required": true
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "format_version": 1,
+  "name": "5.7K VR/360 Capture",
+  "description": "360 VR content - 5760x2880, 30fps, 40+ Mbps",
+  "config": {
+    "target_width": 5760,
+    "target_height": 2880,
+    "target_fps": 30.0,
+    "fps_tolerance": 0.5,
+    "min_bitrate_mbps": 40,
+    "accepted_codecs": [
+      "h264",
+      "hevc"
+    ],
+    "accepted_containers": [
+      "mov",
+      "mp4"
+    ],
+    "audio_required": true
+  }
+}

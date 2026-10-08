@@ -1,0 +1,43 @@
+FrameGuard Desktop - Internal Use License
+
+Copyright (c) 2026 Meta Platforms, Inc. All rights reserved.
+
+FrameGuard Desktop is an internal tool developed by TPG XR Studio. It is
+provided for use by Meta Platforms personnel and authorized partners only.
+
+
+TERMS OF USE
+
+1. Permitted use
+   You may install and use this software to validate video deliverables in
+   the course of your work for Meta Platforms. Redistribution outside Meta
+   Platforms and its authorized partners is not permitted.
+
+2. Local processing and privacy
+   All video analysis is performed on this computer. FrameGuard does not
+   upload, transmit, or share video files, audio, metadata, or scan results.
+   Reports are written only to locations you choose.
+
+3. Content handling
+   You remain responsible for handling all footage in accordance with its
+   data classification and any applicable confidentiality obligations. This
+   tool does not classify content on your behalf.
+
+4. Third-party components
+   This installer bundles FFmpeg, FFprobe, and MediaInfo, which are licensed
+   separately by their respective authors. Their licenses continue to govern
+   those components.
+
+5. No warranty
+   This software is provided "as is", without warranty of any kind, express
+   or implied. FrameGuard reports are an aid to review, not a substitute for
+   it. You are responsible for confirming that a deliverable meets its
+   specification before sign-off.
+
+6. Support
+   FrameGuard is maintained on a best-effort basis by TPG XR Studio. Report
+   issues to the FrameGuard maintainer.
+
+
+By selecting "I accept the agreement" you confirm that you have read and
+agree to these terms.
