@@ -6,22 +6,67 @@ FrameGuard validates video files against configurable delivery specifications, r
 automated checks across metadata, codec compliance, audio integrity, and deep signal
 analysis. All processing happens locally — no data leaves your machine.
 
-## What it does
+## Why
 
-Point FrameGuard at a folder of deliverables and it checks every file against your
-delivery spec — resolution, frame rate, codecs, bitrate, audio, and deep signal
-analysis (black/freeze frames, silence, decode integrity) — then hands you a
-pass/fail verdict per file and a PDF report for the client or the archive.
+XR and high-volume video shoots produce hundreds of files a day. Checking each one by
+hand — resolution, frame rate, codecs, audio, corrupt frames — is slow, inconsistent,
+and easy to get wrong at the end of a long shoot day. A bad file discovered in post
+can mean an expensive reshoot or a compromised deliverable.
 
-Built for XR production pipelines: batch processing, folder-watch auto-scan, and
-PDF handoff reports. Everything runs on your machine; nothing is uploaded.
+FrameGuard automates the tedious, error-prone part: point it at a folder and it checks
+every file against your delivery spec, tells you what failed and why, and hands you a
+PDF report. Hours of manual QC become a background task.
+
+## Features
+
+### Scan engine
+
+- Automated checks across container, codec, resolution, frame rate, CFR, bitrate,
+  audio codec/channels, A/V sync, and frame count
+- **Deep scan** — black frame, freeze frame, and silence detection with absolute
+  timestamps
+- **Decode integrity** — detects dropped frames and decode errors during a full decode
+- **Keyframe-aware segment splitting** for faster parallel deep scans on long files
+- **Hardware-accelerated decode** (CUDA / VAAPI / D3D11VA / VideoToolbox, auto-detected)
+- **MediaInfo enrichment** when MediaInfo is available
+- **9 built-in delivery presets** (4K 24/30/60, 1080p 24/30/60, 720p30, 5.7K VR, 8K)
+- **Confidence-weighted results** — borderline failures are reported as advisory rather
+  than hard failures
+- **Plain-language summaries** — one line per file, free of technical jargon
+
+### Desktop GUI
+
+- Drag-and-drop files, folders, and `.fg` presets — anywhere in the window
+- Results stream in one file at a time as the scan progresses
+- **Failures first, severity-weighted** — failed files sort to the top with
+  critical corruption above minor framerate issues, tinted red with a headline
+  banner; toggle back to scan order at any time
+- Verdict banner auto-dismisses clean results and clears on new files,
+  navigation, or errors — no stale messages
+- **Checks matrix** — every file against every check in one grid, so a systemic
+  problem ("all 40 files failing Bitrate") is obvious at a glance
+- **Issues only** filter to hide files that passed cleanly
+- Right-click any result to open it in VLC, reveal it in Explorer, or copy its path
+- **PDF handoff reports** with a batch summary and per-file detail
+- **15 color themes** with live switching and persistence — the
+  theme also recolors the app icon, title bar, and system tray icon
+- Scan settings persist between sessions
+- Watch folder with automatic scanning and tray notifications
+- Standard window behaviour: Aero Snap, drag-to-maximize, Win+Arrow tiling
+- Keyboard shortcuts: `Ctrl+1..5` panels, `Ctrl+O` browse, `F5` scan, `Ctrl+E` export
+
+### Packaging
+
+- Single-file installer with FFmpeg, FFprobe, and MediaInfo bundled — no dependencies
+  for end users
+- `.fg` preset files are registered with Windows: they show the FrameGuard icon and
+  import on double-click
+
+## Tech stack
+
+Python · PySide6 (Qt) · FFmpeg / FFprobe · MediaInfo · PyInstaller · Inno Setup (Windows) / DMG (macOS)
 
 ## Quick start
-
-### Installed application
-
-Windows 10 or 11 (64-bit), or macOS 12 or later. Everything else (FFmpeg, FFprobe,
-MediaInfo) is bundled — no dependencies for end users.
 
 ### Run from source
 
@@ -71,53 +116,6 @@ cd FGv0.2.2
 pip install -r requirements-dev.txt
 pytest
 ```
-
----
-
-## Features
-
-### Scan engine
-
-- Automated checks across container, codec, resolution, frame rate, CFR, bitrate,
-  audio codec/channels, A/V sync, and frame count
-- **Deep scan** — black frame, freeze frame, and silence detection with absolute
-  timestamps
-- **Decode integrity** — detects dropped frames and decode errors during a full decode
-- **Keyframe-aware segment splitting** for faster parallel deep scans on long files
-- **Hardware-accelerated decode** (CUDA / VAAPI / D3D11VA / VideoToolbox, auto-detected)
-- **MediaInfo enrichment** when MediaInfo is available
-- **9 built-in delivery presets** (4K 24/30/60, 1080p 24/30/60, 720p30, 5.7K VR, 8K)
-- **Confidence-weighted results** — borderline failures are reported as advisory rather
-  than hard failures
-- **Plain-language summaries** — one line per file, free of technical jargon
-
-### Desktop GUI
-
-- Drag-and-drop files, folders, and `.fg` presets — anywhere in the window
-- Results stream in one file at a time as the scan progresses
-- **Failures first, severity-weighted** — failed files sort to the top with
-  critical corruption above minor framerate issues, tinted red with a headline
-  banner; toggle back to scan order at any time
-- Verdict banner auto-dismisses clean results and clears on new files,
-  navigation, or errors — no stale messages
-- **Checks matrix** — every file against every check in one grid, so a systemic
-  problem ("all 40 files failing Bitrate") is obvious at a glance
-- **Issues only** filter to hide files that passed cleanly
-- Right-click any result to open it in VLC, reveal it in Explorer, or copy its path
-- **PDF handoff reports** with a batch summary and per-file detail
-- **15 color themes** with live switching and persistence — the
-  theme also recolors the app icon, title bar, and system tray icon
-- Scan settings persist between sessions
-- Watch folder with automatic scanning and tray notifications
-- Standard window behaviour: Aero Snap, drag-to-maximize, Win+Arrow tiling
-- Keyboard shortcuts: `Ctrl+1..5` panels, `Ctrl+O` browse, `F5` scan, `Ctrl+E` export
-
-### Packaging
-
-- Single-file installer with FFmpeg, FFprobe, and MediaInfo bundled — no dependencies
-  for end users
-- `.fg` preset files are registered with Windows: they show the FrameGuard icon and
-  import on double-click
 
 ---
 
@@ -222,7 +220,6 @@ in sync.
 |----------|-------|----------|-------|
 | Container | Format | FAIL | Extension must be in accepted containers |
 | Video | Codec | FAIL | Must be in accepted codec list |
-| Video | Resolution | FAIL/WARN | FAIL when short of target, WARN within 1% tolerance |
 | Video | Frame Rate | FAIL/WARN | FAIL below target, WARN above target (conformance-friendly) |
 | Video | CFR | FAIL/WARN | Constant frame rate (configurable) |
 | Video | Bitrate | FAIL/WARN | WARN 10-25% under target, FAIL beyond |
