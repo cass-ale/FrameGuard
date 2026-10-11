@@ -14,10 +14,10 @@ AppId={{B7E2F4A1-9C3D-4E5F-8A1B-6D7C8E9F0A2B}
 AppName=FrameGuard Desktop
 AppVersion=0.5.5
 AppVerName=FrameGuard Desktop v0.5.5
-AppPublisher=Meta Platforms - TPG XR Studio
-AppPublisherURL=https://about.meta.com
-AppSupportURL=https://about.meta.com
-AppUpdatesURL=https://about.meta.com
+AppPublisher=Jace Aleria
+AppPublisherURL=https://github.com/cass-ale/FrameGuard
+AppSupportURL=https://github.com/cass-ale/FrameGuard
+AppUpdatesURL=https://github.com/cass-ale/FrameGuard
 DefaultDirName={autopf}\FrameGuard Desktop
 DefaultGroupName=FrameGuard Desktop
 AllowNoIcons=yes
@@ -45,13 +45,13 @@ SetupMutex=FrameGuardDesktopSetup
 AppMutex=FrameGuardDesktopApp
 MinVersion=10.0
 VersionInfoVersion=0.5.4.0
-VersionInfoCompany=Meta Platforms - TPG XR Studio
+VersionInfoCompany=Jace Aleria
 VersionInfoDescription=FrameGuard Desktop Installer
-VersionInfoCopyright=Copyright (c) 2026 Meta Platforms, Inc.
+VersionInfoCopyright=Copyright (c) 2026 Jace Aleria
 VersionInfoProductName=FrameGuard Desktop
 VersionInfoProductVersion=0.5.4.0
 InfoBeforeFile=installer_info.txt
-LicenseFile=installer_license.txt
+LicenseFile=LICENSE
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -60,7 +60,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 WelcomeLabel1=Welcome to FrameGuard Desktop
 WelcomeLabel2=This will install FrameGuard Desktop v0.5.4 on your computer.%n%nFrameGuard checks video deliverables against your delivery specification automatically - resolution, frame rate, codec, bitrate, audio, black frames and silence - and produces a PDF or CSV report you can hand off.%n%nAll processing happens on this computer. No video data is uploaded or shared.%n%nIt is recommended that you close all other applications before continuing.
 FinishedHeadingLabel=FrameGuard Desktop is ready
-FinishedLabel=FrameGuard Desktop v0.5.4 has been installed successfully.%n%nReports are saved to:%n      Documents\FrameGuard%n%nTo get started, drag a video file or folder onto the window and press Start Scan.%n%nDeveloped by Jace Aleria - TPG XR Studio
+FinishedLabel=FrameGuard Desktop v0.5.4 has been installed successfully.%n%nReports are saved to:%n      Documents\FrameGuard%n%nTo get started, drag a video file or folder onto the window and press Start Scan.%n%nDeveloped by Jace Aleria
 ConfirmUninstall=Are you sure you want to completely remove FrameGuard Desktop and all of its components?%n%nYour exported reports and custom presets will be kept unless you choose otherwise.
 SelectDirLabel3=Setup will install FrameGuard Desktop into the following folder. Everything it needs, including the video analysis tools, is installed here.
 SelectDirBrowseLabel=To continue, click Next. If you would like to select a different folder, click Browse.

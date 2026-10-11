@@ -98,7 +98,7 @@ prints the manual commands):
 
 ```bash
 SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
-APPLE_ID=you@meta.com APPLE_TEAM_ID=TEAMID \
+APPLE_ID=you@example.com APPLE_TEAM_ID=TEAMID \
 APPLE_APP_PASSWORD=xxxx-xxxx-xxxx-xxxx \
 ./build_mac.sh
 ```

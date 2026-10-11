@@ -139,47 +139,15 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        # 2. Also drop a copy in the shared CrashLogs folder if one is synced
-        #    locally, so the team sees failures without the user reporting them.
+        # 2. Keep a per-crash copy in the private log dir for diagnosis.
+        #    Deliberately NOT ~/Documents: on macOS that triggers a TCC
+        #    consent dialog, and prompting from inside a crash handler is
+        #    the worst possible moment for it.
         try:
             crash_filename = f"crash_{timestamp.strftime('%Y%m%d_%H%M%S')}_{ver}.log"
-            home = os.path.expanduser("~")
-
-            # "MetaMate Follower" is the project's Drive folder name, not a
-            # stray reference: <root>/CrashLogs is the shared collection point.
-            shared_tail = os.path.join("MetaMate Follower", "CrashLogs")
-            team_root = (
-                "G:\\Shared drives\\TPG XR\\\u2b50gDrive Reorganization\u2b50\\"
-                "Team - Innovation\\Q1\\T260340134 - NY QA Improvement\\"
-                "03 Desktop App\\MetaMate Follower\\CrashLogs"
-            )
-
-            drive_paths = [
-                os.path.join(home, "Downloads", "FGv0.2.2", "CrashLogs"),
-                os.path.join(home, "Google Drive", "My Drive", shared_tail),
-            ]
-            if sys.platform == "win32":
-                drive_paths.insert(0, team_root)
-                drive_paths.append(os.path.join("G:\\My Drive", shared_tail))
-            elif sys.platform == "darwin":
-                import glob
-                drive_paths.extend(glob.glob(os.path.join(
-                    home, "Library", "CloudStorage", "GoogleDrive-*",
-                    "My Drive", shared_tail)))
-
-            for dp in drive_paths:
-                if os.path.isdir(dp):
-                    with open(os.path.join(dp, crash_filename), "w", encoding="utf-8") as f:
-                        f.write(crash_report)
-                    break
-            else:
-                # Fall back to the same private log dir. Deliberately NOT
-                # ~/Documents: on macOS that triggers a TCC consent dialog,
-                # and prompting from inside a crash handler is the worst
-                # possible moment for it.
-                with open(os.path.join(_log_dir(), crash_filename), "w",
-                          encoding="utf-8") as f:
-                    f.write(crash_report)
+            with open(os.path.join(_log_dir(), crash_filename), "w",
+                      encoding="utf-8") as f:
+                f.write(crash_report)
         except Exception:
             pass  # Don't let crash reporting crash the crash handler
         
