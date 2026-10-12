@@ -2672,7 +2672,7 @@ class SettingsPanel(QWidget):
             key="delivery_fps_tolerance",
             title="FPS Tolerance",
             control=self._wrap_slider_with_value(self.fps_tol_slider, self.fps_tol_value),
-            description="Default: 0.5 fps. Accommodates NTSC drop-frame rates (29.97 counts as 30fps, 59.94 counts as 60fps). Per TPG XR SOP: captures report either exact or NTSC-equivalent frame rates.",
+            description="Default: 0.5 fps. Accommodates NTSC drop-frame rates (29.97 counts as 30fps, 59.94 counts as 60fps). Captures report either exact or NTSC-equivalent frame rates.",
             resetter=lambda: self._set_float_slider(self.fps_tol_slider, 0.1, 2.0, 0.1, float(self._defaults.get("fps_tolerance", 0.5)))
         )
 
@@ -2685,7 +2685,7 @@ class SettingsPanel(QWidget):
             key="delivery_min_bitrate_mbps",
             title="Min Bitrate",
             control=self._wrap_slider_with_value(self.min_bitrate_slider, self.min_bitrate_value),
-            description="Default: 20 Mbps for 4K (per TPG XR SOP). Typical values: 4K@30fps=20 Mbps, 4K@60fps=30 Mbps, 1080p=8 Mbps, 360 VR=40 Mbps. Files within 10% below are a soft pass.",
+            description="Default: 20 Mbps for 4K. Typical values: 4K@30fps=20 Mbps, 4K@60fps=30 Mbps, 1080p=8 Mbps, 360 VR=40 Mbps. Files within 10% below are a soft pass.",
             resetter=lambda: self._set_int_slider(self.min_bitrate_slider, int(self._defaults.get("min_bitrate_mbps", 20)))
         )
 
@@ -6155,7 +6155,7 @@ class MainWindow(QMainWindow):
             f"<p>Professional Video QA for XR Production</p>"
             f"<p>Automates delivery spec compliance checks for<br>"
             f"resolution, codec, bitrate, frame rate, and audio.</p>"
-            f"<p><b>Publisher:</b> Meta Platforms — TPG XR Studio<br>"
+            f"<p><b>Publisher:</b> Jace Aleria<br>"
             f"<b>Lead Developer:</b> Jace Aleria{build_info}</p>"
         )
 
