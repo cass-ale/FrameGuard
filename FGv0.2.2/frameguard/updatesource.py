@@ -5,22 +5,26 @@ A release is always the same shape regardless of transport:
     <channel>/manifest.json     SHA-256 of every file in the build
     <channel>/files/...         the full tree
 
-Two transports are supported, behind one interface, so the update channel can
-be a Drive-synced folder today and an HTTP endpoint later without touching the
-updater.
+Two transports are supported, behind one interface. The shipped default
+channel is the project's GitHub repository: releases are published to
+its `releases` branch (RELEASES/ for Windows, RELEASES-macos/ for
+macOS) and raw.githubusercontent.com serves that tree path-addressed
+over HTTPS — exactly the shape HttpSource consumes, with nothing for
+the user to install or sign into.
 
-LocalSource  - any filesystem path: a Drive for Desktop folder, a UNC share, a
+LocalSource  - any filesystem path: a local test mirror, a UNC share, a
                mapped drive. Costs nothing to operate and needs no server.
-HttpSource   - any host that serves a directory over HTTP(S): an internal
-               static host, a GitHub Enterprise release, an artifact store.
+HttpSource   - any host that serves a directory over HTTP(S): the repo's
+               raw content, an internal static host, an artifact store.
 
-NOTE ON GOOGLE DRIVE
-    Drive is a poor *HTTP* host for this: files are addressed by opaque fileId
-    rather than path, large downloads are interrupted by a virus-scan
-    interstitial, and unauthenticated access is throttled. Drive for Desktop,
-    however, is an excellent *filesystem* source - in streaming mode a file is
-    only fetched from the network when it is read, so pulling a delta pulls
-    only those bytes. Use LocalSource against the synced folder.
+NOTE ON GOOGLE DRIVE (the retired channel)
+    Drive hosted this channel until it moved to the repository. As an
+    HTTP host Drive cannot serve this layout at all — files are
+    addressed by opaque fileId rather than path, large downloads are
+    interrupted by a virus-scan interstitial, and unauthenticated
+    access is throttled — so the old channel silently depended on every
+    machine running Drive for Desktop against the same shared folder.
+    The repository needs none of that.
 """
 
 import json
