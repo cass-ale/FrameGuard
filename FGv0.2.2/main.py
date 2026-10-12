@@ -104,7 +104,7 @@ if __name__ == "__main__":
 
     # Global exception hook — prevents silent crashes in windowed mode
     def _global_excepthook(exc_type, exc_value, exc_tb):
-        """Show error dialog, log locally, and auto-upload to shared CrashLogs folder."""
+        """Show error dialog and log locally. Nothing is uploaded anywhere."""
         import traceback
         from datetime import datetime as _dt
         
@@ -155,8 +155,7 @@ if __name__ == "__main__":
         _show_error(
             f"[FrameGuard] Unexpected Error\n\n"
             f"{exc_type.__name__}: {exc_value}\n\n"
-            f"A crash log has been saved locally and, where available, to "
-            f"the team's shared CrashLogs folder for review."
+            f"A crash log has been saved locally for review."
         )
 
     sys.excepthook = _global_excepthook

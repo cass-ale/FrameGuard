@@ -386,8 +386,7 @@ class WatchFolderMonitor(QObject):
             return None
 
         return files
-        return files
-    
+
     def _enter_burst_mode(self):
         """Switch to faster polling to catch straggling files."""
         if not self._in_burst_mode:

@@ -181,8 +181,11 @@ def _is_newer(remote: str, local: str) -> bool:
 # Update source discovery
 # ---------------------------------------------------------------------------
 
-# GitHub repository for updates (set this when repo is created)
-GITHUB_REPO = "meta-tpg-xr/frameguard-desktop"  # owner/repo
+# GitHub repository for updates. This must be the repository the public
+# release actually lives in (it is also the URL installer.iss publishes);
+# the previous value named an internal org repo that does not exist
+# publicly, so the "primary update source" check always failed silently.
+GITHUB_REPO = "cass-ale/FrameGuard"  # owner/repo
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
 
