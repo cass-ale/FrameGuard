@@ -566,18 +566,38 @@ def run_ffprobe(filepath: str) -> Optional[dict]:
     ffprobe = get_ffprobe_path()
     if not ffprobe:
         return None
-    cmd = [
-        ffprobe, "-v", "quiet", "-print_format", "json",
-        "-show_format", "-show_streams",
-        "-show_entries",
+    # start_time feeds the A/V duration check (streams must be aligned by
+    # their start offsets before their ends are compared), and the side-data
+    # rotation / legacy rotate tag feed the resolution check (a stored
+    # 1920x1080 frame with 90-degree rotation displays as 1080x1920).
+    entries = (
+        "stream=codec_name,codec_type,width,height,r_frame_rate,"
+        "avg_frame_rate,nb_frames,duration,start_time,bit_rate,sample_rate,"
+        "channels,channel_layout,pix_fmt,color_space,color_transfer,"
+        "color_primaries,field_order,sample_aspect_ratio,display_aspect_ratio"
+        ":stream_side_data=side_data_type,rotation"
+        ":stream_tags=rotate"
+    )
+    legacy_entries = (
         "stream=codec_name,codec_type,width,height,r_frame_rate,"
         "avg_frame_rate,nb_frames,duration,bit_rate,sample_rate,"
         "channels,channel_layout,pix_fmt,color_space,color_transfer,"
-        "color_primaries,field_order,sample_aspect_ratio,display_aspect_ratio",
-        filepath
+        "color_primaries,field_order,sample_aspect_ratio,display_aspect_ratio"
+    )
+    base_cmd = [
+        ffprobe, "-v", "quiet", "-print_format", "json",
+        "-show_format", "-show_streams", "-show_entries",
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120, env=_get_clean_env(), **_subprocess_kwargs())
+        result = subprocess.run(base_cmd + [entries, filepath],
+                                capture_output=True, text=True, timeout=120,
+                                env=_get_clean_env(), **_subprocess_kwargs())
+        if result.returncode != 0:
+            # An ffprobe too old to know the side-data section must not take
+            # probing down with it: retry with the original field list.
+            result = subprocess.run(base_cmd + [legacy_entries, filepath],
+                                    capture_output=True, text=True, timeout=120,
+                                    env=_get_clean_env(), **_subprocess_kwargs())
         if result.returncode != 0:
             return None
         return json.loads(result.stdout)
@@ -682,6 +702,29 @@ def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
         result.add_fail("Video Codec", f"Codec '{codec}' not in accepted list {cfg['accepted_codecs']}.")
 
 
+def _stream_rotation_degrees(stream: dict) -> int:
+    """Rotation a player applies to this stream, in degrees.
+
+    ffprobe reports it in the Display Matrix side data (negated: a video
+    displayed 90 degrees clockwise carries -90); older files may carry
+    only the QuickTime ``rotate`` tag. 0 when neither is present. Only
+    the magnitude matters to callers: 90/270 swap the displayed axes.
+    """
+    for side_data in stream.get("side_data_list") or []:
+        if isinstance(side_data, dict) and "rotation" in side_data:
+            try:
+                return int(round(float(side_data["rotation"])))
+            except (TypeError, ValueError):
+                continue
+    rotate_tag = (stream.get("tags") or {}).get("rotate")
+    if rotate_tag:
+        try:
+            return int(round(float(rotate_tag)))
+        except (TypeError, ValueError):
+            pass
+    return 0
+
+
 def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     """Check 3: Validate resolution meets target.
 
@@ -699,16 +742,26 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
         return
     width = video_streams[0].get("width", 0)
     height = video_streams[0].get("height", 0)
+    # Judge the frame the audience sees, not the frame as stored: a
+    # 90/270-degree rotation flag swaps the displayed axes, so a portrait
+    # phone capture stored as 1920x1080 must not pass a landscape spec.
+    rotation = _stream_rotation_degrees(video_streams[0])
+    if rotation:
+        result.set_metadata("rotation", rotation)
+        result.set_metadata("stored_resolution", f"{width}x{height}")
+    if abs(rotation) % 180 == 90 and width and height:
+        width, height = height, width
     result.set_metadata("resolution", f"{width}x{height}")
     result.set_metadata("width", width)
     result.set_metadata("height", height)
     tw, th = cfg["target_width"], cfg["target_height"]
 
+    rot_note = f" (displayed after {abs(rotation)}° rotation)" if rotation else ""
     if width >= tw and height >= th:
         if width > tw or height > th:
-            result.add_pass("Resolution", f"{width}x{height} (exceeds {tw}x{th} target)")
+            result.add_pass("Resolution", f"{width}x{height} (exceeds {tw}x{th} target){rot_note}")
         else:
-            result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target)")
+            result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}")
         return
 
     shortfall_pct = max(
@@ -719,14 +772,14 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     if shortfall_pct <= 1.0:
         result.add_warn(
             "Resolution",
-            f"{width}x{height} is {shortfall_pct:.1f}% under the {tw}x{th} target. "
+            f"{width}x{height} is {shortfall_pct:.1f}% under the {tw}x{th} target{rot_note}. "
             f"Within rounding/mod-2 tolerance — verify this is intentional.",
             confidence=75,
         )
     else:
         result.add_fail(
             "Resolution",
-            f"{width}x{height} does not meet the {tw}x{th} target "
+            f"{width}x{height} does not meet the {tw}x{th} target{rot_note} "
             f"({shortfall_pct:.0f}% short). Upscaling to spec would resample the image.",
             confidence=95,
         )
@@ -942,9 +995,24 @@ def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
     if v_dur == 0 or a_dur == 0:
         result.add_skip("A/V Duration", "Duration data unavailable.")
         return
-    diff = abs(v_dur - a_dur)
+    # Compare stream ENDS, not raw durations. Streams routinely start at
+    # different offsets (an audio stream beginning 40 ms in, a video
+    # stream at a negative PTS origin), and comparing durations alone
+    # reads that offset as a mismatch — or hides a real one behind it.
+    # Missing/unparseable start_time falls back to 0, the old behaviour.
+    def _start_of(stream):
+        try:
+            return float(stream.get("start_time") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    v_start = _start_of(video_streams[0])
+    a_start = _start_of(audio_streams[0])
+    diff = abs((v_start + v_dur) - (a_start + a_dur))
     result.set_metadata("video_duration", round(v_dur, 3))
     result.set_metadata("audio_duration", round(a_dur, 3))
+    if v_start or a_start:
+        result.set_metadata("video_start_time", round(v_start, 3))
+        result.set_metadata("audio_start_time", round(a_start, 3))
     result.set_metadata("av_duration_diff", round(diff, 3))
     threshold = cfg["duration_mismatch_threshold"]
     if diff <= threshold:

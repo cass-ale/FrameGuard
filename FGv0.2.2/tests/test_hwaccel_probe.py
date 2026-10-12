@@ -21,9 +21,13 @@ import pytest
 import frameguard.core as core
 from frameguard.core import (
     DEFAULT_CONFIG,
+    QAResult,
     _get_optimal_hwaccel,
     _run_segment_filter_scan,
     _stderr_shows_device_failure,
+    _stream_rotation_degrees,
+    check_av_duration_mismatch,
+    check_resolution,
 )
 from frameguard import manifest as M
 
@@ -193,6 +197,95 @@ class TestManifestPathSafety:
             "files": {"FrameGuard.exe": {"sha256": "0" * 64, "size": 1}},
         }), encoding="utf-8")
         assert M.load_manifest(str(path)) is not None
+
+
+# ---------------------------------------------------------------------------
+# Rotation: judge the displayed frame, not the stored frame
+# (research finding: ffprobe reports stored dims; players autorotate)
+# ---------------------------------------------------------------------------
+
+def _status(result, name):
+    for check in result.checks:
+        if check[0] == name:
+            return check[1]
+    return None
+
+
+class TestRotationAwareResolution:
+    def _probe(self, w, h, **stream_kw):
+        stream = {"codec_type": "video", "width": w, "height": h}
+        stream.update(stream_kw)
+        return {"streams": [stream]}
+
+    def test_rotation_degrees_from_side_data_and_tag(self):
+        assert _stream_rotation_degrees(
+            {"side_data_list": [{"side_data_type": "Display Matrix",
+                                 "rotation": -90}]}) == -90
+        assert _stream_rotation_degrees({"tags": {"rotate": "90"}}) == 90
+        assert _stream_rotation_degrees({}) == 0
+
+    def test_rotated_portrait_capture_fails_a_landscape_target(self):
+        """Stored 1920x1080 with -90 rotation displays as 1080x1920."""
+        r = QAResult("phone.mov")
+        probe = self._probe(1920, 1080, side_data_list=[
+            {"side_data_type": "Display Matrix", "rotation": -90}])
+        check_resolution(probe, r, _cfg(target_width=1920, target_height=1080))
+        assert _status(r, "Resolution") == "FAIL"
+        assert r.metadata["rotation"] == -90
+        assert r.metadata["width"] == 1080
+
+    def test_unrotated_landscape_still_passes(self):
+        r = QAResult("master.mov")
+        check_resolution(self._probe(1920, 1080), r,
+                         _cfg(target_width=1920, target_height=1080))
+        assert _status(r, "Resolution") == "PASS"
+
+    def test_180_rotation_does_not_swap_axes(self):
+        r = QAResult("flipped.mov")
+        probe = self._probe(1920, 1080, side_data_list=[
+            {"side_data_type": "Display Matrix", "rotation": 180}])
+        check_resolution(probe, r, _cfg(target_width=1920, target_height=1080))
+        assert _status(r, "Resolution") == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# A/V duration: compare stream ends (start_time + duration), not durations
+# (research finding: duration subtraction ignores per-stream start offsets
+# and AAC priming, reading both as phantom mismatch)
+# ---------------------------------------------------------------------------
+
+class TestAVDurationAlignment:
+    def _probe(self, v_dur, a_dur, v_start=None, a_start=None):
+        video = {"codec_type": "video", "duration": str(v_dur)}
+        audio = {"codec_type": "audio", "duration": str(a_dur)}
+        if v_start is not None:
+            video["start_time"] = str(v_start)
+        if a_start is not None:
+            audio["start_time"] = str(a_start)
+        return {"streams": [video, audio]}
+
+    def test_offset_starts_with_matching_ends_pass(self):
+        """Audio starts 0.4s late and is 0.4s shorter: same end, in sync.
+        The old duration-only comparison warned on this file."""
+        r = QAResult("offset.mov")
+        check_av_duration_mismatch(
+            self._probe(10.0, 9.6, v_start=0.0, a_start=0.4), r, _cfg())
+        assert _status(r, "A/V Duration") == "PASS"
+        assert r.metadata["av_duration_diff"] == 0.0
+
+    def test_equal_durations_with_shifted_audio_fail_to_warn_tier(self):
+        """Equal durations but audio shifted 0.8s: ends differ by 0.8s,
+        which the old comparison scored as a perfect match."""
+        r = QAResult("shifted.mov")
+        check_av_duration_mismatch(
+            self._probe(10.0, 10.0, v_start=0.0, a_start=0.8), r, _cfg())
+        assert _status(r, "A/V Duration") == "WARN"
+        assert r.metadata["av_duration_diff"] == 0.8
+
+    def test_missing_start_time_falls_back_to_duration_diff(self):
+        r = QAResult("legacy.mov")
+        check_av_duration_mismatch(self._probe(10.0, 10.0), r, _cfg())
+        assert _status(r, "A/V Duration") == "PASS"
 
 
 # ---------------------------------------------------------------------------
