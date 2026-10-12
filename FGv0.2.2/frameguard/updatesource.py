@@ -118,6 +118,10 @@ class HttpSource(BaseSource):
 
         if not isinstance(data, dict) or "files" not in data:
             raise UpdateSourceError(f"The manifest at {url} is not a release manifest.")
+        if not M.manifest_paths_are_safe(data):
+            raise UpdateSourceError(
+                f"The manifest at {url} contains a file path that escapes "
+                f"the release tree; refusing it.")
         if data.get("manifest_version", 0) > M.MANIFEST_VERSION:
             raise UpdateSourceError(
                 "This release was published by a newer version of the build "

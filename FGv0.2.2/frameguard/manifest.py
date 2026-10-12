@@ -153,6 +153,36 @@ def write_manifest(manifest: Dict, path: str) -> str:
     return path
 
 
+def _is_safe_rel_path(rel) -> bool:
+    """True if a manifest path stays inside the tree it describes.
+
+    Manifests arrive over the update channel — a folder share or an HTTP
+    endpoint — and their keys are joined onto the staging directory, the
+    payload directory, and (by the swap scripts, including a delete pass)
+    the installation directory. An entry like ``../..`` or an absolute path
+    would escape all three. Legitimate manifests come from
+    build_manifest(), whose keys are os.path.relpath() output: relative,
+    forward-slashed, with no dot components — so anything else is refused.
+    """
+    if not isinstance(rel, str) or not rel:
+        return False
+    if "\\" in rel or rel.startswith("/") or rel.startswith("~"):
+        return False
+    # Windows drive-absolute ("C:/..."): os.path.join would discard the
+    # staging/install prefix entirely.
+    if len(rel) >= 2 and rel[1] == ":" and rel[0].isalpha():
+        return False
+    return all(part not in ("", ".", "..") for part in rel.split("/"))
+
+
+def manifest_paths_are_safe(data) -> bool:
+    """True if every file path in a parsed manifest is a safe relative path."""
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return False
+    return all(_is_safe_rel_path(rel) for rel in files)
+
+
 def load_manifest(path: str) -> Optional[Dict]:
     """Read a manifest, returning None if it is missing or unusable."""
     try:
@@ -165,6 +195,10 @@ def load_manifest(path: str) -> Optional[Dict]:
     if data.get("manifest_version", 0) > MANIFEST_VERSION:
         # A newer publisher format we do not understand. Refuse rather than
         # guess: a half-understood manifest could delete the wrong files.
+        return None
+    if not manifest_paths_are_safe(data):
+        # A path that escapes the tree (see _is_safe_rel_path). Refuse the
+        # whole manifest rather than guess which entries are honest.
         return None
     return data
 

@@ -1,8 +1,10 @@
-"""Regression tests for the operator feedback in feedback.md.
+"""Regression tests for defects reported by operators in the field.
 
 Every test here corresponds to a defect a real operator hit that the previous
 suite passed clean. Each docstring names the symptom, so a future failure is
 traceable back to the report rather than to an abstract invariant.
+(The field reports themselves were collected in a working document that has
+since been retired; these tests are the durable record.)
 """
 
 import os

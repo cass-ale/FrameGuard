@@ -29,6 +29,11 @@ import os
 APP_NAME = "FrameGuard"
 APP_VERSION = "0.5.5"
 ENTRY_POINT = "main.py"
+# NOTE: this is an opaque identifier, not branding. It is pinned by
+# tests/test_macos.py and changing it makes macOS treat FrameGuard as a
+# different app (bundle identity, .fg UTI ownership, preferences). It
+# still carries the historical "meta.tpgxr" reverse-DNS by design;
+# migrating it is a deliberate, versioned decision, not a cleanup.
 BUNDLE_ID = "com.meta.tpgxr.frameguard"
 
 IS_MAC = sys.platform == "darwin"
@@ -78,14 +83,14 @@ if sys.platform == "win32":
         kids=[
             StringFileInfo([
                 StringTable('040904B0', [
-                    StringStruct('CompanyName', 'Meta Platforms - TPG XR Studio'),
+                    StringStruct('CompanyName', 'Jace Aleria'),
                     StringStruct('FileDescription', 'FrameGuard Desktop - Video QA Tool'),
                     StringStruct('FileVersion', '0.5.5.0'),
                     StringStruct('InternalName', 'FrameGuard'),
                     StringStruct('OriginalFilename', 'FrameGuard.exe'),
                     StringStruct('ProductName', 'FrameGuard Desktop'),
                     StringStruct('ProductVersion', '0.5.5.0'),
-                    StringStruct('LegalCopyright', 'Copyright (c) 2026 Meta Platforms, Inc.'),
+                    StringStruct('LegalCopyright', 'Copyright (c) 2026 Jace Aleria'),
                 ])
             ]),
             VarFileInfo([VarStruct('Translation', [0x0409, 0x04B0])])
@@ -285,7 +290,7 @@ if IS_MAC:
             "CFBundleVersion": APP_VERSION,
             "CFBundleIdentifier": BUNDLE_ID,
             "CFBundlePackageType": "APPL",
-            "NSHumanReadableCopyright": "Copyright (c) 2026 Meta Platforms, Inc.",
+            "NSHumanReadableCopyright": "Copyright (c) 2026 Jace Aleria",
 
             # Retina. Without this the whole UI renders at 1x and looks soft.
             "NSHighResolutionCapable": True,

@@ -457,6 +457,9 @@ def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
       - has_libvmaf: bool
       - has_signalstats: bool
       - hwaccel_methods: list[str]  (e.g., ["cuda", "vaapi", "videotoolbox"])
+        NOTE: this is the list the binary was COMPILED with (``-hwaccels``),
+        not a list of devices present on this machine. Callers must probe
+        before trusting a method — see core._get_optimal_hwaccel.
       - has_ebur128: bool
 
     Cached per ffmpeg path: this is called once per deep-scan segment, and each
@@ -528,7 +531,7 @@ def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
 
 XR_DELIVERY_POLICY_XML = """<?xml version="1.0" encoding="UTF-8"?>
 <policy type="and" name="FrameGuard XR Delivery Policy" license="MIT">
-  <description>Policy for TPG XR video deliverables. Validates container, codec, audio, and structure.</description>
+  <description>Policy for XR video deliverables. Validates container, codec, audio, and structure.</description>
   <rule name="Container is MP4 or MOV" value="Format" tracktype="General" occurrence="*" operator="=">
     <test tracktype="General" value="Format" operator="=" term="MPEG-4"/>
   </rule>

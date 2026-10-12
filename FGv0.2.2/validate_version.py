@@ -53,6 +53,26 @@ def main():
     if v_init != v_json:
         errors.append(f"__init__.py={v_init} != version.json={v_json}")
 
+    # The headline fields above are not the only places a version ships.
+    # installer.iss also carries VersionInfoVersion, the registry "Version"
+    # value and the welcome/finished labels — all of which sat at 0.5.4
+    # through the 0.5.5 release while this validator printed "consistent",
+    # because it only ever read AppVersion=. Every x.y.z[.w] literal in the
+    # installer script and the spec must be the release version (or its
+    # four-part form); anything else is drift that end users can see.
+    allowed = {v_init, v_init + ".0"}
+    literal_re = re.compile(r"\d+\.\d+\.\d+(?:\.\d+)?")
+    for path in ("installer.iss", "frameguard.spec"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError as e:
+            print(f"  ERROR: Cannot read {path}: {e}")
+            sys.exit(1)
+        for literal in sorted(set(literal_re.findall(content))):
+            if literal not in allowed:
+                errors.append(f"{path} contains stale version literal {literal}")
+
     if errors:
         print("  ERROR: Version mismatch!")
         for e in errors:

@@ -150,9 +150,10 @@ step 6 "Generating the app icon..."
 # --- 7. PyInstaller -------------------------------------------------------
 step 7 "Building ${APP_NAME}.app..."
 rm -rf "$DIST_DIR"
-# Meta's Python framework exposes its shared library at sys.base_prefix, while
-# its sysconfig metadata names a nested framework path. Limit this discovery
-# override to PyInstaller so the packaged app cannot depend on the build host.
+# Some managed Python framework builds expose their shared library at
+# sys.base_prefix, while their sysconfig metadata names a nested framework
+# path. Limit this discovery override to PyInstaller so the packaged app
+# cannot depend on the build host.
 PY_BASE="$("$PY" -c 'import sys; print(sys.base_prefix)')"
 PYINSTALLER_DYLD_PATH="${PY_BASE}:${PY_BASE}/lib"
 if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
