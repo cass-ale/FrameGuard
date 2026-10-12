@@ -1,7 +1,7 @@
 """
 FrameGuard Desktop - Core Scan Engine
-Lead Developer: Jace Aleria | TPG XR Studio | Meta Platforms
-Copyright (c) 2026. All rights reserved.
+Lead Developer: Jace Aleria
+Copyright (c) 2026 Jace Aleria. MIT License.
 """
 
 # Single source of truth for the version; this module used to hard-code
@@ -231,7 +231,7 @@ DEFAULT_CONFIG = {
 
     # Naming convention
     "naming_pattern": r"^[A-Z]{2,5}_[A-Za-z0-9]+_[A-Z]+_\d{8}_C\d{3,4}\.\w{3,4}$",
-    "naming_example": "TPG_MQ3P01_MQDH_20260319_C004.mp4",
+    "naming_example": "PROJ_CAM01_TAKE_20260319_C004.mp4",
 
     # File discovery
     "video_extensions": {".mp4", ".mov", ".mkv", ".avi", ".mxf", ".ts", ".webm"},
@@ -1278,27 +1278,110 @@ def _segment_boundaries(duration: float, seg_count: int, overlap: float) -> List
     return segments or [(0.0, duration)]
 
 
-def _get_optimal_hwaccel(cfg: dict) -> List[str]:
+# ---------------------------------------------------------------------------
+# Hardware acceleration selection
+#
+# ``ffmpeg -hwaccels`` lists the methods the binary was COMPILED with, not
+# the methods that can open a device on this machine. A gyan.dev build lists
+# ``cuda`` on a laptop with no NVIDIA GPU; ``-hwaccel cuda`` there does not
+# fall back to software — device creation fails, FFmpeg exits 255 having
+# decoded zero frames, and because the failure lines are exactly what
+# HWACCEL_NOISE_PATTERNS scrubs from stderr, the deep scan then reported a
+# clean pass for every frame-level check. Selection therefore probes each
+# candidate with a real one-frame decode of the file being scanned (cached
+# per process), and a method that fails device initialisation is never
+# offered again.
+# ---------------------------------------------------------------------------
+
+_hwaccel_failed_methods: set = set()
+_hwaccel_probe_cache: dict = {}
+
+# Lines that mean "the hardware device could not be initialised", as opposed
+# to "the file is damaged". A decode that dies this way produced no frames,
+# so its (empty) findings must never be read as a clean result.
+_HWACCEL_DEVICE_FAILURE_PATTERNS = (
+    "Device creation failed",
+    "No device available",
+    "Hardware device setup failed",
+    "Failed to initialise",
+    "Failed to initialize",
+    "Cannot init CUDA",
+    "vaInitialize failed",
+)
+
+
+def _stderr_shows_device_failure(stderr_text: str) -> bool:
+    if not stderr_text:
+        return False
+    return any(p in stderr_text for p in _HWACCEL_DEVICE_FAILURE_PATTERNS)
+
+
+def _probe_hwaccel(ffmpeg_path: str, method: str, sample_file: str) -> bool:
+    """True if `method` can really decode on this machine.
+
+    One frame is enough: device creation happens before the first frame, so
+    a method with no usable device fails immediately. Cached per
+    (binary, method) — the answer cannot change while the process runs.
+    """
+    key = (ffmpeg_path, method)
+    if key in _hwaccel_probe_cache:
+        return _hwaccel_probe_cache[key]
+    ok = False
+    try:
+        proc = subprocess.run(
+            [ffmpeg_path, "-nostdin", "-hide_banner", "-v", "error",
+             "-hwaccel", method, "-i", sample_file,
+             "-frames:v", "1", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=30,
+            env=_get_clean_env(), **_subprocess_kwargs())
+        ok = proc.returncode == 0
+    except Exception:
+        ok = False
+    _hwaccel_probe_cache[key] = ok
+    if not ok:
+        _hwaccel_failed_methods.add(method)
+    return ok
+
+
+def _get_optimal_hwaccel(cfg: dict, probe_file: Optional[str] = None) -> List[str]:
     """Determine the best hwaccel method available on this system.
-    Returns FFmpeg hwaccel args list, or empty list if disabled.
+    Returns FFmpeg hwaccel args list, or empty list if disabled/software.
+
+    A candidate is returned only if it is not already known to fail on this
+    machine and — when `probe_file` is given — a one-frame probe decode of
+    that file succeeds with it. With no probe file the compile-time list is
+    trusted as before, minus any method already known to fail.
     """
     if not cfg.get("use_hwaccel", True):
         return []
 
     method = cfg.get("hwaccel_method", "auto")
+    ffmpeg_path = get_ffmpeg_path() if _HAS_TOOLS_MODULE else "ffmpeg"
+
+    def _usable(candidate: str) -> bool:
+        if candidate in _hwaccel_failed_methods:
+            return False
+        if probe_file and ffmpeg_path:
+            return _probe_hwaccel(ffmpeg_path, candidate, probe_file)
+        return True
+
     if method != "auto":
-        return ["-hwaccel", method]
+        return ["-hwaccel", method] if _usable(method) else []
 
     # Auto-detect: try preferred methods in order
     if _HAS_TOOLS_MODULE:
         caps = detect_ffmpeg_capabilities()
         hw_methods = caps.get("hwaccel_methods", [])
-        # Priority order: cuda > videotoolbox > vaapi > dxva2 > auto
+        # Priority order: cuda > videotoolbox > vaapi > dxva2 > d3d11va
         for preferred in ["cuda", "videotoolbox", "vaapi", "dxva2", "d3d11va"]:
-            if preferred in hw_methods:
+            if preferred in hw_methods and _usable(preferred):
                 return ["-hwaccel", preferred]
 
-    return ["-hwaccel", "auto"]
+    # FFmpeg's own "auto" probes devices itself and falls back to software
+    # decoding when none initialises, so it is safe to offer unprobed.
+    if _usable("auto"):
+        return ["-hwaccel", "auto"]
+    return []
 
 
 def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
@@ -1320,7 +1403,7 @@ def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
     ffmpeg_path = get_ffmpeg_path()
     if not ffmpeg_path:
         return None
-    hwaccel_args = _get_optimal_hwaccel(cfg)
+    hwaccel_args = _get_optimal_hwaccel(cfg, probe_file=filepath)
     ft = str(cfg.get("filter_threads", 4))
     cmd = [ffmpeg_path, "-nostdin", "-hide_banner"] + hwaccel_args + [
         "-ss", str(start_time), "-t", str(duration),
@@ -1347,6 +1430,22 @@ def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
         _, stderr = proc.communicate(timeout=_calc_timeout(duration, cfg))
         if cancel_event is not None and cancel_event.is_set():
             return None
+        if proc.returncode:
+            # A non-zero exit used to be ignored, so a decode that died at
+            # device initialisation (zero frames) returned its error text
+            # and was parsed as "no events found" — a clean pass.
+            if hwaccel_args and _stderr_shows_device_failure(stderr):
+                # Remember it so no later segment or file picks it again.
+                _hwaccel_failed_methods.add(hwaccel_args[1])
+                return None
+            produced = stderr or ""
+            if not any(tok in produced for tok in (
+                    "black_start", "freeze_start", "silence_start", "frame=")):
+                # Nothing was decoded and nothing was detected: this segment
+                # failed, and the caller must count it as uncovered rather
+                # than clean. (A segment that decoded part of the file before
+                # failing keeps its real findings and its decode errors.)
+                return None
         return stderr
     except subprocess.TimeoutExpired:
         if proc:
@@ -1425,8 +1524,11 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     audio_streams = [s for s in (probe_data or {}).get("streams", []) if s.get("codec_type") == "audio"]
     has_audio = len(audio_streams) > 0
 
-    # Build hwaccel args (v0.3: adaptive detection)
-    hwaccel_args = _get_optimal_hwaccel(cfg)
+    # Build hwaccel args (v0.3: adaptive detection). Probed against this
+    # file: a compile-time hwaccel method with no device on this machine
+    # must never be selected — its decode dies before the first frame and
+    # the empty result used to be reported as a clean pass.
+    hwaccel_args = _get_optimal_hwaccel(cfg, probe_file=filepath)
 
     # ---- Quick mode: skip deep scan entirely ----
     if quick:
@@ -1540,6 +1642,13 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                     confidence=40,
                 )
 
+            if failed_segments and failed_segments >= len(segments):
+                # Nothing was scanned at all. Parsing the empty stderr below
+                # would still record clean PASSes ("Full decode completed
+                # with no errors") for checks that never ran — the coverage
+                # warning above is the whole verdict.
+                return
+
             segment_results.sort(key=lambda x: x[0])
             stderr_text, truncated = _cap_stderr_text(
                 "\n".join(r[1] for r in segment_results), cfg)
@@ -1596,6 +1705,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
             stderr_thread = threading.Thread(target=_read_stderr_combined, args=(proc, stderr_lines), daemon=True)
             stderr_thread.start()
 
+            decode_progressed = False
             try:
                 for line in proc.stdout:
                     if cancel_event and cancel_event.is_set():
@@ -1609,18 +1719,38 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                     if line.startswith("out_time_us="):
                         try:
                             us = int(line.split("=")[1])
+                            if us > 0:
+                                decode_progressed = True
                             if progress_callback:
                                 progress_callback("filter", us / 1_000_000, duration, "Deep Scan [combined]")
                         except (ValueError, IndexError):
                             pass
 
-                proc.wait(timeout=timeout)
+                returncode = proc.wait(timeout=timeout)
                 stderr_thread.join(timeout=10)
                 stderr_text, _extra_trunc = _cap_stderr_text("".join(stderr_lines), cfg)
                 if stderr_dropped or _extra_trunc:
                     result.set_metadata(
                         "deep_scan_stderr_truncated_lines",
                         stderr_dropped + _extra_trunc)
+
+                if returncode and not decode_progressed and not any(
+                        tok in stderr_text for tok in (
+                            "black_start", "freeze_start", "silence_start")):
+                    # FFmpeg exited without decoding a single frame. Parsing
+                    # the (event-free) stderr below would report every
+                    # frame-level check as a clean PASS for a file that was
+                    # never actually decoded — the scan must say so instead.
+                    if hwaccel_args and _stderr_shows_device_failure(stderr_text):
+                        _hwaccel_failed_methods.add(hwaccel_args[1])
+                    result.add_warn(
+                        "Deep Scan",
+                        f"FFmpeg could not decode this file (exit code "
+                        f"{returncode}); frame-level checks were not run. "
+                        f"The file may be corrupt or use an unsupported codec.",
+                        confidence=40,
+                    )
+                    return
 
             except subprocess.TimeoutExpired:
                 proc.kill()
