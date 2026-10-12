@@ -1,13 +1,15 @@
 """Release channel tests.
 
-The team's release root contains non-ASCII characters:
-
-    G:\\Shared drives\\TPG XR\\<star>gDrive Reorganization<star>\\...\\MetaMate Follower
-
-That is a real hazard. Batch scripts run under an OEM codepage that mangles
-non-ASCII, QSettings has to round-trip it, and every path join and file read
-has to stay Unicode-clean. These tests pin that behaviour so a future change
-cannot quietly break updates for the whole team.
+The shipped channel is the project's GitHub repository: releases live on
+its `releases` branch and are served from raw.githubusercontent.com.
+These tests pin that, the migration off the retired Google Drive channel
+(a machine that saved the old Drive path as an override must not stay
+pinned to a folder that no longer receives releases), and — because a
+per-machine override may still point at ANY local folder — that a local
+channel under a non-ASCII path round-trips byte-exact: batch scripts run
+under an OEM codepage that mangles non-ASCII, QSettings has to
+round-trip values, and every path join and file read has to stay
+Unicode-clean.
 """
 
 import os
@@ -25,22 +27,24 @@ STAR = "\u2b50"
 
 
 class TestConfiguredChannel:
-    def test_channel_points_at_the_team_release_root(self):
-        from frameguard.updater import DEFAULT_UPDATE_CHANNEL, _RELEASE_ROOT
+    def test_channel_points_at_the_repository(self):
+        from frameguard.updater import DEFAULT_UPDATE_CHANNEL, GITHUB_REPO
 
-        assert "MetaMate Follower" in _RELEASE_ROOT
-        assert "T260340134" in _RELEASE_ROOT
-        assert DEFAULT_UPDATE_CHANNEL.startswith(_RELEASE_ROOT)
+        assert GITHUB_REPO == "cass-ale/FrameGuard"
+        assert DEFAULT_UPDATE_CHANNEL == (
+            f"https://raw.githubusercontent.com/{GITHUB_REPO}"
+            f"/releases/RELEASES")
 
-    def test_channel_uses_the_existing_releases_folder(self):
-        """RELEASES/ already holds FrameGuardInstaller.exe; the manifest and
-        payload go alongside it rather than in a second folder."""
+    def test_channel_uses_the_releases_folder(self):
+        """RELEASES/ on the releases branch holds the manifest and the
+        files/ payload — the layout the channel has always had."""
         from frameguard.updater import DEFAULT_UPDATE_CHANNEL
 
-        assert DEFAULT_UPDATE_CHANNEL.endswith("RELEASES")
+        assert DEFAULT_UPDATE_CHANNEL.endswith("/RELEASES")
 
-    def test_crash_logs_target_the_project_folder(self):
-        """MetaMate Follower/CrashLogs is the real shared collection point."""
+    def test_crash_logs_stay_local(self):
+        """Crash logs go to the per-user local log dir. The retired
+        behaviour — a shared Drive collection folder — must not return."""
         import importlib.util, os
 
         spec = importlib.util.spec_from_file_location(
@@ -49,18 +53,44 @@ class TestConfiguredChannel:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         source = open(spec.origin, encoding="utf-8").read()
-        assert "MetaMate Follower" in source
-        assert "CrashLogs" in source
+        assert "Shared drives" not in source
+        assert "MetaMate" not in source
+        assert "_log_dir" in source
 
-    def test_channel_is_absolute_not_a_url(self):
+    def test_channel_is_a_url(self):
         from frameguard.updater import DEFAULT_UPDATE_CHANNEL
-        from frameguard.updatesource import LocalSource
+        from frameguard.updatesource import HttpSource
 
-        assert os.path.isabs(DEFAULT_UPDATE_CHANNEL)
-        assert isinstance(make_source(DEFAULT_UPDATE_CHANNEL), LocalSource)
+        assert DEFAULT_UPDATE_CHANNEL.startswith("https://")
+        assert isinstance(make_source(DEFAULT_UPDATE_CHANNEL), HttpSource)
+
+    def test_a_legacy_drive_channel_migrates_to_the_default(self, qapp):
+        """Machines that saved the retired Drive channel as an override
+        must not stay pinned to a folder that no longer gets releases:
+        background checks swallow unreachable-channel errors, so nothing
+        would ever surface that they are stuck."""
+        from PySide6.QtCore import QSettings
+        from frameguard import updater as U
+
+        settings = QSettings(U._SETTINGS_ORG, U._SETTINGS_APP)
+        original = settings.value(U._CHANNEL_KEY, None)
+        try:
+            settings.setValue(U._CHANNEL_KEY,
+                              U._LEGACY_RELEASE_ROOT + "\\RELEASES")
+            assert U.get_update_channel() == U.DEFAULT_UPDATE_CHANNEL
+            assert settings.value(U._CHANNEL_KEY, None) is None, \
+                "the legacy override should be cleared, not left to rot"
+            # Storing the legacy value through the setter is also a no-op.
+            U.set_update_channel(U._LEGACY_RELEASE_ROOT + "\\RELEASES-macos")
+            assert settings.value(U._CHANNEL_KEY, None) is None
+        finally:
+            if original is None:
+                settings.remove(U._CHANNEL_KEY)
+            else:
+                settings.setValue(U._CHANNEL_KEY, original)
 
     def test_channel_survives_qsettings(self, qapp):
-        """QSettings is the per-machine override; the emoji has to round-trip."""
+        """QSettings is the per-machine override; the value has to round-trip."""
         from frameguard.updater import (DEFAULT_UPDATE_CHANNEL,
                                         get_update_channel, set_update_channel)
 
@@ -140,17 +170,22 @@ class TestConfiguredChannel:
             else:
                 settings.setValue(U._CHANNEL_KEY, original)
 
-    def test_release_root_is_in_the_update_search_paths(self, qapp):
-        from frameguard.updater import _RELEASE_ROOT, get_default_search_paths
+    def test_search_paths_carry_no_retired_locations(self):
+        """The installer-flow fallback searches Downloads and the app's
+        own folder — never the retired Drive root or team shares."""
+        from frameguard.updater import get_default_search_paths
 
-        if sys.platform != "win32":
-            pytest.skip("Windows-only search paths")
-        assert any(_RELEASE_ROOT in p for p in get_default_search_paths())
+        paths = get_default_search_paths()
+        assert paths
+        assert not any("TPG" in p or "team-share" in p
+                       or "Shared drives" in p for p in paths)
 
 
 @pytest.fixture
 def emoji_release(tmp_path):
-    """A release published under a path shaped like the real one."""
+    """A release published under a path shaped like a real-world messy
+    one — the retired Drive root had exactly this shape, and a local
+    mirror used as an override still can."""
     root = tmp_path / f"{STAR}gDrive Reorganization{STAR}" / "03 Desktop App" \
         / "MetaMate Follower" / "release"
     payload = root / M.PAYLOAD_DIRNAME

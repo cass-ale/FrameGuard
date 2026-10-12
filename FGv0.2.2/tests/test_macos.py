@@ -158,19 +158,17 @@ class TestMacRuntimePaths:
         with mock.patch.object(updater.sys, "platform", "win32"):
             assert updater.installer_filename().endswith(".exe")
 
-    def test_updater_searches_mac_cloud_paths(self):
+    def test_updater_search_paths_have_no_platform_shares(self):
+        """The installer-flow fallback is platform-neutral now: Downloads
+        and the app's own folder. The retired Drive mounts, team shares
+        and UNC paths must not reappear on any platform's list."""
         from frameguard import updater
 
         with mock.patch.object(updater.sys, "platform", "darwin"):
             paths = updater.get_default_search_paths()
-        assert any("/Volumes/" in p for p in paths)
-        # Windows-only configured shares must not leak into the macOS list.
-        # NOTE: the source-tree fallback (repo parent dir) is host-dependent,
-        # not platform-dependent — on a Windows checkout on G: it legitimately
-        # starts with "G:". Only assert on the configured Windows shares.
-        assert updater._RELEASE_ROOT not in paths
-        assert os.path.join(updater._RELEASE_ROOT, "RELEASES") not in paths
-        assert not any("team-share" in p and p.startswith("\\\\") for p in paths), \
+        assert any("Downloads" in p for p in paths)
+        assert not any("team-share" in p or "TPG" in p for p in paths)
+        assert not any(p.startswith("\\\\") for p in paths), \
             "Windows-only update paths leaked into the macOS list"
 
 

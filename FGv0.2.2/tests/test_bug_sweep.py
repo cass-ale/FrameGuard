@@ -419,23 +419,24 @@ class TestMacHardening:
         manifest = m.build_manifest(str(tmp_path))
         assert manifest["arch"] == "arm64"
 
-    def test_mac_channel_is_built_with_os_path_join(self):
-        """The old darwin channel concatenated backslashes — invalid on POSIX,
-        so fresh Mac installs checked a path that could never exist. Channels
-        must be built with os.path.join (backslashes are correct ON Windows,
-        which is why this asserts on the source, not the separator)."""
+    def test_mac_channel_is_a_url_built_with_forward_slashes(self):
+        """Channels are repository URLs now. They must be built with "/"
+        joins on every platform — os.path.join would inject backslashes
+        into the URL on Windows, pointing every client at an address
+        that cannot exist. (The pre-repo bug this replaces: the darwin
+        Drive channel concatenated backslashes, invalid on POSIX.)"""
         import os as _os
         repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
         src = open(_os.path.join(repo, "frameguard", "updater.py"),
                    encoding="utf-8").read()
-        assert 'os.path.join(_RELEASE_ROOT, "RELEASES-macos")' in src
-        assert '_RELEASE_ROOT + "\\\\RELEASES-macos"' not in src
+        assert "_RELEASE_BASE_URL" in src
+        assert 'f"{_RELEASE_BASE_URL}/RELEASES-macos"' in src
         from frameguard import updater
         mac = updater.get_update_channel_for("darwin")
         assert mac != updater.DEFAULT_UPDATE_CHANNEL
         assert "macos" in mac.lower()
-        if _os.name != "nt":
-            assert "\\" not in mac
+        assert mac.startswith("https://")
+        assert "\\" not in mac
 
     def test_updater_restored_last_check_method(self):
         """check_channel_for_delta used to swallow a get_last_check_time def —

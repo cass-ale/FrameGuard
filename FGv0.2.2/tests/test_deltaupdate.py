@@ -125,7 +125,7 @@ class TestManifest:
 
 
 class TestUpdateSources:
-    """One channel setting must work for a Drive folder, a UNC share or a URL."""
+    """One channel setting must work for a local folder, a UNC share or a URL."""
 
     def test_path_yields_a_local_source(self, tmp_path):
         from frameguard.updatesource import LocalSource, make_source
@@ -184,7 +184,8 @@ class TestUpdateSources:
 
 class TestUpdateChannel:
     def test_a_default_channel_ships_with_the_app(self):
-        """A fresh install must already point at the team's release location."""
+        """A fresh install must already point at the project's release
+        location — the repository."""
         from frameguard.updater import DEFAULT_UPDATE_CHANNEL
         assert DEFAULT_UPDATE_CHANNEL.strip()
 
