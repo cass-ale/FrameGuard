@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.5.5
+FrameGuard Desktop v0.5.6
 Video QA for XR Deliverables
 
 
@@ -22,22 +22,23 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.5.5
+WHAT'S NEW IN v0.5.6
 
-  Hardening
-    - The scan page verdict clears with the results, and transient notes
-      dismiss themselves instead of lingering; failures stay until you act
-      on them.
-    - Strict Mode now takes effect: with it on, warnings escalate to FAIL.
-    - "Open in VLC" re-detects installed players on each use, falls back
-      when a launch fails, and reports when nothing could be launched
-      instead of failing silently.
-    - The startup splash tracks progress while the window builds, and
-      startup no longer waits on the FFmpeg check before the window paints.
-
-  If you signed off footage using v0.5.2 or earlier, it is worth
-  re-scanning: the deep-scan checks in those versions could report "no
-  issues found" for files that had them.
+  Release pipeline repair
+    - The macOS build could not finish: the FFmpeg and FFprobe downloads
+      pointed at a retired source, so the build failed at the last step.
+      The tools are now downloaded per architecture (Apple Silicon and
+      Intel separately), pinned to a specific build, and verified against
+      the publisher's SHA-256 checksums before they are bundled.
+    - Both builders now stop immediately, with the real cause, when a
+      required tool or a test fails, instead of warning and failing later
+      with an unrelated message.
+    - App identity moved to the publisher's own: the macOS bundle ID is
+      now com.caprilaria.frameguard, and the organization domain is
+      caprilaria.com. On macOS, preferences and preset-file ownership
+      start fresh under the new identity.
+    - Bundled MediaInfo updated to 26.10.
+    - No changes to scanning behaviour.
 
 
 BEFORE YOU INSTALL
