@@ -104,9 +104,25 @@ class TestMacToolDiscovery:
         """download_tools.py caches under tools_cache/<platform>/."""
         from frameguard import tools
 
-        dirs = tools._candidate_tools_dirs()
         key = "windows" if os.name == "nt" else "darwin"
-        assert any(d.endswith(os.path.join("tools_cache", key)) for d in dirs), dirs
+        # _candidate_tools_dirs() only lists directories that exist, and
+        # tools_cache/ is a gitignored build product: a clean checkout (CI)
+        # has none until download_tools.py runs. Arrange it for this test
+        # and remove it again only if this test created it.
+        cache_dir = os.path.join(REPO, "tools_cache", key)
+        created = not os.path.isdir(cache_dir)
+        if created:
+            os.makedirs(cache_dir)
+        try:
+            dirs = tools._candidate_tools_dirs()
+            assert any(d.endswith(os.path.join("tools_cache", key)) for d in dirs), dirs
+        finally:
+            if created:
+                os.rmdir(cache_dir)
+                try:
+                    os.rmdir(os.path.dirname(cache_dir))
+                except OSError:
+                    pass
 
     def test_unrunnable_binary_is_not_reported_usable(self):
         """A missing +x bit used to be reported as 'found and OK', turning every

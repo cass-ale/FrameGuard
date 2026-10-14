@@ -133,8 +133,15 @@ BUILD_STAMP="${WORK_DIR}/_build_stamp.json"
     || die "Could not write the build stamp."
 export FRAMEGUARD_BUILD_STAMP_PATH="$BUILD_STAMP"
 
-# --- 5. Tests -------------------------------------------------------------
-step 5 "Running the test suite..."
+# --- 5. Icon --------------------------------------------------------------
+# The icon is generated BEFORE the test gate on purpose: the gate asserts
+# the .icns exists and is valid, and the file is a gitignored build product,
+# so a clean checkout (CI) has none until this step runs.
+step 5 "Generating the app icon..."
+"$PY" assets/make_icns.py || die "Could not generate assets/frameguard.icns"
+
+# --- 6. Tests -------------------------------------------------------------
+step 6 "Running the test suite..."
 if [[ $SKIP_TESTS -eq 1 ]]; then
     echo "      SKIPPED (--skip-tests)"
 else
@@ -142,10 +149,6 @@ else
         tests/test_macos.py tests/test_packaging.py \
         || die "macOS packaging tests failed. Fix them before shipping a build."
 fi
-
-# --- 6. Icon --------------------------------------------------------------
-step 6 "Generating the app icon..."
-"$PY" assets/make_icns.py || die "Could not generate assets/frameguard.icns"
 
 # --- 7. PyInstaller -------------------------------------------------------
 step 7 "Building ${APP_NAME}.app..."
