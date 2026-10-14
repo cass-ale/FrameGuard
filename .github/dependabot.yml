@@ -1,0 +1,8 @@
+# Keeps the SHA-pinned actions in release.yml current: Dependabot
+# understands SHA pins and preserves the trailing version comments.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

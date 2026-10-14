@@ -546,7 +546,7 @@ def generate_report(results: List[QAResult], output_path: str,
     pdf.set_x(MARGIN_L)
     pdf.cell(
         0, 5,
-        f"FrameGuard Desktop v{__version__}   |   Developed by Cassian Aléria   |   "
+        f"FrameGuard Desktop v{__version__}   |   Published by Capri la Ria   |   Developed by Cassian Aléria   |   "
         f"{datetime.now().strftime('%Y-%m-%d %H:%M')}   |   Processed locally",
         new_x=XPos.LMARGIN, new_y=YPos.NEXT,
     )

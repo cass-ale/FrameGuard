@@ -285,3 +285,93 @@ class TestSwapScriptEncoding:
         import shutil
         shutil.rmtree(os.path.join(tempfile.gettempdir(),
                                    "frameguard_update_backup"), ignore_errors=True)
+
+
+class TestGithubReleaseAssetPick:
+    """A GitHub Release carries BOTH installers. The updater's GitHub
+    fallback must hand each platform its own file — the old first-match
+    loop ("installer" in the name, or any .exe) gave a Mac the Windows
+    installer whenever the .exe happened to be listed first."""
+
+    ASSETS = [
+        {"name": "FrameGuardInstaller.exe",
+         "browser_download_url": "https://example.test/win.exe", "size": 10},
+        {"name": "FrameGuard.dmg",
+         "browser_download_url": "https://example.test/mac.dmg", "size": 20},
+    ]
+
+    def test_windows_picks_the_exe(self):
+        from frameguard.updater import _pick_release_asset
+        picked = _pick_release_asset(self.ASSETS, platform="win32")
+        assert picked["name"] == "FrameGuardInstaller.exe"
+
+    def test_macos_picks_the_dmg_even_when_the_exe_is_first(self):
+        from frameguard.updater import _pick_release_asset
+        picked = _pick_release_asset(self.ASSETS, platform="darwin")
+        assert picked["name"] == "FrameGuard.dmg"
+
+    def test_macos_picks_the_dmg_when_it_is_first(self):
+        from frameguard.updater import _pick_release_asset
+        picked = _pick_release_asset(list(reversed(self.ASSETS)),
+                                      platform="darwin")
+        assert picked["name"] == "FrameGuard.dmg"
+
+    def test_no_asset_for_this_platform_returns_none(self):
+        from frameguard.updater import _pick_release_asset
+        only_win = [self.ASSETS[0]]
+        assert _pick_release_asset(only_win, platform="darwin") is None
+        assert _pick_release_asset([], platform="win32") is None
+
+    def test_canonical_name_wins_over_another_same_extension_asset(self):
+        from frameguard.updater import _pick_release_asset
+        assets = [
+            {"name": "FrameGuard-arm64.dmg",
+             "browser_download_url": "https://example.test/arm.dmg",
+             "size": 1},
+            {"name": "FrameGuard.dmg",
+             "browser_download_url": "https://example.test/mac.dmg",
+             "size": 2},
+        ]
+        # An Intel machine must not be handed the arm64 DMG when the
+        # canonical (un-suffixed) DMG is also on the release.
+        picked = _pick_release_asset(assets, platform="darwin",
+                                     machine="x86_64")
+        assert picked["name"] == "FrameGuard.dmg"
+
+    def test_arm64_machine_picks_the_arm64_dmg(self):
+        from frameguard.updater import _pick_release_asset
+        assets = [
+            {"name": "FrameGuard-intel.dmg",
+             "browser_download_url": "https://example.test/intel.dmg",
+             "size": 1},
+            {"name": "FrameGuard-arm64.dmg",
+             "browser_download_url": "https://example.test/arm.dmg",
+             "size": 2},
+        ]
+        picked = _pick_release_asset(assets, platform="darwin",
+                                     machine="arm64")
+        assert picked["name"] == "FrameGuard-arm64.dmg"
+
+    def test_intel_machine_picks_the_intel_dmg(self):
+        from frameguard.updater import _pick_release_asset
+        assets = [
+            {"name": "FrameGuard-arm64.dmg",
+             "browser_download_url": "https://example.test/arm.dmg",
+             "size": 1},
+            {"name": "FrameGuard-intel.dmg",
+             "browser_download_url": "https://example.test/intel.dmg",
+             "size": 2},
+        ]
+        picked = _pick_release_asset(assets, platform="darwin",
+                                     machine="x86_64")
+        assert picked["name"] == "FrameGuard-intel.dmg"
+
+    def test_wrong_arch_only_returns_none_rather_than_a_bad_dmg(self):
+        from frameguard.updater import _pick_release_asset
+        assets = [
+            {"name": "FrameGuard-intel.dmg",
+             "browser_download_url": "https://example.test/intel.dmg",
+             "size": 1},
+        ]
+        assert _pick_release_asset(assets, platform="darwin",
+                                   machine="arm64") is None

@@ -1,5 +1,7 @@
 {
   "version": "0.5.5",
+  "publisher": "Capri la Ria",
+  "developer": "Cassian Aléria",
   "installer": "FrameGuardInstaller.exe",
   "installer_windows": "FrameGuardInstaller.exe",
   "installer_darwin": "FrameGuard.dmg",

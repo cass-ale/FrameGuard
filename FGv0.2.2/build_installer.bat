@@ -44,13 +44,13 @@ python --version >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Python not found on PATH.
     echo        Install Python 3.10+ from https://www.python.org/downloads/
-    pause
+    if not defined CI pause
     exit /b 1
 )
 python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"
 if errorlevel 1 (
     echo ERROR: Python 3.10 or newer is required.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 for /f "tokens=2 delims= " %%v in ('python --version 2^>^&1') do set PYVER=%%v
@@ -69,7 +69,7 @@ if exist ".buildenv" rmdir /s /q ".buildenv"
 python -m venv .buildenv
 if errorlevel 1 (
     echo ERROR: Failed to create the virtual environment.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 echo       Created .buildenv
@@ -88,7 +88,7 @@ if errorlevel 1 (
     if errorlevel 1 (
         echo ERROR: Could not bootstrap pip inside .buildenv.
         echo        Try deleting .buildenv and re-running.
-        pause
+        if not defined CI pause
         exit /b 1
     )
 )
@@ -102,7 +102,7 @@ echo [3/9] Installing build dependencies...
 "%PY%" -m pip install --quiet -r requirements.txt "pyinstaller>=6.0,<7.0" "Pillow>=10.0"
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 if "!SKIP_TESTS!"=="0" "%PY%" -m pip install --quiet pytest
@@ -117,14 +117,14 @@ if errorlevel 1 (
     echo.
     echo ERROR: Version numbers disagree across files.
     echo        Fix __init__.py, frameguard.spec, installer.iss and version.json.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
 "%PY%" write_build_stamp.py
 if errorlevel 1 (
     echo ERROR: Could not write the build stamp.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -139,7 +139,7 @@ if "!SKIP_TESTS!"=="1" (
     if errorlevel 1 (
         echo.
         echo ERROR: Tests failed. Fix them before shipping a build.
-        pause
+        if not defined CI pause
         exit /b 1
     )
     set "QT_QPA_PLATFORM="
@@ -155,18 +155,18 @@ if exist "build" rmdir /s /q "build"
 if errorlevel 1 (
     echo.
     echo ERROR: PyInstaller build failed. See the output above.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
 if not exist "dist\FrameGuard\FrameGuard.exe" (
     echo ERROR: dist\FrameGuard\FrameGuard.exe was not produced.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 if not exist "dist\FrameGuard\_internal" (
     echo ERROR: dist\FrameGuard\_internal was not produced.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 echo       Built dist\FrameGuard\FrameGuard.exe
@@ -192,7 +192,7 @@ if errorlevel 1 (
     echo.
     echo ERROR: The built exe failed its self-test. Do not ship this build.
     echo        Reproduce with: dist\FrameGuard\FrameGuard.exe --selftest
-    pause
+    if not defined CI pause
     exit /b 1
 )
 echo       Smoke test passed.
@@ -213,7 +213,7 @@ if not defined ISCC (
     echo.
     echo        The application itself built successfully. You can run it directly:
     echo          dist\FrameGuard\FrameGuard.exe
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -222,14 +222,14 @@ if exist "Output\FrameGuardInstaller.exe" del /q "Output\FrameGuardInstaller.exe
 "%ISCC%" installer.iss
 if errorlevel 1 (
     echo ERROR: Inno Setup compilation failed. See the output above.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
 if not exist "Output\FrameGuardInstaller.exe" (
     echo ERROR: Inno Setup reported success but Output\FrameGuardInstaller.exe
     echo        does not exist. Check OutputDir/OutputBaseFilename in installer.iss.
-    pause
+    if not defined CI pause
     exit /b 1
 )
 
@@ -266,4 +266,4 @@ echo  ====================================================
 echo.
 
 call deactivate
-pause
+if not defined CI pause

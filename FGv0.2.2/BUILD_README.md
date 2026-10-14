@@ -82,11 +82,16 @@ bash build_mac.sh
 ### Gatekeeper — read this before distributing
 
 By default the build is **ad-hoc signed**, which is enough to run locally but
-*not* enough to satisfy Gatekeeper on someone else's Mac. On first launch a
-teammate must either:
+*not* enough to satisfy Gatekeeper on someone else's Mac. The build carries a
+valid seal (required for Apple Silicon to run it at all) but no Apple-issued
+identity and no notarization ticket. On first launch of a downloaded copy:
 
-- Right-click **FrameGuard** → **Open** → **Open**, or
-- Run `xattr -dr com.apple.quarantine /Applications/FrameGuard.app`
+- **macOS 15 or later:** double-click → **Done** → System Settings →
+  Privacy & Security → **Open Anyway** → authenticate → relaunch and confirm
+  **Open**. (Apple removed the right-click → Open bypass in macOS 15.)
+- **macOS 14 or earlier:** right-click **FrameGuard** → **Open** → **Open**.
+- Any version, if the app is reported damaged or Open Anyway doesn't appear:
+  `xattr -dr com.apple.quarantine /Applications/FrameGuard.app`
 
 A Developer ID build without `--allow-unsigned` **fails the build** if signing
 or verification fails, instead of shipping a half-signed app. Pass
@@ -113,8 +118,10 @@ xcrun notarytool submit Output/FrameGuard.dmg \
 xcrun stapler staple Output/FrameGuard.dmg
 ```
 
-Notarization requires a paid Apple Developer account. Until then, include the
-right-click-Open instruction whenever you share the DMG.
+Notarization requires a paid Apple Developer account (no free path exists).
+Until then, include the version-appropriate Gatekeeper instruction above
+whenever you share the DMG — never just "right-click → Open", which is wrong
+for macOS 15+.
 
 ### Architecture
 

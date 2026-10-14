@@ -361,10 +361,13 @@ if [[ "$SIGN_IDENTITY" == "-" ]]; then
 cat <<EOF
   IMPORTANT - Gatekeeper (ad-hoc signed build):
     macOS blocks apps that are not notarized by Apple.
-    On first launch teammates must either:
+    On first launch of a downloaded copy:
 
-      * Right-click FrameGuard -> Open -> Open, or
-      * Run:  xattr -dr com.apple.quarantine /Applications/FrameGuard.app
+      * macOS 15+: double-click -> Done -> System Settings ->
+        Privacy & Security -> Open Anyway -> authenticate -> relaunch.
+        (Right-click -> Open no longer works on macOS 15+.)
+      * macOS 14 and earlier: Right-click FrameGuard -> Open -> Open.
+      * If reported damaged:  xattr -dr com.apple.quarantine /Applications/FrameGuard.app
 
     DMG: ${DMG_PATH}  (volume: ${VOLNAME})
     Arch copy: ${DMG_DIR}/FrameGuard-${TARGET_ARCH}.dmg

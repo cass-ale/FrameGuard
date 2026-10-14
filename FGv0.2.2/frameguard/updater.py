@@ -219,11 +219,64 @@ def _is_newer(remote: str, local: str) -> bool:
 # identity, which the update channel also derives from.
 
 
+def _pick_release_asset(assets, platform: Optional[str] = None,
+                        machine: Optional[str] = None):
+    """Pick the release asset THIS machine can actually install.
+
+    A GitHub Release carries every platform's installer
+    (FrameGuardInstaller.exe, FrameGuard-arm64.dmg, FrameGuard-intel.dmg).
+    Taking the first asset that merely looks like an installer hands a
+    Mac user the Windows .exe — and hands an Intel Mac the arm64 DMG —
+    so selection is by platform AND architecture, preferring the asset
+    named for this machine, then the canonical installer name, and never
+    crossing platforms or architectures when a match exists.
+    """
+    platform = sys.platform if platform is None else platform
+    if platform != "darwin":
+        candidates = [
+            a for a in assets
+            if str(a.get("name", "")).lower().endswith(".exe")
+        ]
+        if not candidates:
+            return None
+        for asset in candidates:
+            if str(asset.get("name", "")).lower() == _INSTALLER_FILENAME.lower():
+                return asset
+        return candidates[0]
+
+    if machine is None:
+        import platform as _platform
+        machine = _platform.machine()
+    machine = machine.lower()
+    arm = machine in ("arm64", "aarch64")
+    want = ("arm64",) if arm else ("intel", "x86_64")
+    other = ("intel", "x86_64") if arm else ("arm64",)
+    dmgs = [
+        a for a in assets
+        if str(a.get("name", "")).lower().endswith(".dmg")
+    ]
+    if not dmgs:
+        return None
+    def _name(a):
+        return str(a.get("name", "")).lower()
+    for asset in dmgs:  # named for this architecture
+        if any(tag in _name(asset) for tag in want):
+            return asset
+    for asset in dmgs:  # the canonical, un-suffixed DMG
+        if _name(asset) == "FrameGuard.dmg".lower():
+            return asset
+    for asset in dmgs:  # any DMG not named for the other architecture
+        if not any(tag in _name(asset) for tag in other):
+            return asset
+    return None
+
+
 def check_github_for_update() -> Optional["UpdateInfo"]:
     """Check GitHub Releases API for a newer version.
-    
+
     Looks for the latest release and compares version tags.
-    The release should have an asset named FrameGuardInstaller.exe.
+    The release should carry FrameGuardInstaller.exe (Windows) and
+    FrameGuard.dmg (macOS); _pick_release_asset chooses per platform.
     """
     try:
         import urllib.request
@@ -239,14 +292,10 @@ def check_github_for_update() -> Optional["UpdateInfo"]:
         tag = data.get("tag_name", "").lstrip("v")
         body = data.get("body", "")
         
-        # Find the installer asset
-        installer_url = ""
-        file_size = 0
-        for asset in data.get("assets", []):
-            if "installer" in asset.get("name", "").lower() or asset.get("name", "").endswith(".exe"):
-                installer_url = asset.get("browser_download_url", "")
-                file_size = asset.get("size", 0) / (1024 * 1024)
-                break
+        # Find the installer asset for this platform
+        asset = _pick_release_asset(data.get("assets", []))
+        installer_url = asset.get("browser_download_url", "") if asset else ""
+        file_size = (asset.get("size", 0) / (1024 * 1024)) if asset else 0
         
         if not tag or not installer_url:
             return None

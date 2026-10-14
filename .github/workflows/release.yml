@@ -1,0 +1,415 @@
+# FrameGuard release pipeline — audited design: RELEASE_PLAN.md
+#
+# HOW A RELEASE HAPPENS:
+#   1. Bump the version in the four places validate_version.py checks
+#      (frameguard/__init__.py, frameguard.spec, installer.iss,
+#      version.json — changelog lives in version.json), commit, push main.
+#   2. Tag that commit:  git tag -a v0.5.6 -m "FrameGuard 0.5.6"
+#      and push the tag. This workflow does the rest — no local builds,
+#      no Windows machine needed.
+#   3. Enable immutable releases in repo settings (Settings -> General ->
+#      Releases) and keep the publish job's `release` environment
+#      restricted to v* tags with yourself as reviewer. A published
+#      release can then never be altered: draft -> verify -> publish.
+#
+# WHAT A RELEASE SHIPS:
+#   FrameGuardInstaller.exe (Windows 10/11 x64), FrameGuard-arm64.dmg and
+#   FrameGuard-intel.dmg (macOS 12+, per architecture), SHA256SUMS.txt,
+#   one CycloneDX SBOM per platform, both update manifests, a build
+#   provenance attestation per binary (verify: gh attestation verify),
+#   and a delta-update mirror on the `releases` branch for installed
+#   copies. Publisher: Capri la Ria. Developer: Cassian Aléria.
+#
+# SIGNING STATE (deliberate, zero budget — see CODE_SIGNING_POLICY.md):
+#   Windows unsigned (SmartScreen: More info -> Run anyway); macOS ad-hoc
+#   signed, not notarized (macOS 15+: System Settings -> Privacy &
+#   Security -> Open Anyway). If Apple secrets are ever added
+#   (MACOS_SIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD),
+#   build_mac.sh signs with the Developer ID and notarizes unchanged.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v0.5.6"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  APP_DIR: FGv0.2.2
+
+# One release at a time, per tag; a re-run never cancels a half-publish.
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# Least privilege: read-only everywhere except the publish job, which
+# restates exactly the extra permissions it needs.
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify tag matches version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: FGv0.2.2/.python-version
+
+      - name: Validate the four version sources agree
+        working-directory: ${{ env.APP_DIR }}
+        run: python validate_version.py
+
+      - name: Fail if the tag is not the version in the tree
+        id: version
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          VERSION="$(python -c 'import json; print(json.load(open("version.json"))["version"])')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "$RELEASE_TAG" != "v$VERSION" ]; then
+            echo "::error::Tag $RELEASE_TAG does not match version.json ($VERSION). Bump the version or fix the tag."
+            exit 1
+          fi
+          echo "Tag $RELEASE_TAG == version $VERSION"
+
+      - name: Build the release notes from version.json
+        run: |
+          python - <<'PY'
+          import json, os
+          with open(os.path.join(os.environ["APP_DIR"], "version.json"), encoding="utf-8") as f:
+              data = json.load(f)
+          notes = f"""**Published by Capri la Ria · Developed by Cassian Aléria**
+
+          ## Download
+
+          | Platform | File | Requirements |
+          |----------|------|----------------|
+          | Windows | `FrameGuardInstaller.exe` | Windows 10/11, 64-bit |
+          | macOS (Apple Silicon) | `FrameGuard-arm64.dmg` | macOS 12 or later |
+          | macOS (Intel) | `FrameGuard-intel.dmg` | macOS 12 or later |
+
+          **Windows:** run the installer. FrameGuard is not yet code-signed, so
+          SmartScreen may ask once — choose "More info", then "Run anyway".
+
+          **macOS:** open the DMG for your Mac's chip and drag FrameGuard into
+          Applications. The build is ad-hoc signed but not notarized, so the
+          first launch is blocked once. On macOS 15 or later: choose **Done** in
+          the dialog, then System Settings → Privacy & Security →
+          **Open Anyway**, authenticate, and launch again. On macOS 14 or
+          earlier: right-click FrameGuard → **Open**.
+
+          **Already installed?** You don't need this download — FrameGuard
+          updates itself with a small delta the next time it checks. If an
+          in-app update ever fails, reinstalling from this page is the fix.
+
+          ## Verify your download
+
+          - Checksums: `SHA256SUMS.txt` (Windows `Get-FileHash`, macOS
+            `shasum -a 256 -c SHA256SUMS.txt`)
+          - Provenance: `gh attestation verify <file> --owner cass-ale`
+          - Components: `sbom-windows.cdx.json` / `sbom-macos.cdx.json`
+
+          ## Changes
+
+          ```
+          {data.get("changelog", "").strip()}
+          ```
+
+          © 2026 Cassian Aléria. MIT License.
+          """
+          with open("release-notes.md", "w", encoding="utf-8") as f:
+              f.write(notes)
+          print("release-notes.md written")
+          PY
+
+      - name: Save the release notes for the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows installer
+    needs: verify
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: FGv0.2.2
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: FGv0.2.2/.python-version
+
+      - name: Ensure Inno Setup 6 is available (detect first)
+        shell: pwsh
+        run: |
+          # The windows-2025 image already ships Inno Setup 6.7.1, and a
+          # pinned Chocolatey install FAILS over it (no downgrades). Only
+          # install, unpinned, when ISCC.exe is genuinely missing.
+          $candidates = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          )
+          if ($candidates | Where-Object { Test-Path $_ }) {
+            Write-Host "Inno Setup found preinstalled."
+          } elseif (Get-Command iscc -ErrorAction SilentlyContinue) {
+            Write-Host "Inno Setup found on PATH."
+          } else {
+            choco install innosetup -y --no-progress
+          }
+          $found = ($candidates | Where-Object { Test-Path $_ }) -or
+                   (Get-Command iscc -ErrorAction SilentlyContinue)
+          if (-not $found) { throw "Inno Setup (ISCC.exe) is not available." }
+
+      - name: Build the installer (full gated build)
+        shell: cmd
+        # build_installer.bat guards its `pause` calls with
+        # `if not defined CI` — under Actions they are skipped entirely.
+        run: build_installer.bat
+
+      - name: Verify the build outputs exist
+        shell: cmd
+        run: |
+          if not exist "Output\FrameGuardInstaller.exe" exit /b 1
+          if not exist "Output\release-windows\manifest.json" exit /b 1
+          dir Output
+
+      - name: Generate the SBOM from the frozen build environment
+        # Non-gating by design (RELEASE_PLAN D8): a broken SBOM tool must
+        # never block a release. From the venv's pip freeze — never by
+        # scanning the PyInstaller bundle, which under-reports Python deps.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          .\.buildenv\Scripts\python.exe -m pip freeze > sbom-freeze.txt
+          python -m venv .sbomtools
+          .\.sbomtools\Scripts\python.exe -m pip install --quiet "cyclonedx-bom==7.5.0"
+          .\.sbomtools\Scripts\cyclonedx-py.exe requirements sbom-freeze.txt --output-reproducible -o sbom-windows.cdx.json
+          Get-Item sbom-windows.cdx.json
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installer
+          path: FGv0.2.2/Output/FrameGuardInstaller.exe
+          if-no-files-found: error
+
+      - name: Upload the delta-update payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-delta
+          path: FGv0.2.2/Output/release-windows/
+          if-no-files-found: error
+
+      - name: Upload the SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-sbom
+          path: FGv0.2.2/sbom-windows.cdx.json
+          if-no-files-found: warn
+
+  build-macos:
+    name: Build macOS DMG (${{ matrix.label }})
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: arm64
+            runner: macos-15
+            artifact: macos-arm64
+            delta: true
+          - label: intel
+            runner: macos-15-intel
+            artifact: macos-intel
+            delta: false # one delta manifest cannot describe two archs
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: FGv0.2.2
+    env:
+      # Empty when the secrets are not set; build_mac.sh then falls back
+      # to its ad-hoc signature ("-") and skips notarization.
+      SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: FGv0.2.2/.python-version
+
+      - name: Build the DMG (full gated build)
+        run: bash build_mac.sh
+
+      - name: Verify the build outputs exist
+        run: |
+          ls -lh Output/
+          test -f Output/FrameGuard.dmg
+          test -f Output/release-macos/manifest.json
+          # The seal must verify on the machine that built it. The bundle
+          # lives under the Mac build cache, not the checkout.
+          BUNDLE="$(find "$HOME/Library/Caches/FrameGuard" -name "FrameGuard.app" -maxdepth 5 | head -1)"
+          test -n "$BUNDLE"
+          codesign --verify --deep --strict "$BUNDLE"
+
+      - name: Generate the SBOM from the frozen build environment
+        if: matrix.label == 'arm64' # identical dependency set on Intel
+        continue-on-error: true
+        run: |
+          VENV_PY="$HOME/Library/Caches/FrameGuard/FGv0.2.2/venv/bin/python"
+          "$VENV_PY" -m pip freeze > sbom-freeze.txt
+          python3 -m venv .sbomtools
+          ./.sbomtools/bin/pip install --quiet "cyclonedx-bom==7.5.0"
+          ./.sbomtools/bin/cyclonedx-py requirements sbom-freeze.txt --output-reproducible -o sbom-macos.cdx.json
+          ls -lh sbom-macos.cdx.json
+
+      - name: Upload the DMG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}-dmg
+          path: FGv0.2.2/Output/FrameGuard.dmg
+          if-no-files-found: error
+
+      - name: Upload the delta-update payload (arm64 only)
+        if: matrix.delta
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-delta
+          path: FGv0.2.2/Output/release-macos/
+          if-no-files-found: error
+
+      - name: Upload the SBOM
+        if: matrix.label == 'arm64'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-sbom
+          path: FGv0.2.2/sbom-macos.cdx.json
+          if-no-files-found: warn
+
+  publish:
+    name: Publish GitHub Release + delta channel
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-24.04
+    # Repo settings gate this job: environment `release`, deployment
+    # limited to v* tags, maintainer as required reviewer (do NOT enable
+    # prevent-self-review — solo maintainer). See RELEASE_PLAN §3.
+    environment: release
+    permissions:
+      contents: write # create the release, push the delta mirror
+      id-token: write # OIDC for the Sigstore attestations below
+      attestations: write
+    steps:
+      - name: Download all build outputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+
+      - name: Stage the release assets under their published names
+        run: |
+          set -euo pipefail
+          mkdir -p stage
+          cp dist/windows-installer/FrameGuardInstaller.exe stage/
+          cp dist/macos-arm64-dmg/FrameGuard.dmg stage/FrameGuard-arm64.dmg
+          cp dist/macos-intel-dmg/FrameGuard.dmg stage/FrameGuard-intel.dmg
+          cp dist/windows-delta/manifest.json stage/update-manifest-windows.json
+          cp dist/macos-delta/manifest.json stage/update-manifest-macos.json
+          # SBOMs are non-gating: include whichever were produced.
+          cp dist/windows-sbom/sbom-windows.cdx.json stage/ 2>/dev/null || echo "no windows SBOM"
+          cp dist/macos-sbom/sbom-macos.cdx.json stage/ 2>/dev/null || echo "no macos SBOM"
+          cd stage && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+
+      - name: Attest build provenance for the binaries
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-path: |
+            stage/FrameGuardInstaller.exe
+            stage/FrameGuard-arm64.dmg
+            stage/FrameGuard-intel.dmg
+
+      - name: Create the release as a DRAFT with every asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" stage/* \
+            --title "FrameGuard $RELEASE_TAG" \
+            --notes-file dist/release-notes/release-notes.md \
+            --draft
+          gh release view "$RELEASE_TAG" --json assets \
+            --jq '.assets[].name' | sort > uploaded.txt
+          ls stage | sort > expected.txt
+          # Immutable releases allow no fix-ups: the draft must be
+          # complete and exact before it is published.
+          diff expected.txt uploaded.txt
+          echo "Draft asset list verified: $(wc -l < uploaded.txt) assets"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest
+
+      - name: Check out the releases branch (update channel)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: releases
+          path: channel
+
+      - name: Mirror the delta channel (payload first, manifest last)
+        run: |
+          set -euo pipefail
+          # The branch is a machine-generated mirror of this release
+          # only — never hand-edited (RELEASE_PLAN D10). Payload first,
+          # manifest last, so a client reading mid-publish never sees a
+          # manifest describing files that have not arrived yet.
+          rm -rf channel/RELEASES/files channel/RELEASES-macos/files
+          cp -a dist/windows-delta/files channel/RELEASES/files
+          cp -a dist/macos-delta/files channel/RELEASES-macos/files
+          cp dist/windows-delta/manifest.json channel/RELEASES/manifest.json
+          cp dist/macos-delta/manifest.json channel/RELEASES-macos/manifest.json
+
+      - name: Commit and push the update channel
+        working-directory: channel
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add RELEASES RELEASES-macos
+          if git diff --cached --quiet; then
+            echo "Delta channel unchanged; nothing to publish."
+          else
+            git commit -m "Publish FrameGuard ${RELEASE_TAG} delta update"
+            git push origin HEAD:releases
+          fi

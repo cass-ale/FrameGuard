@@ -2,9 +2,54 @@
 
 **Video QA for XR Deliverables — Windows and macOS**
 
+**Published by Capri la Ria · Developed by Cassian Aléria**
+
 FrameGuard validates video files against configurable delivery specifications, running
 automated checks across metadata, codec compliance, audio integrity, and deep signal
 analysis. All processing happens locally — no data leaves your machine.
+
+## Download
+
+Get the latest version from the
+[Releases page](https://github.com/cass-ale/FrameGuard/releases/latest):
+
+| Platform | File | Requirements |
+|----------|------|--------------|
+| Windows | `FrameGuardInstaller.exe` | Windows 10/11, 64-bit |
+| macOS (Apple Silicon) | `FrameGuard-arm64.dmg` | macOS 12 or later |
+| macOS (Intel) | `FrameGuard-intel.dmg` | macOS 12 or later |
+
+**Windows:** run the installer — no Python or other dependencies needed,
+FFmpeg and MediaInfo are bundled. FrameGuard is not yet code-signed, so
+SmartScreen may ask once on first run: choose **More info**, then
+**Run anyway**.
+
+**macOS:** open the DMG for your Mac's chip and drag FrameGuard into
+Applications. The build is ad-hoc signed but not notarized by Apple, so
+Gatekeeper blocks the first launch of a downloaded copy:
+
+- **macOS 15 or later:** double-click FrameGuard, choose **Done** in the
+  dialog (not Move to Trash), then open System Settings →
+  Privacy & Security, scroll to Security, and click **Open Anyway** next
+  to the FrameGuard message. Authenticate, then launch FrameGuard again
+  and confirm **Open**. (Right-click → Open no longer works on macOS 15+.)
+- **macOS 14 or earlier:** right-click FrameGuard and choose **Open**.
+- If the app is reported as damaged, or Open Anyway doesn't appear,
+  removing the download quarantine fixes it:
+  `xattr -dr com.apple.quarantine /Applications/FrameGuard.app`
+
+Every release also publishes `SHA256SUMS.txt`, a build-provenance
+attestation for each binary (verify with
+`gh attestation verify <file> --owner cass-ale`), and an SBOM of the
+bundled Python components. See [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)
+for the signing status and roadmap.
+
+**Updates:** once installed, you don't need to come back here for fixes.
+FrameGuard checks its update channel automatically and downloads only the
+files that changed — a small delta instead of the full installer. A fresh
+installer is only needed for a first install or a reinstall.
+
+Prefer to run from source? See [Quick start](#quick-start) below.
 
 ## Why
 
@@ -247,3 +292,5 @@ All video processing is local. Nothing is uploaded, transmitted, or shared.
 ## License
 
 MIT License. See [LICENSE](LICENSE).
+
+Copyright (c) 2026 Cassian Aléria. Published by Capri la Ria.

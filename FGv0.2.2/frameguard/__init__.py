@@ -7,6 +7,7 @@ __version__ = "0.5.5"
 __author__ = "Cassian Aléria"
 __credits__ = ["Cassian Aléria"]
 __license__ = "MIT"
+__publisher__ = "Capri la Ria"
 __maintainer__ = "Cassian Aléria"
 __status__ = "Production"
 
