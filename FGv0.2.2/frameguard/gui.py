@@ -6155,8 +6155,8 @@ class MainWindow(QMainWindow):
             f"<p>Professional Video QA for XR Production</p>"
             f"<p>Automates delivery spec compliance checks for<br>"
             f"resolution, codec, bitrate, frame rate, and audio.</p>"
-            f"<p><b>Publisher:</b> Jace Aleria<br>"
-            f"<b>Lead Developer:</b> Jace Aleria{build_info}</p>"
+            f"<p><b>Publisher:</b> Capri la Ria<br>"
+            f"<b>Lead Developer:</b> Cassian Aléria{build_info}</p>"
         )
 
     def closeEvent(self, event):
