@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.5.4
+FrameGuard Desktop v0.5.5
 Video QA for XR Deliverables
 
 
@@ -6,44 +6,38 @@ WHAT THIS INSTALLS
 
   FrameGuard Desktop
     Checks video files against your delivery specification and reports what
-    passed, what failed, and why. Scan a whole folder in one pass.
-    Failures sort first with critical issues (corruption, unreadable files)
+    passed, what failed, and why. A whole folder can be scanned in one pass.
+    Failures sort first, with critical issues (corruption, unreadable files)
     ranked above minor ones.
 
   FFmpeg and FFprobe
-    The video analysis engine. Bundled with this installer - no separate
-    download or setup required.
+    The video analysis engine. Bundled with this installer; no separate
+    download or setup is required.
 
   MediaInfo
     Adds encoder and container detail to reports.
 
   Delivery presets
-    4K UHD 30/60, 1080p 30, and 5.7K VR/360 profiles to start from. You can
-    save your own and share them with your team as .fg files.
+    4K UHD 30/60, 1080p 30, and 5.7K VR/360 profiles to start from. Your own
+    presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.5.4
+WHAT'S NEW IN v0.5.5
 
-  Stability
-    - Deep scans no longer crash on large or long files: scan parallelism
-      and memory use are bounded, cancellation stops promptly, and missing
-      tools report a clear message instead of an "Internal Error".
-    - Scan verdict banner clears on new files, navigation, and errors, and
-      clean results dismiss themselves; failures stay until you act on them.
-    - Results are severity-weighted: a corrupted file ranks above one with
-      only an off-spec frame rate.
+  Hardening
+    - The scan page verdict clears with the results, and transient notes
+      dismiss themselves instead of lingering; failures stay until you act
+      on them.
+    - Strict Mode now takes effect: with it on, warnings escalate to FAIL.
+    - "Open in VLC" re-detects installed players on each use, falls back
+      when a launch fails, and reports when nothing could be launched
+      instead of failing silently.
+    - The startup splash tracks progress while the window builds, and
+      startup no longer waits on the FFmpeg check before the window paints.
 
-  This release corrects several issues that produced misleading scan results
-  in earlier versions (v0.5.2):
-
-    - Deep scan (black frames, freeze frames, silence) reported "no issues
-      found" on every file. These checks now work.
-    - Settings and presets had no effect on scans.
-    - Reports covering more than one file failed to generate.
-    - Files slightly under the bitrate target were reported as an internal
-      error rather than a bitrate warning.
-
-  If you signed off footage using an earlier version, it is worth re-scanning.
+  If you signed off footage using v0.5.2 or earlier, it is worth
+  re-scanning: the deep-scan checks in those versions could report "no
+  issues found" for files that had them.
 
 
 BEFORE YOU INSTALL
@@ -53,8 +47,8 @@ BEFORE YOU INSTALL
     4 GB RAM minimum, 8 GB recommended for large batches
     500 MB free disk space
 
-  Close FrameGuard if it is currently running. Setup will prompt you if it
-  detects a running copy.
+  If FrameGuard is running when Setup starts, Setup will close it
+  automatically.
 
 
 PRIVACY
@@ -63,4 +57,5 @@ PRIVACY
   transmit, or share your video files or scan results.
 
 
-Developed by Jace Aleria
+Developed by Cassian Aléria
+Published by Capri la Ria

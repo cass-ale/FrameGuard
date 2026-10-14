@@ -1,5 +1,5 @@
-; ============================================================================
-; FrameGuard Desktop v0.5.5 -- Inno Setup Installer Script (Clean Rebuild)
+﻿; ============================================================================
+; FrameGuard Desktop -- Inno Setup Installer Script (Clean Rebuild)
 ;
 ; DESIGN PRINCIPLE: Use a single recursive Source entry for the dist folder.
 ; This guarantees ALL files PyInstaller outputs are included, regardless of
@@ -13,9 +13,9 @@
 AppId={{B7E2F4A1-9C3D-4E5F-8A1B-6D7C8E9F0A2B}
 AppName=FrameGuard Desktop
 AppVersion=0.5.5
-AppVerName=FrameGuard Desktop v0.5.5
-AppPublisher=Jace Aleria
-AppPublisherURL=https://github.com/cass-ale/FrameGuard
+AppVerName=FrameGuard Desktop v{#SetupSetting("AppVersion")}
+AppPublisher=Capri la Ria
+AppPublisherURL=https://caprilaria.com
 AppSupportURL=https://github.com/cass-ale/FrameGuard
 AppUpdatesURL=https://github.com/cass-ale/FrameGuard
 DefaultDirName={autopf}\FrameGuard Desktop
@@ -27,7 +27,7 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 SetupIconFile=assets\frameguard.ico
 UninstallDisplayIcon={app}\FrameGuard.exe
-UninstallDisplayName=FrameGuard Desktop v0.5.5
+UninstallDisplayName=FrameGuard Desktop v{#SetupSetting("AppVersion")}
 WizardStyle=modern
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
@@ -44,12 +44,12 @@ RestartApplications=no
 SetupMutex=FrameGuardDesktopSetup
 AppMutex=FrameGuardDesktopApp
 MinVersion=10.0
-VersionInfoVersion=0.5.5.0
-VersionInfoCompany=Jace Aleria
-VersionInfoDescription=FrameGuard Desktop Installer
-VersionInfoCopyright=Copyright (c) 2026 Jace Aleria
+VersionInfoVersion={#SetupSetting("AppVersion")}.0
+VersionInfoCompany=Capri la Ria
+VersionInfoDescription=FrameGuard Desktop Setup
+VersionInfoCopyright=Copyright © 2026 Cassian Aléria
 VersionInfoProductName=FrameGuard Desktop
-VersionInfoProductVersion=0.5.5.0
+VersionInfoProductVersion={#SetupSetting("AppVersion")}.0
 InfoBeforeFile=installer_info.txt
 LicenseFile=LICENSE
 
@@ -57,16 +57,16 @@ LicenseFile=LICENSE
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Messages]
-WelcomeLabel1=Welcome to FrameGuard Desktop
-WelcomeLabel2=This will install FrameGuard Desktop v0.5.5 on your computer.%n%nFrameGuard checks video deliverables against your delivery specification automatically - resolution, frame rate, codec, bitrate, audio, black frames and silence - and produces a PDF or CSV report you can hand off.%n%nAll processing happens on this computer. No video data is uploaded or shared.%n%nIt is recommended that you close all other applications before continuing.
-FinishedHeadingLabel=FrameGuard Desktop is ready
-FinishedLabel=FrameGuard Desktop v0.5.5 has been installed successfully.%n%nReports are saved to:%n      Documents\FrameGuard%n%nTo get started, drag a video file or folder onto the window and press Start Scan.%n%nDeveloped by Jace Aleria
-ConfirmUninstall=Are you sure you want to completely remove FrameGuard Desktop and all of its components?%n%nYour exported reports and custom presets will be kept unless you choose otherwise.
-SelectDirLabel3=Setup will install FrameGuard Desktop into the following folder. Everything it needs, including the video analysis tools, is installed here.
+WelcomeLabel1=Welcome to the FrameGuard Desktop Setup Wizard
+WelcomeLabel2=This will install FrameGuard Desktop v{#SetupSetting("AppVersion")} on your computer.%n%nFrameGuard checks video deliverables against your delivery specification automatically: resolution, frame rate, codec, bitrate, audio, black frames and silence. It then produces a PDF or CSV report you can hand off.%n%nAll processing happens on this computer. Your video files are never uploaded or shared.%n%nIt is recommended that you close all other applications before continuing.
+FinishedHeadingLabel=Completing the FrameGuard Desktop Setup Wizard
+FinishedLabel=FrameGuard Desktop v{#SetupSetting("AppVersion")} has been installed successfully.%n%nReports are saved to:%n      Documents\FrameGuard%n%nTo get started, drag a video file or folder onto the window and press Start Scan.%n%nDeveloped by Cassian Aléria. Published by Capri la Ria.
+ConfirmUninstall=Are you sure you want to completely remove FrameGuard Desktop and all of its components?%n%nYour exported reports and custom presets will not be removed.
+SelectDirLabel3=Setup will install FrameGuard Desktop into the following folder. Everything FrameGuard needs, including the bundled video analysis tools, is installed in this folder.
 SelectDirBrowseLabel=To continue, click Next. If you would like to select a different folder, click Browse.
-SelectTasksLabel2=Select the additional tasks you would like Setup to perform, then click Next.
-ReadyLabel1=Setup is ready to install FrameGuard Desktop on your computer.
-ReadyLabel2a=Click Install to continue, or click Back if you want to review or change any settings.
+SelectTasksLabel2=Select the additional tasks you want Setup to perform, then click Next.
+ReadyLabel1=Setup is now ready to begin installing FrameGuard Desktop on your computer.
+ReadyLabel2a=Click Install to continue with the installation, or click Back if you want to review or change any settings.
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Shortcuts:"
@@ -100,11 +100,11 @@ Name: "{group}\Uninstall FrameGuard Desktop"; Filename: "{uninstallexe}"
 
 [Run]
 ; Launch app after install - WorkingDir ensures exe finds _internal/
-Filename: "{app}\FrameGuard.exe"; WorkingDir: "{app}"; Description: "Launch FrameGuard Desktop now"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\FrameGuard.exe"; WorkingDir: "{app}"; Description: "Launch FrameGuard Desktop"; Flags: nowait postinstall skipifsilent
 
 [Registry]
 Root: HKCU; Subkey: "Software\FrameGuard Desktop"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\FrameGuard Desktop"; ValueType: string; ValueName: "Version"; ValueData: "0.5.5"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\FrameGuard Desktop"; ValueType: string; ValueName: "Version"; ValueData: "{#SetupSetting("AppVersion")}"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\FrameGuard Desktop"; ValueType: string; ValueName: "ExportPath"; ValueData: "{userdocs}\FrameGuard"; Flags: uninsdeletekey
 
 ; --- .fg preset file association (double-click a preset to import it) ---
@@ -154,7 +154,7 @@ begin
     if InstalledVersion = '{#SetupSetting("AppVersion")}' then
     begin
       if MsgBox('FrameGuard Desktop v' + InstalledVersion + ' is already installed.' + #13#10 + #13#10 +
-                'Would you like to repair this installation by reinstalling it?' + #13#10 +
+                'Do you want to reinstall it to repair the installation?' + #13#10 +
                 'Your settings, presets and saved reports will not be affected.',
                 mbConfirmation, MB_YESNO) = IDNO then
       begin
@@ -206,10 +206,10 @@ begin
     ExportPath := ExpandConstant('{userdocs}\FrameGuard');
     if DirExists(ExportPath) then
     begin
-      if MsgBox('Would you like to delete your saved FrameGuard reports?' + #13#10 + #13#10 +
+      if MsgBox('Do you want to delete your saved FrameGuard reports?' + #13#10 + #13#10 +
                 ExportPath + #13#10 + #13#10 +
                 'Choose No to keep your exported PDF and CSV reports on this computer.',
-                mbConfirmation, MB_YESNO) = IDYES then
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
         DelTree(ExportPath, True, True, True);
     end;
 

@@ -83,14 +83,14 @@ if sys.platform == "win32":
         kids=[
             StringFileInfo([
                 StringTable('040904B0', [
-                    StringStruct('CompanyName', 'Jace Aleria'),
+                    StringStruct('CompanyName', 'Capri la Ria'),
                     StringStruct('FileDescription', 'FrameGuard Desktop - Video QA Tool'),
                     StringStruct('FileVersion', '0.5.5.0'),
                     StringStruct('InternalName', 'FrameGuard'),
                     StringStruct('OriginalFilename', 'FrameGuard.exe'),
                     StringStruct('ProductName', 'FrameGuard Desktop'),
                     StringStruct('ProductVersion', '0.5.5.0'),
-                    StringStruct('LegalCopyright', 'Copyright (c) 2026 Jace Aleria'),
+                    StringStruct('LegalCopyright', 'Copyright © 2026 Cassian Aléria'),
                 ])
             ]),
             VarFileInfo([VarStruct('Translation', [0x0409, 0x04B0])])
@@ -290,7 +290,7 @@ if IS_MAC:
             "CFBundleVersion": APP_VERSION,
             "CFBundleIdentifier": BUNDLE_ID,
             "CFBundlePackageType": "APPL",
-            "NSHumanReadableCopyright": "Copyright (c) 2026 Jace Aleria",
+            "NSHumanReadableCopyright": "Copyright © 2026 Cassian Aléria",
 
             # Retina. Without this the whole UI renders at 1x and looks soft.
             "NSHighResolutionCapable": True,
