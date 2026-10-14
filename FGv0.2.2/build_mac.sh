@@ -116,7 +116,7 @@ fi
 step 3 "Installing build dependencies..."
 "$PY" -m pip install --quiet --upgrade pip setuptools wheel
 "$PY" -m pip install --quiet -r requirements.txt "pyinstaller>=6.0,<7.0" "Pillow>=10.0"
-[[ $SKIP_TESTS -eq 1 ]] || "$PY" -m pip install --quiet pytest
+[[ $SKIP_TESTS -eq 1 ]] || "$PY" -m pip install --quiet pytest pytest-timeout
 echo "      PySide6    $("$PY" -c 'import PySide6;print(PySide6.__version__)')"
 echo "      PyInstaller $("$PY" -m PyInstaller --version)"
 
@@ -133,6 +133,15 @@ BUILD_STAMP="${WORK_DIR}/_build_stamp.json"
     || die "Could not write the build stamp."
 export FRAMEGUARD_BUILD_STAMP_PATH="$BUILD_STAMP"
 
+# Fetch the bundled tools NOW, before the expensive stages: a dead tool
+# source must fail this build in the first minutes, not after PyInstaller
+# (the evermeet.cx 410 outage produced exactly that failure shape: a full
+# build, then death at the final smoke test). This populates the per-arch
+# tool cache; step 8 re-runs the same command, which then stages from cache.
+echo "      Pre-fetching analysis tools (${TARGET_ARCH})..."
+"$PY" download_tools.py --platform darwin --arch "$TARGET_ARCH" \
+    || die "Could not fetch the required analysis tools. Do not ship this build."
+
 # --- 5. Icon --------------------------------------------------------------
 # The icon is generated BEFORE the test gate on purpose: the gate asserts
 # the .icns exists and is valid, and the file is a gitignored build product,
@@ -145,7 +154,7 @@ step 6 "Running the test suite..."
 if [[ $SKIP_TESTS -eq 1 ]]; then
     echo "      SKIPPED (--skip-tests)"
 else
-    QT_QPA_PLATFORM=offscreen "$PY" -m pytest -q \
+    QT_QPA_PLATFORM=offscreen "$PY" -m pytest \
         tests/test_macos.py tests/test_packaging.py \
         || die "macOS packaging tests failed. Fix them before shipping a build."
 fi
@@ -174,8 +183,11 @@ echo "      Built $BUNDLE"
 # --- 8. Tools, permissions, signing --------------------------------------
 step 8 "Staging analysis tools and signing..."
 TOOLS_DEST="${BUNDLE}/Contents/Resources/tools"
-"$PY" download_tools.py --platform darwin --dest "$TOOLS_DEST" \
-    || echo "      WARNING: some tools are missing; scanning will not work until FFmpeg is available."
+# Required tools are not a warning. A bundle without ffmpeg cannot scan
+# video, and the step-9 smoke test would only fail later with a less clear
+# message; fail here, where the cause is.
+"$PY" download_tools.py --platform darwin --arch "$TARGET_ARCH" --dest "$TOOLS_DEST" \
+    || die "Required analysis tools could not be staged. Do not ship this build."
 
 # PyInstaller and unzip both lose the executable bit; without it every scan
 # fails with PermissionError reported as "Internal Error".
@@ -257,17 +269,23 @@ if [[ $SIGN_OK -eq 0 && $ALLOW_UNSIGNED -eq 0 && "$SIGN_IDENTITY" != "-" ]]; the
     die "Code signing failed and --allow-unsigned was not passed. Do not ship this build."
 fi
 
-# Arch check: evermeet serves Intel (x86_64) ffmpeg. An x86_64 tool bundle
-# runs on Apple Silicon via Rosetta 2, but a native arm64 app with Intel-only
-# tools is a support ticket waiting to happen — flag it now.
+# Arch check: the tool sources are per-architecture now, so a staged ffmpeg
+# that does not contain the target architecture is a defect in this build,
+# not a caveat — an x86_64-only ffmpeg inside an arm64 app would silently
+# depend on Rosetta 2 being installed on the user's machine.
 if [[ -f "${TOOLS_DEST}/ffmpeg" ]]; then
     TOOL_ARCH="$(file -b "${TOOLS_DEST}/ffmpeg" 2>/dev/null || true)"
     echo "      ffmpeg: ${TOOL_ARCH}"
-    if [[ "$TARGET_ARCH" == "arm64" && "$TOOL_ARCH" == *"x86_64"* && "$TOOL_ARCH" != *"arm64"* ]]; then
-        echo "      WARNING: arm64 build is bundling an Intel-only ffmpeg."
-        echo "      It will need Rosetta 2 on Apple Silicon Macs:"
-        echo "        softwareupdate --install-rosetta --agree-to-license"
-    fi
+    case "$TARGET_ARCH" in
+        arm64)
+            [[ "$TOOL_ARCH" == *"arm64"* ]] \
+                || die "Staged ffmpeg does not contain an arm64 binary (${TOOL_ARCH}). Refusing to bundle the wrong architecture."
+            ;;
+        x86_64)
+            [[ "$TOOL_ARCH" == *"x86_64"* ]] \
+                || die "Staged ffmpeg does not contain an x86_64 binary (${TOOL_ARCH}). Refusing to bundle the wrong architecture."
+            ;;
+    esac
 fi
 
 # --- 9. Smoke test + DMG --------------------------------------------------

@@ -2,5 +2,6 @@
 -r requirements.txt
 
 pytest>=8.0
+pytest-timeout>=2.3
 pyflakes>=3.0
 pyinstaller>=6.0,<7.0

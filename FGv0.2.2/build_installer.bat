@@ -105,8 +105,11 @@ if errorlevel 1 (
     if not defined CI pause
     exit /b 1
 )
-if "!SKIP_TESTS!"=="0" "%PY%" -m pip install --quiet pytest
-for /f "tokens=*" %%v in ('"%PY%" -c "import PySide6;print(PySide6.__version__)"') do echo       PySide6     %%v
+if "!SKIP_TESTS!"=="0" "%PY%" -m pip install --quiet pytest pytest-timeout
+REM Print the PySide6 version with a direct call, not FOR /F: the nested
+REM double quotes of a -c string inside a FOR command string make cmd
+REM execute '"...python.exe" -c "import' as the command and error out.
+"%PY%" -c "import PySide6; print('      PySide6    ', PySide6.__version__)"
 for /f "tokens=*" %%v in ('"%PY%" -m PyInstaller --version') do echo       PyInstaller %%v
 
 REM --- Step 4: Version validation + build stamp ---
@@ -135,7 +138,7 @@ if "!SKIP_TESTS!"=="1" (
     echo       SKIPPED ^(--skip-tests^)
 ) else (
     set "QT_QPA_PLATFORM=offscreen"
-    "%PY%" -m pytest -q
+    "%PY%" -m pytest
     if errorlevel 1 (
         echo.
         echo ERROR: Tests failed. Fix them before shipping a build.
@@ -176,8 +179,12 @@ echo.
 echo [7/9] Staging analysis tools...
 "%PY%" download_tools.py --platform windows --dest "dist\FrameGuard\tools"
 if errorlevel 1 (
-    echo       WARNING: some tools are missing. Deep scan will be unavailable
-    echo                until FFmpeg is installed on the end user's machine.
+    echo.
+    echo ERROR: Required analysis tools could not be staged. FFmpeg ships
+    echo        inside the app; a build without it cannot scan video, and
+    echo        the smoke test would only fail later with a vaguer message.
+    if not defined CI pause
+    exit /b 1
 )
 
 REM --- Step 8: Smoke test ---
