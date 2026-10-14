@@ -40,7 +40,7 @@ class TestAppBundle:
         spec = _read("frameguard.spec")
         assert "CFBundleDocumentTypes" in spec
         assert "UTExportedTypeDeclarations" in spec
-        assert "com.meta.tpgxr.frameguard.preset" in spec
+        assert "com.caprilaria.frameguard.preset" in spec
 
     def test_bundle_sets_retina_and_minimum_os(self):
         spec = _read("frameguard.spec")

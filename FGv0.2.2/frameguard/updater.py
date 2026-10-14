@@ -32,7 +32,7 @@ from PySide6.QtCore import QObject, Signal, QTimer, QSettings
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-_SETTINGS_ORG = "Meta Platforms"
+_SETTINGS_ORG = "Capri la Ria"
 _SETTINGS_APP = "FrameGuard Desktop"
 _CHECK_INTERVAL_HOURS = 24  # How often to auto-check (hours)
 _INSTALLER_FILENAME = "FrameGuardInstaller.exe"

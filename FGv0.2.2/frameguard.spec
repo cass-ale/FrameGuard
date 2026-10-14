@@ -29,12 +29,14 @@ import os
 APP_NAME = "FrameGuard"
 APP_VERSION = "0.5.5"
 ENTRY_POINT = "main.py"
-# NOTE: this is an opaque identifier, not branding. It is pinned by
-# tests/test_macos.py and changing it makes macOS treat FrameGuard as a
-# different app (bundle identity, .fg UTI ownership, preferences). It
-# still carries the historical "meta.tpgxr" reverse-DNS by design;
-# migrating it is a deliberate, versioned decision, not a cleanup.
-BUNDLE_ID = "com.meta.tpgxr.frameguard"
+# This is an opaque identifier, not branding, but it IS the app's macOS
+# identity (bundle identity, .fg UTI ownership, preferences domain), so
+# changing it makes macOS treat FrameGuard as a different app. It carried
+# a historical "meta.tpgxr" reverse-DNS until 2026-10-14, when it was
+# migrated to the publisher's own domain before the first public release,
+# at the developer's direction. The .fg UTI and the LaunchAgent label
+# migrated with it; tests/test_macos.py pins the current values.
+BUNDLE_ID = "com.caprilaria.frameguard"
 
 IS_MAC = sys.platform == "darwin"
 IS_WIN = sys.platform == "win32"
@@ -305,7 +307,7 @@ if IS_MAC:
             # registry entries in installer.iss). Finder needs BOTH the
             # exported UTI and the document type to show our icon.
             "UTExportedTypeDeclarations": [{
-                "UTTypeIdentifier": "com.meta.tpgxr.frameguard.preset",
+                "UTTypeIdentifier": "com.caprilaria.frameguard.preset",
                 "UTTypeDescription": "FrameGuard Scan Preset",
                 "UTTypeConformsTo": ["public.json", "public.data"],
                 "UTTypeIconFile": "frameguard.icns",
@@ -320,7 +322,7 @@ if IS_MAC:
                 "CFBundleTypeIconFile": "frameguard.icns",
                 "CFBundleTypeRole": "Editor",
                 "LSHandlerRank": "Owner",
-                "LSItemContentTypes": ["com.meta.tpgxr.frameguard.preset"],
+                "LSItemContentTypes": ["com.caprilaria.frameguard.preset"],
             }],
         },
     )
