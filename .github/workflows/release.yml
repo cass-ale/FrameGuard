@@ -187,7 +187,7 @@ jobs:
           if (-not $found) { throw "Inno Setup (ISCC.exe) is not available." }
 
       - name: Build the installer (full gated build)
-              timeout-minutes: 45
+        timeout-minutes: 45
         shell: cmd
         # build_installer.bat guards its `pause` calls with
         # `if not defined CI` — under Actions they are skipped entirely.
@@ -274,7 +274,7 @@ jobs:
           python-version-file: FGv0.2.2/.python-version
 
       - name: Build the DMG (full gated build)
-              timeout-minutes: 45
+        timeout-minutes: 45
         run: bash build_mac.sh
 
       - name: Verify the build outputs exist
