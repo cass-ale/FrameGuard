@@ -4226,7 +4226,7 @@ class WatchFolderPanel(QWidget):
     # silently, which is why "Start with Windows" never did anything.
     _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
     _RUN_VALUE = "FrameGuard Desktop"
-    _LAUNCH_AGENT_ID = "com.meta.tpgxr.frameguard.launchatlogin"
+    _LAUNCH_AGENT_ID = "com.caprilaria.frameguard.launchatlogin"
 
     def _launch_agent_path(self):
         from pathlib import Path
@@ -6590,7 +6590,7 @@ def main(dev_mode: bool = False):
     except ImportError:
         app.setApplicationVersion(APP_VERSION)
     app.setOrganizationName(_SETTINGS_ORG)
-    app.setOrganizationDomain("meta.com")
+    app.setOrganizationDomain("caprilaria.com")
 
     # Set app icon
     icon_paths = [
