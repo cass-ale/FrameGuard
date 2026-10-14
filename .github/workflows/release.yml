@@ -1,4 +1,4 @@
-# FrameGuard release pipeline — audited design: RELEASE_PLAN.md
+# FrameGuard release pipeline — audited design: docs/RELEASE_PLAN.md
 #
 # HOW A RELEASE HAPPENS:
 #   1. Bump the version in the four places validate_version.py checks
@@ -42,7 +42,7 @@ on:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-  APP_DIR: FGv0.2.2
+  APP_DIR: src
 
 # One release at a time, per tag; a re-run never cancels a half-publish.
 concurrency:
@@ -70,7 +70,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version-file: FGv0.2.2/.python-version
+          python-version-file: src/.python-version
 
       - name: Validate the four version sources agree
         working-directory: ${{ env.APP_DIR }}
@@ -152,7 +152,7 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        working-directory: FGv0.2.2
+        working-directory: src
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -163,7 +163,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version-file: FGv0.2.2/.python-version
+          python-version-file: src/.python-version
 
       - name: Ensure Inno Setup 6 is available (detect first)
         shell: pwsh
@@ -217,21 +217,21 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-installer
-          path: FGv0.2.2/Output/FrameGuardInstaller.exe
+          path: src/Output/FrameGuardInstaller.exe
           if-no-files-found: error
 
       - name: Upload the delta-update payload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-delta
-          path: FGv0.2.2/Output/release-windows/
+          path: src/Output/release-windows/
           if-no-files-found: error
 
       - name: Upload the SBOM
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windows-sbom
-          path: FGv0.2.2/sbom-windows.cdx.json
+          path: src/sbom-windows.cdx.json
           if-no-files-found: warn
 
   build-macos:
@@ -253,7 +253,7 @@ jobs:
     timeout-minutes: 60
     defaults:
       run:
-        working-directory: FGv0.2.2
+        working-directory: src
     env:
       # Empty when the secrets are not set; build_mac.sh then falls back
       # to its ad-hoc signature ("-") and skips notarization.
@@ -271,7 +271,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version-file: FGv0.2.2/.python-version
+          python-version-file: src/.python-version
 
       - name: Build the DMG (full gated build)
         timeout-minutes: 45
@@ -292,7 +292,7 @@ jobs:
         if: matrix.label == 'arm64' # identical dependency set on Intel
         continue-on-error: true
         run: |
-          VENV_PY="$HOME/Library/Caches/FrameGuard/FGv0.2.2/venv/bin/python"
+          VENV_PY="$HOME/Library/Caches/FrameGuard/src/venv/bin/python"
           "$VENV_PY" -m pip freeze > sbom-freeze.txt
           python3 -m venv .sbomtools
           ./.sbomtools/bin/pip install --quiet "cyclonedx-bom==7.5.0"
@@ -303,7 +303,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}-dmg
-          path: FGv0.2.2/Output/FrameGuard.dmg
+          path: src/Output/FrameGuard.dmg
           if-no-files-found: error
 
       - name: Upload the delta-update payload (arm64 only)
@@ -311,7 +311,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-delta
-          path: FGv0.2.2/Output/release-macos/
+          path: src/Output/release-macos/
           if-no-files-found: error
 
       - name: Upload the SBOM
@@ -319,7 +319,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: macos-sbom
-          path: FGv0.2.2/sbom-macos.cdx.json
+          path: src/sbom-macos.cdx.json
           if-no-files-found: warn
 
   publish:
