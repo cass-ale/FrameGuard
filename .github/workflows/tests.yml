@@ -1,0 +1,54 @@
+# FrameGuard test CI — the suite runs here first: on push and on pull
+# request, so a bad commit is caught before it is ever tagged for release.
+#
+# Modeled on the reference pipelines reviewed 2026-10-14 (Picard's
+# run-tests.yml, yt-dlp's quick-test.yml — see
+# research_notes/frameguard-builder-fix-plan-20261014.md, Part C):
+#   * tests live in their own workflow, not only inside the release
+#     builders (the builders keep their in-build gate as a second line of
+#     defence, the same belt-and-braces Picard uses on Windows);
+#   * the job is bounded (30 minutes) instead of inheriting the 360-minute
+#     GitHub default, and pytest.ini adds a 300-second per-test ceiling
+#     (pytest-timeout) as the inner net;
+#   * the suite runs at --verbose so a failure or a hang is diagnosable
+#     from the log — a gate that prints only dots cannot tell you where
+#     it stopped.
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-windows:
+    name: Test suite (Windows)
+    runs-on: windows-2025
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: FGv0.2.2
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version-file: FGv0.2.2/.python-version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Run the test suite
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest --verbose
