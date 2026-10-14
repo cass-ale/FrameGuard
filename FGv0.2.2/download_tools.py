@@ -42,10 +42,84 @@ TOOLS_CACHE_ROOT = SCRIPT_DIR / "tools_cache"
 # ---------------------------------------------------------------------------
 # Per-platform sources
 #
-# macOS: evermeet.cx publishes ffmpeg and ffprobe as SEPARATE archives, unlike
-# the Windows builds which ship both in one zip. Each entry is therefore a list
-# of (url, archive_member_basename) pairs.
+# macOS: ffmpeg and ffprobe ship as SEPARATE archives, unlike the Windows
+# builds which ship both in one zip. Each entry is therefore a list of
+# (url, archive_member_basename) pairs.
+#
+# The previous macOS source, evermeet.cx, returns HTTP 410 Gone for every
+# getrelease download (verified live 2026-10-14) and its builds were
+# Intel-only. macOS tools now come from Martin Riedl's build site, which
+# publishes per-architecture zips (arm64 and amd64) with a .sha256 sidecar
+# next to every archive. The pinned URLs below are the reproducible source;
+# the redirect/latest URL is the fallback, and its checksum is taken from
+# the sidecar of the version it actually resolved to, so the fallback is
+# verified too. Bump _RIEDL_RELEASES deliberately, like a dependency.
 # ---------------------------------------------------------------------------
+_RIEDL_BASE = "https://ffmpeg.martin-riedl.de"
+_RIEDL_RELEASES = {  # pinned build directories, per architecture segment
+    "arm64": "1789931890_9.0.2",
+    "amd64": "1789931006_9.0.2",
+}
+
+
+def _norm_arch(arch: str) -> str:
+    """Normalize an architecture name to 'arm64' or 'x86_64'."""
+    a = (arch or "").lower()
+    if a in ("arm64", "aarch64"):
+        return "arm64"
+    if a in ("x86_64", "amd64", "intel"):
+        return "x86_64"
+    raise SystemExit(f"Unsupported architecture: {arch!r} (expected arm64 or x86_64)")
+
+
+def _riedl_segment(arch: str) -> str:
+    return "arm64" if _norm_arch(arch) == "arm64" else "amd64"
+
+
+def _riedl_urls(tool: str, arch: str):
+    seg = _riedl_segment(arch)
+    pinned = (f"{_RIEDL_BASE}/download/macos/{seg}/"
+              f"{_RIEDL_RELEASES[seg]}/{tool}.zip")
+    latest = f"{_RIEDL_BASE}/redirect/latest/macos/{seg}/release/{tool}.zip"
+    return [pinned, latest]
+
+
+def _darwin_sources(arch: str) -> dict:
+    return {
+        "suffix": "",
+        "ffmpeg": {
+            "required": True,
+            "members": ["ffmpeg"],
+            "urls": _riedl_urls("ffmpeg", arch),
+            "sha256_from_url": True,
+        },
+        "ffprobe": {
+            "required": True,
+            "members": ["ffprobe"],
+            "urls": _riedl_urls("ffprobe", arch),
+            "sha256_from_url": True,
+        },
+        "mediainfo": {
+            "required": False,
+            "members": ["mediainfo"],
+            # MediaArea's Mac CLI ships as a DMG whose internal layout
+            # changes between versions (loose binary, .app bundle, or an
+            # installer .pkg — the 26.05 DMG contained no loose binary and
+            # the tool was silently absent from every v0.5.5 Mac build).
+            # The extractor therefore DISCOVERS the payload (loose files,
+            # .app contents, expanded .pkg payloads) instead of assuming
+            # one layout. MediaInfo is optional (the app degrades), so a
+            # miss still does not fail the build. Pinned to the current
+            # universal (x86_64+arm64) CLI release. .dmg extraction
+            # requires a Mac host (hdiutil); on other hosts the archive
+            # is cached and extraction is retried on the Mac.
+            "urls": [
+                "https://mediaarea.net/download/binary/mediainfo/26.10/MediaInfo_CLI_26.10_Mac.dmg",
+            ],
+        },
+    }
+
+
 SOURCES = {
     "windows": {
         "suffix": ".exe",
@@ -61,40 +135,12 @@ SOURCES = {
             "required": False,
             "members": ["mediainfo.exe"],
             "urls": [
-                "https://mediaarea.net/download/binary/mediainfo/24.11/MediaInfo_CLI_24.11_Windows_x64.zip",
+                "https://mediaarea.net/download/binary/mediainfo/26.10/MediaInfo_CLI_26.10_Windows_x64.zip",
             ],
         },
     },
-    "darwin": {
-        "suffix": "",
-        "ffmpeg": {
-            "required": True,
-            "members": ["ffmpeg"],
-            "urls": ["https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip"],
-        },
-        "ffprobe": {
-            "required": True,
-            "members": ["ffprobe"],
-            "urls": ["https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip"],
-        },
-        "mediainfo": {
-            # NOTE: evermeet serves Intel (x86_64) ffmpeg builds. An x86_64
-            # tool bundle runs on Apple Silicon via Rosetta 2, but a native
-            # arm64 build needs arm64 tools. Refusing to silently bundle the
-            # wrong arch is handled in build_mac.sh (arch check + Rosetta
-            # prompt); the manifest records FRAMEGUARD_TARGET_ARCH so the
-            # updater refuses cross-arch updates.
-            "required": False,
-            "members": ["mediainfo"],
-            # mediaarea ships the Mac CLI as a .dmg (verified 200). There is
-            # no .tar.bz2 for recent versions — the old tar.bz2 URL 404s.
-            # .dmg extraction requires a Mac host (hdiutil); on other hosts
-            # the archive is cached and extraction is retried on the Mac.
-            "urls": [
-                "https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Mac.dmg",
-            ],
-        },
-    },
+    # "darwin" is intentionally absent here: its sources are
+    # per-architecture and are built by _darwin_sources(arch) at runtime.
 }
 
 
@@ -107,7 +153,12 @@ def detect_platform() -> str:
     raise SystemExit(f"Unsupported build platform: {system}")
 
 
-def cache_dir(target: str) -> Path:
+def cache_dir(target: str, arch: str = None) -> Path:
+    # macOS tools are per-architecture: an arm64 ffmpeg and an x86_64 ffmpeg
+    # must never share a cache directory, or whichever downloaded first
+    # would be silently bundled into both builds.
+    if target == "darwin":
+        return TOOLS_CACHE_ROOT / f"darwin-{_norm_arch(arch or _platform.machine())}"
     return TOOLS_CACHE_ROOT / target
 
 
@@ -128,13 +179,15 @@ def migrate_legacy_cache(target: str):
             print(f"  Migrated cached {old.name} -> tools_cache/{target}/")
 
 
-def download_file(url: str, dest: Path, label: str = "") -> bool:
+def download_file(url: str, dest: Path, label: str = ""):
+    """Download url to dest. Returns (ok, final_url_after_redirects)."""
     import urllib.request
 
     print(f"  Downloading {label or url.split('/')[-1]}...")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "FrameGuard-Builder/1.0"})
         with urllib.request.urlopen(req, timeout=180) as response:
+            final_url = response.geturl()
             total = int(response.headers.get("Content-Length", 0))
             downloaded = 0
             with open(dest, "wb") as f:
@@ -151,12 +204,41 @@ def download_file(url: str, dest: Path, label: str = "") -> bool:
                               end="", flush=True)
             if total:
                 print()
-        return True
+        return True, final_url
     except Exception as e:
         print(f"\n  ERROR: Download failed: {e}")
         if dest.exists():
             dest.unlink()
-        return False
+        return False, None
+
+
+def _sha256_of(path: Path) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _expected_sha256(final_url: str):
+    """Read the '<archive>.sha256' sidecar published next to an archive and
+    return the hex digest, or None when it cannot be read or parsed. The
+    caller treats None as a failed source: an unverifiable required tool is
+    a failed tool, never a silently trusted one."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(final_url + ".sha256",
+                                     headers={"User-Agent": "FrameGuard-Builder/1.0"})
+        with urllib.request.urlopen(req, timeout=60) as response:
+            text = response.read().decode("utf-8", "replace").strip()
+        parts = text.split()
+        token = parts[0].lower() if parts else ""
+        if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
+            return token
+    except Exception as e:
+        print(f"  ERROR: Could not read checksum sidecar: {e}")
+    return None
 
 
 def make_executable(path: Path):
@@ -252,6 +334,32 @@ def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
                                     shutil.copy2(Path(broot) / bfn, dest_dir / bfn)
                                     make_executable(dest_dir / bfn)
                                     found.add(bfn.lower())
+            if not found:
+                # Recent MediaArea Mac DMGs ship an installer package
+                # instead of a loose binary. Expand any .pkg payload and
+                # search inside it; discovering the payload per pinned
+                # version beats hard-coding a layout that changes.
+                for root, _dirs, files in os.walk(mount):
+                    for fn in files:
+                        if not fn.lower().endswith(".pkg"):
+                            continue
+                        expanded = Path(_tf.mkdtemp(prefix="fg_pkg_"))
+                        try:
+                            r2 = subprocess.run(
+                                ["pkgutil", "--expand-full",
+                                 str(Path(root) / fn), str(expanded)],
+                                capture_output=True, text=True, timeout=120)
+                            if r2.returncode != 0:
+                                continue
+                            for broot, _bdirs, bfiles in os.walk(expanded):
+                                for bfn in bfiles:
+                                    if bfn.lower() in wanted_lower:
+                                        shutil.copy2(Path(broot) / bfn,
+                                                     dest_dir / bfn)
+                                        make_executable(dest_dir / bfn)
+                                        found.add(bfn.lower())
+                        finally:
+                            shutil.rmtree(expanded, ignore_errors=True)
         finally:
             subprocess.run(["hdiutil", "detach", str(mount), "-quiet"],
                            capture_output=True, timeout=60)
@@ -308,8 +416,21 @@ def fetch(target: str, name: str, entry: dict, cache: Path, force: bool) -> bool
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            if not download_file(url, tmp_path, name):
+            ok, final_url = download_file(url, tmp_path, name)
+            if not ok:
                 continue
+            if entry.get("sha256_from_url"):
+                expected = _expected_sha256(final_url or url)
+                if expected is None:
+                    print("  No checksum sidecar available; refusing this source.")
+                    continue
+                actual = _sha256_of(tmp_path)
+                if actual != expected:
+                    print(f"  ERROR: SHA-256 mismatch (expected "
+                          f"{expected[:16]}..., got {actual[:16]}...); "
+                          f"trying next source.")
+                    continue
+                print("  SHA-256 verified.")
             found = extract_members(tmp_path, members, cache)
             if found >= {m.lower() for m in members}:
                 print(f"  {name} ready.")
@@ -328,6 +449,10 @@ def main():
     parser.add_argument("--platform", default="auto",
                         choices=["auto", "windows", "darwin"],
                         help="Target platform (default: auto-detect the host).")
+    parser.add_argument("--arch", default=None,
+                        help="Tool architecture for macOS: arm64 or x86_64 "
+                             "(default: this machine's architecture). "
+                             "Ignored on Windows.")
     parser.add_argument("--dest", type=Path, default=None,
                         help="Directory to stage tools into "
                              "(default: the platform's usual build output).")
@@ -338,15 +463,26 @@ def main():
     args = parser.parse_args()
 
     target = detect_platform() if args.platform == "auto" else args.platform
-    host = detect_platform()
-    cache = cache_dir(target)
+    try:
+        host = detect_platform()
+    except SystemExit:
+        # Cross-inspection from a third platform (e.g. reviewing the macOS
+        # tool set from Linux): the documented --platform flag must still
+        # work; host-dependent verification is simply skipped (host=None
+        # never equals target below).
+        host = None
+    arch = (_norm_arch(args.arch or _platform.machine())
+            if target == "darwin" else None)
+    cache = cache_dir(target, arch)
     cache.mkdir(parents=True, exist_ok=True)
     migrate_legacy_cache(target)
 
     print(f"Target platform : {target}")
+    if arch:
+        print(f"Target arch     : {arch}")
     print(f"Cache directory : {cache}")
 
-    spec = SOURCES[target]
+    spec = _darwin_sources(arch) if target == "darwin" else SOURCES[target]
     entries = {k: v for k, v in spec.items() if isinstance(v, dict)}
 
     required_ok = True
