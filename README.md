@@ -116,7 +116,7 @@ Python · PySide6 (Qt) · FFmpeg / FFprobe · MediaInfo · PyInstaller · Inno S
 ### Run from source
 
 ```bash
-cd FGv0.2.2
+cd src
 pip install -r requirements.txt
 python main.py
 ```
@@ -137,27 +137,27 @@ then common install locations including Homebrew and MacPorts.
 ### Build the installer
 
 ```batch
-cd FGv0.2.2
+cd src
 build_installer.bat          :: Windows -> Output\FrameGuardInstaller.exe
 ```
 
 ```bash
-cd FGv0.2.2
+cd src
 ./build_mac.sh               # macOS -> Output/FrameGuard.dmg
 ```
 
-See [BUILD_README.md](FGv0.2.2/BUILD_README.md). Windows runs the full test suite;
+See [BUILD_README.md](src/BUILD_README.md). Windows runs the full test suite;
 macOS runs its platform and packaging tests. Both self-test the packaged app
 before producing an artifact.
 
 The macOS build is ad-hoc signed rather than notarized, so on first launch
 right-click FrameGuard and choose **Open**. See
-[BUILD_README.md](FGv0.2.2/BUILD_README.md#gatekeeper--read-this-before-distributing).
+[BUILD_README.md](src/BUILD_README.md#gatekeeper--read-this-before-distributing).
 
 ### Run the tests
 
 ```bash
-cd FGv0.2.2
+cd src
 pip install -r requirements-dev.txt
 pytest
 ```
@@ -190,8 +190,8 @@ the Settings page, written to disk.
 
 The result is a small JSON file you can email, drop in a shared folder, or commit.
 Anyone who drags it onto FrameGuard gets your exact spec. Hand-authoring one also
-works — see `PRESET_CONFIG_KEYS` in `FGv0.2.2/frameguard/presets.py` for the accepted keys,
-and `FGv0.2.2/presets/` for worked examples.
+works — see `PRESET_CONFIG_KEYS` in `src/frameguard/presets.py` for the accepted keys,
+and `src/presets/` for worked examples.
 
 User-imported presets are stored in `~/.frameguard/presets/` and persist across
 reinstalls.
@@ -204,7 +204,7 @@ reinstalls.
 FrameGuard/
 ├── README.md                 # This file
 ├── LICENSE                   # MIT
-├── FGv0.2.2/
+├── src/
 │   ├── main.py               # Entry point (handles .fg paths from argv)
 │   ├── requirements.txt      # Runtime dependencies
 │   ├── requirements-dev.txt  # + pytest, pyflakes, pyinstaller

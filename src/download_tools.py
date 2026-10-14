@@ -7,7 +7,7 @@ End users never run this.
 
     python download_tools.py                        # auto-detect platform
     python download_tools.py --platform darwin      # cross-inspect
-    python download_tools.py --dest ~/Library/Caches/FrameGuard/FGv0.2.2/dist/FrameGuard.app/Contents/Resources/tools
+    python download_tools.py --dest ~/Library/Caches/FrameGuard/src/dist/FrameGuard.app/Contents/Resources/tools
     python download_tools.py --verify-only          # check the cache, download nothing
 
 Binaries are cached per-platform under tools_cache/<platform>/ so switching

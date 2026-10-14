@@ -11,7 +11,7 @@ proceeds)
 
 FrameGuard is currently distributed **unsigned** on Windows and
 **ad-hoc signed** on macOS. This is a deliberate, disclosed state — see
-`RELEASE_PLAN.md` for the audited reasoning and the signing roadmap.
+`docs/RELEASE_PLAN.md` for the audited reasoning and the signing roadmap.
 
 - **Windows:** the installer and app carry no Authenticode signature, so
   SmartScreen shows "Windows protected your PC" on first run. Choose
