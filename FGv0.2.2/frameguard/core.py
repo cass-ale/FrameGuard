@@ -1,7 +1,7 @@
 """
 FrameGuard Desktop - Core Scan Engine
-Lead Developer: Jace Aleria
-Copyright (c) 2026 Jace Aleria. MIT License.
+Lead Developer: Cassian Aléria
+Copyright (c) 2026 Cassian Aléria. MIT License.
 """
 
 # Single source of truth for the version; this module used to hard-code
@@ -373,7 +373,7 @@ class QAResult:
     def __init__(self, filepath: str):
         self.filepath = filepath
         self.filename = os.path.basename(filepath)
-        self._engine = "FrameGuard by Jace Aleria"
+        self._engine = "FrameGuard by Cassian Aléria"
         self.checks: List[Tuple[str, str, str]] = []
         self.passed = True
         self.warnings: List[str] = []
