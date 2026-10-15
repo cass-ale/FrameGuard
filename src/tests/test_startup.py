@@ -75,6 +75,35 @@ def _assert_passed(completed, evidence):
     assert evidence["event_loop"]["deferred_show_confirmed"] is True
 
 
+def test_evidence_accepts_authenticated_child_of_spawned_launcher():
+    from tools_dev.startup_smoke import REQUIRED_CHECKPOINTS, _validate
+
+    launched_ns = 100
+    evidence = {
+        "challenge": "current-run",
+        "process_id": 222,
+        "parent_process_id": 111,
+        "started_wall_time_ns": launched_ns,
+        "status": "passed",
+        "frozen": False,
+        "event_loop": {
+            "turn_observed": True,
+            "deferred_show_confirmed": True,
+        },
+        "checkpoints": [{"name": name} for name in REQUIRED_CHECKPOINTS],
+        "executable": "python.exe",
+        "os": "Windows",
+        "architecture": "AMD64",
+        "python": "3.12",
+        "qt_version": "6.9",
+        "qpa": "windows",
+        "profile_path": "profile",
+        "theme": "default",
+        "duration_ms": 1,
+    }
+    assert _validate(evidence, False, "current-run", 111, launched_ns) == []
+
+
 def test_real_source_startup_preflight_is_bounded_and_machine_readable(tmp_path):
     completed, evidence, report = _run_startup(tmp_path)
     _assert_passed(completed, evidence)
@@ -167,7 +196,8 @@ def test_injected_startup_fault_never_produces_a_passing_report(tmp_path, checkp
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="native Cocoa requires macOS")
 def test_real_source_startup_preflight_runs_on_native_cocoa(tmp_path):
-    completed, evidence, _ = _run_startup(tmp_path, qpa="cocoa")
+    completed, evidence, _ = _run_startup(
+        tmp_path, qpa="cocoa", timeout_ms=15000)
     _assert_passed(completed, evidence)
     assert evidence["qpa"] == "cocoa"
 

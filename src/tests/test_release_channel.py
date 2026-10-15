@@ -338,13 +338,14 @@ class TestGithubReleaseAssetPick:
 
     def test_macos_picks_the_dmg_even_when_the_exe_is_first(self):
         from frameguard.updater import _pick_release_asset
-        picked = _pick_release_asset(self.ASSETS, platform="darwin")
+        picked = _pick_release_asset(
+            self.ASSETS, platform="darwin", machine="arm64")
         assert picked["name"] == "FrameGuard-arm64.dmg"
 
     def test_macos_picks_the_dmg_when_it_is_first(self):
         from frameguard.updater import _pick_release_asset
-        picked = _pick_release_asset(list(reversed(self.ASSETS)),
-                                      platform="darwin")
+        picked = _pick_release_asset(
+            list(reversed(self.ASSETS)), platform="darwin", machine="arm64")
         assert picked["name"] == "FrameGuard-arm64.dmg"
 
     def test_no_asset_for_this_platform_returns_none(self):

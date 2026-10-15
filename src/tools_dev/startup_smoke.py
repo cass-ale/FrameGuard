@@ -67,10 +67,13 @@ def _validate(evidence, expect_frozen, challenge, process_id, launched_ns):
     problems = []
     if evidence.get("challenge") != challenge:
         problems.append("startup evidence challenge does not match this run")
-    if evidence.get("process_id") != process_id:
+    evidence_pid = evidence.get("process_id")
+    evidence_parent_pid = evidence.get("parent_process_id")
+    if evidence_pid != process_id and evidence_parent_pid != process_id:
         problems.append(
-            f"evidence process_id is {evidence.get('process_id')!r}, "
-            f"expected spawned PID {process_id}")
+            f"evidence process lineage is pid={evidence_pid!r}, "
+            f"parent={evidence_parent_pid!r}; expected spawned PID {process_id} "
+            "to be the application or its direct launcher")
     started_ns = evidence.get("started_wall_time_ns")
     if not isinstance(started_ns, int) or started_ns < launched_ns:
         problems.append("startup evidence predates this process launch")

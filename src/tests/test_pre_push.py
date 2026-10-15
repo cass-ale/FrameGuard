@@ -614,7 +614,7 @@ def test_ignored_dmg_tampering_before_return_is_in_digest_and_fails(
     record = _materialize_stage_record(stage, evidence_dir, snapshot, tools)
     digest = pre_push.authorization_evidence_digest((stage,), (record,))
     assert any(
-        item["path"].endswith("Output/FrameGuard-arm64.dmg")
+        Path(item["path"]).name == "FrameGuard-arm64.dmg"
         for item in record["evidence_files"])
     pre_authorization_ok, _ = pre_push.revalidate_authorization_evidence(
         (stage,), (record,), snapshot, tools, evidence_dir, digest,

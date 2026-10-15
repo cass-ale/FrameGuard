@@ -344,13 +344,14 @@ class TestPerWorkerPsutilOwnership:
 
         owned_proc = _Popen(501)
         other_proc = _Popen(502)
-        owner.register_proc(owned_proc)
-        other.register_proc(other_proc)
         terminated = []
 
         class _PsutilProc:
             def __init__(self, pid):
                 self.pid = pid
+
+            def create_time(self):
+                return float(self.pid)
 
             def terminate(self):
                 terminated.append(self.pid)
@@ -368,6 +369,8 @@ class TestPerWorkerPsutilOwnership:
             TimeoutExpired=type("TimeoutExpired", (Exception,), {}),
         )
         monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+        owner.register_proc(owned_proc)
+        other.register_proc(other_proc)
 
         owner.cancel()
         assert terminated == [owned_proc.pid]
