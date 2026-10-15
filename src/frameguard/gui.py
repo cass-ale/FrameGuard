@@ -5655,8 +5655,8 @@ class MainWindow(QMainWindow):
             )
         self._apply_responsive_layout()
 
-    def _apply_responsive_layout(self):
-        """Adapt spacing and chrome to the current window size.
+    def _apply_responsive_layout(self, width=None):
+        """Adapt spacing and chrome to the current or supplied window width.
 
         Everything below was tuned for a maximized window; at the 1000x700
         minimum the fixed gutters and the badge strip left the table with barely
@@ -5665,7 +5665,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "stack"):
             return
 
-        width = self.width()
+        width = self.width() if width is None else width
 
         for panel in (getattr(self, name, None) for name in
                       ("scan_panel", "results_panel", "checks_panel",

@@ -364,18 +364,17 @@ class TestSidebar:
     def test_sidebar_width_is_not_frozen_by_the_stylesheet(self, window, qapp):
         """A hard-coded min-width/max-width in theme.py silently overrode the
         responsive sizing, so the sidebar never actually narrowed."""
-        window.resize(1000, 700)
-        for _ in range(4):
-            qapp.processEvents()
-        narrow = window._sidebar.width()
+        # Exercise the policy directly: a native window manager may cap an
+        # oversized test window to the runner's desktop before resizeEvent.
+        window._apply_responsive_layout(1000)
+        narrow = window._sidebar.maximumWidth()
 
-        window.resize(1920, 1080)
-        for _ in range(4):
-            qapp.processEvents()
-        wide = window._sidebar.width()
+        window._apply_responsive_layout(1920)
+        wide = window._sidebar.maximumWidth()
 
         assert narrow < wide, f"sidebar did not adapt: {narrow}px vs {wide}px"
         assert narrow == D.sidebar_width(1000)
+        assert wide == D.sidebar_width(1920)
 
     def test_every_nav_row_has_a_real_icon(self, window):
         for btn in window.nav_buttons:
@@ -767,14 +766,10 @@ class TestLayoutIntegrity:
         from frameguard import gui as G
 
         window._switch_panel(G.PANEL_RESULTS)
-        window.resize(1000, 700)
-        for _ in range(3):
-            qapp.processEvents()
+        window._apply_responsive_layout(1000)
         narrow = window.results_panel.layout().contentsMargins().left()
 
-        window.resize(1920, 1080)
-        for _ in range(3):
-            qapp.processEvents()
+        window._apply_responsive_layout(1920)
         wide = window.results_panel.layout().contentsMargins().left()
 
         assert narrow < wide, f"gutter did not adapt: {narrow} vs {wide}"

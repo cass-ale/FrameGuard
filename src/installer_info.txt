@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.7.2
+FrameGuard Desktop v0.7.3
 Video QA for XR Deliverables
 
 
@@ -22,9 +22,12 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.7.2
+WHAT'S NEW IN v0.7.3
 
   Native Windows validation
+    - Responsive layout contracts now test the intended target width directly,
+      independent of a hosted desktop's physical maximum window size.
+    - Windows automation
     - Windows automation now uses Qt's native Windows backend and verifies font
       glyph support before testing; the offscreen backend produced unusable
       placeholder glyphs and invalid text metrics on hosted Windows runners.

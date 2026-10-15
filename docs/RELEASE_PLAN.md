@@ -1,8 +1,8 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.6 · **Date:** 2026-10-15 · **Status:** v0.7.2 native Windows
-validation recovery; immutable failed v0.7.0 and v0.7.1 tags are preserved and
-the next remote operation atomically pushes both `main` and `v0.7.2`.
+**Version:** 1.7 · **Date:** 2026-10-15 · **Status:** v0.7.3 native Windows
+responsive-contract recovery; immutable failed v0.7.0 through v0.7.2 tags are
+preserved and the next remote operation atomically pushes `main` and `v0.7.3`.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -158,6 +158,8 @@ are metadata lines only, to be merged on top of his text.
   promised by this plan, only prepared for.
 
 ## 8. Revision log
+
+- **1.7 - 2026-10-15.** Fixes forward from immutable v0.7.2 after its native Windows run proved font rasterization and both macOS platforms green, then exposed two responsive tests that relied on resizing beyond the hosted desktop. v0.7.3 verifies the responsive policy directly at target widths without weakening production behavior.
 
 - **1.6 - 2026-10-15.** Fixes forward from immutable v0.7.1 after its Windows run proved Qt's offscreen backend could not rasterize system-font glyphs, making its visual metrics invalid, while Intel macOS was cancelled by the 30-minute job limit at 53%. v0.7.2 uses the native Windows backend with a glyph preflight and gives the complete Intel suite a 90-minute budget.
 
