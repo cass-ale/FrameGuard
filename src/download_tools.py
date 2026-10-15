@@ -23,6 +23,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -354,6 +355,62 @@ def _extract_pkg_payload(pkg_path: Path, wanted_lower: set,
         shutil.rmtree(work, ignore_errors=True)
 
 
+_HDIUTIL_ATTEMPTS = 3
+_HDIUTIL_BACKOFF_SECONDS = (1, 2)
+
+
+def _diagnostic_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return str(value)
+
+
+def _run_hdiutil(args: list, operation: str, timeout: int,
+                   attempts: int = _HDIUTIL_ATTEMPTS):
+    """Run hdiutil with bounded retries and complete failure diagnostics."""
+    for attempt in range(1, attempts + 1):
+        try:
+            result = subprocess.run(
+                ["hdiutil"] + list(args),
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except subprocess.TimeoutExpired as exc:
+            print(f"  ERROR: hdiutil {operation} timed out "
+                  f"(attempt {attempt}/{attempts}, {timeout}s)")
+            stdout = _diagnostic_text(exc.stdout)
+            stderr = _diagnostic_text(exc.stderr)
+        except OSError as exc:
+            print(f"  ERROR: hdiutil {operation} could not start "
+                  f"(attempt {attempt}/{attempts}): {exc}")
+            stdout = ""
+            stderr = ""
+        else:
+            if result.returncode == 0:
+                return result
+            print(f"  ERROR: hdiutil {operation} exited {result.returncode} "
+                  f"(attempt {attempt}/{attempts})")
+            stdout = _diagnostic_text(result.stdout)
+            stderr = _diagnostic_text(result.stderr)
+
+        if stdout:
+            print(f"  hdiutil {operation} stdout:\n{stdout.rstrip()}")
+        if stderr:
+            print(f"  hdiutil {operation} stderr:\n{stderr.rstrip()}")
+        if attempt < attempts:
+            delay = _HDIUTIL_BACKOFF_SECONDS[
+                min(attempt - 1, len(_HDIUTIL_BACKOFF_SECONDS) - 1)
+            ]
+            print(f"  Retrying hdiutil {operation} in {delay}s...")
+            time.sleep(delay)
+    return None
+
+
 def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
     """Pull files out of a macOS .dmg (mediaarea ships MediaInfo this way).
 
@@ -369,15 +426,19 @@ def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
         return found
     import tempfile as _tf
     mount = Path(_tf.mkdtemp(prefix="fg_dmg_"))
+    attached = False
+    detached = True
     try:
-        r = subprocess.run(
-            ["hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint",
+        result = _run_hdiutil(
+            ["attach", "-nobrowse", "-readonly", "-mountpoint",
              str(mount), str(archive)],
-            capture_output=True, text=True, timeout=120,
+            "attach", timeout=120,
         )
-        if r.returncode != 0:
-            print(f"  ERROR: hdiutil attach failed: {(r.stderr or r.stdout)[:200]}")
+        if result is None:
+            print(f"  MediaInfo remains optional; retaining no files from "
+                  f"{archive.name} after attach retries.")
             return found
+        attached = True
         try:
             for root, dirs, files in os.walk(mount):
                 for fn in files:
@@ -448,12 +509,24 @@ def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
                             _extract_pkg_payload(Path(root) / fn, wanted_lower,
                                                  dest_dir, found)
         finally:
-            subprocess.run(["hdiutil", "detach", str(mount), "-quiet"],
-                           capture_output=True, timeout=60)
+            result = _run_hdiutil(
+                ["detach", str(mount)], "detach", timeout=60)
+            if result is None:
+                print("  Normal hdiutil detach retries exhausted; "
+                      "trying one forced detach.")
+                result = _run_hdiutil(
+                    ["detach", "-force", str(mount)],
+                    "forced detach", timeout=60, attempts=1,
+                )
+            detached = result is not None
+            if not detached:
+                print(f"  ERROR: could not detach MediaInfo image; "
+                      f"mount retained for manual cleanup: {mount}")
     except Exception as e:
         print(f"  ERROR: .dmg extraction failed: {e}")
     finally:
-        shutil.rmtree(mount, ignore_errors=True)
+        if not attached or detached:
+            shutil.rmtree(mount, ignore_errors=True)
     return found
 
 

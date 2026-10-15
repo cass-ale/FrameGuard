@@ -12,9 +12,9 @@ cross-compilation.
 Both scripts perform the same gated sequence and fail loudly at each step:
 
 ```
-1. Check the host toolchain (Python 3.10+)
+1. Check the host toolchain (Python 3.12)
 2. Create a CLEAN platform-specific build virtualenv
-3. Install pinned dependencies from requirements.txt
+3. Install requirements through constraints-3.12.txt
 4. validate_version.py   - refuses to build if versions disagree
    write_build_stamp.py  - records when/where this build was made
 5. Run tests - Windows runs the full suite; macOS runs packaging/macOS tests
@@ -31,7 +31,7 @@ Both scripts perform the same gated sequence and fail loudly at each step:
 Pass `--fast` to reuse the platform's existing build environment (much quicker
 for iteration), or `--skip-tests` to bypass the test gate. Windows owns
 `.buildenv`, `build`, and `dist` in this checkout. macOS builds under
-`~/Library/Caches/FrameGuard/<checkout>/` because Google Drive cannot preserve
+`~/Library/Caches/FrameGuard/<checkout>/<architecture>/` because cloud-backed filesystems cannot preserve
 Qt's framework symlinks; only the completed DMG is copied to `Output`. The
 builders therefore coexist without deleting or reusing each other's state.
 Neither fast mode nor skipping tests is appropriate for a build you intend to
@@ -42,7 +42,7 @@ distribute.
 ## Windows
 
 ### One-time setup
-1. **Python 3.10+** — [python.org](https://www.python.org/downloads/), check
+1. **Python 3.12** — CI pins 3.12.10 via `.python-version`; check
    "Add Python to PATH"
 2. **Inno Setup 6.2+** — [jrsoftware.org](https://jrsoftware.org/isdl.php),
    install to the default location
@@ -68,7 +68,7 @@ Send **only** `FrameGuardInstaller.exe`. When teammates run it:
 
 ### One-time setup
 1. **Xcode Command Line Tools** — `xcode-select --install`
-2. **Python 3.10+** — python.org or Homebrew (the system `python3` also works)
+2. **Python 3.12** — CI pins 3.12.10 via `.python-version`
 
 ### Build
 ```bash
@@ -78,6 +78,10 @@ chmod +x build_mac.sh     # first time only
 # Google Drive may drop the executable bit; this equivalent form always works:
 bash build_mac.sh
 ```
+
+Both builders install through `constraints-3.12.txt`, the dependency set
+proven by Windows, Apple Silicon, and Intel CI. Update the constraints only
+through a reviewed cross-platform build; do not bypass them for a release.
 
 ### Gatekeeper — read this before distributing
 
@@ -118,6 +122,13 @@ xcrun notarytool submit Output/FrameGuard.dmg \
 xcrun stapler staple Output/FrameGuard.dmg
 ```
 
+For GitHub-hosted release builds, configure all six secrets together:
+`MACOS_SIGN_IDENTITY`, `MACOS_CERTIFICATE_P12_BASE64`,
+`MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`, and
+`APPLE_APP_PASSWORD`. The workflow imports the P12 into a temporary keychain,
+scopes credentials only to first-party signing steps, and deletes the keychain
+after the build. A partial official-signing configuration fails before build.
+
 Notarization requires a paid Apple Developer account (no free path exists).
 Until then, include the version-appropriate Gatekeeper instruction above
 whenever you share the DMG — never just "right-click → Open", which is wrong
@@ -125,22 +136,17 @@ for macOS 15+.
 
 ### Architecture
 
-The build targets the architecture of the build Mac (`TARGET_ARCH`, default
-`uname -m`), recorded in the release manifest so the updater refuses
-cross-arch updates. An Apple Silicon build will not run on an Intel Mac and
-vice versa. Options:
+The build targets the architecture of the build Mac (`uname -m`) and exports
+that value as `FRAMEGUARD_TARGET_ARCH` for PyInstaller and the release
+manifest. The updater refuses cross-architecture deltas. Build once on each
+native architecture; universal2 builds are intentionally unsupported because
+Python and every binary wheel would also need to be universal2.
 
-- Build once on each architecture (simplest, recommended). Each build also
-  leaves an arch-tagged copy (`Output/FrameGuard-arm64.dmg`,
-  `Output/FrameGuard-x86_64.dmg`) alongside the canonical `FrameGuard.dmg`, or
-- Set `FRAMEGUARD_TARGET_ARCH=universal2` — this requires a universal2 Python
-  **and** universal2 wheels for PySide6, and fails late and confusingly if
-  either is missing.
-
-Note: the bundled FFmpeg comes from evermeet, which serves Intel (x86_64)
-builds. An arm64 build bundling Intel-only tools runs via Rosetta 2 — the
-build prints a warning with the `softwareupdate --install-rosetta` command
-when this happens.
+Each build leaves an arch-tagged copy (`Output/FrameGuard-arm64.dmg` or
+`Output/FrameGuard-x86_64.dmg`) beside the canonical `FrameGuard.dmg`.
+FFmpeg and FFprobe come from pinned Martin Riedl releases with publisher
+SHA-256 sidecars, separately for arm64 and x86_64. The builder rejects a tool
+whose Mach-O architecture does not match the target; Rosetta is not required.
 
 ### Known macOS differences
 
@@ -160,8 +166,9 @@ reads a watched folder in one of those locations. That is expected.
 
 ## Before You Ship (either platform)
 
-The Windows build runs the full suite; the macOS build runs its packaging and
-platform suite. Both run a self-test of the packaged app.
+Every push runs the full constrained suite on Windows, Apple Silicon, and
+Intel macOS. Release builders keep an additional platform packaging gate and
+self-test the packaged application before producing an artifact.
 Still verify by hand:
 
 1. Install from the produced artifact
@@ -194,8 +201,9 @@ FFmpeg, FFprobe and MediaInfo are cached per-platform:
 
 ```
 tools_cache/
-├── windows/    ffmpeg.exe, ffprobe.exe, mediainfo.exe
-└── darwin/     ffmpeg, ffprobe, mediainfo
+├── windows/          ffmpeg.exe, ffprobe.exe, mediainfo.exe
+├── darwin-arm64/     ffmpeg, ffprobe, mediainfo
+└── darwin-x86_64/    ffmpeg, ffprobe, mediainfo
 ```
 
 They are downloaded once and reused. Useful commands:
@@ -203,7 +211,8 @@ They are downloaded once and reused. Useful commands:
 ```bash
 python download_tools.py --verify-only          # check the cache
 python download_tools.py --force                # re-download
-python download_tools.py --platform darwin      # fetch macOS tools from any host
+python download_tools.py --platform darwin --arch arm64   # Apple Silicon
+python download_tools.py --platform darwin --arch x86_64  # Intel
 ```
 
 The cache is gitignored — these are large binaries, not source.
@@ -214,7 +223,7 @@ The cache is gitignored — these are large binaries, not source.
 
 | Issue | Fix |
 |-------|-----|
-| "Python not found" | Install Python 3.10+ and ensure it's on PATH |
+| "Python not found" | Install Python 3.12 and ensure it's on PATH |
 | "Version numbers disagree" | Reconcile the four files in the table above |
 | "Tests failed" | Fix them. Do not ship with `--skip-tests` |
 | "failed its self-test" | Run the printed `--selftest` command to see why |
@@ -224,7 +233,7 @@ The cache is gitignored — these are large binaries, not source.
 | macOS: `bad interpreter` | `build_mac.sh` has CRLF endings — `dos2unix build_mac.sh` |
 | macOS: `Permission denied` | `chmod +x build_mac.sh` |
 | "Inno Setup not found" | Install from jrsoftware.org to the default path |
-| FFmpeg download fails | Build continues; FFmpeg becomes an end-user prerequisite |
+| FFmpeg download fails | The build stops; verify the pinned source and checksum sidecar, then retry |
 | Antivirus flags the exe | Add this folder to exclusions during the build |
 
 ---

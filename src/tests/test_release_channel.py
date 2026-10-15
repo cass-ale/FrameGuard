@@ -77,7 +77,7 @@ class TestConfiguredChannel:
         try:
             settings.setValue(U._CHANNEL_KEY,
                               U._LEGACY_RELEASE_ROOT + "\\RELEASES")
-            assert U.get_update_channel() == U.DEFAULT_UPDATE_CHANNEL
+            assert U.get_update_channel() == U.get_update_channel_for(sys.platform)
             assert settings.value(U._CHANNEL_KEY, None) is None, \
                 "the legacy override should be cleared, not left to rot"
             # Storing the legacy value through the setter is also a no-op.
@@ -91,13 +91,15 @@ class TestConfiguredChannel:
 
     def test_channel_survives_qsettings(self, qapp):
         """QSettings is the per-machine override; the value has to round-trip."""
-        from frameguard.updater import (DEFAULT_UPDATE_CHANNEL,
-                                        get_update_channel, set_update_channel)
+        from frameguard.updater import (get_update_channel,
+                                        get_update_channel_for,
+                                        set_update_channel)
 
         original = get_update_channel()
+        expected = get_update_channel_for(sys.platform)
         try:
-            set_update_channel(DEFAULT_UPDATE_CHANNEL)
-            assert get_update_channel() == DEFAULT_UPDATE_CHANNEL
+            set_update_channel(expected)
+            assert get_update_channel() == expected
         finally:
             set_update_channel(original)
 

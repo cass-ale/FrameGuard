@@ -200,12 +200,13 @@ class TestUpdateChannel:
             set_update_channel(original)
 
     def test_blank_channel_falls_back_to_the_default(self, qapp):
-        from frameguard.updater import (DEFAULT_UPDATE_CHANNEL,
-                                        get_update_channel, set_update_channel)
+        from frameguard.updater import (get_update_channel,
+                                        get_update_channel_for,
+                                        set_update_channel)
         original = get_update_channel()
         try:
             set_update_channel("")
-            assert get_update_channel() == DEFAULT_UPDATE_CHANNEL
+            assert get_update_channel() == get_update_channel_for(sys.platform)
         finally:
             set_update_channel(original)
 
@@ -220,10 +221,20 @@ class TestInstallRootDetection:
         assert D.find_install_root() is None
 
     def test_frozen_windows_uses_the_exe_directory(self, monkeypatch):
-        monkeypatch.setattr(sys, "frozen", True, raising=False)
-        monkeypatch.setattr(sys, "executable", r"C:\Apps\FrameGuard\FrameGuard.exe")
-        monkeypatch.setattr(sys, "platform", "win32")
-        assert D.find_install_root().endswith("FrameGuard")
+        import ntpath
+        from types import SimpleNamespace
+
+        windows_sys = SimpleNamespace(
+            frozen=True,
+            executable=r"C:\Apps\FrameGuard\FrameGuard.exe",
+            platform="win32",
+        )
+        windows_os = SimpleNamespace(
+            name="nt", path=ntpath, pathsep=";", sep="\\")
+        monkeypatch.setattr(D, "sys", windows_sys)
+        monkeypatch.setattr(D, "os", windows_os)
+
+        assert D.find_install_root() == r"C:\Apps\FrameGuard"
 
 
 class TestSwapScript:

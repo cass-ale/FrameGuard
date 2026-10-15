@@ -1,8 +1,8 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.1 · **Date:** 2026-10-14 · **Status:** implemented locally,
-re-based onto `df35054` and merged with the 2026-10-14 credit commits,
-awaiting review. Nothing in this plan has been pushed.
+**Version:** 1.2 · **Date:** 2026-10-15 · **Status:** v0.6.1 hardening
+implemented locally; push CI and tag release validation are required before
+publication.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -23,15 +23,19 @@ Windows code-signing certificate.
 | D5 | Gatekeeper instructions are split by macOS version | Apple removed right-click → Open in macOS 15. 15/26: double-click → **Done** → System Settings → Privacy & Security → **Open Anyway** → authenticate → relaunch. ≤14: right-click → Open still works. Fallback on all versions: `xattr -dr com.apple.quarantine` on the .app (or on the DMG first if the app is reported "damaged"). All repo text that said only "right-click → Open" was wrong for current macOS and is corrected. |
 | D6 | Draft → attach everything → verify → publish, with **immutable releases** enabled | Immutable releases are GA (2025-10-28). Once enabled, a published release's tag and assets can never be changed or deleted, and the tag name can never be reused. A forgotten asset means a new version — hence draft-first with a verification gate before publishing. |
 | D7 | Provenance is free, so it is mandatory | `actions/attest-build-provenance` on the final EXE + both DMGs (Sigstore keyless via OIDC; **SLSA Build L2** — L3 is not claimed), plus `SHA256SUMS.txt` covering every asset. Users verify with `gh attestation verify`. |
-| D8 | SBOM ships, generated from the **frozen Python environment** | One CycloneDX JSON per platform from `pip freeze` of the build venv (`cyclonedx-bom`, command verified locally). Never by scanning the PyInstaller bundle/installer — the frozen archive under-reports exactly the Python deps an SBOM exists to list. SBOM step failures do not gate the release. Its value is CVE response and licence inventory; it does **not** replace a human THIRD_PARTY_NOTICES (open item, §7). |
+| D8 | SBOM ships, generated from the **constrained frozen Python environment** | Windows and both macOS architectures install through `constraints-3.12.txt`; one CycloneDX JSON per platform is generated from `pip freeze` of the build venv. Never scan the PyInstaller bundle/installer — the frozen archive under-reports exactly the Python deps an SBOM exists to list. SBOM step failures remain non-gating. |
 | D9 | version.json is the single source of truth | SemVer, annotated `vX.Y.Z` tags, never moved. CI fails the release unless tag == version.json == Inno AppVersion == spec version. The curated changelog in version.json becomes the release-notes body (plus a compare link). release-please / git-cliff are rejected for this project shape — the curated changelog already exists and beats commit-log prose. |
 | D10 | The delta channel stays, demoted to a **machine-generated mirror** | Research is blunt about the risks: a mutable branch bypasses immutability/attestation, delta bases don't compose across skipped versions, file patching desyncs Inno's registry state, and on macOS patching inside a .app breaks its code seal (TCC re-prompts, possible re-quarantine). Mitigations adopted now: the workflow generates the manifests from the tag, ships them as Release assets (`update-manifest-windows.json`, `update-manifest-macos.json`), and only then mirrors them to the `releases` branch — the branch is never hand-edited again. Known remaining risks, accepted explicitly: macOS in-app delta patching vs. the bundle seal is **not device-verified**; the full installer is always the fallback and the release notes say so. |
 | D11 | Publisher ≠ copyright holder, deliberately | Publisher/brand fields say **Capri la Ria**: Inno `AppPublisher`, `VersionInfoCompany`; spec `CompanyName`; About dialog "Publisher"; README and release-notes voice. Legal fields carry his legal name, **Cassian Aléria**: `LegalCopyright`, `VersionInfoCopyright`, `NSHumanReadableCopyright`, and both LICENSE files — copyright sits with him personally, while Capri la Ria (his label, founded 2022) is the publishing imprint credited wherever a publisher is named. This model was applied repo-wide on 2026-10-14 in commits `35dd479`–`df35054` (installer, spec, app metadata, About dialog, both LICENSE files). If SignPath is ever adopted, the *certificate* publisher becomes "SignPath Foundation" while these fields stay the project's — the policy page discloses that. |
-| D12 | The three Inno URLs are distinct | `AppPublisherURL` = caprilaria.com (set in `35dd479`), `AppSupportURL` = GitHub Issues, `AppUpdatesURL` = GitHub Releases (the latter two applied in the merged change set; in `35dd479` both still pointed at the repo root). |
+| D12 | The three Inno URLs are distinct | `AppPublisherURL` = caprilaria.com, `AppSupportURL` = GitHub Issues, and `AppUpdatesURL` = GitHub Releases. |
+| D13 | A release tag is created only from a green three-platform push commit | The full constrained suite runs on `windows-2025`, `macos-15`, and `macos-15-intel`. Release-only validation discovered too many defects after tagging; `vX.Y.Z` now points only at a commit already proven on every supported build architecture. |
+| D14 | Drafts resume; published releases never mutate | A rerun may reconcile assets only while the release is a draft. An existing published release is a hard failure requiring a new version. The delta channel is committed before the final undraft, so a branch failure leaves a recoverable draft rather than a public release with a stale channel. |
 
 ## 2. What the workflow does (`.github/workflows/release.yml`)
 
-Trigger: push of a `v*` tag, or manual dispatch naming an existing tag.
+Trigger: push of a `v*` tag, or manual dispatch from that existing tag's
+ref. Supplying a tag input while dispatching from `main` is rejected because
+the protected `release` environment admits only `v*` tag refs.
 
 1. **verify** (`ubuntu-24.04`) — checkout the tag, Python from
    `src/.python-version` (3.12, pinned everywhere), `validate_version.py`,
@@ -54,16 +58,17 @@ Trigger: push of a `v*` tag, or manual dispatch naming an existing tag.
    `contents: write` + `id-token: write` + `attestations: write`) —
    stage assets under release names (`FrameGuardInstaller.exe`,
    `FrameGuard-arm64.dmg`, `FrameGuard-intel.dmg`), generate
-   `SHA256SUMS.txt`, attest the three binaries, create a **draft** release
-   with every asset via `gh`, verify the draft's asset list matches the
-   expected set exactly, undraft, and only then mirror the delta manifests
-   + payloads to the `releases` branch (payload first, manifest last).
+   `SHA256SUMS.txt`, attest the three binaries, create or safely resume a
+   **draft** release, and verify its assets. Mirror the delta manifests and
+   payloads to the `releases` branch, then undraft only after that push
+   succeeds. Published releases are immutable and are never reconciled.
 
-Hardening throughout: every action pinned to a full commit SHA with a
-version comment; `.github/dependabot.yml` keeps the pins moving;
-top-level `permissions: contents: read`; `persist-credentials: false` on
-build checkouts; per-tag concurrency with `cancel-in-progress: false`;
-pinned runner labels (no floating `*-latest` for release jobs).
+Hardening throughout: Node 24-compatible actions pinned to full commit SHAs;
+`.github/dependabot.yml` keeps the pins moving; top-level
+`permissions: contents: read`; `persist-credentials: false` on build
+checkouts; per-tag build concurrency plus globally serialized channel
+publishing; bounded job and network retries; pinned runner labels (no floating
+`*-latest` for release jobs).
 
 ## 3. One-time setup the publisher must do in GitHub settings
 
@@ -77,6 +82,11 @@ These live in repo settings, not YAML, so no workflow edit can bypass them:
    **DONE 2026-10-14** (reviewer = cass-ale, `v*` tag rule, self-review
    prevention off; confirmed by screenshot and his word).
 3. Confirm Dependabot alerts/updates are on (the config file is in the repo).
+4. For a future official macOS release, configure all-or-none secrets:
+   `MACOS_SIGN_IDENTITY`, `MACOS_CERTIFICATE_P12_BASE64`,
+   `MACOS_CERTIFICATE_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID`, and
+   `APPLE_APP_PASSWORD`. The workflow imports the P12 into a temporary
+   keychain and fails closed on any partial configuration.
 
 ## 4. Release-day checklist (against the draft, before publishing)
 
@@ -84,7 +94,8 @@ From the research §6 — with immutable releases there is no fix-up after
 publishing, so this list is the gate. (The workflow automates items 1–2
 partially; the rest are human, on real machines.)
 
-- [ ] Tag ↔ version.json ↔ installer ↔ spec versions all equal (CI asserts).
+- [ ] Full constrained push CI is green on Windows, macOS arm64, and macOS Intel for the exact `main` commit.
+- [ ] Annotated tag target ↔ version.json ↔ installer ↔ spec versions all equal (CI asserts).
 - [ ] Draft assets downloaded *from GitHub*; `SHA256SUMS.txt` verifies;
       `gh attestation verify` passes on each binary.
 - [ ] Clean-machine installs: Windows with no Python (install, launch,
@@ -134,20 +145,16 @@ are metadata lines only, to be merged on top of his text.
 
 ## 7. Open items / not-checked
 
-- The workflow has never run on GitHub. First tag is the real test —
-  especially the SBOM step on Windows, artifact layouts, and the Intel
-  runner label.
 - macOS delta patching vs. the .app code seal: not device-verified (D10).
 - THIRD_PARTY_NOTICES: not yet written. Needed before a public push for
   LGPL hygiene (PySide6/Qt) — and the bundled FFmpeg builds' exact licence
-  terms (gyan.dev / evermeet builds) must be verified first, not guessed.
+  terms (gyan.dev / Martin Riedl builds) must be verified first, not guessed.
 - SignPath's reputation threshold is unpublished; acceptance is not
   promised by this plan, only prepared for.
-- PySide6's pinned-version wheel layout was not re-checked (moot under
-  per-arch builds, D4).
 
 ## 8. Revision log
 
+- **1.2 — 2026-10-15.** Adds constrained cross-platform push CI, a macOS-12-compatible Qt pin, bounded DMG verification, complete nested-code signing, temporary CI keychain provisioning, Node 24 action pins, overwrite-safe workflow artifacts, monotonic delta channels, rerun-safe drafts, channel-before-undraft ordering, and the green-commit-before-tag rule for v0.6.1.
 - **1.1 — 2026-10-14.** Credit model corrected to the one Cassian applied
   himself in commits `35dd479`–`df35054`: developer and copyright holder is
   **Cassian Aléria** (legal name, accent included) across the installer, the

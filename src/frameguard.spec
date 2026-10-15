@@ -27,7 +27,7 @@ import os
 # Configuration
 # ---------------------------------------------------------------------------
 APP_NAME = "FrameGuard"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.6.1"
 ENTRY_POINT = "main.py"
 # This is an opaque identifier, not branding, but it IS the app's macOS
 # identity (bundle identity, .fg UTI ownership, preferences domain), so
@@ -74,8 +74,8 @@ if sys.platform == "win32":
     )
     version_info = VSVersionInfo(
         ffi=FixedFileInfo(
-            filevers=(0, 6, 0, 0),
-            prodvers=(0, 6, 0, 0),
+            filevers=(0, 6, 1, 0),
+            prodvers=(0, 6, 1, 0),
             mask=0x3F,
             flags=0x0,
             OS=0x40004,
@@ -87,11 +87,11 @@ if sys.platform == "win32":
                 StringTable('040904B0', [
                     StringStruct('CompanyName', 'Capri la Ria'),
                     StringStruct('FileDescription', 'FrameGuard Desktop - Video QA Tool'),
-                    StringStruct('FileVersion', '0.6.0.0'),
+                    StringStruct('FileVersion', '0.6.1.0'),
                     StringStruct('InternalName', 'FrameGuard'),
                     StringStruct('OriginalFilename', 'FrameGuard.exe'),
                     StringStruct('ProductName', 'FrameGuard Desktop'),
-                    StringStruct('ProductVersion', '0.6.0.0'),
+                    StringStruct('ProductVersion', '0.6.1.0'),
                     StringStruct('LegalCopyright', 'Copyright © 2026 Cassian Aléria'),
                 ])
             ]),
@@ -240,9 +240,9 @@ exe = EXE(
     # instead, which also handles a .fg opened while the app is already
     # running. argv_emulation only covers the cold-launch case.
     argv_emulation=False,
-    # None = build for the host architecture. Set to "universal2" only with a
-    # universal2 Python and universal2 wheels for PySide6, or the build fails
-    # late and confusingly. Two native builds are the pragmatic option.
+    # The release builder exports the native host architecture explicitly.
+    # FrameGuard ships separate arm64 and Intel artifacts; universal2 is not a
+    # supported release target.
     target_arch=os.environ.get("FRAMEGUARD_TARGET_ARCH") or None,
     # Signing identity comes from the environment so build_mac.sh and direct
     # PyInstaller runs agree. Ad-hoc ("-") for internal distribution; a real

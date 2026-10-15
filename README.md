@@ -146,19 +146,21 @@ cd src
 ./build_mac.sh               # macOS -> Output/FrameGuard.dmg
 ```
 
-See [BUILD_README.md](src/BUILD_README.md). Windows runs the full test suite;
-macOS runs its platform and packaging tests. Both self-test the packaged app
-before producing an artifact.
+See [BUILD_README.md](src/BUILD_README.md). Every push runs the full,
+constrained suite on Windows, Apple Silicon, and Intel macOS. Release builders
+also run packaging gates and self-test each packaged application.
 
-The macOS build is ad-hoc signed rather than notarized, so on first launch
-right-click FrameGuard and choose **Open**. See
+The macOS build is ad-hoc signed rather than notarized. On macOS 15 or later,
+use System Settings → Privacy & Security → **Open Anyway** after the first
+blocked launch; on macOS 14 or earlier, right-click FrameGuard and choose
+**Open**. See
 [BUILD_README.md](src/BUILD_README.md#gatekeeper--read-this-before-distributing).
 
 ### Run the tests
 
 ```bash
 cd src
-pip install -r requirements-dev.txt
+pip install -c constraints-3.12.txt -r requirements-dev.txt
 pytest
 ```
 

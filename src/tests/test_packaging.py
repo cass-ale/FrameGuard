@@ -44,6 +44,13 @@ class TestVersionConsistency:
 
         assert frameguard.core.__version__ == frameguard.__version__
 
+    def test_installer_information_matches_the_package_version(self):
+        from frameguard import __version__
+
+        info = _read("installer_info.txt")
+        assert info.startswith(f"FrameGuard Desktop v{__version__}\n")
+        assert f"WHAT'S NEW IN v{__version__}" in info
+
     def test_no_hardcoded_versions_in_source(self):
         """Splash screen and PDF footer used to hard-code an old version."""
         # Sentinels and floors are legitimate constants, not the app version.
@@ -131,6 +138,26 @@ class TestPackaging:
         for pkg in ("pyside6", "fpdf2", "psutil"):
             assert pkg in reqs
 
+    def test_release_builders_use_the_shared_constraints(self):
+        constraints = _read("constraints-3.12.txt").lower()
+        for pkg in ("pyside6==", "fpdf2==", "psutil==", "pyinstaller==",
+                    "pytest==", "pillow=="):
+            assert pkg in constraints
+
+        for script in ("build_installer.bat", "build_mac.sh"):
+            body = _read(script)
+            assert "constraints-3.12.txt" in body
+            assert "-c" in body
+            assert "pip check" in body
+
+    def test_pyside_pin_preserves_the_advertised_macos_floor(self):
+        constraints = _read("constraints-3.12.txt")
+        spec = _read("frameguard.spec")
+        assert "PySide6==6.9.3" in constraints
+        assert "PySide6_Essentials==6.9.3" in constraints
+        assert '"LSMinimumSystemVersion": "12.0"' in spec
+        assert "6.12 requires macOS 14.4" in constraints
+
 
 class TestToolDiscovery:
     def test_candidate_dirs_include_the_source_tree(self):
@@ -160,17 +187,28 @@ class TestToolDiscovery:
         assert str(exe_dir / "_internal" / "tools") in dirs
         assert str(exe_dir / "tools") in dirs
 
-    def test_capabilities_are_cached(self):
+    def test_capabilities_are_cached(self, monkeypatch):
         """Uncached, this ran two extra FFmpeg processes per scan segment."""
         from frameguard import tools
 
-        if not tools.get_ffmpeg_path():
-            pytest.skip("FFmpeg not available")
+        class Result:
+            def __init__(self, stdout):
+                self.stdout = stdout
 
+        calls = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            if "-filters" in args:
+                return Result("libvmaf signalstats ebur128")
+            return Result("Hardware acceleration methods:\nvideotoolbox\n")
+
+        monkeypatch.setattr(tools.subprocess, "run", fake_run)
         tools._caps_cache.clear()
-        first = tools.detect_ffmpeg_capabilities()
+        first = tools.detect_ffmpeg_capabilities("/fake/ffmpeg")
         assert tools._caps_cache, "capabilities were not cached"
-        assert tools.detect_ffmpeg_capabilities() == first
+        assert tools.detect_ffmpeg_capabilities("/fake/ffmpeg") == first
+        assert len(calls) == 2
 
     def test_unparseable_version_is_still_usable(self, monkeypatch):
         """Nightly builds report 'N-114523-g4a1b2c3' with no dotted version;

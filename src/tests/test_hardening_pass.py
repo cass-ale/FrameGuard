@@ -16,12 +16,9 @@ TDD red step — each test pins one reported behaviour:
 """
 
 import os
-import time
 from unittest import mock
 
 import pytest
-
-from conftest import make_result
 
 pytestmark = pytest.mark.usefixtures("qapp")
 
@@ -156,8 +153,14 @@ class TestVlcHandoff:
 
         clip = tmp_path / "a.mov"
         clip.write_bytes(b"0")
-        with mock.patch.object(G.os, "startfile", create=True,
-                               side_effect=OSError("no association")):
+        if G.sys.platform == "win32":
+            opener = mock.patch.object(
+                G.os, "startfile", create=True,
+                side_effect=OSError("no association"))
+        else:
+            opener = mock.patch.object(
+                G.subprocess, "Popen", side_effect=OSError("no association"))
+        with opener:
             assert G._open_path(str(clip)) is False
 
     def test_open_path_reports_success(self, tmp_path):
@@ -165,8 +168,12 @@ class TestVlcHandoff:
 
         clip = tmp_path / "a.mov"
         clip.write_bytes(b"0")
-        with mock.patch.object(G.os, "startfile", create=True,
-                               return_value=None):
+        if G.sys.platform == "win32":
+            opener = mock.patch.object(
+                G.os, "startfile", create=True, return_value=None)
+        else:
+            opener = mock.patch.object(G.subprocess, "Popen", return_value=None)
+        with opener:
             assert G._open_path(str(clip)) is True
 
     def test_fallback_failure_is_reported(self, tmp_path, monkeypatch,
@@ -202,15 +209,27 @@ class TestVlcHandoff:
         """The frozen build's bundled-Qt directory leaked into VLC's PATH,
         so VLC could start against the wrong DLLs and appear to do
         nothing."""
-        import sys as _sys
+        import ntpath
+        from types import SimpleNamespace
         from frameguard import gui as G
 
-        monkeypatch.setattr(_sys, "frozen", True, raising=False)
-        monkeypatch.setattr(_sys, "_MEIPASS", r"C:\bundle", raising=False)
-        monkeypatch.setenv("PATH", os.pathsep.join([r"C:\bundle", r"C:\Windows"]))
+        windows_sys = SimpleNamespace(
+            frozen=True,
+            _MEIPASS=r"C:\bundle",
+            executable=r"C:\bundle\FrameGuard.exe",
+            platform="win32",
+        )
+        windows_os = SimpleNamespace(
+            environ=os.environ, name="nt", path=ntpath, pathsep=";", sep="\\")
+        monkeypatch.setattr(G, "sys", windows_sys)
+        monkeypatch.setattr(G, "os", windows_os)
+        monkeypatch.setenv(
+            "PATH", windows_os.pathsep.join([r"C:\bundle", r"C:\Windows"]))
+
         env = G._player_env()
-        assert r"C:\bundle" not in env["PATH"].split(os.pathsep)
-        assert r"C:\Windows" in env["PATH"].split(os.pathsep)
+        entries = env["PATH"].split(windows_os.pathsep)
+        assert r"C:\bundle" not in entries
+        assert r"C:\Windows" in entries
 
 
 # ---------------------------------------------------------------------------

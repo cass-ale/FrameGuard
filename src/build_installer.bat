@@ -10,7 +10,7 @@ REM   versions and the app crashes with 0xC0000005 (Access Violation).
 REM   A clean venv guarantees the bundled DLLs are compatible.
 REM
 REM Prerequisites on the BUILD machine:
-REM   1. Python 3.10+ (python.exe on PATH)
+REM   1. Python 3.12 (CI pins 3.12.10 in .python-version)
 REM   2. Inno Setup 6.2+ (default install path or on PATH)
 REM
 REM Usage:
@@ -27,6 +27,7 @@ cd /d "%~dp0"
 
 set "FAST=0"
 set "SKIP_TESTS=0"
+set "CONSTRAINTS=constraints-3.12.txt"
 for %%A in (%*) do (
     if /i "%%~A"=="--fast" set "FAST=1"
     if /i "%%~A"=="--skip-tests" set "SKIP_TESTS=1"
@@ -43,13 +44,13 @@ echo [1/9] Checking the build environment...
 python --version >nul 2>&1
 if errorlevel 1 (
     echo ERROR: Python not found on PATH.
-    echo        Install Python 3.10+ from https://www.python.org/downloads/
+    echo        Install Python 3.12 from https://www.python.org/downloads/
     if not defined CI pause
     exit /b 1
 )
-python -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)"
+python -c "import sys; sys.exit(0 if sys.version_info[:2] == (3,12) else 1)"
 if errorlevel 1 (
-    echo ERROR: Python 3.10 or newer is required.
+    echo ERROR: Python 3.12 is required for reproducible release builds.
     if not defined CI pause
     exit /b 1
 )
@@ -98,15 +99,26 @@ REM Runtime deps come from requirements.txt so the build can never drift from
 REM what developers actually run.
 echo.
 echo [3/9] Installing build dependencies...
-"%PY%" -m pip install --quiet --upgrade pip setuptools wheel
-"%PY%" -m pip install --quiet -r requirements.txt "pyinstaller>=6.0,<7.0" "Pillow>=10.0"
+if not exist "%CONSTRAINTS%" (
+    echo ERROR: Missing %CONSTRAINTS%.
+    exit /b 1
+)
+"%PY%" -m pip install --quiet --upgrade -c "%CONSTRAINTS%" pip setuptools wheel
+"%PY%" -m pip install --quiet -c "%CONSTRAINTS%" -r requirements.txt pyinstaller Pillow
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies.
     if not defined CI pause
     exit /b 1
 )
-if "!SKIP_TESTS!"=="0" "%PY%" -m pip install --quiet pytest pytest-timeout
+if "!SKIP_TESTS!"=="0" "%PY%" -m pip install --quiet -c "%CONSTRAINTS%" pytest pytest-timeout
+"%PY%" -m pip check
+if errorlevel 1 (
+    echo ERROR: The build environment has incompatible packages.
+    echo        Re-run without --fast to rebuild the virtual environment.
+    exit /b 1
+)
 REM Print the PySide6 version with a direct call, not FOR /F: the nested
+REM double quotes
 REM double quotes of a -c string inside a FOR command string make cmd
 REM execute '"...python.exe" -c "import' as the command and error out.
 "%PY%" -c "import PySide6; print('      PySide6    ', PySide6.__version__)"
@@ -153,13 +165,23 @@ echo.
 echo [6/9] Building FrameGuard.exe...
 if exist "dist" rmdir /s /q "dist"
 if exist "build" rmdir /s /q "build"
+if not exist "Output\build-logs" mkdir "Output\build-logs"
 
-"%PY%" -m PyInstaller frameguard.spec --noconfirm --clean
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& '%PY%' -m PyInstaller frameguard.spec --noconfirm --clean 2>&1 | Tee-Object -FilePath 'Output\build-logs\pyinstaller-windows.log'; exit $LASTEXITCODE"
 if errorlevel 1 (
     echo.
-    echo ERROR: PyInstaller build failed. See the output above.
+    echo ERROR: PyInstaller build failed. See Output\build-logs\pyinstaller-windows.log.
     if not defined CI pause
     exit /b 1
+)
+if exist "build\frameguard\warn-frameguard.txt" (
+    copy /y "build\frameguard\warn-frameguard.txt" "Output\build-logs\warn-frameguard-windows.txt" >nul
+    findstr /i /c:"missing module named 'frameguard." "build\frameguard\warn-frameguard.txt" >nul
+    if not errorlevel 1 (
+        echo ERROR: PyInstaller reported a missing FrameGuard module.
+        type "build\frameguard\warn-frameguard.txt"
+        exit /b 1
+    )
 )
 
 if not exist "dist\FrameGuard\FrameGuard.exe" (

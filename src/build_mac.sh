@@ -15,7 +15,7 @@
 #
 # Prerequisites on the BUILD Mac:
 #   1. macOS 12+ with Xcode Command Line Tools  (xcode-select --install)
-#   2. Python 3.10+  (python.org or Homebrew; the system python3 works too)
+#   2. Python 3.12  (3.12.10 is pinned for release builds)
 #
 # Usage:
 #   ./build_mac.sh              full clean build
@@ -25,20 +25,48 @@
 # ============================================================================
 set -euo pipefail
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+cd "$SCRIPT_DIR"
 
 APP_NAME="FrameGuard"
-PROJECT_KEY="$(basename "$PWD")"
-LOCAL_BUILD_ROOT="${FRAMEGUARD_MAC_BUILD_ROOT:-${HOME}/Library/Caches/FrameGuard/${PROJECT_KEY}}"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+PROJECT_PATH_ID="$(printf '%s' "$REPO_ROOT" | cksum | awk '{print $1}')"
+PROJECT_KEY="$(basename "$REPO_ROOT")-${PROJECT_PATH_ID}"
+ARCH="$(uname -m)"
+TARGET_ARCH="${FRAMEGUARD_TARGET_ARCH:-$ARCH}"
+case "$TARGET_ARCH" in
+    arm64|x86_64) ;;
+    *)
+        echo "ERROR: Unsupported FRAMEGUARD_TARGET_ARCH: ${TARGET_ARCH}" >&2
+        exit 1
+        ;;
+esac
+if [[ "$TARGET_ARCH" != "$ARCH" ]]; then
+    echo "ERROR: Cross-architecture macOS builds are unsupported (${ARCH} host, ${TARGET_ARCH} target)." >&2
+    exit 1
+fi
+export FRAMEGUARD_TARGET_ARCH="$TARGET_ARCH"
+
+# The default cache is deterministic for both the checkout and architecture.
+# An explicit override remains the exact root so existing CI paths stay valid.
+if [[ -n "${FRAMEGUARD_MAC_BUILD_ROOT:-}" ]]; then
+    LOCAL_BUILD_ROOT="$FRAMEGUARD_MAC_BUILD_ROOT"
+else
+    LOCAL_BUILD_ROOT="${HOME}/Library/Caches/FrameGuard/${PROJECT_KEY}/${TARGET_ARCH}"
+fi
 case "$LOCAL_BUILD_ROOT" in
     ""|"/"|"$HOME")
         echo "ERROR: Refusing unsafe FRAMEGUARD_MAC_BUILD_ROOT: ${LOCAL_BUILD_ROOT:-<empty>}" >&2
         exit 1
         ;;
+    /*) ;;
+    *) LOCAL_BUILD_ROOT="${SCRIPT_DIR}/${LOCAL_BUILD_ROOT}" ;;
 esac
 VENV="${LOCAL_BUILD_ROOT}/venv"
 WORK_DIR="${LOCAL_BUILD_ROOT}/build"
 DIST_DIR="${LOCAL_BUILD_ROOT}/dist"
+LOG_DIR="${LOCAL_BUILD_ROOT}/logs"
+CONSTRAINTS="${SCRIPT_DIR}/constraints-3.12.txt"
 BUNDLE="${DIST_DIR}/${APP_NAME}.app"
 LOCAL_DMG_PATH="${LOCAL_BUILD_ROOT}/FrameGuard.dmg"
 DMG_DIR="Output"
@@ -48,8 +76,6 @@ DMG_DIR="Output"
 DMG_PATH="${DMG_DIR}/FrameGuard.dmg"
 # ...but an Apple Silicon build will not run on an Intel Mac and vice versa,
 # so the VOLUME name calls out the arch inside the DMG.
-ARCH="$(uname -m)"
-TARGET_ARCH="${FRAMEGUARD_TARGET_ARCH:-$ARCH}"
 VOLNAME="FrameGuard Desktop (${TARGET_ARCH})"
 TOTAL_STEPS=9
 
@@ -60,8 +86,8 @@ for arg in "$@"; do
     case "$arg" in
         --fast) FAST=1 ;;
         --skip-tests) SKIP_TESTS=1 ;;
-        # Permits shipping an ad-hoc/unsigned Developer ID build without
-        # aborting at the signature gate (internal testing only).
+        # Retained for compatibility with internal ad-hoc builds. It never
+        # downgrades failures when a Developer ID identity is configured.
         --allow-unsigned) ALLOW_UNSIGNED=1 ;;
         *) echo "Unknown option: $arg"; exit 2 ;;
     esac
@@ -70,6 +96,81 @@ done
 step() { echo; echo "[$1/${TOTAL_STEPS}] $2"; }
 die()  { echo; echo "ERROR: $*" >&2; exit 1; }
 
+verify_dmg() { # verify_dmg <path> <diagnostic-label>
+    local image="$1"
+    local label="$2"
+    local diagnostic="${LOG_DIR}/hdiutil-verify-${label}.log"
+    local attempt attempt_log delay
+
+    [[ -s "$image" ]] || {
+        echo "      ERROR: disk image is missing or empty: $image" >&2
+        return 1
+    }
+    mkdir -p "$LOG_DIR"
+    : > "$diagnostic"
+    sync
+    attempt=1
+    while [[ $attempt -le 3 ]]; do
+        attempt_log="${diagnostic}.attempt-${attempt}"
+        if hdiutil verify "$image" >"$attempt_log" 2>&1; then
+            cat "$attempt_log" >> "$diagnostic"
+            rm -f "$attempt_log"
+            echo "      Disk image verified (${label}, attempt ${attempt})"
+            return 0
+        fi
+        {
+            echo "--- hdiutil verify attempt ${attempt}/3 ---"
+            cat "$attempt_log"
+        } >> "$diagnostic"
+        echo "      hdiutil verify failed (${label}, attempt ${attempt}/3):" >&2
+        cat "$attempt_log" >&2
+        rm -f "$attempt_log"
+        if [[ $attempt -lt 3 ]]; then
+            delay=$attempt
+            echo "      Retrying disk image verification in ${delay}s..." >&2
+            sleep "$delay"
+            sync
+        fi
+        attempt=$((attempt + 1))
+    done
+    {
+        echo "--- hdiutil imageinfo after verify exhaustion ---"
+        hdiutil imageinfo "$image" 2>&1 || true
+    } | tee -a "$diagnostic" >&2
+    echo "      Full hdiutil diagnostics: $diagnostic" >&2
+    return 1
+}
+
+print_notary_log() { # Redact credentials before diagnostics reach build logs.
+    local log_path="$1"
+    "$PY" - "$log_path" <<'PYEOF'
+import os
+import pathlib
+import sys
+
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+for name in ("APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"):
+    value = os.environ.get(name)
+    if value:
+        text = text.replace(value, "<redacted>")
+pathlib.Path(sys.argv[1]).write_text(text, encoding="utf-8")
+print(text, end="" if text.endswith("\n") else "\n")
+PYEOF
+}
+
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+NOTARIZE=0
+if [[ -n "${APPLE_ID:-}" || -n "${APPLE_TEAM_ID:-}" || -n "${APPLE_APP_PASSWORD:-}" ]]; then
+    [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]] \
+        || die "Notarization is partially configured. Set APPLE_ID, APPLE_TEAM_ID, and APPLE_APP_PASSWORD together."
+    [[ "$SIGN_IDENTITY" != "-" ]] \
+        || die "Notarization credentials require a configured Developer ID SIGN_IDENTITY."
+    NOTARIZE=1
+fi
+if [[ $ALLOW_UNSIGNED -eq 1 && "$SIGN_IDENTITY" != "-" ]]; then
+    echo "      NOTE: --allow-unsigned cannot bypass configured Developer ID signing failures."
+fi
+
 echo "===================================================="
 echo "  FrameGuard Desktop - macOS Build"
 echo "===================================================="
@@ -77,12 +178,15 @@ echo "===================================================="
 # --- 1. Host checks -------------------------------------------------------
 step 1 "Checking the build environment..."
 [[ "$(uname)" == "Darwin" ]] || die "This script must run on macOS. Use build_installer.bat on Windows."
-command -v python3 >/dev/null 2>&1 || die "python3 not found. Install Python 3.10+ from python.org"
+for required_tool in python3 hdiutil codesign xcrun file xattr; do
+    command -v "$required_tool" >/dev/null 2>&1 \
+        || die "Required build tool not found: ${required_tool}. Install the Xcode Command Line Tools and Python 3.12."
+done
 
 PY_VER=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')
-python3 - <<'PYEOF' || die "Python 3.10 or newer is required."
+python3 - <<'PYEOF' || die "Python 3.12 is required for reproducible release builds."
 import sys
-sys.exit(0 if sys.version_info >= (3, 10) else 1)
+sys.exit(0 if sys.version_info[:2] == (3, 12) else 1)
 PYEOF
 export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
 echo "      Python ${PY_VER}  ($(python3 -c 'import platform;print(platform.machine())'))"
@@ -93,7 +197,7 @@ echo "      DMG:   ${DMG_PATH}"
 
 # --- 2. Clean virtualenv --------------------------------------------------
 step 2 "Preparing the build environment..."
-mkdir -p "$LOCAL_BUILD_ROOT"
+mkdir -p "$LOCAL_BUILD_ROOT" "$LOG_DIR"
 if [[ $FAST -eq 1 && -x "${VENV}/bin/python" ]]; then
     echo "      Reusing existing $VENV (--fast)"
 else
@@ -114,9 +218,14 @@ fi
 
 # --- 3. Dependencies ------------------------------------------------------
 step 3 "Installing build dependencies..."
-"$PY" -m pip install --quiet --upgrade pip setuptools wheel
-"$PY" -m pip install --quiet -r requirements.txt "pyinstaller>=6.0,<7.0" "Pillow>=10.0"
-[[ $SKIP_TESTS -eq 1 ]] || "$PY" -m pip install --quiet pytest pytest-timeout
+[[ -f "$CONSTRAINTS" ]] || die "Missing shared dependency constraints: $CONSTRAINTS"
+"$PY" -m pip install --quiet --upgrade -c "$CONSTRAINTS" pip setuptools wheel
+"$PY" -m pip install --quiet -c "$CONSTRAINTS" -r requirements.txt \
+    "pyinstaller>=6.0,<7.0" "Pillow>=10.0"
+[[ $SKIP_TESTS -eq 1 ]] \
+    || "$PY" -m pip install --quiet -c "$CONSTRAINTS" pytest pytest-timeout
+"$PY" -m pip check \
+    || die "The build environment has incompatible packages. Re-run without --fast."
 echo "      PySide6    $("$PY" -c 'import PySide6;print(PySide6.__version__)')"
 echo "      PyInstaller $("$PY" -m PyInstaller --version)"
 
@@ -171,10 +280,42 @@ PYINSTALLER_DYLD_PATH="${PY_BASE}:${PY_BASE}/lib"
 if [[ -n "${DYLD_LIBRARY_PATH:-}" ]]; then
     PYINSTALLER_DYLD_PATH="${PYINSTALLER_DYLD_PATH}:${DYLD_LIBRARY_PATH}"
 fi
+PYINSTALLER_LOG="${LOG_DIR}/pyinstaller.log"
+PYINSTALLER_WARN_SOURCE="${WORK_DIR}/frameguard/warn-frameguard.txt"
+PYINSTALLER_WARN_LOG="${LOG_DIR}/pyinstaller-warnings.txt"
+PYINSTALLER_MISSING_LOG="${LOG_DIR}/pyinstaller-missing-frameguard-modules.txt"
+rm -f "$PYINSTALLER_LOG" "$PYINSTALLER_WARN_LOG" "$PYINSTALLER_MISSING_LOG"
+set +e
 DYLD_LIBRARY_PATH="$PYINSTALLER_DYLD_PATH" \
     "$PY" -m PyInstaller frameguard.spec --noconfirm --clean \
-        --workpath "$WORK_DIR" --distpath "$DIST_DIR" \
-    || die "PyInstaller build failed. See the output above."
+        --workpath "$WORK_DIR" --distpath "$DIST_DIR" 2>&1 \
+    | tee "$PYINSTALLER_LOG"
+PYINSTALLER_PIPESTATUS=("${PIPESTATUS[@]}")
+set -e
+PYINSTALLER_STATUS="${PYINSTALLER_PIPESTATUS[0]}"
+TEE_STATUS="${PYINSTALLER_PIPESTATUS[1]}"
+if [[ -f "$PYINSTALLER_WARN_SOURCE" ]]; then
+    cp -f "$PYINSTALLER_WARN_SOURCE" "$PYINSTALLER_WARN_LOG"
+fi
+[[ "$TEE_STATUS" -eq 0 ]] \
+    || die "Could not preserve the PyInstaller log at ${PYINSTALLER_LOG}."
+[[ "$PYINSTALLER_STATUS" -eq 0 ]] \
+    || die "PyInstaller build failed. Full log: ${PYINSTALLER_LOG}"
+
+PYINSTALLER_DIAGNOSTICS=("$PYINSTALLER_LOG")
+if [[ -f "$PYINSTALLER_WARN_LOG" ]]; then
+    PYINSTALLER_DIAGNOSTICS+=("$PYINSTALLER_WARN_LOG")
+fi
+if grep -E -i \
+        "missing module named ['\"]?frameguard([.]|['\"]|[[:space:]])|Hidden import ['\"]frameguard([.]|['\"]).*not found" \
+        "${PYINSTALLER_DIAGNOSTICS[@]}" > "$PYINSTALLER_MISSING_LOG"; then
+    cat "$PYINSTALLER_MISSING_LOG" >&2
+    die "PyInstaller reported missing internal FrameGuard modules. Diagnostics: ${PYINSTALLER_MISSING_LOG}"
+fi
+rm -f "$PYINSTALLER_MISSING_LOG"
+echo "      PyInstaller log: $PYINSTALLER_LOG"
+[[ ! -f "$PYINSTALLER_WARN_LOG" ]] \
+    || echo "      PyInstaller warnings: $PYINSTALLER_WARN_LOG"
 
 [[ -d "$BUNDLE" ]] || die "$BUNDLE was not produced. Does frameguard.spec still contain the BUNDLE() step?"
 [[ -f "${BUNDLE}/Contents/Info.plist" ]] || die "The bundle has no Info.plist."
@@ -211,62 +352,76 @@ xattr -cr "$BUNDLE" 2>/dev/null || true
 # `codesign --deep`, which signs in an undefined order and can leave nested
 # code (ffmpeg, Qt frameworks) improperly sealed. Sign the tools, then the
 # frameworks, then the bundle itself.
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 ENT_ARGS=()
 if [[ -f "entitlements.plist" ]]; then
     ENT_ARGS=(--entitlements "entitlements.plist")
+elif [[ "$SIGN_IDENTITY" != "-" ]]; then
+    die "entitlements.plist is required for configured Developer ID signing."
 else
-    echo "      WARNING: entitlements.plist missing; hardened-runtime sign may fail."
+    echo "      WARNING: entitlements.plist missing; continuing with ad-hoc signing."
 fi
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
     SIGN_FLAGS=(--timestamp --options runtime)
 else
     SIGN_FLAGS=(--timestamp=none)
 fi
-_sign_one() { # _sign_one <path>
-    # ${#ENT_ARGS[@]} (length) is safe under `set -u` even when empty;
-    # expanding an empty "${ENT_ARGS[@]}" directly is not on bash 3.2
-    # (macOS default), where it aborts with "unbound variable".
+_sign_one() { # _sign_one <nested-code-path>
+    codesign --force --sign "$SIGN_IDENTITY" "${SIGN_FLAGS[@]}" "$1"
+}
+_sign_outer_app() {
+    # Entitlements belong on the main application, not every nested library.
+    # ${#ENT_ARGS[@]} is safe under macOS's Bash 3.2 when the array is empty.
     if ((${#ENT_ARGS[@]})); then
         codesign --force --sign "$SIGN_IDENTITY" "${SIGN_FLAGS[@]}" \
-            "${ENT_ARGS[@]}" "$1" 2>/dev/null
+            "${ENT_ARGS[@]}" "$BUNDLE"
     else
-        codesign --force --sign "$SIGN_IDENTITY" "${SIGN_FLAGS[@]}" \
-            "$1" 2>/dev/null
+        _sign_one "$BUNDLE"
     fi
 }
-SIGN_OK=1
-if [[ -d "$TOOLS_DEST" ]]; then
-    for tool in "$TOOLS_DEST"/*; do
-        [[ -f "$tool" ]] || continue
-        _sign_one "$tool" || { echo "      WARNING: could not sign $tool"; SIGN_OK=0; }
-    done
-fi
-# Qt frameworks inside the bundle, deepest first.
-if [[ -d "${BUNDLE}/Contents/Frameworks" ]]; then
-    while IFS= read -r -d '' fw; do
-        _sign_one "$fw" || { echo "      WARNING: could not sign $fw"; SIGN_OK=0; }
-    done < <(find "${BUNDLE}/Contents/Frameworks" \
-        \( -name "*.dylib" -o -name "*.so" \) -print0 2>/dev/null)
-fi
-if _sign_one "$BUNDLE"; then
+_sign_failure() { # _sign_failure <path>
+    if [[ "$SIGN_IDENTITY" != "-" ]]; then
+        die "Configured Developer ID signing failed for $1. Do not ship this build."
+    fi
+    if [[ $ALLOW_UNSIGNED -ne 1 ]]; then
+        die "Ad-hoc signing failed for $1. Use --allow-unsigned only for an internal diagnostic build."
+    fi
+    echo "      WARNING: ad-hoc signing failed for $1 (--allow-unsigned)"
+}
+
+# Sign every nested Mach-O file, including extensionless framework executables
+# and Qt/PyInstaller helpers. Filename suffixes alone miss code that Apple then
+# rejects during notarization.
+while IFS= read -r -d '' candidate; do
+    if [[ "$(file -b "$candidate" 2>/dev/null || true)" == *"Mach-O"* ]]; then
+        _sign_one "$candidate" || _sign_failure "$candidate"
+    fi
+done < <(find "${BUNDLE}/Contents" -type f -print0)
+
+# Seal nested code bundles after their contents, deepest first, then seal the
+# outer app with its entitlements. `find -depth` guarantees inside-out order.
+while IFS= read -r -d '' nested_bundle; do
+    _sign_one "$nested_bundle" || _sign_failure "$nested_bundle"
+done < <(find "${BUNDLE}/Contents" -depth -type d \
+    \( -name "*.framework" -o -name "*.app" -o -name "*.appex" \
+       -o -name "*.bundle" -o -name "*.xpc" -o -name "*.plugin" \) -print0)
+
+if _sign_outer_app; then
     if [[ "$SIGN_IDENTITY" == "-" ]]; then
         echo "      Signed ad-hoc (internal distribution)"
     else
         echo "      Signed with: $SIGN_IDENTITY"
     fi
 else
-    echo "      WARNING: codesign failed; the app may not launch on other Macs."
-    SIGN_OK=0
+    _sign_failure "$BUNDLE"
 fi
-if codesign --verify --deep --strict "$BUNDLE" 2>/dev/null; then
-    echo "      Signature verified"
+if codesign --verify --deep --strict --verbose=2 "$BUNDLE"; then
+    echo "      App signature verified"
+elif [[ "$SIGN_IDENTITY" != "-" ]]; then
+    die "Configured Developer ID app signature validation failed. Do not ship this build."
+elif [[ $ALLOW_UNSIGNED -ne 1 ]]; then
+    die "Ad-hoc app signature validation failed. Use --allow-unsigned only for an internal diagnostic build."
 else
-    echo "      WARNING: signature verification failed"
-    SIGN_OK=0
-fi
-if [[ $SIGN_OK -eq 0 && $ALLOW_UNSIGNED -eq 0 && "$SIGN_IDENTITY" != "-" ]]; then
-    die "Code signing failed and --allow-unsigned was not passed. Do not ship this build."
+    echo "      WARNING: ad-hoc app signature verification failed (--allow-unsigned)"
 fi
 
 # Arch check: the tool sources are per-architecture now, so a staged ffmpeg
@@ -313,37 +468,59 @@ ln -s /Applications "$DMG_STAGE/Applications"
 hdiutil create -volname "${VOLNAME}" \
     -srcfolder "$DMG_STAGE" -ov -format UDZO -quiet "$LOCAL_DMG_PATH" \
     || die "Could not create the disk image."
-hdiutil verify "$LOCAL_DMG_PATH" >/dev/null \
-    || die "The disk image failed verification."
+verify_dmg "$LOCAL_DMG_PATH" "created" \
+    || die "The newly created disk image failed verification."
 
 # Sign the DMG itself so tampering in transit is detectable (previously the
-# DMG was never signed, only the .app inside it).
+# DMG was never signed, only the .app inside it). A configured Developer ID is
+# a release contract: signing and immediate validation must both succeed.
 if [[ "$SIGN_IDENTITY" != "-" ]]; then
-    codesign --force --sign "$SIGN_IDENTITY" "$LOCAL_DMG_PATH" 2>/dev/null \
-        && echo "      DMG signed" \
-        || echo "      WARNING: could not sign the DMG (app inside is still signed)"
+    codesign --force --timestamp --sign "$SIGN_IDENTITY" "$LOCAL_DMG_PATH" \
+        || die "Configured Developer ID DMG signing failed. Do not ship this build."
+    codesign --verify --verbose=2 "$LOCAL_DMG_PATH" \
+        || die "Configured Developer ID DMG signature validation failed."
+    echo "      DMG signed and signature verified"
 fi
 
-DMG_SIZE=$(du -h "$LOCAL_DMG_PATH" | cut -f1)
-
-# Opt-in notarization: needs Apple credentials, so it never runs by default
-# and never fails an offline/internal build. Set all three to notarize:
-#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD (app-specific password)
-if [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_PASSWORD:-}" ]]; then
+# Opt-in notarization: no credentials keeps ad-hoc/internal builds offline.
+# Once any credential is supplied, the complete fail-closed contract was
+# validated before the build began and every Apple operation is mandatory.
+if [[ $NOTARIZE -eq 1 ]]; then
+    NOTARY_LOG="${LOG_DIR}/notarytool.log"
+    rm -f "$NOTARY_LOG"
+    : > "$NOTARY_LOG"
+    chmod 600 "$NOTARY_LOG"
     echo "      Notarizing with Apple (this takes a few minutes)..."
     if xcrun notarytool submit "$LOCAL_DMG_PATH" --apple-id "$APPLE_ID" \
             --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
-            --wait 2>&1 | tail -3; then
-        xcrun stapler staple "$LOCAL_DMG_PATH" \
-            && echo "      Notarized + stapled" \
-            || echo "      WARNING: stapler failed; Gatekeeper will check online on first launch"
+            --wait >"$NOTARY_LOG" 2>&1; then
+        print_notary_log "$NOTARY_LOG"
     else
-        echo "      WARNING: notarization failed; the DMG still works but"
-        echo "      Gatekeeper will prompt on first launch."
+        print_notary_log "$NOTARY_LOG" >&2
+        die "Configured notarization failed. Full redacted diagnostics: ${NOTARY_LOG}"
     fi
+    xcrun stapler staple "$LOCAL_DMG_PATH" \
+        || die "Configured notarization succeeded but stapling failed."
+    xcrun stapler validate "$LOCAL_DMG_PATH" \
+        || die "The stapled notarization ticket failed validation."
+    echo "      Notarized, stapled, and validated"
 else
     echo "      Notarization skipped (set APPLE_ID/APPLE_TEAM_ID/APPLE_APP_PASSWORD to enable)"
 fi
+
+# codesign and stapler mutate the image. Verify the final bytes, then repeat
+# the applicable signature/ticket validations before publishing either copy.
+verify_dmg "$LOCAL_DMG_PATH" "final" \
+    || die "The disk image failed final post-signing/notarization verification."
+if [[ "$SIGN_IDENTITY" != "-" ]]; then
+    codesign --verify --verbose=2 "$LOCAL_DMG_PATH" \
+        || die "Final DMG signature validation failed after image mutation."
+fi
+if [[ $NOTARIZE -eq 1 ]]; then
+    xcrun stapler validate "$LOCAL_DMG_PATH" \
+        || die "Final stapled ticket validation failed after image mutation."
+fi
+DMG_SIZE=$(du -h "$LOCAL_DMG_PATH" | cut -f1)
 
 # Copy only the completed disk image into the shared checkout. Both copies are
 # made after optional notarization so the canonical and arch-specific files are

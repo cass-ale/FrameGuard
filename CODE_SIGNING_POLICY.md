@@ -46,6 +46,15 @@ developed by Cassian Aléria; this page will be updated when that happens,
 and every signing request will continue to be manually approved by the
 Approver named above.
 
+The macOS builder also supports a future Apple Developer ID. That mode is
+fail-closed: if an identity or notarization credentials are configured, any
+nested-code signature, DMG signature, notarization, stapling, or validation
+failure stops the release. GitHub-hosted signing imports the configured P12
+into an ephemeral keychain and exposes Apple credentials only to first-party
+shell steps; the keychain is deleted after the build. Warning-only fallback is
+reserved for the explicit ad-hoc internal-build mode; an official release
+never silently downgrades.
+
 ## Privacy statement
 
 FrameGuard processes all video locally on the user's machine. Nothing is

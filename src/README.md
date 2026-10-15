@@ -6,5 +6,5 @@ Quick links:
 
 - `main.py` — application entry point
 - `frameguard/` — application package (scan engine, GUI, reports, presets)
-- `tests/` — pytest suite (`pip install -r requirements-dev.txt && pytest`)
+- `tests/` — pytest suite (`pip install -c constraints-3.12.txt -r requirements-dev.txt && pytest`)
 - `BUILD_README.md` — building the Windows/macOS installers

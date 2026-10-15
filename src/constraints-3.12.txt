@@ -1,0 +1,41 @@
+# Reproducible Python 3.12 environment for CI and release builders.
+#
+# The shared set is audited for Windows x64 and native arm64/Intel macOS.
+# PySide6 intentionally stays on 6.9.3: its universal2 Qt binaries retain the
+# advertised macOS 12 deployment floor. PySide6 6.10 requires macOS 13 and
+# 6.12 requires macOS 14.4. Platform-only constraints do not install packages.
+
+# Packaging toolchain
+pip==26.2.1
+setuptools==84.0.0
+wheel==0.48.0
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.8
+altgraph==0.17.5
+macholib==1.16.4
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+
+# Runtime
+PySide6==6.9.3
+PySide6_Addons==6.9.3
+PySide6_Essentials==6.9.3
+shiboken6==6.9.3
+fpdf2==2.8.9
+defusedxml==0.7.1
+fonttools==4.67.0
+Pillow==12.3.0
+psutil==7.2.2
+
+# Test and static analysis
+pytest==9.1.1
+pytest-timeout==2.4.0
+pyflakes==4.0.3
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.6.0
+Pygments==2.21.0
+colorama==0.4.6
+
+# Optional SBOM tooling is installed in an isolated environment.
+cyclonedx-bom==7.5.0

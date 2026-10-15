@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.6.0
+FrameGuard Desktop v0.6.1
 Video QA for XR Deliverables
 
 
@@ -22,30 +22,21 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.6.0
+WHAT'S NEW IN v0.6.1
 
-  Release pipeline repair
-    - The macOS build could not finish: the FFmpeg and FFprobe downloads
-      pointed at a retired source, so the build failed at the last step.
-      The tools are now downloaded per architecture (Apple Silicon and
-      Intel separately), pinned to a specific build, and verified against
-      the publisher's SHA-256 checksums before they are bundled.
-    - MediaInfo silently went missing from macOS builds: unpacking its
-      installer package failed without a trace. It is now unpacked
-      reliably, and failures are reported instead of swallowed.
-    - Both builders now stop immediately, with the real cause, when a
-      required tool or a test fails, instead of warning and failing later
-      with an unrelated message.
-    - The Windows test gate could stall forever on a startup dialog that
-      automated runs could never dismiss. The check no longer opens
-      dialogs when the app runs without a display, and every test now
-      has a time limit.
-    - App identity moved to the publisher's own: the macOS bundle ID is
-      now com.caprilaria.frameguard, and the organization domain is
-      caprilaria.com. On macOS, preferences and preset-file ownership
-      start fresh under the new identity.
-    - Bundled MediaInfo updated to 26.10.
-    - No changes to scanning behaviour.
+  Release reliability
+    - macOS disk-image verification now retries transient system failures
+      instead of discarding a valid Apple Silicon build.
+    - Windows, Apple Silicon, and Intel run the same pinned full test suite
+      before a release tag is created.
+    - Python, packaging, and test dependencies are constrained to the
+      versions proven by all three builders.
+    - Official macOS signing and notarization fail closed when configured;
+      internal ad-hoc builds continue to work without Apple credentials.
+    - Release drafts resume safely after an interrupted run, and the update
+      channel is committed before an immutable release is published.
+    - GitHub Actions now use reviewed Node 24-compatible revisions and
+      retain build diagnostics when a platform fails.
 
 
 BEFORE YOU INSTALL

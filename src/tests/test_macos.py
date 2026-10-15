@@ -27,6 +27,16 @@ def _spec_tree():
     return ast.parse(_read("frameguard.spec"))
 
 
+def _load_download_tools(name="dl_tools_test"):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        name, os.path.join(REPO, "download_tools.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class TestAppBundle:
     def test_spec_contains_a_bundle_call(self):
         """Without BUNDLE() PyInstaller emits a bare Unix binary on macOS and
@@ -333,9 +343,98 @@ class TestBuildScripts:
         assert 'write_build_stamp.py --output "$BUILD_STAMP"' in sh
         assert 'FRAMEGUARD_BUILD_STAMP_PATH' in sh
 
-    def test_mac_signing_visits_dylibs_and_extension_modules(self):
+    def test_mac_signing_visits_all_nested_macho_code_inside_out(self):
         sh = _read("build_mac.sh")
-        assert '\\( -name "*.dylib" -o -name "*.so" \\) -print0' in sh
+        assert 'find "${BUNDLE}/Contents" -type f -print0' in sh
+        assert '== *"Mach-O"*' in sh
+        for suffix in ("*.framework", "*.app", "*.appex", "*.bundle", "*.xpc", "*.plugin"):
+            assert f'-name "{suffix}"' in sh
+        assert 'find "${BUNDLE}/Contents" -depth -type d' in sh
+        assert "Entitlements belong on the main application" in sh
+        nested = sh.index('find "${BUNDLE}/Contents" -type f -print0')
+        bundles = sh.index('find "${BUNDLE}/Contents" -depth -type d')
+        outer = sh.index("if _sign_outer_app; then")
+        assert nested < bundles < outer
+
+    def test_mac_target_arch_is_explicit_and_build_paths_are_deterministic(self):
+        sh = _read("build_mac.sh")
+        assert 'SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"' in sh
+        assert 'REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"' in sh
+        assert 'PROJECT_PATH_ID="$(printf' in sh
+        assert "cksum" in sh
+        assert 'PROJECT_KEY="$(basename "$REPO_ROOT")-${PROJECT_PATH_ID}"' in sh
+        assert 'arm64|x86_64)' in sh
+        assert 'if [[ "$TARGET_ARCH" != "$ARCH" ]]' in sh
+        assert "Cross-architecture macOS builds are unsupported" in sh
+        assert 'export FRAMEGUARD_TARGET_ARCH="$TARGET_ARCH"' in sh
+        assert ('Library/Caches/FrameGuard/${PROJECT_KEY}/${TARGET_ARCH}' in sh)
+        assert 'PROJECT_KEY="$(basename "$PWD")"' not in sh
+
+    def test_pyinstaller_diagnostics_are_preserved_and_internal_modules_gate(self):
+        sh = _read("build_mac.sh")
+        assert 'PYINSTALLER_LOG="${LOG_DIR}/pyinstaller.log"' in sh
+        assert 'warn-frameguard.txt' in sh
+        assert '| tee "$PYINSTALLER_LOG"' in sh
+        assert 'PYINSTALLER_PIPESTATUS=("${PIPESTATUS[@]}")' in sh
+        assert 'PYINSTALLER_STATUS="${PYINSTALLER_PIPESTATUS[0]}"' in sh
+        assert 'TEE_STATUS="${PYINSTALLER_PIPESTATUS[1]}"' in sh
+        assert 'missing module named' in sh
+        assert 'frameguard([.]' in sh
+        assert 'PyInstaller reported missing internal FrameGuard modules' in sh
+
+    def test_dmg_verification_is_bounded_diagnostic_and_post_mutation(self):
+        sh = _read("build_mac.sh")
+        helper = sh[sh.index("verify_dmg()"):
+                    sh.index("print_notary_log()")]
+        assert '[[ -s "$image" ]]' in helper
+        assert "sync" in helper
+        assert 'while [[ $attempt -le 3 ]]' in helper
+        assert 'sleep "$delay"' in helper
+        assert 'cat "$attempt_log" >&2' in helper
+        assert 'hdiutil-verify-${label}.log' in helper
+        assert 'hdiutil imageinfo "$image"' in helper
+
+        created = sh.index('verify_dmg "$LOCAL_DMG_PATH" "created"')
+        dmg_sign = sh.index('codesign --force --timestamp --sign')
+        staple = sh.index('xcrun stapler staple')
+        final = sh.index('verify_dmg "$LOCAL_DMG_PATH" "final"')
+        publish = sh.index('cp -f "$LOCAL_DMG_PATH" "$DMG_PATH"')
+        assert created < dmg_sign < staple < final < publish
+
+    def test_mac_builder_requires_the_release_python_and_apple_tools(self):
+        sh = _read("build_mac.sh")
+        assert "sys.version_info[:2] == (3, 12)" in sh
+        assert "for required_tool in python3 hdiutil codesign xcrun file xattr" in sh
+        assert "Python 3.12 is required for reproducible release builds" in sh
+
+    def test_ad_hoc_signing_failure_needs_an_explicit_internal_override(self):
+        sh = _read("build_mac.sh")
+        assert "Ad-hoc signing failed" in sh
+        assert "Ad-hoc app signature validation failed" in sh
+        assert "if [[ $ALLOW_UNSIGNED -ne 1 ]]" in sh
+        assert "--allow-unsigned only for an internal diagnostic build" in sh
+
+    def test_configured_apple_release_operations_fail_closed(self):
+        sh = _read("build_mac.sh")
+        assert "Notarization is partially configured" in sh
+        assert "Notarization credentials require a configured Developer ID" in sh
+        assert "--allow-unsigned cannot bypass configured Developer ID" in sh
+        assert "Configured Developer ID signing failed" in sh
+        assert "Configured Developer ID app signature validation failed" in sh
+        assert "Configured Developer ID DMG signing failed" in sh
+        assert "Configured Developer ID DMG signature validation failed" in sh
+        assert "Configured notarization failed" in sh
+        assert 'xcrun stapler staple "$LOCAL_DMG_PATH" \\\n        || die' in sh
+        assert sh.count('xcrun stapler validate "$LOCAL_DMG_PATH"') >= 2
+        assert "tail -3" not in sh
+
+    def test_notarization_diagnostics_redact_credentials(self):
+        sh = _read("build_mac.sh")
+        assert "set -x" not in sh
+        assert 'text.replace(value, "<redacted>")' in sh
+        assert '>"$NOTARY_LOG" 2>&1' in sh
+        for secret in ("APPLE_ID", "APPLE_TEAM_ID", "APPLE_APP_PASSWORD"):
+            assert f'echo "${secret}' not in sh
 
     def test_spec_supports_an_isolated_build_stamp(self):
         spec = _read("frameguard.spec")
@@ -457,6 +556,98 @@ class TestDownloadTools:
         src = _read("download_tools.py")
         assert "_extract_dmg_members" in src
         assert "hdiutil" in src
+
+    def test_hdiutil_retries_with_bounded_backoff_and_full_diagnostics(self, capsys):
+        m = _load_download_tools("dl_tools_hdiutil_retry")
+        long_error = "attach failure " + ("diagnostic-" * 40)
+        failed = subprocess.CompletedProcess(
+            ["hdiutil"], 1, stdout="complete stdout", stderr=long_error)
+        succeeded = subprocess.CompletedProcess(
+            ["hdiutil"], 0, stdout="attached", stderr="")
+
+        with mock.patch.object(m.subprocess, "run",
+                               side_effect=[failed, failed, succeeded]) as run, \
+             mock.patch.object(m.time, "sleep") as sleep:
+            result = m._run_hdiutil(
+                ["attach", "image.dmg"], "attach", timeout=5)
+
+        assert result is succeeded
+        assert run.call_count == 3
+        assert [call.args[0] for call in sleep.call_args_list] == [1, 2]
+        output = capsys.readouterr().out
+        assert long_error in output
+        assert "attempt 1/3" in output
+        assert "attempt 2/3" in output
+
+    def test_hdiutil_retries_timeouts_without_losing_output(self, capsys):
+        m = _load_download_tools("dl_tools_hdiutil_timeout")
+        timed_out = subprocess.TimeoutExpired(
+            ["hdiutil"], 5, output=b"partial stdout", stderr=b"timeout stderr")
+        succeeded = subprocess.CompletedProcess(["hdiutil"], 0, "ok", "")
+
+        with mock.patch.object(m.subprocess, "run",
+                               side_effect=[timed_out, succeeded]), \
+             mock.patch.object(m.time, "sleep") as sleep:
+            result = m._run_hdiutil(
+                ["attach", "image.dmg"], "attach", timeout=5)
+
+        assert result is succeeded
+        sleep.assert_called_once_with(1)
+        output = capsys.readouterr().out
+        assert "timed out" in output
+        assert "partial stdout" in output
+        assert "timeout stderr" in output
+
+    def test_non_mac_dmg_extraction_never_invokes_hdiutil(self, tmp_path):
+        m = _load_download_tools("dl_tools_non_mac_dmg")
+        archive = tmp_path / "MediaInfo.dmg"
+        archive.write_bytes(b"not a real image")
+
+        with mock.patch.object(m._platform, "system", return_value="Linux"), \
+             mock.patch.object(m, "_run_hdiutil") as hdiutil:
+            found = m._extract_dmg_members(
+                archive, ["mediainfo"], tmp_path / "dest")
+
+        assert found == set()
+        hdiutil.assert_not_called()
+
+    def test_optional_mediainfo_survives_exhausted_attach_retries(self, tmp_path):
+        m = _load_download_tools("dl_tools_optional_mediainfo")
+        archive = tmp_path / "MediaInfo.dmg"
+        archive.write_bytes(b"not a real image")
+
+        with mock.patch.object(m._platform, "system", return_value="Darwin"), \
+             mock.patch.object(m, "_run_hdiutil", return_value=None) as hdiutil:
+            found = m._extract_dmg_members(
+                archive, ["mediainfo"], tmp_path / "dest")
+
+        assert found == set()
+        assert hdiutil.call_count == 1
+        assert m.sources_for("darwin", "arm64")["mediainfo"]["required"] is False
+
+    def test_dmg_detach_retries_then_uses_bounded_force(self, tmp_path):
+        m = _load_download_tools("dl_tools_dmg_detach")
+        archive = tmp_path / "MediaInfo.dmg"
+        archive.write_bytes(b"not a real image")
+        mount = tmp_path / "mount"
+        mount.mkdir()
+        succeeded = subprocess.CompletedProcess(["hdiutil"], 0, "", "")
+
+        with mock.patch.object(m._platform, "system", return_value="Darwin"), \
+             mock.patch.object(m.tempfile, "mkdtemp", return_value=str(mount)), \
+             mock.patch.object(
+                 m, "_run_hdiutil",
+                 side_effect=[succeeded, None, succeeded]) as hdiutil:
+            found = m._extract_dmg_members(
+                archive, ["mediainfo"], tmp_path / "dest")
+
+        assert found == set()
+        operations = [call.args[1] for call in hdiutil.call_args_list]
+        assert operations == ["attach", "detach", "forced detach"]
+        forced_args = hdiutil.call_args_list[-1].args[0]
+        assert forced_args[:2] == ["detach", "-force"]
+        assert hdiutil.call_args_list[-1].kwargs["attempts"] == 1
+        assert not mount.exists()
 
 
 class TestMacInstallerGaps:
