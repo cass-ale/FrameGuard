@@ -14,6 +14,7 @@ from frameguard.core import (
     QAResult,
     _extract_decode_errors,
     _offset_event_times,
+    _pair_detect_events,
     run_qa_checks,
 )
 from frameguard.tools import get_ffmpeg_path
@@ -131,6 +132,45 @@ class TestTimestampOffset:
     def test_silence_events_shift(self):
         out = _offset_event_times("silence_start: 2.0\nsilence_end: 8.0", 100.0)
         assert "102.000" in out and "108.000" in out
+
+
+class TestDetectEventPairing:
+    """FFmpeg logs from several filter threads share one stderr pipe, and
+    under threaded filtering the lines interleave mid-line: a detect
+    token can land glued onto the tail of an ebur128 status line, its
+    "[Parsed_blackdetect...]" prefix overwritten. The token payload
+    survives intact, so the parser must not demand a word boundary (or
+    a line start) before it. Regression: identical scans of one clip
+    intermittently reported "No black frame sequences detected" for a
+    6-second black segment when the glued line was dropped."""
+
+    # Captured verbatim from a real losing scan (prefix eaten by the
+    # ebur128 line it collided with).
+    GLUED = ("[Parsed_ebur128_1 @ 0x7b51d8001c00] t: 15.899979  "
+             "TARGET:-23 LUFS    M:-166.1 S:   nan     I: -21.8 LUFS       "
+             "LRA:   4.8 LUblack_start:10 black_end:16.033333 "
+             "black_duration:6.033333")
+
+    def test_glued_black_event_is_paired(self):
+        events = _pair_detect_events(self.GLUED, "black")
+        assert len(events) == 1
+        start, dur = events[0]
+        assert start == 10.0
+        assert abs(dur - 6.033333) < 0.001
+
+    def test_glued_silence_event_is_paired(self):
+        text = ("[Parsed_ebur128_1 @ 0x0] t: 9.9 LUFSsilence_start: 10.005333\n"
+                "silence_end: 16.021333 | silence_duration: 6.016")
+        events = _pair_detect_events(text, "silence")
+        assert len(events) == 1
+        start, dur = events[0]
+        assert abs(start - 10.005333) < 0.0001
+        assert abs(dur - 6.016) < 0.001
+
+    def test_glued_token_is_shifted_for_segments(self):
+        out = _offset_event_times("LUFSblack_start:10 black_end:16.0", 100.0)
+        assert "black_start:110.000" in out
+        assert "black_end:116.000" in out
 
 
 class TestDecodeErrorClassifier:

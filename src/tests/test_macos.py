@@ -50,6 +50,10 @@ class TestAppBundle:
     def test_icns_exists_and_is_valid(self):
         """macOS rejects a .ico; the bundle needs a real .icns."""
         path = os.path.join(REPO, "assets", "frameguard.icns")
+        if not os.path.isfile(path):
+            import pytest
+            pytest.skip("assets/frameguard.icns is a build product "
+                        "(assets/make_icns.py); not generated in this checkout")
         assert os.path.isfile(path), "assets/frameguard.icns missing (run assets/make_icns.py)"
 
         data = open(path, "rb").read()
@@ -104,18 +108,26 @@ class TestMacToolDiscovery:
         """download_tools.py caches under tools_cache/<platform>/."""
         from frameguard import tools
 
-        key = "windows" if os.name == "nt" else "darwin"
+        if os.name == "nt":
+            key = os.path.join("tools_cache", "windows")
+        elif sys.platform == "darwin":
+            import platform as _platform
+            arch = "arm64" if _platform.machine() == "arm64" else "x86_64"
+            key = os.path.join("tools_cache", f"darwin-{arch}")
+        else:
+            import pytest
+            pytest.skip("the tool cache layout is only exercised on macOS/Windows")
         # _candidate_tools_dirs() only lists directories that exist, and
         # tools_cache/ is a gitignored build product: a clean checkout (CI)
         # has none until download_tools.py runs. Arrange it for this test
         # and remove it again only if this test created it.
-        cache_dir = os.path.join(REPO, "tools_cache", key)
+        cache_dir = os.path.join(REPO, key)
         created = not os.path.isdir(cache_dir)
         if created:
             os.makedirs(cache_dir)
         try:
             dirs = tools._candidate_tools_dirs()
-            assert any(d.endswith(os.path.join("tools_cache", key)) for d in dirs), dirs
+            assert any(d.endswith(key) for d in dirs), dirs
         finally:
             if created:
                 os.rmdir(cache_dir)
@@ -392,12 +404,16 @@ class TestDownloadTools:
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
 
-        assert set(m.SOURCES) == {"windows", "darwin"}
-        assert m.SOURCES["darwin"]["suffix"] == ""
         assert m.SOURCES["windows"]["suffix"] == ".exe"
-        # evermeet ships ffmpeg and ffprobe separately on macOS
-        assert "ffprobe" in m.SOURCES["darwin"]
-        assert m.SOURCES["darwin"]["ffmpeg"]["members"] == ["ffmpeg"]
+        # darwin sources are per-architecture (the arm64 and x86_64 ffmpeg
+        # builds live at different URLs), so they are built on demand by
+        # sources_for() instead of sitting in the static SOURCES table.
+        for arch in ("arm64", "x86_64"):
+            darwin = m.sources_for("darwin", arch)
+            assert darwin["suffix"] == ""
+            # Riedl ships ffmpeg and ffprobe as separate macOS downloads
+            assert "ffprobe" in darwin
+            assert darwin["ffmpeg"]["members"] == ["ffmpeg"]
 
     def test_macos_sources_are_not_windows_binaries(self):
         import importlib.util
@@ -407,13 +423,14 @@ class TestDownloadTools:
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
 
-        for name, entry in m.SOURCES["darwin"].items():
-            if not isinstance(entry, dict):
-                continue
-            for member in entry["members"]:
-                assert not member.endswith(".exe"), f"{name} expects a .exe on macOS"
-            for url in entry["urls"]:
-                assert "Windows" not in url, f"{name} points at a Windows build: {url}"
+        for arch in ("arm64", "x86_64"):
+            for name, entry in m.sources_for("darwin", arch).items():
+                if not isinstance(entry, dict):
+                    continue
+                for member in entry["members"]:
+                    assert not member.endswith(".exe"), f"{name} expects a .exe on macOS"
+                for url in entry["urls"]:
+                    assert "Windows" not in url, f"{name} points at a Windows build: {url}"
 
     def test_sets_executable_bit_on_posix(self):
         src = _read("download_tools.py")
@@ -429,7 +446,7 @@ class TestDownloadTools:
         m = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(m)
 
-        urls = m.SOURCES["darwin"]["mediainfo"]["urls"]
+        urls = m.sources_for("darwin", "arm64")["mediainfo"]["urls"]
         assert urls, "no macOS mediainfo source configured"
         assert not any(u.endswith(".tar.bz2") for u in urls), \
             f"dead tarball URL still configured: {urls}"

@@ -245,15 +245,39 @@ class TestStartupResponsiveness:
         import time as _time
         from frameguard import gui as G
 
+        calls = []
+
         def _slow():
+            calls.append(1)
             _time.sleep(1.5)
             return True, "ok"
 
         monkeypatch.setattr(G, "check_ffmpeg_available", _slow)
+
+        # A full-suite run reaches this test with dozens of earlier windows
+        # merely close()d, never destroyed, and construction cost scales
+        # with the live widget count (the theme pass restyles every widget
+        # in the process). That accumulation measured 16s here while the
+        # probe was never called. Destroy leftovers so this times a clean
+        # process, i.e. a real app start. processEvents() alone does not
+        # deliver DeferredDelete events; sendPostedEvents does.
+        from PySide6.QtCore import QCoreApplication, QEvent
+        for leftover in list(qapp.topLevelWidgets()):
+            leftover.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+
         started = _time.time()
         w = G.MainWindow()
         try:
-            assert _time.time() - started < 1.0
+            # The invariant under test is DEFERRAL: the probe must not run
+            # during construction at all. Assert that directly (a call
+            # count) instead of only a wall-clock bound: a tight bound
+            # passes or fails with the machine's speed and load, not with
+            # the code — it failed on a loaded VM where construction alone
+            # took over a second with the probe never called. A generous
+            # bound stays as a coarse backstop.
+            assert calls == [], "ffmpeg probe ran during window construction"
+            assert _time.time() - started < 5.0
         finally:
             w._cleanup_worker()
             if getattr(w, "_watch_monitor", None) is not None:

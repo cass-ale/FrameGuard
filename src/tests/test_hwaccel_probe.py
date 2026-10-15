@@ -12,6 +12,7 @@ the version validator's coverage of every version literal that ships.
 
 import json
 import os
+import re
 import subprocess
 import sys
 from unittest import mock
@@ -302,10 +303,15 @@ class TestVersionValidatorCoverage:
         result = self._run_validator(ROOT)
         assert result.returncode == 0, result.stdout + result.stderr
 
-    def test_stale_installer_literal_is_caught(self, tmp_path):
-        """0.5.5 shipped with installer.iss labels still saying 0.5.4 while
-        the validator only read AppVersion= and passed. The literal scan
-        must catch that class of drift."""
+    def test_stale_version_literal_is_caught(self, tmp_path):
+        """0.5.5 shipped with installer labels still saying 0.5.4 while the
+        validator only read AppVersion= and passed. The literal scan must
+        catch that class of drift. (The original target, a VersionInfoVersion
+        literal in installer.iss, no longer exists: installer versions are
+        now routed through AppVersion via ISPP. The spec still carries
+        literal FileVersion/ProductVersion strings, so the drift class is
+        exercised there — located generically, so the test does not rot
+        again at the next literal change.)"""
         (tmp_path / "frameguard").mkdir()
         for rel in ("frameguard/__init__.py", "frameguard.spec",
                     "installer.iss", "version.json"):
@@ -313,10 +319,11 @@ class TestVersionValidatorCoverage:
             dst = tmp_path / rel
             with open(src, encoding="utf-8") as f:
                 text = f.read()
-            if rel == "installer.iss":
-                text = text.replace("VersionInfoVersion=0.5.5.0",
-                                    "VersionInfoVersion=0.5.4.0")
+            if rel == "frameguard.spec":
+                text, n = re.subn(r"\d+\.\d+\.\d+\.\d+", "9.9.9.9",
+                                  text, count=1)
+                assert n == 1, "spec carries no four-part version literal"
             dst.write_text(text, encoding="utf-8")
         result = self._run_validator(str(tmp_path))
         assert result.returncode == 1
-        assert "0.5.4.0" in result.stdout
+        assert "9.9.9.9" in result.stdout
