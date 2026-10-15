@@ -90,7 +90,7 @@ jobs:
             }
 
       - name: Check out the tagged commit
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ env.RELEASE_TAG }}
           persist-credentials: false
@@ -258,7 +258,7 @@ jobs:
         working-directory: src
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.release_sha }}
           persist-credentials: false
@@ -374,7 +374,7 @@ jobs:
       FRAMEGUARD_TARGET_ARCH: ${{ matrix.target_arch }}
     steps:
       - name: Check out the tagged commit
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify.outputs.release_sha }}
           persist-credentials: false
