@@ -27,7 +27,7 @@ import os
 # Configuration
 # ---------------------------------------------------------------------------
 APP_NAME = "FrameGuard"
-APP_VERSION = "0.6.3"
+APP_VERSION = "0.7.0"
 ENTRY_POINT = "main.py"
 # This is an opaque identifier, not branding, but it IS the app's macOS
 # identity (bundle identity, .fg UTI ownership, preferences domain), so
@@ -74,8 +74,8 @@ if sys.platform == "win32":
     )
     version_info = VSVersionInfo(
         ffi=FixedFileInfo(
-            filevers=(0, 6, 3, 0),
-            prodvers=(0, 6, 3, 0),
+            filevers=(0, 7, 0, 0),
+            prodvers=(0, 7, 0, 0),
             mask=0x3F,
             flags=0x0,
             OS=0x40004,
@@ -87,11 +87,11 @@ if sys.platform == "win32":
                 StringTable('040904B0', [
                     StringStruct('CompanyName', 'Capri la Ria'),
                     StringStruct('FileDescription', 'FrameGuard Desktop - Video QA Tool'),
-                    StringStruct('FileVersion', '0.6.3.0'),
+                    StringStruct('FileVersion', '0.7.0.0'),
                     StringStruct('InternalName', 'FrameGuard'),
                     StringStruct('OriginalFilename', 'FrameGuard.exe'),
                     StringStruct('ProductName', 'FrameGuard Desktop'),
-                    StringStruct('ProductVersion', '0.6.3.0'),
+                    StringStruct('ProductVersion', '0.7.0.0'),
                     StringStruct('LegalCopyright', 'Copyright © 2026 Cassian Aléria'),
                 ])
             ]),

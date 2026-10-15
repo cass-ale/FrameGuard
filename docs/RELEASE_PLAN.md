@@ -1,8 +1,8 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.3 · **Date:** 2026-10-15 · **Status:** v0.6.3 release recovery
-implemented locally; the next remote push includes both main and the release
-tag after local validation.
+**Version:** 1.4 · **Date:** 2026-10-15 · **Status:** v0.7.0 Quiet Pro release
+validated locally; the next remote operation atomically pushes both `main` and
+the annotated release tag.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -101,8 +101,16 @@ partially; the rest are human, on real machines.)
       instructions literally.
 - [ ] Installed-app smoke test: run a scan, export a multi-file PDF,
       check the report footer and About dialog credits.
+- [ ] Clean-profile first open follows OS light/dark appearance, stays within
+      the active screen, creates no Documents/FrameGuard folder, and preserves
+      an explicit theme choice on restart.
+- [ ] macOS arm64 and Intel: inspect Retina rendering and native traffic lights,
+      shadow, drag, resize, green-button fullscreen, menu bar and file pickers.
+- [ ] Windows 11 at 100%, 125%, 150% and 200%: inspect title-bar active/inactive
+      states, edge resize, maximize/restore, Aero Snap, Snap Layouts, Alt+Space,
+      right-click system menu and per-monitor DPI transitions.
 - [ ] VirusTotal check on the installer; if flagged, start the Microsoft
-      file-submission false-positive process before announcing. (PyInstaller
+      file-submission false-positive process before announcing.
       false positives are structural: onedir + Inno, full version resource,
       UPX off are already the posture; never tell users to disable AV.)
 - [ ] Only then publish the draft (the workflow's publish job does this
@@ -150,6 +158,8 @@ are metadata lines only, to be merged on top of his text.
   promised by this plan, only prepared for.
 
 ## 8. Revision log
+
+- **1.4 - 2026-10-15.** Adds the v0.7.0 packaged GUI acceptance gate: clean-profile OS theme selection, screen-safe first open, macOS native chrome, and Windows title-bar/DPI/Snap behavior are explicit release evidence rather than assumptions from offscreen tests.
 
 - **1.3 — 2026-10-15.** Retires the impossible Git-backed delta mirror after live release runs proved the Windows payload violates GitHub's hard per-object limit and the macOS tree is over 600 MB. Public updates use architecture-aware GitHub Release installers; optional differential channels require an external filesystem/static host. v0.6.3 fixes forward without rewriting the immutable v0.6.1 or v0.6.2 tags.
 - **1.2 — 2026-10-15.** Added constrained cross-platform push CI, a macOS-12-compatible Qt pin, bounded DMG verification, complete nested-code signing, temporary CI keychain provisioning, Node 24 action pins, overwrite-safe workflow artifacts, rerun-safe drafts, and the green-commit-before-tag rule.

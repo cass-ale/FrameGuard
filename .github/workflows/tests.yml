@@ -24,6 +24,7 @@ jobs:
     env:
       PIP_CONSTRAINT: ${{ github.workspace }}/src/constraints-3.12.txt
       QT_QPA_PLATFORM: offscreen
+      FRAMEGUARD_VISUAL_ARTIFACTS: visual-test-artifacts
     defaults:
       run:
         working-directory: src
@@ -43,3 +44,22 @@ jobs:
 
       - name: Run the full test suite
         run: python -m pytest --verbose
+
+      # Qt reads its scale factor before QApplication construction, so the
+      # audit launcher creates one bounded subprocess per supported scale.
+      - name: Audit rendered UI across supported DPI scales
+        run: >-
+          python tools_dev/gui_audit.py --matrix
+          --json-dir gui-audit-artifacts
+          --artifacts-dir gui-audit-artifacts/screenshots
+
+      - name: Upload actionable visual evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v4
+        with:
+          name: visual-evidence-${{ matrix.runner }}
+          path: |
+            src/gui-audit-artifacts/
+            src/visual-test-artifacts/
+          if-no-files-found: warn
+          retention-days: 14

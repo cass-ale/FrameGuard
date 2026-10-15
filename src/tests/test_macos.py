@@ -235,6 +235,32 @@ class TestNativeChrome:
 
         assert ui_font(10).family()
 
+    def test_native_platform_has_no_placeholder_titlebar(self, qapp):
+        from frameguard import gui
+
+        if gui.USE_CUSTOM_CHROME:
+            import pytest
+            pytest.skip("Windows intentionally uses custom chrome")
+        window = gui.MainWindow()
+        try:
+            assert window._title_bar is None
+            assert not (window.windowFlags() & gui.Qt.FramelessWindowHint)
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+    def test_os_mapping_does_not_become_an_explicit_choice(self):
+        from PySide6.QtCore import QSettings
+        from frameguard.gui import (
+            _SETTINGS_APP, _SETTINGS_ORG, _THEME_KEY, resolve_startup_theme,
+        )
+
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.clear()
+        assert resolve_startup_theme(settings, prefers_dark=False) == ("Clean Light", False)
+        assert not settings.contains(_THEME_KEY)
+
 
 class TestFileOpenEvent:
     def test_file_open_filter_exists(self):
@@ -271,6 +297,38 @@ class TestFileOpenEvent:
 
         assert filt.eventFilter(None, _FileOpenEvent(str(target))) is True
         assert opened == [str(target)]
+
+    def test_cold_launch_event_waits_for_the_main_window(self, qapp, tmp_path):
+        from PySide6.QtCore import QEvent
+        from frameguard.gui import _FileOpenFilter
+
+        target = tmp_path / "cold-launch.fg"
+        target.write_text("{}", encoding="utf-8")
+        opened = []
+
+        class _FileOpenEvent(QEvent):
+            def __init__(self, path):
+                super().__init__(QEvent.FileOpen)
+                self._path = path
+
+            def file(self):
+                return self._path
+
+        class _Window:
+            def open_paths(self, paths):
+                opened.extend(paths)
+
+            show = raise_ = activateWindow = staticmethod(lambda: None)
+
+        filt = _FileOpenFilter()
+        assert filt.eventFilter(None, _FileOpenEvent(str(target))) is True
+        assert opened == []
+        assert filt._pending_paths == [str(target)]
+
+        filt.set_window(_Window())
+        qapp.processEvents()
+        assert opened == [str(target)]
+        assert filt._pending_paths == []
 
     def test_nonexistent_path_is_ignored(self, qapp):
         from PySide6.QtCore import QEvent

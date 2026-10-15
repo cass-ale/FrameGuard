@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.6.3
+FrameGuard Desktop v0.7.0
 Video QA for XR Deliverables
 
 
@@ -22,27 +22,22 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.6.3
+WHAT'S NEW IN v0.7.0
 
-  Release reliability
-    - Public updates now use complete, architecture-specific GitHub Release
-      installers instead of an oversized Git branch payload mirror.
-    - First-release publication handles a repository with no previous
-      GitHub release without weakening draft or asset verification.
-    - macOS disk-image creation retries transient failures and preserves
-      complete hdiutil diagnostics.
-    - macOS disk-image verification now retries transient system failures
-      instead of discarding a valid Apple Silicon build.
-    - Windows, Apple Silicon, and Intel run the same pinned full test suite
-      before a release tag is created.
-    - Python, packaging, and test dependencies are constrained to the
-      versions proven by all three builders.
-    - Official macOS signing and notarization fail closed when configured;
-      internal ad-hoc builds continue to work without Apple credentials.
-    - Release drafts resume safely after an interrupted run, and the update
-      channel is committed before an immutable release is published.
-    - GitHub Actions now use reviewed Node 24-compatible revisions and
-      retain build diagnostics when a platform fails.
+  Quiet Pro interface
+    - Every application-owned control and state is intentionally styled across
+      all 15 themes, including disabled, focused, selected and error states.
+    - First launch follows the operating system appearance and opens with
+      screen-safe geometry without creating an output folder prematurely.
+    - Scan, Watch Folder and Settings adapt cleanly to short or narrow screens.
+    - Results and Checks tables use actual font metrics so headers, long names,
+      summaries and failure counts remain readable at supported DPI scales.
+    - macOS keeps its native title bar and window behavior; Windows preserves
+      DWM, resize, Aero Snap, Snap Layouts and the native system menu.
+    - Keyboard focus, accessible names, label buddies, contrast and practical
+      interaction targets have automated coverage.
+    - CI renders populated interfaces at three sizes and four DPI scales and
+      preserves JSON and screenshot evidence for any regression.
 
 
 BEFORE YOU INSTALL

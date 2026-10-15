@@ -59,7 +59,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QGroupBox, QMessageBox, QTextEdit, QFrame, QSplitter,
     QAbstractItemView, QScrollArea, QSpinBox, QSlider, QGridLayout,
     QListWidget, QListWidgetItem, QDialog, QSizeGrip, QStyledItemDelegate,
-    QSizePolicy, QProgressDialog, QLineEdit
+    QSizePolicy, QProgressDialog, QLineEdit, QPlainTextEdit
 )
 from PySide6.QtCore import (
     Qt, QObject, QThread, QRunnable, QThreadPool,
@@ -68,7 +68,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import (
     QDragEnterEvent, QDropEvent, QFont, QColor, QIcon, QPixmap,
-    QPainter, QPen, QBrush, QMouseEvent, QCursor, QFontMetrics
+    QPainter, QPen, QBrush, QMouseEvent, QCursor, QFontMetrics, QPalette
 )
 
 from frameguard.core import (
@@ -100,14 +100,133 @@ _SETTINGS_APP = "FrameGuardDesktop"
 # full-edge resize and green-button fullscreen, none of which we reimplement.
 USE_CUSTOM_CHROME = sys.platform == "win32"
 
+_THEME_KEY = "appearance/theme"
+_LEGACY_THEME_KEY = "theme"
+_WINDOW_GEOMETRY_KEY = "window/normal_geometry"
+_RESULTS_SPLITTER_KEY = "window/results_splitter"
+_DEFAULT_DARK_THEME = "Meta Dark"
+_DEFAULT_LIGHT_THEME = "Clean Light"
+
+
+def _set_role(widget: QWidget, role: str):
+    """Assign the shared design-system role without replacing stable names."""
+    widget.setProperty("fgRole", role)
+    return widget
+
+
+def _os_prefers_dark(app=None) -> bool:
+    """Resolve the current OS colour scheme through public Qt APIs."""
+    app = app or QApplication.instance()
+    if app is None:
+        return True
+    try:
+        scheme = app.styleHints().colorScheme()
+        if scheme == Qt.ColorScheme.Dark:
+            return True
+        if scheme == Qt.ColorScheme.Light:
+            return False
+    except (AttributeError, RuntimeError):
+        pass
+    return app.palette().color(QPalette.Window).lightness() < 128
+
+
+def resolve_startup_theme(settings=None, prefers_dark=None) -> tuple[str, bool]:
+    """Return ``(theme_name, is_explicit)`` without persisting OS defaults.
+
+    The legacy ``theme`` key remains readable so existing preferences survive
+    the migration. New explicit choices use ``appearance/theme``; an absent or
+    invalid value follows the operating system instead.
+    """
+    settings = settings or QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+    invalid_saved_value = False
+    for key in (_THEME_KEY, _LEGACY_THEME_KEY):
+        if settings.contains(key):
+            saved = settings.value(key, "")
+            if saved in THEMES:
+                return str(saved), True
+            invalid_saved_value = True
+    if invalid_saved_value:
+        settings.remove(_THEME_KEY)
+        settings.remove(_LEGACY_THEME_KEY)
+    dark = _os_prefers_dark() if prefers_dark is None else bool(prefers_dark)
+    return (_DEFAULT_DARK_THEME if dark else _DEFAULT_LIGHT_THEME), False
+
+
+def _apply_application_palette(theme: ThemeColors, app=None):
+    """Set native-adjacent colours before any top-level window is shown."""
+    app = app or QApplication.instance()
+    if app is None:
+        return
+    palette = QPalette(app.palette())
+    pairs = {
+        QPalette.Window: theme.bg_primary,
+        QPalette.WindowText: theme.text_primary,
+        QPalette.Base: theme.bg_secondary,
+        QPalette.AlternateBase: theme.bg_tertiary,
+        QPalette.Text: theme.text_primary,
+        QPalette.Button: theme.bg_tertiary,
+        QPalette.ButtonText: theme.text_primary,
+        QPalette.Highlight: theme.accent,
+        QPalette.HighlightedText: getattr(theme, "accent_foreground", "#FFFFFF"),
+        QPalette.ToolTipBase: theme.bg_secondary,
+        QPalette.ToolTipText: theme.text_primary,
+    }
+    for role, colour in pairs.items():
+        palette.setColor(role, QColor(colour))
+    app.setPalette(palette)
+
+
+def _clamp_window_rect(rect: QRect, available: QRect) -> QRect:
+    """Fit a normal window rectangle inside one screen's available area."""
+    width = min(max(1, rect.width()), available.width())
+    height = min(max(1, rect.height()), available.height())
+    x = min(max(rect.x(), available.left()), available.right() - width + 1)
+    y = min(max(rect.y(), available.top()), available.bottom() - height + 1)
+    return QRect(x, y, width, height)
+
+
+def _best_available_geometry(rect: QRect, screens=None) -> Optional[QRect]:
+    """Pick the screen with the largest intersection with ``rect``."""
+    screens = screens if screens is not None else QApplication.screens()
+    geometries = [s.availableGeometry() if hasattr(s, "availableGeometry") else s
+                  for s in screens]
+    if not geometries:
+        return None
+    best = max(geometries, key=lambda area: area.intersected(rect).width()
+               * area.intersected(rect).height())
+    intersection = best.intersected(rect)
+    if intersection.width() < 48 or intersection.height() < 48:
+        return None
+    return QRect(best)
+
+
+def _active_available_geometry() -> QRect:
+    screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+    return screen.availableGeometry() if screen is not None else QRect(0, 0, 1200, 800)
+
+
+def _screen_safe_size(preferred: QSize, minimum: QSize = QSize(480, 320)) -> QSize:
+    available = _active_available_geometry().size()
+    return QSize(
+        min(max(minimum.width(), preferred.width()), available.width()),
+        min(max(minimum.height(), preferred.height()), available.height()),
+    )
+
+
+def _fit_dialog_to_screen(dialog: QDialog, preferred: QSize, minimum: QSize = QSize(480, 320)):
+    area = _active_available_geometry()
+    dialog.setMinimumSize(
+        min(minimum.width(), area.width()), min(minimum.height(), area.height()))
+    dialog.resize(_screen_safe_size(preferred, minimum))
+    frame = dialog.frameGeometry()
+    frame.moveCenter(area.center())
+    dialog.move(frame.topLeft())
 
 
 def _style_combobox_popup(combo, theme):
-    """Force QComboBox popup to use theme colors on Windows.
-    
-    Windows renders combo popups as native widgets that ignore Qt stylesheets.
-    We use BOTH QPalette AND inline stylesheet on the view for maximum compatibility.
-    """
+    """Force QComboBox popups through Qt drawing on Windows."""
+    if sys.platform != "win32":
+        return
     from PySide6.QtWidgets import QListView
     from PySide6.QtGui import QPalette, QColor
     
@@ -116,6 +235,10 @@ def _style_combobox_popup(combo, theme):
         combo.setView(QListView())
     
     view = combo.view()
+    # Explicitly audited platform exception: Windows native popup palettes can
+    # ignore the application QSS, so this view must own theme-derived styling.
+    view.setProperty("fgInlineStyleAllowed", True)
+    combo.setProperty("fgInlineStyleAllowed", True)
     
     # Method 1: Inline stylesheet on the view (highest priority, always wins)
     view.setStyleSheet(
@@ -133,8 +256,8 @@ def _style_combobox_popup(combo, theme):
         f"  background-color: {theme.surface_hover};"
         f"}}"
         f"QListView::item:selected {{"
-        f"  background-color: {theme.accent};"
-        f"  color: #FFFFFF;"
+        f"  background-color: {theme.selection};"
+        f"  color: {theme.selection_foreground};"
         f"}}"
     )
     
@@ -142,8 +265,9 @@ def _style_combobox_popup(combo, theme):
     palette = view.palette()
     palette.setColor(QPalette.ColorRole.Base, QColor(theme.bg_secondary))
     palette.setColor(QPalette.ColorRole.Text, QColor(theme.text_primary))
-    palette.setColor(QPalette.ColorRole.Highlight, QColor(theme.accent))
-    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor(theme.selection))
+    palette.setColor(
+        QPalette.ColorRole.HighlightedText, QColor(theme.selection_foreground))
     palette.setColor(QPalette.ColorRole.Window, QColor(theme.bg_secondary))
     palette.setColor(QPalette.ColorRole.WindowText, QColor(theme.text_primary))
     view.setPalette(palette)
@@ -246,13 +370,9 @@ def _hex_to_rgb(hex_color: str) -> str:
 
 
 def apply_responsive_margins(widget, width: int):
-    """Scale a panel's outer gutter to the space actually available.
-
-    A fixed 32px gutter costs 64px of a ~710px content area on a non-maximized
-    window — noticeable crowding that disappears when maximized, which is
-    exactly the symptom users report.
-    """
-    layout = widget.layout()
+    """Scale a panel's outer gutter to the space actually available."""
+    content = getattr(widget, "_responsive_content", widget)
+    layout = content.layout()
     if layout is None:
         return
     h = D.page_margins(width)
@@ -268,97 +388,24 @@ def _fps_text(fps: float) -> str:
     return str(int(fps)) if fps == int(fps) else str(fps)
 
 
-_UI_FONT_FAMILY = None
-_MONO_FONT_FAMILY = None
-
-# Preference order for the UI face. Each is tried in turn and only accepted if
-# the system actually resolves it - asking for a missing family silently gives
-# you a substitute with different metrics, so the request has to be verified.
-#
-# Segoe UI Variable is Windows 11's refined system face. "Text" is its
-# optical-size instance tuned for body copy, which is noticeably cleaner than
-# plain Segoe UI at 12-14px, where most of this UI lives.
-_UI_FONT_CANDIDATES = {
-    "win32": ["Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI",
-              "Selawik", "Tahoma"],
-    "darwin": ["SF Pro Text", "Helvetica Neue", "Helvetica"],
-    "default": ["Inter", "Roboto", "Cantarell", "DejaVu Sans"],
-}
-
-# Numeric columns (timecodes, resolutions, bitrates) need TABULAR figures -
-# digits of equal width - or values fail to line up down a column and the
-# table becomes hard to scan. Proportional digits are the reason "00:01:30"
-# and "00:11:02" don't align in most UI fonts.
-_MONO_FONT_CANDIDATES = {
-    "win32": ["Cascadia Mono", "Consolas", "Segoe UI Mono", "Courier New"],
-    "darwin": ["SF Mono", "Menlo", "Monaco"],
-    "default": ["JetBrains Mono", "Roboto Mono", "DejaVu Sans Mono", "monospace"],
-}
-
-
-def _resolve_family(candidates: list, fallback_generic) -> str:
-    """First candidate the system genuinely has, else a sane generic.
-
-    QFontInfo reports the family actually used after substitution, so it is the
-    only reliable way to tell "this font exists" from "Qt quietly gave me
-    something else".
-    """
-    from PySide6.QtGui import QFontDatabase, QFontInfo
-
-    available = set(QFontDatabase.families())
-    for name in candidates:
-        if name in available:
-            return name
-        # Variable-font named instances are not always listed as families but
-        # still resolve, so confirm via QFontInfo before rejecting.
-        probe = QFont(name)
-        if QFontInfo(probe).family() == name:
-            return name
-
-    return QFontDatabase.systemFont(fallback_generic).family()
+# Compatibility exports for tests and callers that inspect platform fallback
+# chains. Font resolution itself is owned by design.py so layout measurement and
+# widget rendering cannot drift onto different families.
+_UI_FONT_CANDIDATES = {key: list(value) for key, value in D.UI_FONT_CANDIDATES.items()}
+_MONO_FONT_CANDIDATES = {key: list(value) for key, value in D.MONO_FONT_CANDIDATES.items()}
 
 
 def ui_font(size: int, weight=None) -> QFont:
-    """A QFont in the platform's UI face, with tabular-safe defaults.
-
-    "Segoe UI" does not exist on macOS or Linux; Qt silently substitutes
-    something with different metrics, so weights and spacing drift. Resolve the
-    real system UI family once and reuse it.
-    """
-    global _UI_FONT_FAMILY
-    if _UI_FONT_FAMILY is None:
-        from PySide6.QtGui import QFontDatabase
-        key = sys.platform if sys.platform in _UI_FONT_CANDIDATES else "default"
-        _UI_FONT_FAMILY = _resolve_family(
-            _UI_FONT_CANDIDATES[key], QFontDatabase.GeneralFont)
-
-    font = QFont(_UI_FONT_FAMILY, size)
-    if weight is not None:
-        font.setWeight(weight)
-    return font
+    return D.ui_font(size, weight)
 
 
 def mono_font(size: int, weight=None) -> QFont:
-    """A font with tabular figures, for columns of numbers."""
-    global _MONO_FONT_FAMILY
-    if _MONO_FONT_FAMILY is None:
-        from PySide6.QtGui import QFontDatabase
-        key = sys.platform if sys.platform in _MONO_FONT_CANDIDATES else "default"
-        _MONO_FONT_FAMILY = _resolve_family(
-            _MONO_FONT_CANDIDATES[key], QFontDatabase.FixedFont)
-
-    font = QFont(_MONO_FONT_FAMILY, size)
-    font.setStyleHint(QFont.Monospace)
-    if weight is not None:
-        font.setWeight(weight)
-    return font
+    return D.mono_font(size, weight)
 
 
 def resolved_font_families() -> tuple:
     """(ui, mono) families actually in use - for the About/report dialogs."""
-    ui_font(10)
-    mono_font(10)
-    return _UI_FONT_FAMILY, _MONO_FONT_FAMILY
+    return ui_font(10).family(), mono_font(10).family()
 
 
 def _open_path(path: str) -> bool:
@@ -678,8 +725,10 @@ class TitleBar(QWidget):
         super().__init__(parent)
         self._window = parent
         self._is_maximized = False
-        self.setFixedHeight(D.TITLEBAR_H)
+        self.setFixedHeight(D.control_height(self.font(), self.style(), D.TITLEBAR_H))
         self.setObjectName("custom_title_bar")
+        _set_role(self, "toolbar")
+        self.setProperty("active", True)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 0, 4, 0)
@@ -701,6 +750,7 @@ class TitleBar(QWidget):
         # Title text
         self._title_label = QLabel(f"FrameGuard Desktop v{APP_VERSION}")
         self._title_label.setObjectName("title_bar_label")
+        _set_role(self._title_label, "muted")
         layout.addWidget(self._title_label)
 
         layout.addStretch()
@@ -712,6 +762,8 @@ class TitleBar(QWidget):
         self._btn_minimize.setObjectName("title_btn")
         self._btn_minimize.setFixedSize(btn_size)
         self._btn_minimize.setToolTip("Minimize")
+        self._btn_minimize.setAccessibleName("Minimize window")
+        _set_role(self._btn_minimize, "icon")
         self._btn_minimize.clicked.connect(self._on_minimize)
         layout.addWidget(self._btn_minimize)
 
@@ -719,6 +771,8 @@ class TitleBar(QWidget):
         self._btn_maximize.setObjectName("title_btn")
         self._btn_maximize.setFixedSize(btn_size)
         self._btn_maximize.setToolTip("Maximize")
+        self._btn_maximize.setAccessibleName("Maximize window")
+        _set_role(self._btn_maximize, "icon")
         self._btn_maximize.clicked.connect(self._on_maximize_restore)
         layout.addWidget(self._btn_maximize)
 
@@ -726,6 +780,8 @@ class TitleBar(QWidget):
         self._btn_close.setObjectName("title_btn_close")
         self._btn_close.setFixedSize(btn_size)
         self._btn_close.setToolTip("Close")
+        self._btn_close.setAccessibleName("Close window")
+        _set_role(self._btn_close, "destructive")
         self._btn_close.clicked.connect(self._window.close)
         layout.addWidget(self._btn_close)
 
@@ -735,29 +791,11 @@ class TitleBar(QWidget):
 
     # ---- Theme ----
     def apply_theme(self, t: ThemeColors):
-        """Update all inline styles to match the current theme."""
-        self.setStyleSheet(
-            f"QWidget#custom_title_bar {{ background-color: {t.bg_primary}; "
-            f"border-bottom: 1px solid {t.border}; }}"
-        )
-        self._title_label.setStyleSheet(
-            f"color: {t.text_secondary}; font-size: 12px; font-weight: normal; "
-            f"background: transparent; border: none;"
-        )
-        btn_style = (
-            f"QPushButton#title_btn {{ background: transparent; border: none; "
-            f"color: {t.text_secondary}; font-size: 14px; border-radius: 0px; }}"
-            f"QPushButton#title_btn:hover {{ background-color: {t.surface}; "
-            f"color: {t.text_primary}; }}"
-        )
-        self._btn_minimize.setStyleSheet(btn_style)
-        self._btn_maximize.setStyleSheet(btn_style)
-        self._btn_close.setStyleSheet(
-            f"QPushButton#title_btn_close {{ background: transparent; border: none; "
-            f"color: {t.text_secondary}; font-size: 14px; border-radius: 0px; }}"
-            f"QPushButton#title_btn_close:hover {{ background-color: #E81123; "
-            f"color: #FFFFFF; }}"
-        )
+        """Refresh selector-driven titlebar styling."""
+        for widget in (self, self._title_label, self._btn_minimize,
+                       self._btn_maximize, self._btn_close):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
 
     def set_icon_pixmap(self, pixmap: QPixmap):
         """Swap the title bar mark, e.g. when the theme accent changes."""
@@ -785,23 +823,26 @@ class TitleBar(QWidget):
         if self._window.isMaximized():
             self._btn_maximize.setText("\u2752")  # overlapping squares
             self._btn_maximize.setToolTip("Restore Down")
+            self._btn_maximize.setAccessibleName("Restore window")
         else:
             self._btn_maximize.setText("\u25A1")
             self._btn_maximize.setToolTip("Maximize")
+            self._btn_maximize.setAccessibleName("Maximize window")
 
-    def is_draggable_point(self, window_pos) -> bool:
-        """Whether a window-relative point counts as caption (drag) area.
-
-        Excludes the min/max/close buttons — reporting HTCAPTION over them
-        would make Windows swallow the click and they'd stop working.
-        """
+    def hit_test_code(self, window_pos) -> int:
+        """Return a Windows non-client code for a window-relative point."""
         local = self.mapFrom(self._window, window_pos)
         if not self.rect().contains(local):
-            return False
-        for btn in (self._btn_minimize, self._btn_maximize, self._btn_close):
+            return 1  # HTCLIENT
+        if self._btn_maximize.geometry().contains(local):
+            return 9  # HTMAXBUTTON enables Windows 11 Snap Layouts
+        for btn in (self._btn_minimize, self._btn_close):
             if btn.geometry().contains(local):
-                return False
-        return True
+                return 1  # HTCLIENT: Qt owns these button clicks
+        return 2  # HTCAPTION
+
+    def is_draggable_point(self, window_pos) -> bool:
+        return self.hit_test_code(window_pos) == 2
 
     # ---- Drag-to-move ----
     def mousePressEvent(self, event: QMouseEvent):
@@ -890,6 +931,7 @@ class DropZone(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("drop_zone")
+        self.setProperty("fgInlineStyleAllowed", True)
         self.setAcceptDrops(True)
         self.setMinimumHeight(200)
         self.setCursor(Qt.PointingHandCursor)
@@ -906,17 +948,16 @@ class DropZone(QFrame):
         empty_layout.setAlignment(Qt.AlignCenter)
 
         self.icon_label = QLabel()
-        self.icon_label.setStyleSheet("border: none; background: transparent;")
         self.icon_label.setAlignment(Qt.AlignCenter)
         self.icon_label.setFixedHeight(48)
 
         t = get_theme()
         self.text_label = QLabel("Drop video files or folders here")
-        self.text_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px; font-weight: normal; border: none;")
+        _set_role(self.text_label, "muted")
         self.text_label.setAlignment(Qt.AlignCenter)
 
         self.hint_label = QLabel("or click anywhere to browse")
-        self.hint_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 12px; border: none;")
+        _set_role(self.hint_label, "muted")
         self.hint_label.setAlignment(Qt.AlignCenter)
 
         empty_layout.addWidget(self.icon_label)
@@ -933,21 +974,22 @@ class DropZone(QFrame):
 
         queue_header = QHBoxLayout()
         self._queue_title = QLabel("Queued Files")
-        self._queue_title.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: bold; border: none;")
+        self._queue_title.setFont(D.ui_font(D.FONT_SUBHEAD, D.WEIGHT_SEMIBOLD))
         queue_header.addWidget(self._queue_title)
         queue_header.addStretch()
 
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.setObjectName("secondary_btn")
+        _set_role(self._clear_btn, "quiet")
         self._clear_btn.setFixedHeight(D.CONTROL_SM)
-        self._clear_btn.setStyleSheet(f"font-size: 11px; padding: 4px 8px; color: {t.text_secondary}; border: 1px solid {t.border}; border-radius: 4px; background: transparent;")
         self._clear_btn.clicked.connect(self._clear_queue)
         queue_header.addWidget(self._clear_btn)
 
         queue_layout.addLayout(queue_header)
 
         self._file_list = _QueueList()
-        # The queue list covers the whole drop zone once files are added.
+        self._file_list.setProperty("fgInlineStyleAllowed", True)
+        # The queue list covers
         # Refusing drops here lets Qt propagate them to the DropZone parent, so
         # "drop more files onto the queue" keeps working; the clicked signal
         # restores "click anywhere to browse".
@@ -991,7 +1033,7 @@ class DropZone(QFrame):
         """
         self._file_list.setStyleSheet(
             f"QListWidget {{ background-color: transparent; border: none;"
-            f" color: {t.text_secondary}; font-size: 12px; }}"
+            f" color: {t.text_secondary}; }}"
             f"QListWidget::item {{ padding: 5px 4px; border: none; }}"
             f"QListWidget QScrollBar:vertical {{ background: transparent;"
             f" width: 14px; margin: 0px; }}"
@@ -1006,11 +1048,9 @@ class DropZone(QFrame):
         )
 
     def apply_theme(self, t: ThemeColors):
-        """Update all inline styles to match the current theme."""
-        self.text_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px; font-weight: normal; border: none;")
-        self.hint_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 12px; border: none;")
-        self._queue_title.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: bold; border: none;")
-        self._clear_btn.setStyleSheet(f"font-size: 11px; padding: 4px 8px; color: {t.text_secondary}; border: 1px solid {t.border}; border-radius: 4px; background: transparent;")
+        """Update theme-derived list and icon rendering."""
+        _set_role(self.text_label, "muted")
+        _set_role(self.hint_label, "muted")
         self._apply_list_style(t)
         self._apply_icon(t)
 
@@ -1108,8 +1148,8 @@ class DetailPopup(QDialog):
     def __init__(self, result: QAResult, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Details: {result.filename}")
-        self.setMinimumSize(700, 500)
-        self.resize(800, 600)
+        self.setMinimumSize(480, 320)
+        _fit_dialog_to_screen(self, QSize(800, 600), QSize(480, 320))
 
         t = get_theme()
 
@@ -1136,13 +1176,14 @@ class DetailPopup(QDialog):
         # Detailed checks in larger font
         detail_text = QTextEdit()
         detail_text.setReadOnly(True)
+        detail_text.setAccessibleName("Detailed QA checks")
         detail_text.setStyleSheet(f"font-size: 14px; background-color: {t.bg_secondary}; border: 1px solid {t.border}; border-radius: 8px; padding: 12px;")
 
         html_lines = ["<table style='width:100%;border-collapse:collapse;'>"]
         html_lines.append(
             f"<tr style='border-bottom:2px solid {t.border};'>"
-            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};width:100px;font-size:14px;'>Status</th>"
-            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};width:160px;font-size:14px;'>Check</th>"
+            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};font-size:14px;'>Status</th>"
+            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};font-size:14px;'>Check</th>"
             f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};font-size:14px;'>Detail</th></tr>"
         )
 
@@ -1164,7 +1205,7 @@ class DetailPopup(QDialog):
             html_lines.append("<table style='width:100%;border-collapse:collapse;'>")
             for k, v in result.metadata.items():
                 html_lines.append(
-                    f"<tr><td style='padding: 4px 8px;color:{t.text_secondary};width:180px;font-size:13px;'>{k}</td>"
+                    f"<tr><td style='padding: 4px 8px;color:{t.text_secondary};font-size:13px;'>{k}</td>"
                     f"<td style='padding: 4px 8px;color:{t.text_primary};font-size:13px;'>{v}</td></tr>"
                 )
             html_lines.append("</table>")
@@ -1175,6 +1216,8 @@ class DetailPopup(QDialog):
         # Close button
         close_btn = QPushButton("Close")
         close_btn.setObjectName("primary_btn")
+        _set_role(close_btn, "primary")
+        close_btn.setDefault(True)
         close_btn.clicked.connect(self.accept)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -1192,8 +1235,8 @@ class SummaryPopup(QDialog):
     def __init__(self, results: List[QAResult], parent=None):
         super().__init__(parent)
         self.setWindowTitle("Scan Summary \u2014 Full Details")
-        self.setMinimumSize(600, 400)
-        self.resize(700, 500)
+        self.setMinimumSize(480, 320)
+        _fit_dialog_to_screen(self, QSize(700, 500), QSize(480, 320))
 
         t = get_theme()
 
@@ -1227,8 +1270,8 @@ class SummaryPopup(QDialog):
         html_lines = ["<table style='width:100%;border-collapse:collapse;'>"]
         html_lines.append(
             f"<tr style='border-bottom:2px solid {t.border};'>"
-            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};width:80px;'>Result</th>"
-            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};width:200px;'>Filename</th>"
+            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};'>Result</th>"
+            f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};'>Filename</th>"
             f"<th style='text-align:left;padding: 8px;color:{t.text_secondary};'>Summary</th></tr>"
         )
 
@@ -1248,6 +1291,8 @@ class SummaryPopup(QDialog):
 
         close_btn = QPushButton("Close")
         close_btn.setObjectName("primary_btn")
+        _set_role(close_btn, "primary")
+        close_btn.setDefault(True)
         close_btn.clicked.connect(self.accept)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -1286,18 +1331,31 @@ class ScanPanel(QWidget):
         # delivery — files would silently never load. Same pattern as
         # MainWindow._export_runners.
         self._discovery_runners = []
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._content = QWidget()
+        self._responsive_content = self._content
+        self._scroll.setWidget(self._content)
+        root.addWidget(self._scroll)
+
+        layout = QVBoxLayout(self._content)
         layout.setContentsMargins(D.SPACE_6, D.SPACE_5, D.SPACE_6, D.SPACE_5)
-        layout.setSpacing(20)
+        layout.setSpacing(D.SPACE_4)
 
         t = get_theme()
 
         # Header
         self._header = QLabel("Scan Files")
         self._header.setProperty("class", "section-header")
-        self._header.setStyleSheet(f"color: {t.text_primary}; font-size: 20px; font-weight: bold; letter-spacing: -0.5px;")
+        _set_role(self._header, "heading")
+        self._subtitle = QLabel
         self._subtitle = QLabel("Select video files or a folder to run QA checks")
-        self._subtitle.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px; margin-bottom: 4px;")
+        _set_role(self._subtitle, "muted")
         layout.addWidget(self._header)
         layout.addWidget(self._subtitle)
 
@@ -1311,12 +1369,14 @@ class ScanPanel(QWidget):
         # File count + single browse button
         file_row = QHBoxLayout()
         self.file_count_label = QLabel("No files selected")
-        self.file_count_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px;")
+        self.file_count_label.setProperty("fgInlineStyleAllowed", True)
+        _set_role(self.file_count_label, "muted")
         file_row.addWidget(self.file_count_label)
         file_row.addStretch()
 
         self.browse_btn = QPushButton("  Browse")
         self.browse_btn.setObjectName("secondary_btn")
+        _set_role(self.browse_btn, "secondary")
         self.browse_btn.setFixedHeight(D.CONTROL_MD)
         self.browse_btn.setIconSize(QSize(18, 18))
         self.browse_btn.setToolTip("Browse for video files or a folder")
@@ -1333,6 +1393,7 @@ class ScanPanel(QWidget):
         preset_group = QVBoxLayout()
         preset_label = QLabel("Profile")
         preset_label.setProperty("class", "field-label")
+        _set_role(preset_label, "muted")
         self.preset_combo = QComboBox()
         self.preset_combo.addItem("Custom (config defaults)", "custom")
         
@@ -1348,14 +1409,16 @@ class ScanPanel(QWidget):
         self.preset_combo.setCurrentIndex(1)  # Default to 4k30
 
         # Hint shown when Custom preset is selected
-        self._custom_hint = QLabel("\u2139 Using values from Settings")
+        self._custom_hint = QLabel("Using values from Settings")
         self._custom_hint.setWordWrap(True)
-        self._custom_hint.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; font-style: italic; padding: 4px 0;")
+        _set_role(self._custom_hint, "muted")
         self._custom_hint.setVisible(False)
         preset_group.addWidget(self._custom_hint)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         self.preset_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.preset_combo.setMinimumContentsLength(22)
+        self.preset_combo.setAccessibleName("Delivery profile")
+        preset_label.setBuddy(self.preset_combo)
         preset_group.addWidget(preset_label)
         preset_group.addWidget(self.preset_combo)
 
@@ -1364,6 +1427,7 @@ class ScanPanel(QWidget):
         # existed in Settings but nothing on this page pointed at them.
         self.edit_profile_btn = QPushButton("Edit values\u2026")
         self.edit_profile_btn.setObjectName("secondary_btn")
+        _set_role(self.edit_profile_btn, "quiet")
         self.edit_profile_btn.setFixedHeight(D.CONTROL_SM)
         self.edit_profile_btn.setToolTip(
             "Set resolution, frame rate and bitrate by hand, and save them as a "
@@ -1380,6 +1444,7 @@ class ScanPanel(QWidget):
         cb_group = QVBoxLayout()
         cb_label = QLabel("Scan mode")
         cb_label.setProperty("class", "field-label")
+        _set_role(cb_label, "muted")
 
         from PySide6.QtWidgets import QRadioButton, QButtonGroup
         self.deep_radio = QRadioButton("Deep scan")
@@ -1391,6 +1456,7 @@ class ScanPanel(QWidget):
             "Container, codec, resolution, frame rate, bitrate and audio only. "
             "Skips the frame-level deep scan.")
         self.deep_radio.setChecked(True)
+        cb_label.setBuddy(self.deep_radio)
 
         self._mode_group = QButtonGroup(self)
         self._mode_group.setExclusive(True)
@@ -1401,8 +1467,7 @@ class ScanPanel(QWidget):
         # on hovering for a tooltip.
         self._mode_hint = QLabel("Deep also checks black/freeze frames and silence")
         self._mode_hint.setWordWrap(True)
-        self._mode_hint.setStyleSheet(
-            f"color: {t.text_tertiary}; font-size: 11px; font-style: italic;")
+        _set_role(self._mode_hint, "muted")
         self.deep_radio.toggled.connect(self._on_mode_changed)
 
         cb_group.addWidget(cb_label)
@@ -1423,9 +1488,9 @@ class ScanPanel(QWidget):
         progress_layout.setSpacing(D.SPACE_2)
 
         self.progress_label = QLabel("Scanning...")
-        self.progress_label.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: normal;")
         self.progress_label.setWordWrap(True)
-        self.progress_label.setMaximumHeight(40)
+        self.progress_label.setAccessibleName("Scan progress status")
+        progress_layout.addWidget(self.progress_label)
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setTextVisible(False)
@@ -1433,7 +1498,7 @@ class ScanPanel(QWidget):
 
         # Separate percentage label with fixed width to prevent cutoff
         self.pct_label = QLabel("0%")
-        self.pct_label.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: bold;")
+        self.pct_label.setFont(D.ui_font(D.FONT_BODY, D.WEIGHT_SEMIBOLD))
         self.pct_label.setFixedWidth(50)
         self.pct_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
@@ -1443,7 +1508,7 @@ class ScanPanel(QWidget):
         bar_row.addWidget(self.pct_label)
 
         self.progress_detail = QLabel("")
-        self.progress_detail.setStyleSheet(f"color: {t.text_secondary}; font-size: 12px;")
+        _set_role(self.progress_detail, "muted")
         self.progress_detail.setWordWrap(True)
 
         # Scan outcome, shown where the operator is already looking. The
@@ -1451,6 +1516,7 @@ class ScanPanel(QWidget):
         # after set_scanning(False) had hidden the whole progress frame, so
         # nothing was ever displayed when a scan ended.
         self.completion_banner = QLabel()
+        self.completion_banner.setProperty("fgInlineStyleAllowed", True)
         self.completion_banner.setVisible(False)
         self.completion_banner.setWordWrap(True)
         self.completion_banner.setAlignment(Qt.AlignCenter)
@@ -1467,6 +1533,7 @@ class ScanPanel(QWidget):
 
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("secondary_btn")
+        _set_role(self.cancel_btn, "secondary")
         self.cancel_btn.setVisible(False)
         self.cancel_btn.setAccessibleName("Cancel scan")
         self.cancel_btn.setAccessibleDescription(
@@ -1475,6 +1542,7 @@ class ScanPanel(QWidget):
 
         self.scan_btn = QPushButton("Start Scan")
         self.scan_btn.setObjectName("primary_btn")
+        _set_role(self.scan_btn, "primary")
         self.scan_btn.setEnabled(False)
         self.scan_btn.setToolTip("Start scanning the queued files  (Ctrl+Enter or F5)")
         self.scan_btn.setAccessibleName("Start scan")
@@ -1497,18 +1565,11 @@ class ScanPanel(QWidget):
 
     def apply_theme(self, t: ThemeColors):
         """Update all inline styles to match the current theme."""
-        self._header.setStyleSheet(f"color: {t.text_primary}; font-size: 20px; font-weight: bold; letter-spacing: -0.5px;")
-        self._subtitle.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px;")
-        # Update file count label based on current state
-        if self._files:
-            self.file_count_label.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: normal;")
-        else:
-            self.file_count_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px;")
-        self.progress_label.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: normal;")
-        self.pct_label.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: bold;")
-        self.progress_detail.setStyleSheet(f"color: {t.text_secondary}; font-size: 12px;")
-        self._custom_hint.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; font-style: italic; padding: 4px 0;")
-        self._mode_hint.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; font-style: italic;")
+        _set_role(self._header, "heading")
+        _set_role(self._subtitle, "muted")
+        _set_role(self._custom_hint, "muted")
+        _set_role(self._mode_hint, "muted")
+        _set_role(self.progress_detail, "muted")
         self._apply_button_icons(t)
         self.drop_zone.apply_theme(t)
         # Re-render the verdict against the new palette instead of wiping it:
@@ -1851,6 +1912,7 @@ class ResultsPanel(QWidget):
         self._scan_order: dict = {}
         self._scan_seq = 0
         self._sort_by_severity = True
+        self._toolbar_compact = None
         self._init_ui()
 
     def _init_ui(self):
@@ -1869,7 +1931,7 @@ class ResultsPanel(QWidget):
         header_row = QHBoxLayout()
         header_row.setSpacing(8)
         self._header = QLabel("Results")
-        self._header.setStyleSheet(f"color: {t.text_primary}; font-size: 20px; font-weight: bold; letter-spacing: -0.5px;")
+        _set_role(self._header, "heading")
         header_row.addWidget(self._header)
         header_row.addStretch()
 
@@ -1887,6 +1949,7 @@ class ResultsPanel(QWidget):
         # menu as "Clear History", which does not read as "empty this page".
         self.clear_btn = QPushButton("Clear Results")
         self.clear_btn.setObjectName("secondary_btn")
+        _set_role(self.clear_btn, "destructive")
         self.clear_btn.setEnabled(False)
         self.clear_btn.setToolTip("Remove all results from this page")
         self.clear_btn.setAccessibleName("Clear results")
@@ -1898,13 +1961,13 @@ class ResultsPanel(QWidget):
         self._more_btn.setFixedSize(D.ICON_BTN, D.CONTROL_MD)
         self._more_btn.setToolTip("More actions")
         self._more_btn.setAccessibleName("More actions")
-        # Inherited button padding made this 32px control demand 55px.
-        self._more_btn.setStyleSheet("padding: 0px; text-align: center;")
+        _set_role(self._more_btn, "icon")
         self._more_btn.clicked.connect(self._show_actions_menu)
         header_row.addWidget(self._more_btn)
 
         self.export_btn = QPushButton("Export PDF")
         self.export_btn.setObjectName("primary_btn")
+        _set_role(self.export_btn, "primary")
         self.export_btn.setEnabled(False)
         self.export_btn.setToolTip("Export checked files to PDF (or all files if none selected)")
         self.export_btn.setAccessibleName("Export PDF report")
@@ -1912,35 +1975,39 @@ class ResultsPanel(QWidget):
         header_row.addWidget(self.export_btn)
 
         layout.addLayout(header_row)
+        self._set_toolbar_compact(False)
+
+        # Attention banner
 
         # Attention banner — headline verdict for the batch, so a failure is
         # visible before the operator reads a single row.
         self._attention_banner = QLabel()
+        self._attention_banner.setProperty("fgInlineStyleAllowed", True)
         self._attention_banner.setVisible(False)
         self._attention_banner.setWordWrap(True)
         layout.addWidget(self._attention_banner)
 
         # Hint text for summary popup
-        self._summary_hint = QLabel("\U0001F6C8  Click any summary badge below to see full details")
-        self._summary_hint.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; font-style: italic;")
+        self._summary_hint = QLabel("Select any summary badge below to see full details")
+        _set_role(self._summary_hint, "muted")
         self._summary_hint.setVisible(False)
         layout.addWidget(self._summary_hint)
 
-        # Summary badges row with horizontal scroll
+        # Summary statistics use a deterministic metric-driven grid: four
+        # columns when wide, two rows below the narrow breakpoint.
         summary_scroll = QScrollArea()
         summary_scroll.setWidgetResizable(True)
-        summary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        summary_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         summary_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # 130px of a 700px window was ~19% of the height for four numbers.
-        # _apply_responsive_layout shrinks this further on short windows.
-        summary_scroll.setFixedHeight(104)
-        summary_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        summary_scroll.setFrameShape(QFrame.NoFrame)
+        summary_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._summary_scroll = summary_scroll
 
         summary_widget = QWidget()
-        self.summary_row = QHBoxLayout(summary_widget)
-        self.summary_row.setContentsMargins(4, 4, 4, 4)
-        self.summary_row.setSpacing(12)
+        self._summary_widget = summary_widget
+        self.summary_row = QGridLayout(summary_widget)
+        self.summary_row.setContentsMargins(D.SPACE_1, D.SPACE_1, D.SPACE_1, D.SPACE_1)
+        self.summary_row.setSpacing(D.SPACE_3)
 
         # Store badge references for theme updates
         self._badge_frames = {}
@@ -1952,17 +2019,17 @@ class ResultsPanel(QWidget):
         self.badge_pass = self._make_badge("passed", "Passed", "0", t.status_pass)
         self.badge_fail = self._make_badge("mismatched", "Failed", "0", t.status_fail)
         self.badge_warn = self._make_badge("warnings", "Warnings", "0", t.status_warn)
-        self.summary_row.addWidget(self.badge_total)
-        self.summary_row.addWidget(self.badge_pass)
-        self.summary_row.addWidget(self.badge_fail)
-        self.summary_row.addWidget(self.badge_warn)
-        self.summary_row.addStretch()
+        self._summary_badges = [
+            self.badge_total, self.badge_pass, self.badge_fail, self.badge_warn]
+        self._summary_compact = None
+        self._set_summary_compact(False)
 
         summary_scroll.setWidget(summary_widget)
         layout.addWidget(summary_scroll)
 
         # Splitter: table + detail
         splitter = QSplitter(Qt.Vertical)
+        splitter.setHandleWidth(D.SPLITTER_HIT_AREA)
 
         # Results table
         self.table = QTableWidget()
@@ -1974,8 +2041,10 @@ class ResultsPanel(QWidget):
         # hardcoded pixels (which clipped "3840x2160") or ResizeToContents
         # (which over-pads so generously that Filename was squeezed to 101px).
         # Filename and Summary then share everything that is left.
-        header.setMinimumSectionSize(28)
-        self.table.setColumnWidth(0, 32)
+        header.setMinimumSectionSize(D.CONTROL_SM)
+        from PySide6.QtWidgets import QStyle
+        indicator = self.table.style().pixelMetric(QStyle.PM_IndicatorWidth)
+        self.table.setColumnWidth(0, indicator + 2 * D.SPACE_2)
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         for col in (1, 3, 4, 5):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
@@ -1986,6 +2055,11 @@ class ResultsPanel(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(D.table_row_height(self.table.font()))
+        header.setFixedHeight(D.table_header_height(header.font()))
+        self.table.setAccessibleName("Scan results")
+        self.table.setAccessibleDescription(
+            "Results table. Filename and summary cells expose their full text to assistive technology.")
         self.table.setWordWrap(False)
         self.table.setTextElideMode(Qt.ElideRight)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -1998,17 +2072,25 @@ class ResultsPanel(QWidget):
         # Detail panel
         self.detail_panel = QTextEdit()
         self.detail_panel.setReadOnly(True)
-        self.detail_panel.setStyleSheet(
-            f"background-color: {t.bg_secondary}; border: 1px solid {t.border}; "
-            f"border-radius: 8px; color: {t.text_primary}; padding: 12px; font-size: 12px;"
-        )
+        _set_role(self.detail_panel, "framed-tool")
         self.detail_panel.setPlaceholderText("Select a file above to view detailed check results.\nDouble-click a row to open in a larger popup window.")
         splitter.addWidget(self.detail_panel)
 
         splitter.setSizes([300, 200])
+        self._splitter = splitter
         layout.addWidget(splitter)
 
 
+
+    def _set_toolbar_compact(self, compact: bool):
+        if compact == self._toolbar_compact:
+            return
+        self._toolbar_compact = compact
+        self.setProperty("layoutMode", "compact" if compact else "wide")
+        self.clear_btn.setText("Clear" if compact else "Clear Results")
+        self.export_btn.setText("Export" if compact else "Export PDF")
+        self.style().unpolish(self)
+        self.style().polish(self)
 
     def _make_badge(self, key: str, label: str, count: str, color: str) -> QFrame:
         """Build a summary badge.
@@ -2019,17 +2101,22 @@ class ResultsPanel(QWidget):
         to "Failed" silently stopped the counter from ever updating.
         """
         frame = QFrame()
+        frame.setObjectName(f"summary_badge_{key}")
+        frame.setProperty("fgInlineStyleAllowed", True)
         frame.setCursor(Qt.PointingHandCursor)
         frame.setStyleSheet(
+            f"QFrame#summary_badge_{key} {{ "
             f"background-color: rgba({_hex_to_rgb(color)}, 0.1); "
             f"border: 1px solid rgba({_hex_to_rgb(color)}, 0.25); "
-            f"border-radius: 16px; padding: 8px 16px;"
+            f"border-radius: 8px; padding: 8px 16px; }}"
         )
-        frame.setMinimumWidth(D.SPACE_6 * 3 + D.SPACE_1)  # 100
-        frame.setMinimumHeight(D.SPACE_7 + D.SPACE_5 + D.SPACE_4)   # 88 - measured content need
-        frame.setMaximumHeight(D.SPACE_7 + D.SPACE_5 + D.SPACE_4)
-
-        t = get_theme()
+        frame.setMinimumWidth(D.SPACE_6 * 3 + D.SPACE_1)
+        metric_font = D.ui_font(D.FONT_DISPLAY, D.WEIGHT_SEMIBOLD)
+        label_font = D.ui_font(D.FONT_SMALL)
+        frame.setMinimumHeight(
+            D.label_height(metric_font) + D.label_height(label_font)
+            + 2 * D.SPACE_2 + D.SPACE_1)
+        _set_role(frame, "statistic")
 
         badge_layout = QVBoxLayout(frame)
         badge_layout.setContentsMargins(D.SPACE_3, D.SPACE_2, D.SPACE_3, D.SPACE_2)
@@ -2037,11 +2124,18 @@ class ResultsPanel(QWidget):
 
         count_lbl = QLabel(count)
         count_lbl.setObjectName(f"badge_count_{key}")
-        count_lbl.setStyleSheet(f"color: {color}; font-size: 20px; font-weight: bold; border: none; padding: 4px 0px;")
+        count_lbl.setFont(metric_font)
+        count_lbl.setProperty("fgInlineStyleAllowed", True)
+        _set_role(count_lbl, "metric")
+        count_lbl.setStyleSheet(
+            f"color: {color}; background: transparent; border: none; padding: 4px 0px;")
         count_lbl.setAlignment(Qt.AlignCenter)
 
         name_lbl = QLabel(label)
-        name_lbl.setStyleSheet(f"color: {t.text_secondary}; font-size: 11px; font-weight: normal; border: none;")
+        name_lbl.setFont(label_font)
+        name_lbl.setProperty("fgInlineStyleAllowed", True)
+        _set_role(name_lbl, "muted")
+        name_lbl.setStyleSheet("background: transparent; border: none;")
         name_lbl.setAlignment(Qt.AlignCenter)
 
         badge_layout.addWidget(count_lbl)
@@ -2057,14 +2151,27 @@ class ResultsPanel(QWidget):
         frame.mousePressEvent = lambda e: self._show_summary_popup()
         return frame
 
+    def _set_summary_compact(self, compact: bool):
+        if compact == self._summary_compact:
+            return
+        self._summary_compact = compact
+        for badge in self._summary_badges:
+            self.summary_row.removeWidget(badge)
+        columns = 2 if compact else 4
+        for index, badge in enumerate(self._summary_badges):
+            self.summary_row.addWidget(badge, index // columns, index % columns)
+        for column in range(4):
+            self.summary_row.setColumnStretch(column, 1 if column < columns else 0)
+        rows = 2 if compact else 1
+        badge_height = max(b.minimumSizeHint().height() for b in self._summary_badges)
+        self._summary_scroll.setMinimumHeight(
+            rows * badge_height + (rows - 1) * D.SPACE_3 + 2 * D.SPACE_1)
+
     def apply_theme(self, t: ThemeColors):
         """Update all inline styles to match the current theme."""
-        self._header.setStyleSheet(f"color: {t.text_primary}; font-size: 20px; font-weight: bold;")
-        self._summary_hint.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; font-style: italic;")
-        self.detail_panel.setStyleSheet(
-            f"background-color: {t.bg_secondary}; border: 1px solid {t.border}; "
-            f"border-radius: 8px; color: {t.text_primary}; padding: 12px; font-size: 12px;"
-        )
+        _set_role(self._header, "heading")
+        _set_role(self._summary_hint, "muted")
+        _set_role(self.detail_panel, "framed-tool")
 
         # Update badge colors to match new theme
         color_map = {
@@ -2077,17 +2184,18 @@ class ResultsPanel(QWidget):
             self._badge_colors[key] = color
             if key in self._badge_frames:
                 self._badge_frames[key].setStyleSheet(
+                    f"QFrame#summary_badge_{key} {{ "
                     f"background-color: rgba({_hex_to_rgb(color)}, 0.1); "
                     f"border: 1px solid rgba({_hex_to_rgb(color)}, 0.25); "
-                    f"border-radius: 8px; padding: 8px 16px;"
+                    f"border-radius: 8px; padding: 8px 16px; }}"
                 )
             if key in self._badge_count_labels:
                 self._badge_count_labels[key].setStyleSheet(
-                    f"color: {color}; font-size: 20px; font-weight: bold; border: none; padding: 4px 0px;"
+                    f"color: {color}; background: transparent; border: none; padding: 4px 0px;"
                 )
             if key in self._badge_name_labels:
                 self._badge_name_labels[key].setStyleSheet(
-                    f"color: {t.text_secondary}; font-size: 11px; font-weight: normal; border: none;"
+                    f"color: {t.text_secondary}; background: transparent; border: none;"
                 )
 
         # Re-render detail panel if results are loaded
@@ -2170,6 +2278,8 @@ class ResultsPanel(QWidget):
 
             filename_item = QTableWidgetItem(r.filename)
             filename_item.setToolTip(r.filepath)
+            filename_item.setData(Qt.AccessibleTextRole, r.filename)
+            filename_item.setData(Qt.AccessibleDescriptionRole, r.filepath)
             if failed:
                 filename_item.setFont(ui_font(10, QFont.Bold))
             self.table.setItem(idx, 2, filename_item)
@@ -2195,6 +2305,10 @@ class ResultsPanel(QWidget):
                 f"<div style='max-width:400px;padding: 4px;'>"
                 f"<b>{r.filename}</b><br/><br/>{summary_text}</div>"
             )
+            summary_item.setData(Qt.AccessibleTextRole, summary_text)
+            summary_item.setData(
+                Qt.AccessibleDescriptionRole,
+                f"Summary for {r.filename}: {summary_text}")
             self.table.setItem(idx, 6, summary_item)
 
             # Tint the whole row so failures read as a block, not one red word.
@@ -2354,29 +2468,24 @@ class ResultsPanel(QWidget):
         Measured, not guessed: "3840x2160" needs 117px and "WARNING" in bold
         needs 91px, both of which overflowed the old hardcoded widths.
         """
-        metrics = QFontMetrics(self.table.font())
-        bold = QFont(self.table.font())
-        bold.setBold(True)
-        bold_metrics = QFontMetrics(bold)
-        # Resolution and duration render in the tabular face, which is wider
-        # per character than the UI face.
-        mono_metrics = QFontMetrics(mono_font(9))
-
+        header_metrics = QFontMetrics(self.table.horizontalHeader().font())
+        bounds = {
+            1: (80, 132),
+            3: (72, 168),
+            4: (104, 184),
+            5: (96, 168),
+        }
         for col, header_text in ((1, "Status"), (3, "Codec"),
                                  (4, "Resolution"), (5, "Duration")):
-            widest = metrics.horizontalAdvance(header_text)
+            widest = header_metrics.horizontalAdvance(header_text)
             for row in range(self.table.rowCount()):
                 item = self.table.item(row, col)
-                if item is None:
-                    continue
-                if col == 1:
-                    fm = bold_metrics       # Status renders bold
-                elif col in (4, 5):
-                    fm = mono_metrics       # tabular figures
-                else:
-                    fm = metrics
-                widest = max(widest, fm.horizontalAdvance(item.text()))
-            self.table.setColumnWidth(col, widest + 20)
+                if item is not None:
+                    widest = max(widest, QFontMetrics(item.font()).horizontalAdvance(item.text()))
+            minimum, maximum = bounds[col]
+            # Cell margins plus room for a header sort indicator.
+            width = max(minimum, min(maximum, widest + 2 * D.SPACE_2 + D.SPACE_4))
+            self.table.setColumnWidth(col, width)
 
     def _show_actions_menu(self):
         """Secondary actions, kept off the toolbar so it fits a small window."""
@@ -2514,8 +2623,8 @@ class ResultsPanel(QWidget):
         lines.append("<table style='width:100%;border-collapse:collapse;'>")
         lines.append(
             f"<tr style='border-bottom:1px solid {t.border};'>"
-            f"<th style='text-align:left;padding: 4px 8px;color:{t.text_secondary};width:80px;'>Status</th>"
-            f"<th style='text-align:left;padding: 4px 8px;color:{t.text_secondary};width:130px;'>Check</th>"
+            f"<th style='text-align:left;padding: 4px 8px;color:{t.text_secondary};'>Status</th>"
+            f"<th style='text-align:left;padding: 4px 8px;color:{t.text_secondary};'>Check</th>"
             f"<th style='text-align:left;padding: 4px 8px;color:{t.text_secondary};'>Detail</th></tr>"
         )
 
@@ -2538,7 +2647,7 @@ class ResultsPanel(QWidget):
             lines.append("<table style='width:100%;border-collapse:collapse;'>")
             for k, v in r.metadata.items():
                 lines.append(
-                    f"<tr><td style='padding: 4px 8px;color:{t.text_secondary};width:160px;'>{k}</td>"
+                    f"<tr><td style='padding: 4px 8px;color:{t.text_secondary};'>{k}</td>"
                     f"<td style='padding: 4px 8px;color:{t.text_primary};'>{v}</td></tr>"
                 )
             lines.append("</table>")
@@ -2579,32 +2688,37 @@ class SettingsPanel(QWidget):
         root.addWidget(self._scroll)
 
         self._content = QWidget()
+        self._responsive_content = self._content
         self._scroll.setWidget(self._content)
 
         self._main_layout = QVBoxLayout(self._content)
         self._main_layout.setContentsMargins(D.SPACE_6, D.SPACE_5, D.SPACE_6, D.SPACE_5)
         self._main_layout.setSpacing(16)
 
-        self._title_font_css = "font-size: 14px; font-weight: bold;"
-        self._label_font_css = "font-size: 14px;"
-        self._desc_font_css = "font-size: 12px;"
-
         self._reset_buttons = []
         self._desc_labels = []
         self._name_labels = []
         self._group_boxes = []
+        self._setting_rows = []
+        self._settings_compact = None
 
-        # --- Delivery Profile ---
-
-        # --- Simple / Advanced Mode Toggle ---
+        # --- Page heading / Simple-Advanced Mode Toggle ---
         self._advanced_mode = False  # Start in simple mode
-        self._simple_mode_btn = QPushButton("▼  Show Advanced Settings")
+        settings_header = QHBoxLayout()
+        settings_header.setSpacing(D.SPACE_3)
+        heading = QLabel("Settings")
+        _set_role(heading, "heading")
+        settings_header.addWidget(heading)
+        settings_header.addStretch(1)
+        self._simple_mode_btn = QPushButton("Show Advanced Settings")
         self._simple_mode_btn.setToolTip("Simple mode shows only the most common settings")
         self._simple_mode_btn.setFixedHeight(D.CONTROL_LG)
         self._simple_mode_btn.setObjectName("advToggleBtn")
+        _set_role(self._simple_mode_btn, "quiet")
         self._simple_mode_btn.clicked.connect(self._toggle_simple_mode)
-        self._main_layout.addWidget(self._simple_mode_btn)
-        self._main_layout.addSpacing(12)
+        settings_header.addWidget(self._simple_mode_btn)
+        self._main_layout.addLayout(settings_header)
+        self._main_layout.addSpacing(D.SPACE_2)
         
         # Track which groups are "advanced only"
         self._advanced_groups = []
@@ -2801,7 +2915,7 @@ class SettingsPanel(QWidget):
         
         # Theme selector: button grid (no dropdown - guaranteed theme-aware)
         theme_label = QLabel("Color Theme")
-        theme_label.setStyleSheet("border: none; background: transparent; font-size: 14px; font-weight: bold;")
+        theme_label.setFont(D.ui_font(D.FONT_SUBHEAD, D.WEIGHT_SEMIBOLD))
         appearance_layout.addWidget(theme_label)
         
         theme_grid = QGridLayout()
@@ -2816,7 +2930,10 @@ class SettingsPanel(QWidget):
         for idx, name in enumerate(theme_names):
             t_data = THEMES[name]
             btn = QPushButton(name)
-            # Not setFixedSize: "Slate Professional" needs 210px and was being
+            btn.setProperty("fgInlineStyleAllowed", True)
+            btn.setFont(D.ui_font(D.FONT_SMALL, D.WEIGHT_SEMIBOLD))
+            _set_role(btn, "secondary")
+            # Not setFixedSize
             # clipped at every window size. Let the grid distribute the width
             # and keep only the height on the control scale.
             btn.setMinimumHeight(D.CONTROL_XL)
@@ -2831,8 +2948,6 @@ class SettingsPanel(QWidget):
                 f"  color: {t_data.text_primary};"
                 f"  border: 2px solid {t_data.border};"
                 f"  border-radius: 8px;"
-                f"  font-size: 11px;"
-                f"  font-weight: bold;"
                 f"  padding: 4px;"
                 f"}}"
                 f"QPushButton:hover {{"
@@ -2883,108 +2998,13 @@ class SettingsPanel(QWidget):
     def apply_theme(self, t):
         self._t = t
 
-        # Labels/descriptions: use theme text colors. Avoid setting stylesheet on the panel itself.
-        text_primary = getattr(t, "text_primary", "#EDEDED")
-        text_secondary = getattr(t, "text_secondary", "#B8B8B8")
-        bg_secondary = getattr(t, "bg_secondary", "transparent")
-        border = getattr(t, "border", getattr(t, "bg_tertiary", "#2A2A2A"))
-        accent = getattr(t, "accent", "#0A6EEA")
-
-
-        # Advanced toggle button - theme-aware text color
+        # Advanced toggle button
         if hasattr(self, '_simple_mode_btn'):
-            self._simple_mode_btn.setStyleSheet(
-                f"QPushButton {{"
-                f"  background-color: transparent;"
-                f"  border: 2px solid {border};"
-                f"  border-radius: 6px;"
-                f"  color: {text_primary};"
-                f"  font-size: 14px;"
-                f"  font-weight: bold;"
-                f"  padding: 8px 16px;"
-                f"}}"
-                f"QPushButton:hover {{"
-                f"  border-color: {accent};"
-                f"  color: {accent};"
-                f"}}"
-            )
+            _set_role(self._simple_mode_btn, "quiet")
 
-        for lab in self._name_labels:
-            lab.setStyleSheet(f"{self._label_font_css} color: {text_primary};")
-
-        for lab in self._desc_labels:
-            lab.setStyleSheet(f"{self._desc_font_css} color: {text_secondary};")
-
-        # Get theme colors for interactive controls
-        accent = getattr(t, "accent", "#0A6EEA")
-        bg_tertiary = getattr(t, "bg_tertiary", bg_secondary)
-        surface_hover = getattr(t, "surface_hover", bg_tertiary)
-        
         for gb in self._group_boxes:
-            gb.setStyleSheet(
-                "QGroupBox {"
-                f"  color: {text_primary};"
-                f"  background-color: {bg_secondary};"
-                f"  border: 1px solid {border};"
-                "  border-radius: 8px;"
-                "  margin-top: 12px;"
-                "  padding: 12px;"
-                "}"
-                "QGroupBox::title {"
-                "  subcontrol-origin: margin;"
-                "  subcontrol-position: top left;"
-                "  padding: 0 8px;"
-                f"  {self._title_font_css}"
-                "}"
-                "QComboBox {"
-                f"  color: {text_primary};"
-                f"  background: {bg_tertiary};"
-                f"  border: 1px solid {border};"
-                "  border-radius: 6px;"
-                "  min-height: 30px;"
-                "  padding: 8px 12px;"
-                "}"
-                "QComboBox:hover {"
-                f"  border-color: {accent};"
-                "}"
-                "QComboBox::drop-down {"
-                "  width: 36px;"
-                "  border: none;"
-                f"  border-left: 1px solid {border};"
-                "}"
-                "QComboBox QAbstractItemView {"
-                f"  background-color: {bg_secondary};"
-                f"  color: {text_primary};"
-                f"  border: 1px solid {border};"
-                f"  selection-background-color: {accent};"
-                "  selection-color: #FFFFFF;"
-                "  padding: 4px;"
-                "}"
-                "QComboBox QAbstractItemView::item {"
-                "  padding: 8px 12px;"
-                "  min-height: 28px;"
-                "}"
-                "QComboBox QAbstractItemView::item:hover {"
-                f"  background-color: {surface_hover};"
-                "}"
-            )
-
-        # Reset buttons styling (small, subtle)
-        accent = getattr(t, "accent", getattr(t, "text_primary", "#EDEDED"))
-        for b in self._reset_buttons:
-            b.setStyleSheet(
-                "QPushButton {"
-                f"  color: {accent};"
-                "  font-size: 14px;"
-                "  padding: 4px 8px;"
-                "  border-radius: 6px;"
-                "}"
-                "QPushButton:hover {"
-                "  text-decoration: underline;"
-                "}"
-            )
-
-
+            gb.style().unpolish(gb)
+            gb.style().polish(gb)
 
         # Force combo popups to use new theme colors (Windows palette fix)
         from PySide6.QtWidgets import QComboBox
@@ -3021,12 +3041,15 @@ class SettingsPanel(QWidget):
         btn_grid = QGridLayout()
         btn_grid.setSpacing(8)
         self.export_preset_btn = QPushButton("Export Current")
+        _set_role(self.export_preset_btn, "secondary")
         self.export_preset_btn.setToolTip("Save current settings as a shareable .fg preset file")
         self.export_preset_btn.clicked.connect(self._export_current_preset)
         self.import_preset_btn = QPushButton("Import Preset")
+        _set_role(self.import_preset_btn, "secondary")
         self.import_preset_btn.setToolTip("Load settings from a preset file")
         self.import_preset_btn.clicked.connect(self._import_preset_file)
         self.open_presets_btn = QPushButton("Open Folder")
+        _set_role(self.open_presets_btn, "secondary")
         self.open_presets_btn.setToolTip("Open the presets directory")
         self.open_presets_btn.clicked.connect(self._open_presets_folder)
 
@@ -3050,7 +3073,8 @@ class SettingsPanel(QWidget):
         # Without wordWrap this single label demands ~1050px, which forces the
         # entire Settings page into horizontal scrolling on a non-maximized window.
         info.setWordWrap(True)
-        info.setStyleSheet("border: none; background: transparent; padding: 4px;")
+        _set_role(info, "muted")
+        info.setMargin(D.SPACE_1)
         preset_layout.addWidget(info)
 
         parent_layout.addWidget(preset_box)
@@ -3066,6 +3090,7 @@ class SettingsPanel(QWidget):
         update_grid = QGridLayout()
         update_grid.setSpacing(D.SPACE_2)
         self.check_update_btn = QPushButton("Check for Updates")
+        _set_role(self.check_update_btn, "secondary")
         self.check_update_btn.setToolTip("Check if a newer version of FrameGuard is available")
         self.check_update_btn.setMinimumHeight(D.CONTROL_MD)
         self.check_update_btn.clicked.connect(self._check_for_updates)
@@ -3075,6 +3100,7 @@ class SettingsPanel(QWidget):
         # tell users to "go to Settings to install" with no control to do it.
         self.install_update_btn = QPushButton("Install Update")
         self.install_update_btn.setObjectName("primary_btn")
+        _set_role(self.install_update_btn, "primary")
         self.install_update_btn.setVisible(False)
         self.install_update_btn.setMinimumHeight(D.CONTROL_MD)
         self.install_update_btn.clicked.connect(self.install_update_requested.emit)
@@ -3083,6 +3109,7 @@ class SettingsPanel(QWidget):
         # Differential update: pull a release folder and transfer only the
         # files that differ, rather than re-running the ~90MB installer.
         self.delta_update_btn = QPushButton("Update from Folder...")
+        _set_role(self.delta_update_btn, "secondary")
         self.delta_update_btn.setMinimumHeight(D.CONTROL_MD)
         self.delta_update_btn.setToolTip(
             "Update from a published release folder, downloading only the "
@@ -3092,6 +3119,7 @@ class SettingsPanel(QWidget):
 
         # There was previously no way to report a problem from inside the app.
         self.report_problem_btn = QPushButton("Report a Problem...")
+        _set_role(self.report_problem_btn, "secondary")
         self.report_problem_btn.setMinimumHeight(D.CONTROL_MD)
         self.report_problem_btn.setToolTip(
             "Collect version, tool and session details into a report you can send")
@@ -3109,6 +3137,9 @@ class SettingsPanel(QWidget):
 
         from frameguard.updater import get_update_channel
         self.channel_edit = QLineEdit(get_update_channel())
+        self.channel_edit.setAccessibleName("Optional delta channel")
+        channel_label.setBuddy(self.channel_edit)
+        _set_role(channel_label, "muted")
         self.channel_edit.setMinimumHeight(D.CONTROL_MD)
         self.channel_edit.setPlaceholderText(
             r"Leave blank for GitHub Releases, or enter \\share\FrameGuard\release")
@@ -3407,28 +3438,8 @@ class SettingsPanel(QWidget):
     # UI helpers
     # ----------------------------
     def _make_group(self, title: str) -> QGroupBox:
-        from frameguard.theme import get_theme
-        t = get_theme()
         gb = QGroupBox(title)
-        gb.setStyleSheet(f"""
-            QGroupBox {{
-                border: 1px solid {t.border};
-                border-radius: 12px;
-                margin-top: 24px;
-                padding: 20px 16px 16px 16px;
-                background: {t.surface};
-            }}
-            QGroupBox::title {{
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 12px;
-                font-size: 14px;
-                font-weight: bold;
-                color: {t.text_secondary};
-                letter-spacing: 0.3px;
-                background: transparent;
-            }}
-        """)
+        _set_role(gb, "page")
         lay = QVBoxLayout(gb)
         lay.setContentsMargins(8, 16, 8, 12)
         # Each setting is a self-contained block that carries its own vertical
@@ -3437,15 +3448,11 @@ class SettingsPanel(QWidget):
         self._group_boxes.append(gb)
         return gb
 
-    # Every setting's control sits in a fixed-width, right-aligned cell so the
-    # column has one left edge and one right edge. Without it a 260px combo, a
-    # 194px slider and a 22px checkbox each started at a different x, which is
-    # most of what read as "uneven".
-    #
-    # 240 rather than the 260 the widest combo asks for: at 260 the settings
-    # page needed 772px inside a 770px viewport and grew a horizontal
-    # scrollbar. Controls are capped to the column so none can overflow it.
+    # Kept for source compatibility with older extensions/tests. It is now a
+    # preferred width, not a rigid column: rows grow in wide mode and stack in
+    # compact mode when measured content cannot fit.
     CONTROL_COL_W = 240
+    SETTINGS_COMPACT_W = 720
 
     def _add_setting(self, parent_layout: QVBoxLayout, key: str, title: str, control: QWidget, description: str, resetter):
         """Add one setting: name + control on a row, description beneath.
@@ -3463,74 +3470,90 @@ class SettingsPanel(QWidget):
         """
         # --- Name label (floating, no border) ---
         name = QLabel(title)
-        name.setFont(ui_font(15, QFont.DemiBold))
-        name.setStyleSheet("border: none; background: transparent; padding: 0;")
+        name.setFont(ui_font(D.FONT_SUBHEAD, QFont.DemiBold))
         self._name_labels.append(name)
 
         # --- Reset button (minimal, circular) ---
         reset_btn = QPushButton("↺")
         reset_btn.setFixedSize(D.CONTROL_MD, D.CONTROL_MD)
         reset_btn.setCursor(Qt.PointingHandCursor)
-        reset_btn.setToolTip("Reset to default")
-        reset_btn.setStyleSheet("""
-            QPushButton {
-                border: none;
-                border-radius: 16px;
-                background: transparent;
-                font-size: 14px;
-                font-weight: bold;
-                padding: 0px;
-            }
-            QPushButton:hover {
-                background: rgba(10, 110, 234, 0.2);
-            }
-        """)
+        reset_btn.setToolTip(f"Reset {title} to default")
+        reset_btn.setAccessibleName(f"Reset {title} to default")
+        reset_btn.setProperty("class", "reset-btn")
+        _set_role(reset_btn, "icon")
         reset_btn.clicked.connect(resetter)
         self._reset_buttons.append(reset_btn)
 
-        # --- Control cell: fixed width, contents right-aligned and centred ---
-        control.setMaximumWidth(self.CONTROL_COL_W)
+        # --- Responsive control cell ---
+        control.setSizePolicy(QSizePolicy.Expanding, control.sizePolicy().verticalPolicy())
+        control.setAccessibleName(control.accessibleName() or title)
+        name.setBuddy(control)
         cell = QWidget()
-        cell.setFixedWidth(self.CONTROL_COL_W)
-        cell.setStyleSheet("border: none; background: transparent;")
+        cell.setMinimumWidth(180)
+        cell.setMaximumWidth(360)
+        cell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         cell_lay = QHBoxLayout(cell)
         cell_lay.setContentsMargins(0, 0, 0, 0)
         cell_lay.setSpacing(0)
-        cell_lay.addStretch(1)
-        cell_lay.addWidget(control, 0, Qt.AlignVCenter)
-
-        # --- Row: name + stretch + control cell + reset ---
-        row = QWidget()
-        row.setStyleSheet("border: none; background: transparent;")
-        row_lay = QHBoxLayout(row)
-        row_lay.setContentsMargins(0, 0, 0, 0)
-        row_lay.setSpacing(12)
-        row_lay.addWidget(name, 0, Qt.AlignVCenter)
-        row_lay.addStretch(1)
-        row_lay.addWidget(cell, 0, Qt.AlignVCenter)
-        row_lay.addWidget(reset_btn, 0, Qt.AlignVCenter)
+        cell_lay.addWidget(control, 1, Qt.AlignVCenter)
 
         # --- Description (floating text, subdued) ---
         desc = QLabel(description)
         desc.setWordWrap(True)
-        desc.setFont(ui_font(11))
-        desc.setStyleSheet("border: none; background: transparent; padding: 0;")
+        desc.setFont(ui_font(D.FONT_SMALL))
+        _set_role(desc, "muted")
         self._desc_labels.append(desc)
 
         # --- One block per setting ---
         block = QWidget()
-        block.setStyleSheet("border: none; background: transparent;")
-        block_lay = QVBoxLayout(block)
-        # Generous outside, tight inside: that ratio is what makes the name,
-        # its control and its description read as one thing. Measured, not
-        # guessed — name-to-own-description ~17px against ~38px to the next
-        # setting, where the two used to be 8px and 12px apart.
+        block_lay = QGridLayout(block)
         block_lay.setContentsMargins(0, D.SPACE_3, 0, D.SPACE_3)
-        block_lay.setSpacing(2)
-        block_lay.addWidget(row)
-        block_lay.addWidget(desc)
+        block_lay.setHorizontalSpacing(D.SPACE_3)
+        block_lay.setVerticalSpacing(D.SPACE_1)
+        block_lay.addWidget(name, 0, 0, Qt.AlignVCenter)
+        block_lay.addWidget(cell, 0, 1, Qt.AlignVCenter)
+        block_lay.addWidget(reset_btn, 0, 2, Qt.AlignVCenter)
+        block_lay.addWidget(desc, 1, 0, 1, 3)
+        block_lay.setColumnStretch(0, 1)
+        block_lay.setColumnStretch(1, 1)
+        self._setting_rows.append((block_lay, name, cell, reset_btn, desc))
 
         parent_layout.addWidget(block)
+        self._settings_compact = None
+        self._apply_settings_layout(self.width())
+
+    def _apply_settings_layout(self, width: int):
+        compact = width < self.SETTINGS_COMPACT_W
+        if compact == self._settings_compact:
+            return
+        self._settings_compact = compact
+        for grid, name, cell, reset_btn, desc in self._setting_rows:
+            for widget in (name, cell, reset_btn, desc):
+                grid.removeWidget(widget)
+            if compact:
+                cell.setMinimumWidth(0)
+                cell.setMaximumWidth(16777215)
+                grid.addWidget(name, 0, 0, Qt.AlignVCenter)
+                grid.addWidget(reset_btn, 0, 1, Qt.AlignRight | Qt.AlignVCenter)
+                grid.addWidget(cell, 1, 0, 1, 2)
+                grid.addWidget(desc, 2, 0, 1, 2)
+                grid.setColumnStretch(0, 1)
+                grid.setColumnStretch(1, 0)
+            else:
+                cell.setMinimumWidth(180)
+                cell.setMaximumWidth(360)
+                grid.addWidget(name, 0, 0, Qt.AlignVCenter)
+                grid.addWidget(cell, 0, 1, Qt.AlignVCenter)
+                grid.addWidget(reset_btn, 0, 2, Qt.AlignVCenter)
+                grid.addWidget(desc, 1, 0, 1, 3)
+                grid.setColumnStretch(0, 1)
+                grid.setColumnStretch(1, 1)
+                grid.setColumnStretch(2, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        viewport_width = self._scroll.viewport().width() if hasattr(self, "_scroll") else self.width()
+        self._apply_settings_layout(viewport_width)
 
     def _wrap_slider_with_value(self, slider: QSlider, value_label: QLabel) -> QWidget:
         w = QWidget()
@@ -3705,11 +3728,11 @@ class SettingsPanel(QWidget):
         """Toggle between simple and advanced settings view."""
         self._advanced_mode = not self._advanced_mode
         if self._advanced_mode:
-            self._simple_mode_btn.setText("\u25B2  Hide Advanced Settings")
+            self._simple_mode_btn.setText("Hide Advanced Settings")
             for group in self._advanced_groups:
                 group.show()
         else:
-            self._simple_mode_btn.setText("\u25BC  Show Advanced Settings")
+            self._simple_mode_btn.setText("Show Advanced Settings")
             for group in self._advanced_groups:
                 group.hide()
 
@@ -3792,8 +3815,7 @@ class ChecksPanel(QWidget):
 
         header_row = QHBoxLayout()
         self._header = QLabel("Checks")
-        self._header.setStyleSheet(
-            f"color: {t.text_primary}; font-size: 20px; font-weight: bold; letter-spacing: -0.5px;")
+        _set_role(self._header, "heading")
         header_row.addWidget(self._header)
         header_row.addStretch()
 
@@ -3806,10 +3828,12 @@ class ChecksPanel(QWidget):
             "Every scanned file against every check. Columns with red are failing "
             "across the batch \u2014 usually a wrong preset rather than bad footage."
         )
+        _set_role(self._subtitle, "muted")
         self._subtitle.setWordWrap(True)
         layout.addWidget(self._subtitle)
 
         self._empty = QLabel("No scans yet.\n\nRun a scan and the matrix will appear here.")
+        _set_role(self._empty, "muted")
         self._empty.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._empty, 1)
 
@@ -3817,6 +3841,10 @@ class ChecksPanel(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(D.table_row_height(self.table.font()))
+        self.table.setAccessibleName("Checks matrix")
+        self.table.setAccessibleDescription(
+            "Each row is a file and each following column is a QA check. Double-click a cell for details.")
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setWordWrap(False)
         self.table.cellDoubleClicked.connect(self._on_cell_activated)
@@ -3864,23 +3892,32 @@ class ChecksPanel(QWidget):
         self.table.setRowCount(len(self._results))
 
         header = self.table.horizontalHeader()
+        header.setFixedHeight(D.table_header_height(header.font(), lines=2))
         header.setSectionResizeMode(0, QHeaderView.Interactive)
-        self.table.setColumnWidth(0, 260)
-        # Size each check column to its own header. A flat 104px clipped the
-        # longer names ("Black Frames" needs 156px), and a truncated column
-        # header in a matrix makes the whole grid unreadable - you cannot tell
-        # which check a red cell belongs to.
-        metrics = QFontMetrics(self.table.font())
+        file_width = max(180, min(360, self.table.viewport().width() // 3))
+        self.table.setColumnWidth(0, file_width)
+        metrics = QFontMetrics(header.font())
         for col, name in enumerate(columns, start=1):
             title = self._column_title(name, fail_counts[name])
             needed = max(metrics.horizontalAdvance(line) for line in title.split("\n"))
             header.setSectionResizeMode(col, QHeaderView.Fixed)
-            self.table.setColumnWidth(col, max(96, needed + 24))
+            self.table.setColumnWidth(col, max(96, min(220, needed + 2 * D.SPACE_3)))
+            header_item = self.table.horizontalHeaderItem(col)
+            header_item.setToolTip(name)
+            header_item.setData(Qt.AccessibleTextRole, name)
+            failures = fail_counts[name]
+            header_item.setData(
+                Qt.AccessibleDescriptionRole,
+                f"{name}: {failures} {'failure' if failures == 1 else 'failures'}")
+        file_header = self.table.horizontalHeaderItem(0)
+        file_header.setData(Qt.AccessibleTextRole, "File")
 
         for row, r in enumerate(self._results):
             status = _result_status(r)
             name_item = QTableWidgetItem(r.filename)
             name_item.setToolTip(r.filepath)
+            name_item.setData(Qt.AccessibleTextRole, r.filename)
+            name_item.setData(Qt.AccessibleDescriptionRole, r.filepath)
             if status == "MISMATCH":
                 name_item.setFont(ui_font(10, QFont.Bold))
                 name_item.setForeground(QColor(t.status_fail))
@@ -3916,7 +3953,10 @@ class ChecksPanel(QWidget):
     def _column_title(name: str, fail_count: int) -> str:
         # Keep headers narrow; the failing count is the signal worth surfacing.
         short = name.replace("Container ", "").replace("Audio ", "Aud ")
-        return f"{short}\n{fail_count} fail" if fail_count else short
+        if not fail_count:
+            return short
+        label = "failure" if fail_count == 1 else "failures"
+        return f"{short}\n{fail_count} {label}"
 
     def clear(self):
         self.set_results([])
@@ -3936,10 +3976,9 @@ class ChecksPanel(QWidget):
         )
 
     def apply_theme(self, t: ThemeColors):
-        self._header.setStyleSheet(
-            f"color: {t.text_primary}; font-size: 20px; font-weight: bold; letter-spacing: -0.5px;")
-        self._subtitle.setStyleSheet(f"color: {t.text_secondary}; font-size: 12px;")
-        self._empty.setStyleSheet(f"color: {t.text_tertiary}; font-size: 14px;")
+        _set_role(self._header, "heading")
+        _set_role(self._subtitle, "muted")
+        _set_role(self._empty, "muted")
         self._update_legend(t)
         if self._results:
             self.set_results(self._results)
@@ -3965,28 +4004,36 @@ class WatchFolderPanel(QWidget):
             monitor.error.connect(self._on_error)
     
     def _init_ui(self):
-        from frameguard.theme import get_theme
-        t = get_theme()
-        
-        layout = QVBoxLayout(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self._scroll = QScrollArea(self)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._content = QWidget()
+        self._responsive_content = self._content
+        self._scroll.setWidget(self._content)
+        root.addWidget(self._scroll)
+
+        layout = QVBoxLayout(self._content)
         layout.setContentsMargins(D.SPACE_6, D.SPACE_5, D.SPACE_6, D.SPACE_5)
-        layout.setSpacing(20)
+        layout.setSpacing(D.SPACE_4)
         
         # Header
         header = QLabel("Watch Folder")
-        header.setStyleSheet(f"color: {t.text_primary}; font-size: 20px; font-weight: bold; letter-spacing: -0.5px; border: none;")
+        _set_role(header, "heading")
         layout.addWidget(header)
         
         subtitle = QLabel("Automatically scan new video files as they appear in a folder")
+        _set_role(subtitle, "muted")
         subtitle.setWordWrap(True)
-        subtitle.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px; border: none;")
         layout.addWidget(subtitle)
         
         layout.addSpacing(12)
         
         # Enable toggle
         self._enable_check = QCheckBox("Enable auto-scan")
-        self._enable_check.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; spacing: 10px;")
         self._enable_check.toggled.connect(self._on_toggle)
         layout.addWidget(self._enable_check)
         
@@ -3994,7 +4041,6 @@ class WatchFolderPanel(QWidget):
         self._auto_export_check = QCheckBox("Auto-export PDF report after scan")
         self._auto_export_check.setToolTip("Automatically saves a PDF to Documents/FrameGuard when a scan completes")
         self._auto_export_check.setChecked(False)
-        self._auto_export_check.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; spacing: 10px;")
         layout.addWidget(self._auto_export_check)
         
         # Launch at login (Windows Run key / macOS LaunchAgent)
@@ -4005,7 +4051,6 @@ class WatchFolderPanel(QWidget):
         self._startup_check.setToolTip("Launch FrameGuard automatically when you log in")
         self._startup_check.setChecked(self._is_startup_enabled())
         self._startup_check.toggled.connect(self._toggle_startup)
-        self._startup_check.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; spacing: 10px;")
         self._startup_check.setEnabled(sys.platform in ("win32", "darwin"))
         layout.addWidget(self._startup_check)
         
@@ -4016,19 +4061,19 @@ class WatchFolderPanel(QWidget):
         path_group.setSpacing(8)
         
         self._path_label = QLabel("No folder selected")
-        self._path_label.setStyleSheet(
-            f"color: {t.text_secondary}; font-size: 14px; padding: 8px 12px; "
-            f"background: {t.bg_tertiary}; border-radius: 6px; border: none;"
-        )
+        _set_role(self._path_label, "status")
+        self._path_label.setMargin(D.SPACE_2)
         path_group.addWidget(self._path_label, 1)
         
         self._browse_btn = QPushButton("Browse...")
+        _set_role(self._browse_btn, "secondary")
         self._browse_btn.setMinimumWidth(D.SPACE_6 * 4)  # label needs ~131px
         self._browse_btn.setFixedHeight(D.CONTROL_MD)
         self._browse_btn.clicked.connect(self._browse)
         path_group.addWidget(self._browse_btn)
         
         self._sync_btn = QPushButton("⟳ Sync")
+        _set_role(self._sync_btn, "secondary")
         self._sync_btn.setMinimumWidth(D.SPACE_6 * 3)   # label needs ~92px
         self._sync_btn.setFixedHeight(D.CONTROL_MD)
         self._sync_btn.setToolTip("Re-scan folder to pick up any missed files")
@@ -4042,6 +4087,7 @@ class WatchFolderPanel(QWidget):
         # at a folder that already has content and seeing nothing happen is the
         # most common confusion, so make the opt-in explicit.
         self._backlog_btn = QPushButton("Scan files already in this folder")
+        _set_role(self._backlog_btn, "secondary")
         self._backlog_btn.setFixedHeight(D.CONTROL_MD)
         self._backlog_btn.setToolTip(
             "Watching only picks up files that arrive after it starts.\n"
@@ -4054,19 +4100,17 @@ class WatchFolderPanel(QWidget):
         layout.addSpacing(16)
         
         self._status_label = QLabel("Status: Inactive")
-        self._status_label.setStyleSheet(
-            f"color: {t.text_secondary}; font-size: 14px; font-style: italic; border: none;"
-        )
+        _set_role(self._status_label, "muted")
         layout.addWidget(self._status_label)
         
-        # Activity log
-        self._log = QLabel("No activity yet")
-        self._log.setStyleSheet(
-            f"color: {t.text_tertiary}; font-size: 12px; padding: 12px; "
-            f"background: {t.bg_tertiary}; border-radius: 6px; border: none;"
-        )
-        self._log.setWordWrap(True)
-        self._log.setMinimumHeight(80)
+        # Bounded activity log: long-running watch sessions remain readable
+        # without making the whole page grow indefinitely.
+        self._log = QPlainTextEdit("No activity yet")
+        self._log.setReadOnly(True)
+        self._log.setAccessibleName("Watch folder activity log")
+        self._log.setMinimumHeight(112)
+        self._log.setMaximumHeight(200)
+        self._log.document().setMaximumBlockCount(80)
         layout.addWidget(self._log)
         
         layout.addStretch()
@@ -4075,7 +4119,7 @@ class WatchFolderPanel(QWidget):
         info = QLabel("Files are scanned using the profile selected on the Scan page.\n"
                       "New files are detected via polling (works on all drives).\n"
                       "Use Sync to manually pick up any files missed during batch placement.")
-        info.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; border: none;")
+        _set_role(info, "muted")
         info.setWordWrap(True)
         layout.addWidget(info)
     
@@ -4136,7 +4180,7 @@ class WatchFolderPanel(QWidget):
             # Folder is gone (unplugged drive, deleted share). Don't silently
             # resume against nothing.
             if path:
-                self._log.setText(
+                self._log.setPlainText(
                     f"Previous watch folder is unavailable:\n{path}")
             return
 
@@ -4185,42 +4229,18 @@ class WatchFolderPanel(QWidget):
         names = ", ".join(os.path.basename(f) for f in files[:3])
         if count > 3:
             names += f" (+{count-3} more)"
-        self._log.setText(f"Detected {count} new file(s):\n{names}")
+        self._log.setPlainText(f"Detected {count} new file(s):\n{names}")
         self.scan_files.emit(files)
     
     def _on_error(self, msg: str):
         self._status_label.setText(f"Status: Error - {msg}")
     
-    def apply_theme(self, t):
-        """Update all panel widgets to match the new theme."""
-        # Header
-        for child in self.findChildren(QLabel):
-            style = child.styleSheet()
-            if 'font-size: 20px' in style:
-                child.setStyleSheet(f"color: {t.text_primary}; font-size: 20px; font-weight: bold; border: none;")
-            elif 'font-size: 14px' in style and 'italic' not in style:
-                child.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px; border: none;")
-            elif 'italic' in style:
-                child.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px; font-style: italic; border: none;")
-            elif 'font-size: 12px' in style or 'background' in style:
-                child.setStyleSheet(
-                    f"color: {t.text_tertiary}; font-size: 12px; padding: 12px; "
-                    f"background: {t.bg_tertiary}; border-radius: 6px; border: none;"
-                )
-            elif 'font-size: 11px' in style:
-                child.setStyleSheet(f"color: {t.text_tertiary}; font-size: 11px; border: none;")
-            elif 'padding: 8px' in style: child.setStyleSheet( f"color: {t.text_secondary}; font-size: 14px; padding: 8px 12px; "
-                    f"background: {t.bg_tertiary}; border-radius: 6px; border: none;"
-                )
-        
-        # Checkbox
-        if hasattr(self, '_enable_check'):
-            self._enable_check.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; spacing: 10px;")
-        
-        # Browse button uses app-level stylesheet (no inline override needed)rent
-
-
-
+    def apply_theme(self, _theme):
+        """Refresh semantic selectors after the application theme changes."""
+        for widget in (self._content, self._path_label, self._status_label):
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+            widget.update()
 
     # r"...\\..." would be a LITERAL double backslash and every OpenKey fails
     # silently, which is why "Start with Windows" never did anything.
@@ -4317,9 +4337,15 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
 
+        self._startup_theme_name, self._theme_is_explicit = resolve_startup_theme()
+        set_current_theme(self._startup_theme_name)
+        _apply_application_palette(get_theme(self._startup_theme_name))
+
         self.setWindowTitle(f"FrameGuard Desktop v{APP_VERSION}")
-        self.setMinimumSize(1000, 700)
-        self.resize(1200, 800)
+        available = _active_available_geometry()
+        # Keep the window recoverable on compact or changed monitor layouts.
+        # The preferred first-open size remains 1200x800 in _restore_window_state.
+        self.setMinimumSize(min(480, available.width()), min(320, available.height()))
 
         # Frameless window with a custom title bar on Windows, where we also
         # reimplement Aero Snap via WM_NCHITTEST. On macOS the same flag would
@@ -4376,11 +4402,11 @@ class MainWindow(QMainWindow):
         self._sidebar_logo_label = None
         self._sidebar_logo_small = None
 
-        # Ensure Documents/FrameGuard folder exists for PDF exports
+        # Keep the preferred output path side-effect free. The directory is
+        # created only when an export/report operation actually writes there.
         self._docs_folder = os.path.join(
             os.path.expanduser("~"), "Documents", "FrameGuard"
         )
-        os.makedirs(self._docs_folder, exist_ok=True)
 
         self._init_ui()
         # The ffmpeg -version probe spawns two subprocesses; on a slow or
@@ -4396,18 +4422,14 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.watch_panel.restore_watch_settings)
         self._sync_preset_from_settings()
 
-        # Apply persisted theme on startup
-        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        saved_theme = settings.value("theme", "Meta Dark")
-        if saved_theme in THEMES:
-            # Always route through _apply_theme, even for the default: it also
-            # syncs the Settings panel's selected-theme highlight and the tray
-            # icon tint. Skipping it left the panel showing "Meta Dark" while
-            # the app rendered something else, making that button a no-op.
-            self._apply_theme(saved_theme)
+        # Route startup through the full cascade without turning an automatic
+        # OS mapping into an explicit preference.
+        self._apply_theme(self._startup_theme_name, persist=False)
+        self._restore_window_state()
 
     def _init_ui(self):
         central = QWidget()
+        _set_role(central, "page")
         self.setCentralWidget(central)
 
         # Outer layout: title bar on top, content below
@@ -4415,24 +4437,23 @@ class MainWindow(QMainWindow):
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
 
-        # Custom title bar (Windows only — macOS uses its native titlebar).
-        # Still constructed on macOS so theme cascades and the icon-update path
-        # don't need platform branches everywhere; it just isn't shown.
-        self._title_bar = TitleBar(self)
-        self._title_bar.setVisible(USE_CUSTOM_CHROME)
-        outer_layout.addWidget(self._title_bar)
+        # Custom title bar exists only on Windows. Native macOS chrome meets
+        # the first application surface directly, with no hidden placeholder.
+        self._title_bar = TitleBar(self) if USE_CUSTOM_CHROME else None
+        if self._title_bar is not None:
+            outer_layout.addWidget(self._title_bar)
 
         # Content row: sidebar + toggle + stack
         content_row = QWidget()
+        _set_role(content_row, "page")
         main_layout = QHBoxLayout(content_row)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        t = get_theme()
-
         # ---- Sidebar ----
         self._sidebar = QWidget()
         self._sidebar.setObjectName("sidebar")
+        _set_role(self._sidebar, "sidebar")
         self._sidebar.setMinimumWidth(0)
         self._sidebar.setMaximumWidth(200)
         self._sidebar_expanded_width = 200
@@ -4481,7 +4502,6 @@ class MainWindow(QMainWindow):
         # Everything below the banner keeps the 8px gutter that makes each nav
         # row read as an inset pill.
         sidebar_body = QWidget()
-        sidebar_body.setStyleSheet("background: transparent; border: none;")
         body_layout = QVBoxLayout(sidebar_body)
         body_layout.setContentsMargins(D.SPACE_2, D.SPACE_1, D.SPACE_2, D.SPACE_0)
         body_layout.setSpacing(D.SPACE_1)
@@ -4498,7 +4518,7 @@ class MainWindow(QMainWindow):
             btn = QPushButton(f"   {label}")
             btn.setProperty("active", idx == 0)
             btn.setIconSize(QSize(20, 20))
-            btn.setMinimumHeight(D.CONTROL_LG)
+            btn.setFixedHeight(D.CONTROL_LG)
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda checked, i=idx: self._switch_panel(i))
             body_layout.addWidget(btn)
@@ -4530,21 +4550,17 @@ class MainWindow(QMainWindow):
             pix = self._logo_pixmap_original.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self._sidebar_logo_label.setPixmap(pix)
         self._sidebar_logo_label.setAlignment(Qt.AlignCenter)
-        self._sidebar_logo_label.setStyleSheet("padding: 0px; border: none;")
         sidebar_bottom.addWidget(self._sidebar_logo_label)
 
         self._dss_label = QLabel("DSS-2 Compliant")
-        self._dss_label.setStyleSheet(
-            f"color: {t.text_secondary}; font-size: 10px; padding: 4px 8px; "
-            f"border: 1px solid {t.border}; border-radius: 4px;"
-        )
+        self._dss_label.setFont(D.ui_font(D.FONT_CAPTION))
+        _set_role(self._dss_label, "status")
         self._dss_label.setAlignment(Qt.AlignCenter)
         sidebar_bottom.addWidget(self._dss_label)
 
         self._version_footer = QLabel(f"v{APP_VERSION}")
-        self._version_footer.setStyleSheet(
-            f"color: {t.text_tertiary}; font-size: 9px; padding: 0px;"
-        )
+        self._version_footer.setFont(D.ui_font(D.FONT_CAPTION))
+        _set_role(self._version_footer, "muted")
         self._version_footer.setAlignment(Qt.AlignCenter)
         sidebar_bottom.addWidget(self._version_footer)
 
@@ -4552,8 +4568,7 @@ class MainWindow(QMainWindow):
 
         # Sidebar toggle button (hamburger icon)
         self._toggle_container = QWidget()
-        self._toggle_container.setFixedWidth(24)
-        self._toggle_container.setStyleSheet("background: transparent; border: none;")
+        self._toggle_container.setFixedWidth(D.ICON_BTN)
         toggle_layout = QVBoxLayout(self._toggle_container)
         toggle_layout.setContentsMargins(0, 8, 0, 0)
         toggle_layout.setSpacing(0)
@@ -4561,11 +4576,8 @@ class MainWindow(QMainWindow):
         self._sidebar_toggle_btn = QPushButton("\u25C0")  # left arrow = collapse
         self._sidebar_toggle_btn.setFixedSize(D.SPACE_5, D.CONTROL_SM)
         self._sidebar_toggle_btn.setToolTip("Toggle sidebar")
-        self._sidebar_toggle_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {t.text_secondary}; "
-            f"font-size: 16px; padding: 0px; }}"
-            f"QPushButton:hover {{ color: {t.accent}; }}"
-        )
+        self._sidebar_toggle_btn.setAccessibleName("Hide sidebar")
+        _set_role(self._sidebar_toggle_btn, "icon")
         self._sidebar_toggle_btn.clicked.connect(self._toggle_sidebar)
         toggle_layout.addWidget(self._sidebar_toggle_btn)
         toggle_layout.addStretch()
@@ -4681,7 +4693,8 @@ class MainWindow(QMainWindow):
 
 
 
-        self.settings_panel.theme_changed.connect(self._apply_theme)
+        self.settings_panel.theme_changed.connect(
+            lambda name: self._apply_theme(name, persist=True))
         self.settings_panel.preset_imported.connect(self._on_preset_imported)
         self.settings_panel.install_update_requested.connect(self._confirm_install_update)
         self.settings_panel.report_problem_requested.connect(self._report_problem)
@@ -4696,7 +4709,8 @@ class MainWindow(QMainWindow):
 
         # Resize grip, bottom-right. Only needed with custom chrome; macOS
         # resizes from any edge natively and the grip looks foreign there.
-        self._size_grip = QSizeGrip(self)
+        self._size_grip = QSizeGrip(central)
+        self._size_grip.setProperty("fgInlineStyleAllowed", True)
         self._size_grip.setFixedSize(16, 16)
         self._size_grip.setStyleSheet("background: transparent; border: none;")
         self._size_grip.setVisible(USE_CUSTOM_CHROME)
@@ -4707,7 +4721,42 @@ class MainWindow(QMainWindow):
         elif os.path.isfile(_LOGO_PATH):
             self.setWindowIcon(QIcon(_LOGO_PATH))
 
+        self._assign_semantic_roles()
 
+    def _assign_semantic_roles(self):
+        """Give every application-owned control a stable semantic selector."""
+        primary_words = ("start scan", "export pdf", "install update")
+        destructive_words = ("clear results",)
+        icon_texts = {"", "\u22ef", "\u25c0", "\u25b6", "\u21ba", "\u2013", "\u25a1", "\u2752", "\u2715"}
+        for button in self.findChildren(QPushButton):
+            if button.property("fgRole") is None:
+                text = button.text().strip().lower()
+                name = button.objectName()
+                if name == "primary_btn" or any(word in text for word in primary_words):
+                    role = "primary"
+                elif name == "title_btn_close" or any(word in text for word in destructive_words):
+                    role = "destructive"
+                elif button.text().strip() in icon_texts or name == "title_btn":
+                    role = "icon"
+                elif button in getattr(self, "nav_buttons", ()):
+                    role = "toolbar"
+                elif name == "advToggleBtn":
+                    role = "quiet"
+                else:
+                    role = "secondary"
+                _set_role(button, role)
+            if not button.accessibleName():
+                label = button.text().strip() or button.toolTip().strip()
+                if label:
+                    button.setAccessibleName(label.replace("&", ""))
+
+        headings = {"Scan Files", "Results", "Checks", "Watch Folder"}
+        for label in self.findChildren(QLabel):
+            if label.property("fgRole") is None:
+                if label.text() in headings or label.property("class") == "section-header":
+                    _set_role(label, "heading")
+                elif label.property("class") in ("section-subtitle", "hint", "field-label"):
+                    _set_role(label, "muted")
 
     def _refresh_nav_icons(self, theme=None):
         """Re-render the sidebar icons in the current theme colour.
@@ -4733,6 +4782,10 @@ class MainWindow(QMainWindow):
     def _toggle_sidebar(self):
         """Smoothly collapse/expand the entire sidebar widget to/from 0 width."""
         self._sidebar_collapsed = not self._sidebar_collapsed
+        for animation_name in ("_sidebar_anim", "_sidebar_anim2"):
+            animation = getattr(self, animation_name, None)
+            if animation is not None:
+                animation.stop()
 
         start_w = self._sidebar.width()
         end_w = 0 if self._sidebar_collapsed else self._sidebar_expanded_width
@@ -4831,10 +4884,13 @@ class MainWindow(QMainWindow):
                 combo.setCurrentIndex(i)
                 break
 
-    def _apply_theme(self, theme_name: str):
-        """Apply a new color theme live to every visible pixel, recolor logo, persist."""
+    def _apply_theme(self, theme_name: str, persist: bool = False):
+        """Apply a theme; persist only an explicit Settings-page choice."""
+        if theme_name not in THEMES:
+            theme_name, _ = resolve_startup_theme()
         set_current_theme(theme_name)
         theme = get_theme(theme_name)
+        _apply_application_palette(theme)
         stylesheet = generate_stylesheet(theme)
         QApplication.instance().setStyleSheet(stylesheet)
 
@@ -4853,22 +4909,13 @@ class MainWindow(QMainWindow):
                 pix = tinted.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self._sidebar_logo_label.setPixmap(pix)
 
-        # === Sidebar inline styles ===
-        self._dss_label.setStyleSheet(
-            f"color: {t.text_secondary}; font-size: 10px; padding: 4px 8px; "
-            f"border: 1px solid {t.border}; border-radius: 4px;"
-        )
-        self._version_footer.setStyleSheet(
-            f"color: {t.text_tertiary}; font-size: 9px; padding: 0px;"
-        )
-        self._sidebar_toggle_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; border: none; color: {t.text_secondary}; "
-            f"font-size: 16px; padding: 0px; }}"
-            f"QPushButton:hover {{ color: {t.accent}; }}"
-        )
+        _set_role(self._dss_label, "status")
+        _set_role(self._version_footer, "muted")
+        _set_role(self._sidebar_toggle_btn, "icon")
 
         # === Cascade to title bar and all panels ===
-        self._title_bar.apply_theme(t)
+        if self._title_bar is not None:
+            self._title_bar.apply_theme(t)
         self.scan_panel.apply_theme(t)
         self.results_panel.apply_theme(t)
         self.checks_panel.apply_theme(t)
@@ -4881,10 +4928,11 @@ class MainWindow(QMainWindow):
         self.settings_panel._current_theme_name = theme_name
         self.settings_panel._highlight_active_theme(theme_name)
 
-        # === Persist theme choice ===
-        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        settings.setValue("theme", theme_name)
-
+        if persist:
+            settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+            settings.setValue(_THEME_KEY, theme_name)
+            settings.remove(_LEGACY_THEME_KEY)
+            self._theme_is_explicit = True
 
         # Force theme colors on all QComboBox popups (Windows fix)
         from PySide6.QtWidgets import QComboBox
@@ -4893,7 +4941,8 @@ class MainWindow(QMainWindow):
 
         # Recolor everything the OS draws for us, plus the tray badge.
         self._apply_window_chrome_theme(t)
-        self._title_bar.set_icon_pixmap(self._themed_app_pixmap(t, 32))
+        if self._title_bar is not None:
+            self._title_bar.set_icon_pixmap(self._themed_app_pixmap(t, 32))
         self.setWindowIcon(QIcon(self._themed_app_pixmap(t, 64)))
         self._update_tray_icon_theme(t)
 
@@ -4902,6 +4951,57 @@ class MainWindow(QMainWindow):
         from frameguard import icons as _icons
         _icons.clear_cache()
         self._refresh_nav_icons(t)
+
+    def _on_system_color_scheme_changed(self, scheme):
+        """Follow runtime OS appearance changes until the user picks a theme."""
+        if self._theme_is_explicit:
+            return
+        dark = scheme == Qt.ColorScheme.Dark
+        light = scheme == Qt.ColorScheme.Light
+        if not (dark or light):
+            dark = _os_prefers_dark()
+        name = _DEFAULT_DARK_THEME if dark else _DEFAULT_LIGHT_THEME
+        self._startup_theme_name = name
+        self._apply_theme(name, persist=False)
+
+    def _restore_window_state(self):
+        """Restore a visible normal geometry and the Results splitter state."""
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        saved = settings.value(_WINDOW_GEOMETRY_KEY)
+        rect = saved if isinstance(saved, QRect) and saved.isValid() else None
+        if rect is not None:
+            available = _best_available_geometry(rect)
+            if available is not None:
+                self.setGeometry(_clamp_window_rect(rect, available))
+            else:
+                self.setGeometry(D.screen_safe_geometry(
+                    QSize(1200, 800), _active_available_geometry(),
+                    QSize(1000, 700), margin=0))
+        else:
+            self.setGeometry(D.screen_safe_geometry(
+                QSize(1200, 800), _active_available_geometry(),
+                QSize(1000, 700), margin=0))
+
+        splitter_state = settings.value(_RESULTS_SPLITTER_KEY)
+        if splitter_state and hasattr(self.results_panel, "_splitter"):
+            try:
+                self.results_panel._splitter.restoreState(splitter_state)
+            except (TypeError, RuntimeError):
+                pass
+
+    def _save_window_state(self):
+        """Persist only the restored geometry, never a maximized frame."""
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        rect = self.normalGeometry() if self.isMaximized() or self.isFullScreen() else self.geometry()
+        available = _best_available_geometry(rect)
+        if available is not None:
+            settings.setValue(_WINDOW_GEOMETRY_KEY, _clamp_window_rect(rect, available))
+        if hasattr(self.results_panel, "_splitter"):
+            settings.setValue(_RESULTS_SPLITTER_KEY, self.results_panel._splitter.saveState())
+
+    def _ensure_output_directory(self) -> str:
+        os.makedirs(self._docs_folder, exist_ok=True)
+        return self._docs_folder
 
     def _check_ffmpeg(self):
         ok, msg = check_ffmpeg_available()
@@ -5105,8 +5205,13 @@ class MainWindow(QMainWindow):
         if not results:
             return
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        try:
+            output_dir = self._ensure_output_directory()
+        except OSError as error:
+            self._report_idle_status(f"Auto-export failed: {error}")
+            return
         output_path = os.path.join(
-            self._docs_folder,
+            output_dir,
             f"FrameGuard_Report_{timestamp}_{len(results)}files.pdf"
         )
         preset = self.scan_panel.preset_combo.currentText()
@@ -5133,9 +5238,15 @@ class MainWindow(QMainWindow):
         # and self._worker_thread, orphaning the first thread: both then emit
         # into the same slots, interleaving results, double-firing auto-export
         # and double-draining the watch queue.
-        if self._worker_thread is not None and self._worker_thread.isRunning():
-            print("[FrameGuard] Scan already running; ignoring duplicate request.")
-            return
+        if self._worker_thread is not None:
+            if self._worker_thread.isRunning():
+                print("[FrameGuard] Scan already running; ignoring duplicate request.")
+                return
+            # A prior timed-out cleanup may have retained the now-finished
+            # thread deliberately. Dispose it before replacing its owner.
+            self._cleanup_worker()
+
+        # Disk-space preflight
 
         # Disk-space preflight: PDF auto-export and crash logs need headroom.
         # A batch that fills the disk mid-scan used to die with an opaque
@@ -5322,14 +5433,14 @@ class MainWindow(QMainWindow):
         log_text = f"[{timestamp}] Scanned {len(results)} file(s):\n" + "\n".join(entries)
         
         # Prepend to existing log (keep last 10 entries)
-        existing = self.watch_panel._log.text()
+        existing = self.watch_panel._log.toPlainText()
         if existing == "No activity yet":
             existing = ""
         combined = log_text + ("\n\n" + existing if existing else "")
-        # Trim to ~500 chars
-        if len(combined) > 500:
-            combined = combined[:500] + "..."
-        self.watch_panel._log.setText(combined)
+        # Keep the newest activity readable while bounding retained text.
+        if len(combined) > 4000:
+            combined = combined[:4000] + "..."
+        self.watch_panel._log.setPlainText(combined)
 
     def _is_in_background(self) -> bool:
         """True when the user is not looking at the window.
@@ -5393,7 +5504,7 @@ class MainWindow(QMainWindow):
         panel._backlog_btn.setEnabled(False)
 
         note = f"\u26A0 Watching stopped \u2014 folder unavailable: {path}"
-        panel._log.setText(note)
+        panel._log.setPlainText(note)
 
         if self._tray_icon and self._tray_icon.isVisible():
             self._tray_icon.showMessage(
@@ -5427,21 +5538,13 @@ class MainWindow(QMainWindow):
                     pass
             self._worker_thread.quit()
             if not self._worker_thread.wait(8000):
-                # Last resort: the thread is wedged inside a blocking
-                # communicate()/wait() that ignores cancel. Log loudly;
-                # terminate() here can still crash, but hanging forever
-                # is worse than a risky kill at shutdown.
+                # Keep both Python wrappers alive. Dropping the final QThread
+                # owner while Qt is still running it can abort the process, and
+                # clearing the field would also defeat the scan re-entry guard.
+                # closeEvent retries until the worker's bounded subprocess call
+                # returns; a future scan disposes this pair once it is stopped.
                 print("[FrameGuard] WARNING: worker thread did not exit in 8s; "
-                      "leaving it to finish instead of terminate() to avoid crash.")
-                # Do NOT terminate: orphan the thread object rather than
-                # segfault. It will exit when its ffmpeg call times out.
-                self._worker_thread = None
-                if self._worker:
-                    try:
-                        self._worker.deleteLater()
-                    except Exception:
-                        pass
-                    self._worker = None
+                      "retaining it until it finishes.")
                 return
             try:
                 self._worker_thread.deleteLater()
@@ -5466,7 +5569,7 @@ class MainWindow(QMainWindow):
             from PySide6.QtWidgets import QFileDialog
             timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
             default_path = os.path.join(
-                self._docs_folder, f"FrameGuard_Report_{timestamp}.pdf"
+                self._ensure_output_directory(), f"FrameGuard_Report_{timestamp}.pdf"
             )
             output_path, _ = QFileDialog.getSaveFileName(
                 self, "Save PDF Report", default_path, "PDF Files (*.pdf)")
@@ -5474,6 +5577,12 @@ class MainWindow(QMainWindow):
                 return
             if not output_path.lower().endswith(".pdf"):
                 output_path += ".pdf"
+
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        except OSError as error:
+            QMessageBox.warning(self, "Export Failed", str(error))
+            return
 
         if preset_label is None:
             preset_label = self.scan_panel.preset_combo.currentText()
@@ -5556,11 +5665,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_sidebar") and not self._sidebar_collapsed:
             self._sidebar.setMaximumWidth(D.sidebar_width(width))
 
-        # Badge strip. The measured content height is 96px; anything less
-        # clips the count numerals, so this is a floor, not a preference.
         rp = getattr(self, "results_panel", None)
         if rp is not None and hasattr(rp, "_summary_scroll"):
-            rp._summary_scroll.setFixedHeight(104)
+            compact = width < D.BP_NARROW
+            rp._set_summary_compact(compact)
+            rp._set_toolbar_compact(compact)
 
     # --- Window-wide drag & drop -------------------------------------------
     # The Scan page has its own drop zone, but a preset dropped while the user
@@ -5573,8 +5682,21 @@ class MainWindow(QMainWindow):
         return [os.path.normpath(u.toLocalFile())
                 for u in mime.urls() if u.isLocalFile()]
 
+    def keyPressEvent(self, event):
+        if (USE_CUSTOM_CHROME and event.key() == Qt.Key_Space
+                and event.modifiers() & Qt.AltModifier):
+            try:
+                import ctypes
+                ctypes.windll.user32.PostMessageW(
+                    int(self.winId()), 0x0112, 0xF100, ord(" "))
+                event.accept()
+                return
+            except (AttributeError, OSError):
+                pass
+        super().keyPressEvent(event)
+
     def dragEnterEvent(self, event):
-        if self._drag_paths(event.mimeData()):
+        if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -5641,7 +5763,7 @@ class MainWindow(QMainWindow):
                 pos = self.mapFromGlobal(QCursor.pos())
                 x, y = pos.x(), pos.y()
                 w, h = self.width(), self.height()
-                bw = self._BORDER_WIDTH
+                bw = self._resize_border_width()
 
                 # Resize borders are meaningless while maximized.
                 if not self.isMaximized():
@@ -5662,12 +5784,20 @@ class MainWindow(QMainWindow):
                     if y > h - bw:
                         return True, 15  # HTBOTTOM
 
-                if self._title_bar.is_draggable_point(self.mapTo(self, pos)):
-                    return True, 2  # HTCAPTION
+                if self._title_bar is not None:
+                    hit = self._title_bar.hit_test_code(pos)
+                    if hit != 1:
+                        return True, hit
         except Exception:
             pass
 
         return super().nativeEvent(event_type, message)
+
+    def _resize_border_width(self) -> int:
+        """Logical resize hit target derived from the active platform style."""
+        from PySide6.QtWidgets import QStyle
+        metric = self.style().pixelMetric(QStyle.PM_DefaultFrameWidth)
+        return max(self._BORDER_WIDTH, metric + D.SPACE_1)
 
     def _apply_maximize_bounds(self, msg) -> bool:
         """Clamp the maximized size to the monitor work area (taskbar-safe)."""
@@ -5719,8 +5849,16 @@ class MainWindow(QMainWindow):
         Snap, Win+Arrow and double-click all change the window state without
         going through our button, so the glyph would otherwise go stale.
         """
-        if event.type() == QEvent.WindowStateChange and hasattr(self, "_title_bar"):
+        if event.type() == QEvent.WindowStateChange and self._title_bar is not None:
             self._title_bar.sync_maximize_button()
+        elif event.type() in (QEvent.WindowActivate, QEvent.WindowDeactivate):
+            if self._title_bar is not None:
+                self._title_bar.setProperty("active", event.type() == QEvent.WindowActivate)
+                self._title_bar.style().unpolish(self._title_bar)
+                self._title_bar.style().polish(self._title_bar)
+        elif event.type() in (QEvent.FontChange, QEvent.StyleChange):
+            if hasattr(self, "results_panel"):
+                QTimer.singleShot(0, self.results_panel._autosize_metadata_columns)
         super().changeEvent(event)
 
 
@@ -5982,6 +6120,11 @@ class MainWindow(QMainWindow):
                 return (b << 16) | (g << 8) | r  # DWM wants 0x00BBGGRR
 
             dwm = ctypes.windll.dwmapi
+            dark_mode = ctypes.c_int(
+                1 if QColor(theme.bg_primary).lightness() < 128 else 0)
+            dwm.DwmSetWindowAttribute(
+                ctypes.c_void_p(hwnd), ctypes.c_int(20),
+                ctypes.byref(dark_mode), ctypes.sizeof(dark_mode))
             for attribute, color in (
                 (35, theme.bg_secondary),   # DWMWA_CAPTION_COLOR
                 (34, theme.border),         # DWMWA_BORDER_COLOR
@@ -6072,7 +6215,7 @@ class MainWindow(QMainWindow):
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Report a Problem")
-        dlg.resize(640, 520)
+        _fit_dialog_to_screen(dlg, QSize(640, 520), QSize(480, 360))
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(D.SPACE_5, D.SPACE_5, D.SPACE_5, D.SPACE_5)
         layout.setSpacing(D.SPACE_3)
@@ -6104,7 +6247,10 @@ class MainWindow(QMainWindow):
         buttons = QDialogButtonBox()
         copy_btn = buttons.addButton("Copy to Clipboard", QDialogButtonBox.ActionRole)
         save_btn = buttons.addButton("Save to File...", QDialogButtonBox.ActionRole)
-        buttons.addButton(QDialogButtonBox.Close)
+        _set_role(copy_btn, "secondary")
+        _set_role(save_btn, "primary")
+        close_btn = buttons.addButton(QDialogButtonBox.Close)
+        _set_role(close_btn, "quiet")
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
 
@@ -6115,13 +6261,14 @@ class MainWindow(QMainWindow):
 
         def _save():
             default = os.path.join(
-                self._docs_folder,
+                self._ensure_output_directory(),
                 f"FrameGuard_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
             path, _ = QFileDialog.getSaveFileName(
                 dlg, "Save Problem Report", default, "Text Files (*.txt)")
             if not path:
                 return
             try:
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(preview.toPlainText())
                 _reveal_in_file_manager(path)
@@ -6180,6 +6327,7 @@ class MainWindow(QMainWindow):
                 # lose the whole session's configuration.
                 self.settings_panel.save_settings()
                 self.watch_panel.save_watch_settings()
+                self._save_window_state()
                 # Start heartbeat for periodic status updates
                 if hasattr(self, '_tray_heartbeat'):
                     self._tray_heartbeat.start()
@@ -6189,6 +6337,7 @@ class MainWindow(QMainWindow):
         # Full shutdown: stop all services
         self.settings_panel.save_settings()
         self.watch_panel.save_watch_settings()
+        self._save_window_state()
         if hasattr(self, '_watch_monitor') and self._watch_monitor.is_active:
             self._watch_monitor.stop()
         self._cleanup_worker()
@@ -6217,15 +6366,8 @@ class MainWindow(QMainWindow):
 # ============================================================================
 
 def get_saved_theme_name() -> str:
-    """The theme the user last chose, or the default.
-
-    Needed before any window exists: the splash is constructed at startup, and
-    without this it always painted in the default palette no matter which
-    theme the user had selected.
-    """
-    settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-    name = settings.value("theme", "Meta Dark")
-    return name if name in THEMES else "Meta Dark"
+    """Resolve the explicit theme or current OS-mapped first-launch theme."""
+    return resolve_startup_theme()[0]
 
 
 class SplashScreen(QWidget):
@@ -6514,26 +6656,42 @@ class SplashScreen(QWidget):
 
 
 class _FileOpenFilter(QObject):
-    """Routes macOS Apple-Event file opens into MainWindow.open_paths().
+    """Queue macOS Apple-Event file opens until MainWindow is ready.
 
-    Finder does not pass document paths in argv on macOS; it sends
-    kAEOpenDocuments, which Qt delivers to the QApplication as QEvent.FileOpen.
-    Without this, double-clicking a .fg launches FrameGuard with an empty queue
-    and the preset is silently ignored.
+    Finder sends kAEOpenDocuments rather than argv. The collector is installed
+    before the splash processes events so a cold-launch document cannot be
+    consumed before the window exists.
     """
 
-    def __init__(self, window, parent=None):
+    def __init__(self, window=None, parent=None):
         super().__init__(parent)
         self._window = window
+        self._pending_paths = []
+
+    def set_window(self, window):
+        self._window = window
+        if self._pending_paths:
+            pending = self._pending_paths
+            self._pending_paths = []
+            QTimer.singleShot(0, lambda: self._deliver(pending))
+
+    def _deliver(self, paths):
+        if self._window is None or not paths:
+            return
+        self._window.open_paths(paths)
+        self._window.show()
+        self._window.raise_()
+        self._window.activateWindow()
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.FileOpen:
             path = event.file()
             if path and os.path.exists(path):
-                self._window.open_paths([path])
-                self._window.show()
-                self._window.raise_()
-                self._window.activateWindow()
+                if self._window is None:
+                    if path not in self._pending_paths:
+                        self._pending_paths.append(path)
+                else:
+                    self._deliver([path])
                 return True
         return super().eventFilter(obj, event)
 
@@ -6557,13 +6715,25 @@ def main(dev_mode: bool = False):
     app = QApplication(sys.argv)
     app.setApplicationName("FrameGuard Desktop")
 
-    # FrameGuard outlives its main window: closing it while a watch folder is
+    # Install before the splash or any processEvents() call. Finder can deliver
+    # a cold-launch QEvent.FileOpen as soon as QApplication exists.
+    file_open_filter = _FileOpenFilter(parent=app)
+    app.installEventFilter(file_open_filter)
+
+    # FrameGuard outlives its main window:
     # active hides it to the tray. With Qt's default of quitting once the last
     # window closes, dismissing any dialog while the main window was hidden
     # terminated the whole app — reported as "app unexpectedly quit when
     # switching windows". Shutdown is now explicit (MainWindow.closeEvent and
     # _tray_quit) rather than a side effect of window bookkeeping.
     app.setQuitOnLastWindowClosed(False)
+
+    # Resolve the effective palette before creating or showing any top-level
+    # surface, including the splash and platform-native window frame.
+    startup_theme = get_saved_theme_name()
+    set_current_theme(startup_theme)
+    _apply_application_palette(get_theme(startup_theme), app)
+    app.setStyleSheet(generate_stylesheet())
     
     # Show splash screen immediately (before heavy imports)
     splash = SplashScreen()
@@ -6607,19 +6777,21 @@ def main(dev_mode: bool = False):
             app.setWindowIcon(QIcon(icon_path))
             break
 
-    # Apply theme stylesheet
     splash.set_status("Loading themes...", 30)
-    from frameguard.theme import generate_stylesheet
-    set_current_theme(get_saved_theme_name())
-    app.setStyleSheet(generate_stylesheet())
     # Keep the splash in step in case the saved theme changed since it was built.
-    splash.set_theme(get_saved_theme_name())
+    splash.set_theme(startup_theme)
     splash.set_status("Applying stylesheet...", 50)
 
 
     # Create and show main window
     splash.set_status("Building interface...", 70)
     window = MainWindow()
+    file_open_filter.set_window(window)
+    try:
+        app.styleHints().colorSchemeChanged.connect(
+            window._on_system_color_scheme_changed)
+    except AttributeError:
+        pass
     splash.set_status("Ready!", 100)
 
     # Fade out splash and show main window
@@ -6632,12 +6804,6 @@ def main(dev_mode: bool = False):
                  if not a.startswith("-") and os.path.exists(a)]
     if cli_paths:
         _QT.singleShot(400, lambda: window.open_paths(cli_paths))
-
-    # macOS delivers "Open With" / double-click as an Apple Event, which Qt
-    # turns into QEvent.FileOpen — it never appears in argv. This also covers
-    # opening a second .fg while FrameGuard is already running, which
-    # argv_emulation alone would miss.
-    app.installEventFilter(_FileOpenFilter(window, app))
 
     # Initial combo popup styling (Windows needs QPalette, not just CSS)
     from PySide6.QtWidgets import QComboBox

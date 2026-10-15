@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "description": "Reviewed platform-tolerant render-stability and geometry contracts. This is not a golden-image baseline: Qt and OS patch releases rasterize fonts and native-adjacent controls differently.",
+  "capture_scope": "QMainWindow.centralWidget application-owned content only; native title bars require packaged manual review",
+  "signature": {
+    "columns": 16,
+    "rows": 12,
+    "repeat_distance_max": 0.002,
+    "minimum_luma_span": 24,
+    "minimum_sampled_colors": 8,
+    "minimum_distinct_page_distance": 0.001
+  },
+  "geometry": {
+    "supported_window_sizes": [
+      [1000, 700],
+      [1280, 800],
+      [1920, 1080]
+    ],
+    "supported_scale_factors": [1.0, 1.25, 1.5, 2.0]
+  },
+  "failure_artifacts": [
+    "first.png",
+    "repeat.png",
+    "diff.png",
+    "signatures.json",
+    "gui-audit JSON and state screenshots"
+  ]
+}

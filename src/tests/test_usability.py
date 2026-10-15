@@ -5,6 +5,7 @@ filtering, and the result context menu.
 import os
 
 import pytest
+from PySide6.QtCore import Qt
 
 from conftest import make_result
 
@@ -176,3 +177,69 @@ class TestResultContextMenu:
 
         _reveal_in_file_manager(os.path.join(os.sep, "definitely", "missing.mov"))
         _open_path(os.path.join(os.sep, "definitely", "missing.mov"))
+
+
+class TestResponsiveSurfaces:
+    @pytest.mark.parametrize("panel_name", ["ScanPanel", "WatchFolderPanel"])
+    def test_short_operational_pages_scroll(self, qapp, panel_name):
+        from frameguard import gui
+
+        panel = getattr(gui, panel_name)()
+        panel.resize(760, 420)
+        panel.show()
+        for _ in range(5):
+            qapp.processEvents()
+        assert panel._scroll.widgetResizable()
+        assert panel._scroll.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+        assert panel._scroll.verticalScrollBar().maximum() > 0
+        panel.close()
+
+    def test_settings_switches_to_label_above_field(self, qapp):
+        from frameguard.gui import SettingsPanel
+
+        panel = SettingsPanel()
+        panel.resize(620, 700)
+        panel.show()
+        for _ in range(5):
+            qapp.processEvents()
+        assert panel._settings_compact
+        grid, name, cell, reset, desc = panel._setting_rows[0]
+        assert grid.getItemPosition(grid.indexOf(name))[:2] == (0, 0)
+        assert grid.getItemPosition(grid.indexOf(cell))[:2] == (1, 0)
+        assert cell.width() <= panel._scroll.viewport().width()
+        panel.close()
+
+    def test_results_summary_reflows_deterministically(self, qapp):
+        from frameguard.gui import ResultsPanel
+
+        panel = ResultsPanel()
+        panel._set_summary_compact(False)
+        wide_rows = {
+            panel.summary_row.getItemPosition(panel.summary_row.indexOf(badge))[0]
+            for badge in panel._summary_badges
+        }
+        panel._set_summary_compact(True)
+        compact_rows = {
+            panel.summary_row.getItemPosition(panel.summary_row.indexOf(badge))[0]
+            for badge in panel._summary_badges
+        }
+        assert wide_rows == {0}
+        assert compact_rows == {0, 1}
+
+    def test_results_and_checks_headers_are_metric_driven(self, result_factory):
+        from frameguard import design as D
+        from frameguard.gui import ChecksPanel, ResultsPanel
+
+        result = result_factory("A_very_long_delivery_filename_for_metrics.mov", "fail")
+        results = ResultsPanel()
+        results.set_results([result], append=False)
+        assert results.table.horizontalHeader().height() >= D.table_header_height(
+            results.table.horizontalHeader().font())
+        assert results.table.verticalHeader().defaultSectionSize() >= D.table_row_height(
+            results.table.font())
+
+        checks = ChecksPanel()
+        checks.set_results([result])
+        assert checks.table.horizontalHeader().height() >= D.table_header_height(
+            checks.table.horizontalHeader().font(), lines=2)
+        assert checks.table.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded

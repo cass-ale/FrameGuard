@@ -177,17 +177,18 @@ class TestSplashTheme:
         finally:
             settings.setValue("theme", original)
 
-    def test_unknown_saved_theme_falls_back(self, qapp):
+    def test_unknown_saved_theme_heals_to_os_appearance(self, qapp, monkeypatch):
         from PySide6.QtCore import QSettings
-        from frameguard.gui import get_saved_theme_name, _SETTINGS_APP, _SETTINGS_ORG
+        from frameguard import gui as G
 
-        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        original = settings.value("theme", "Meta Dark")
-        try:
-            settings.setValue("theme", "A Theme That Was Deleted")
-            assert get_saved_theme_name() == "Meta Dark"
-        finally:
-            settings.setValue("theme", original)
+        settings = QSettings(G._SETTINGS_ORG, G._SETTINGS_APP)
+        settings.clear()
+        settings.setValue(G._THEME_KEY, "A Theme That Was Deleted")
+        monkeypatch.setattr(G, "_os_prefers_dark", lambda app=None: False)
+
+        assert G.get_saved_theme_name() == "Clean Light"
+        assert not settings.contains(G._THEME_KEY)
+        assert not settings.contains(G._LEGACY_THEME_KEY)
 
     def test_splash_can_be_retinted_live(self, qapp):
         from frameguard.gui import SplashScreen
@@ -444,6 +445,204 @@ class TestIconSet:
 
         for name in ("scan", "results", "checks", "watch", "settings", "import"):
             assert name in icons.BUILDERS
+
+
+class TestSemanticThemeContract:
+    ACTION_ROLES = {
+        "primary", "secondary", "quiet", "destructive", "toolbar", "icon",
+    }
+    SURFACE_ROLES = {
+        "page", "toolbar", "sidebar", "statistic", "framed-tool", "status",
+    }
+    TEXT_ROLES = {"heading", "muted", "metric", "status"}
+
+    def test_fg_role_is_the_single_semantic_property_contract(self):
+        from frameguard import theme
+
+        assert theme.FG_ROLE_PROPERTY == "fgRole"
+        assert set(theme.ACTION_ROLES) == self.ACTION_ROLES
+        assert set(theme.SURFACE_ROLES) == self.SURFACE_ROLES
+        assert set(theme.TEXT_ROLES) == self.TEXT_ROLES
+        assert theme.FG_ROLES == (
+            self.ACTION_ROLES | self.SURFACE_ROLES | self.TEXT_ROLES)
+
+    def test_all_semantic_roles_have_type_specific_selectors(self):
+        from frameguard.theme import generate_stylesheet
+
+        css = generate_stylesheet()
+        for role in self.ACTION_ROLES:
+            assert f'QPushButton[fgRole="{role}"]' in css
+        for role in self.SURFACE_ROLES:
+            assert f'QWidget[fgRole="{role}"]' in css
+        for role in self.TEXT_ROLES:
+            assert f'QLabel[fgRole="{role}"]' in css
+
+    def test_generic_and_semantic_buttons_own_every_state(self):
+        from frameguard.theme import generate_stylesheet
+
+        css = generate_stylesheet()
+        states = ("hover", "pressed", "checked", "focus", "disabled", "default")
+        for state in states:
+            assert f"QPushButton:{state}" in css
+        for role in self.ACTION_ROLES:
+            for state in states:
+                selector = f'QPushButton[fgRole="{role}"]:{state}'
+                assert selector in css, f"missing state selector: {selector}"
+
+    def test_stylesheet_uses_supported_point_sized_typography(self):
+        import re
+        from frameguard.theme import generate_stylesheet
+
+        css = generate_stylesheet()
+        assert "text-transform" not in css
+        assert "font-family" not in css
+        assert not re.search(r"letter-spacing\s*:\s*-", css)
+        assert not re.search(r"font-size\s*:\s*\d+(?:\.\d+)?px", css)
+        assert re.search(r"font-size\s*:\s*\d+(?:\.\d+)?pt", css)
+
+    def test_every_theme_renders_without_unresolved_tokens(self):
+        from frameguard.theme import THEMES, generate_stylesheet
+
+        assert tuple(THEMES) == (
+            "Meta Dark", "Midnight Charcoal", "Slate Professional", "Nord Frost",
+            "Monokai Pro", "Solarized Dark", "Darkula", "Carbon", "Abyss Teal",
+            "Clean Light", "Warm Cream", "Arctic Blue", "Sage", "Pearl", "Glacier",
+        )
+        for name, theme in THEMES.items():
+            css = generate_stylesheet(theme)
+            assert "%%" not in css, f"unresolved token in {name}"
+            assert theme.accent in css
+            assert theme.accent_foreground in css
+            assert theme.disabled_text in css
+
+    def test_all_interactive_state_contrast(self):
+        from frameguard.theme import THEMES, contrast_ratio
+
+        failures = []
+        for name, theme in THEMES.items():
+            checks = {
+                "accent foreground": (
+                    min(contrast_ratio(theme.accent_foreground, fill) for fill in (
+                        theme.accent, theme.accent_hover, theme.accent_pressed)), 4.5),
+                "selection foreground": (
+                    contrast_ratio(theme.selection_foreground, theme.selection), 4.5),
+                "focus boundary": (
+                    min(contrast_ratio(theme.focus, fill) for fill in (
+                        theme.bg_primary, theme.bg_secondary, theme.bg_input)), 3.0),
+                "disabled content": (
+                    contrast_ratio(theme.disabled_text, theme.disabled_bg), 3.0),
+                "destructive foreground": (
+                    min(contrast_ratio(theme.destructive_foreground, fill)
+                        for fill in (theme.destructive, theme.destructive_hover,
+                                     theme.destructive_pressed)), 4.5),
+            }
+            for label, (ratio, minimum) in checks.items():
+                if ratio < minimum:
+                    failures.append(f"{name}/{label}: {ratio:.2f}:1")
+        assert not failures, "; ".join(failures)
+
+    def test_all_status_surface_contrast(self):
+        from frameguard.theme import THEMES, contrast_ratio
+
+        failures = []
+        for name, theme in THEMES.items():
+            for status in ("pass", "fail", "warn", "skip"):
+                text = getattr(theme, f"status_{status}")
+                surface = getattr(theme, f"status_{status}_surface")
+                border = getattr(theme, f"status_{status}_border")
+                text_ratio = contrast_ratio(text, surface)
+                border_ratio = contrast_ratio(border, surface)
+                if text_ratio < 4.5:
+                    failures.append(
+                        f"{name}/{status} text: {text_ratio:.2f}:1")
+                if border_ratio < 3.0:
+                    failures.append(
+                        f"{name}/{status} border: {border_ratio:.2f}:1")
+        assert not failures, "; ".join(failures)
+
+    def test_scrollbars_splitters_and_group_sections_follow_contract(self):
+        from frameguard.theme import generate_stylesheet
+
+        css = generate_stylesheet()
+        assert f"width: {D.SCROLLBAR_HIT_AREA}px" in css
+        assert f"height: {D.SCROLLBAR_HIT_AREA}px" in css
+        assert f"width: {D.SPLITTER_HIT_AREA}px" in css
+        assert f"height: {D.SPLITTER_HIT_AREA}px" in css
+        generic_group = css[css.index("QGroupBox {"):css.index("QGroupBox::title")]
+        assert "border: none" in generic_group
+        assert 'QGroupBox[fgRole="framed-tool"]' in css
+
+    def test_icon_role_meets_hit_area_in_every_theme(self, qapp):
+        from PySide6.QtWidgets import QPushButton
+        from frameguard.theme import THEMES, generate_stylesheet
+
+        original = qapp.styleSheet()
+        button = QPushButton()
+        button.setProperty("fgRole", "icon")
+        try:
+            for name, theme in THEMES.items():
+                qapp.setStyleSheet(generate_stylesheet(theme))
+                button.style().unpolish(button)
+                button.style().polish(button)
+                hint = button.sizeHint()
+                assert hint.width() >= D.CONTROL_SM, f"{name}: icon width {hint.width()}"
+                assert hint.height() >= D.CONTROL_SM, f"{name}: icon height {hint.height()}"
+        finally:
+            button.deleteLater()
+            qapp.setStyleSheet(original)
+
+
+class TestMetricHelpers:
+    def test_fonts_are_point_sized_and_platform_resolved(self, qapp):
+        assert D.font_css(D.FONT_BODY, D.WEIGHT_MEDIUM) == (
+            f"font-size: {D.FONT_BODY}pt; font-weight: {D.WEIGHT_MEDIUM};")
+        ui = D.ui_font()
+        mono = D.mono_font()
+        assert ui.pointSize() == D.FONT_BODY
+        assert mono.pointSize() == D.FONT_SMALL
+        assert ui.pixelSize() == -1 and mono.pixelSize() == -1
+        assert ui.family() and mono.family()
+
+    def test_text_metrics_derive_readable_grid_aligned_heights(self, qapp):
+        from PySide6.QtGui import QFontMetrics
+
+        metrics = QFontMetrics(D.ui_font())
+        assert D.line_height(metrics) == metrics.lineSpacing()
+        assert D.label_height(metrics, lines=2) >= metrics.height() + metrics.lineSpacing()
+        assert D.control_height(metrics, qapp.style()) >= D.CONTROL_MD
+        assert D.table_row_height(metrics) >= D.ROW_H
+        assert D.table_header_height(metrics, lines=2) > D.table_header_height(
+            metrics, lines=1)
+        for value in (
+                D.label_height(metrics, lines=2),
+                D.control_height(metrics, qapp.style()),
+                D.table_row_height(metrics),
+                D.table_header_height(metrics, lines=2)):
+            assert value % D.SPACE_1 == 0
+
+    def test_bounded_text_width_uses_realized_metrics(self, qapp):
+        from PySide6.QtGui import QFontMetrics
+
+        metrics = QFontMetrics(D.ui_font())
+        short = D.bounded_text_width("File", metrics, 80, 240)
+        long = D.bounded_text_width("A very long filename that must be bounded", metrics,
+                                    80, 240)
+        assert 80 <= short <= long <= 240
+        assert D.bounded_text_width("x", metrics, 120, 120) == 120
+
+    def test_screen_safe_geometry_centers_and_clamps(self):
+        from PySide6.QtCore import QRect, QSize
+
+        available = QRect(100, 50, 1000, 700)
+        normal = D.screen_safe_geometry(QSize(800, 600), available)
+        oversized = D.screen_safe_geometry(QSize(1600, 1200), available)
+        assert normal.center() == available.center()
+        assert available.contains(normal)
+        assert available.contains(oversized)
+        assert oversized.width() == available.width() - 2 * D.SPACE_2
+        assert oversized.height() == available.height() - 2 * D.SPACE_2
+
+
 class TestLayoutIntegrity:
     """Measured against a real window, at the smallest size we allow."""
 

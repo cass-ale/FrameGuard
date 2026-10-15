@@ -354,6 +354,23 @@ class TestThemePersistence:
         w.settings_panel._select_theme("Meta Dark")
         assert emitted == ["Meta Dark"]
 
+    def test_windows_combo_popup_uses_theme_selection_contrast(self, monkeypatch):
+        from PySide6.QtWidgets import QComboBox
+        from frameguard import gui
+        from frameguard.theme import get_theme
+
+        monkeypatch.setattr(gui.sys, "platform", "win32")
+        combo = QComboBox()
+        theme = get_theme("Nord Frost")
+        gui._style_combobox_popup(combo, theme)
+
+        popup_qss = combo.view().styleSheet().lower()
+        assert theme.selection.lower() in popup_qss
+        assert theme.selection_foreground.lower() in popup_qss
+        assert "#ffffff" not in popup_qss
+        assert combo.property("fgInlineStyleAllowed") is True
+        assert combo.view().property("fgInlineStyleAllowed") is True
+
 
 class TestResetToDefaults:
     def test_reset_matches_engine_defaults(self):
@@ -369,3 +386,108 @@ class TestResetToDefaults:
                 f"reset produced {key}={value!r}, engine default is "
                 f"{DEFAULT_CONFIG[key]!r}"
             )
+
+
+class TestFirstLaunchContract:
+    def test_os_theme_mapping_is_not_persisted(self):
+        from PySide6.QtCore import QSettings
+        from frameguard.gui import (
+            _SETTINGS_APP, _SETTINGS_ORG, _THEME_KEY, resolve_startup_theme,
+        )
+
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.clear()
+        assert resolve_startup_theme(settings, prefers_dark=False) == ("Clean Light", False)
+        assert not settings.contains(_THEME_KEY)
+        assert resolve_startup_theme(settings, prefers_dark=True) == ("Meta Dark", False)
+        assert not settings.contains(_THEME_KEY)
+
+    def test_valid_legacy_theme_is_preserved(self):
+        from PySide6.QtCore import QSettings
+        from frameguard.gui import _SETTINGS_APP, _SETTINGS_ORG, resolve_startup_theme
+
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.setValue("theme", "Nord Frost")
+        assert resolve_startup_theme(settings, prefers_dark=False) == ("Nord Frost", True)
+
+    def test_invalid_saved_theme_heals_to_the_os_appearance(self):
+        from PySide6.QtCore import QSettings
+        from frameguard.gui import (
+            _LEGACY_THEME_KEY, _SETTINGS_APP, _SETTINGS_ORG, _THEME_KEY,
+            resolve_startup_theme,
+        )
+
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.setValue(_THEME_KEY, "Removed Theme")
+        settings.setValue(_LEGACY_THEME_KEY, "Also Invalid")
+        assert resolve_startup_theme(settings, prefers_dark=False) == ("Clean Light", False)
+        assert not settings.contains(_THEME_KEY)
+        assert not settings.contains(_LEGACY_THEME_KEY)
+
+    def test_explicit_selection_persists_exact_theme(self):
+        from PySide6.QtCore import QSettings
+        from frameguard.gui import MainWindow, _SETTINGS_APP, _SETTINGS_ORG, _THEME_KEY
+
+        window = MainWindow()
+        try:
+            window._apply_theme("Glacier", persist=True)
+            assert QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(_THEME_KEY) == "Glacier"
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+    def test_constructing_window_does_not_create_documents_output(self, isolated_user_dirs):
+        from frameguard.gui import MainWindow
+
+        output = isolated_user_dirs / "Documents" / "FrameGuard"
+        output.rmdir()
+        window = MainWindow()
+        try:
+            assert not output.exists()
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+    def test_runtime_os_changes_stop_after_explicit_selection(self):
+        from PySide6.QtCore import QSettings
+        from frameguard.gui import MainWindow, _SETTINGS_APP, _SETTINGS_ORG, _THEME_KEY
+        from frameguard.theme import get_theme
+
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.clear()
+        window = MainWindow()
+        try:
+            window._on_system_color_scheme_changed(Qt.ColorScheme.Light)
+            assert get_theme().name == "Clean Light"
+            assert not settings.contains(_THEME_KEY)
+
+            window._apply_theme("Glacier", persist=True)
+            window._on_system_color_scheme_changed(Qt.ColorScheme.Dark)
+            assert get_theme().name == "Glacier"
+            assert settings.value(_THEME_KEY) == "Glacier"
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+
+class TestSemanticOwnership:
+    def test_every_application_button_has_an_exact_fg_role(self):
+        from PySide6.QtWidgets import QPushButton
+        from frameguard.gui import MainWindow
+
+        allowed = {"primary", "secondary", "quiet", "destructive", "toolbar", "icon"}
+        window = MainWindow()
+        try:
+            offenders = [
+                button.text() or button.objectName()
+                for button in window.findChildren(QPushButton)
+                if button.property("fgRole") not in allowed
+            ]
+            assert not offenders
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()

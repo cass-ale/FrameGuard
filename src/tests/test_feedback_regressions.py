@@ -331,6 +331,53 @@ def window(qapp):
     qapp.processEvents()
 
 
+class TestWorkerCleanup:
+    def test_timed_out_thread_keeps_its_owners_and_reentry_guard(self, window):
+        class _Worker:
+            cancelled = False
+            deleted = False
+
+            def cancel(self):
+                self.cancelled = True
+
+            def deleteLater(self):
+                self.deleted = True
+
+        class _Thread:
+            quit_requested = False
+            deleted = False
+
+            def quit(self):
+                self.quit_requested = True
+
+            @staticmethod
+            def wait(_timeout):
+                return False
+
+            @staticmethod
+            def isRunning():
+                return True
+
+            def deleteLater(self):
+                self.deleted = True
+
+        worker = _Worker()
+        thread = _Thread()
+        window._worker = worker
+        window._worker_thread = thread
+        try:
+            window._cleanup_worker()
+            assert worker.cancelled
+            assert thread.quit_requested
+            assert window._worker is worker
+            assert window._worker_thread is thread
+            assert not worker.deleted
+            assert not thread.deleted
+        finally:
+            window._worker = None
+            window._worker_thread = None
+
+
 class TestResultsPageReset:
     def test_clear_removes_the_verdict_banner(self, window, qapp):
         """'8 of 24 files passed with warnings' stayed on screen over an empty
@@ -663,9 +710,6 @@ class TestScanPageIcons:
     def test_icons_are_rerendered_on_theme_change(self, window, qapp):
         """icons.py caches by (name, size, colour); without a cache clear the
         old theme's colour is reused forever."""
-        from frameguard import icons as _icons
-        from frameguard.theme import get_theme
-
         window._apply_theme("Meta Dark")
         qapp.processEvents()
         dark = window.scan_panel.drop_zone.icon_label.pixmap().toImage()
@@ -747,86 +791,56 @@ class TestThemeLegibility:
 
 class TestSettingsRowRhythm:
     def test_a_setting_reads_as_one_block(self, laid_out_window, qapp):
-        """'The settings page looks uneven, the checkboxes seem higher than the
-        setting they correspond to.'
-
-        A name sat 8px above its own description and 12px below the previous
-        setting's description, so descriptions did not visually belong to
-        anything and the control — which aligns to the name — appeared to
-        float above the text explaining it.
-        """
+        """Every wide setting keeps name/control together and description below."""
         window = laid_out_window
         sp = window.settings_panel
         window._switch_panel(4)
         for _ in range(4):
             qapp.processEvents()
 
-        gb = next(g for g in sp._group_boxes if g.title() == "Delivery Profile")
-        items = []
-        for lbl in sp._name_labels + sp._desc_labels:
-            if not gb.isAncestorOf(lbl) or not lbl.isVisible():
+        for grid, name, cell, reset, desc in sp._setting_rows:
+            if not name.isVisible():
                 continue
-            y = lbl.mapTo(gb, lbl.rect().topLeft()).y()
-            items.append((y, lbl in sp._name_labels, lbl, y + lbl.height()))
-        items.sort()
+            assert grid.getItemPosition(grid.indexOf(name))[:2] == (0, 0)
+            if sp._settings_compact:
+                assert grid.getItemPosition(grid.indexOf(cell))[:2] == (1, 0)
+                assert grid.getItemPosition(grid.indexOf(desc))[:2] == (2, 0)
+            else:
+                assert grid.getItemPosition(grid.indexOf(cell))[:2] == (0, 1)
+                assert grid.getItemPosition(grid.indexOf(desc))[:2] == (1, 0)
 
-        intra, inter = [], []
-        for (y, is_name, lbl, bottom), nxt in zip(items, items[1:]):
-            gap = nxt[0] - bottom
-            if gap < 0:
-                continue          # slider value label shares its row
-            (intra if is_name else inter).append(gap)
-
-        assert intra and inter
-        assert max(intra) < min(inter), (
-            f"a description is not closer to its own setting than to the next: "
-            f"intra={intra} inter={inter}")
-
-    def test_controls_share_one_column(self, laid_out_window, qapp):
-        """A 260px combo, a 194px slider and a 22px checkbox each started at a
-        different x, which is most of what read as 'uneven'."""
+    def test_controls_share_one_responsive_column(self, laid_out_window, qapp):
         window = laid_out_window
         sp = window.settings_panel
         window._switch_panel(4)
-        sp._toggle_simple_mode()
         for _ in range(4):
             qapp.processEvents()
 
-        lefts = set()
-        for name_lbl in sp._name_labels:
-            row = name_lbl.parentWidget()
-            if row is None or row.layout() is None or not name_lbl.isVisible():
-                continue
-            for i in range(row.layout().count()):
-                wd = row.layout().itemAt(i).widget()
-                if wd is not None and wd.width() == sp.CONTROL_COL_W:
-                    lefts.add(wd.x())
+        lefts = {
+            cell.mapTo(sp._content, cell.rect().topLeft()).x()
+            for _grid, name, cell, _reset, _desc in sp._setting_rows
+            if name.isVisible()
+        }
         assert len(lefts) <= 1, f"control column starts at several x positions: {lefts}"
 
     def test_control_and_label_are_vertically_centred(self, laid_out_window, qapp):
         window = laid_out_window
         sp = window.settings_panel
         window._switch_panel(4)
-        sp._toggle_simple_mode()
         for _ in range(4):
             qapp.processEvents()
 
-        for name_lbl in sp._name_labels:
-            row = name_lbl.parentWidget()
-            if row is None or row.layout() is None or not name_lbl.isVisible():
+        for _grid, name, cell, _reset, _desc in sp._setting_rows:
+            if not name.isVisible():
                 continue
-            cell = None
-            for i in range(row.layout().count()):
-                wd = row.layout().itemAt(i).widget()
-                if wd is not None and wd.width() == sp.CONTROL_COL_W:
-                    cell = wd
-            if cell is None:
-                continue
-            n, c = name_lbl.geometry(), cell.geometry()
-            n_mid = n.y() + n.height() / 2
-            c_mid = c.y() + c.height() / 2
-            assert abs(n_mid - c_mid) <= 1, (
-                f"{name_lbl.text()}: label centre {n_mid} vs control {c_mid}")
+            parent = name.parentWidget()
+            if sp._settings_compact:
+                assert name.mapTo(parent, name.rect().bottomLeft()).y() < cell.y()
+            else:
+                name_mid = name.mapTo(parent, name.rect().center()).y()
+                cell_mid = cell.mapTo(parent, cell.rect().center()).y()
+                assert abs(name_mid - cell_mid) <= 1, (
+                    f"{name.text()}: label centre {name_mid} vs control {cell_mid}")
 
 
 class TestPresetRoundTrip:

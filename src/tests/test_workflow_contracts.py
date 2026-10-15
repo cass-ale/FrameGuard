@@ -55,6 +55,32 @@ def test_push_and_pull_requests_run_the_full_supported_runner_matrix():
     assert "python -m pytest --verbose" in TESTS_WORKFLOW
 
 
+def test_visual_evidence_uses_fresh_dpi_processes_and_preserves_failures():
+    test_job = _job(TESTS_WORKFLOW, "test")
+    assert "FRAMEGUARD_VISUAL_ARTIFACTS: visual-test-artifacts" in test_job
+    assert "python tools_dev/gui_audit.py --matrix" in test_job
+    assert "--json-dir gui-audit-artifacts" in test_job
+    assert "--artifacts-dir gui-audit-artifacts/screenshots" in test_job
+    assert test_job.index("python -m pytest --verbose") < test_job.index(
+        "python tools_dev/gui_audit.py --matrix"
+    )
+
+    upload = "actions/upload-artifact@" + ACTION_PINS["actions/upload-artifact"]
+    assert upload in test_job
+    assert "if: failure()" in test_job
+    assert "name: visual-evidence-${{ matrix.runner }}" in test_job
+    assert "src/gui-audit-artifacts/" in test_job
+    assert "src/visual-test-artifacts/" in test_job
+    assert "if-no-files-found: warn" in test_job
+    assert "retention-days: 14" in test_job
+
+    # Keep the expensive DPI expansion inside the audit launcher rather than
+    # multiplying the three supported OS runners in the Actions matrix.
+    strategy = test_job.split("    runs-on:", 1)[0]
+    assert "scale:" not in strategy
+    assert "timeout-minutes: 30" in test_job
+
+
 def test_release_checks_out_only_the_requested_tag_ref():
     verify = _job(RELEASE_WORKFLOW, "verify")
     assert "if: github.event_name == 'workflow_dispatch'" in verify
