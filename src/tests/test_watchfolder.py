@@ -196,6 +196,14 @@ class TestDuplicates:
         """Users who point the watcher at a folder with content expect a way
         to process it."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        # The exclusivity probe is environmental on Windows: it renames the
+        # file onto itself, which any transient holder (Defender scanning a
+        # just-written file, the indexer) refuses without delete-sharing.
+        # That made this test fail intermittently on Windows CI with one of
+        # two identical files deferred. The probe has its own contract test
+        # below; here it is pinned open so the backlog behaviour itself is
+        # what is under test.
+        monkeypatch.setattr(W, "_can_open_exclusively", lambda f: True)
         write_video(tmp_path, "old1.mp4")
         write_video(tmp_path, "old2.mp4")
         m = WatchFolderMonitor()
@@ -206,6 +214,25 @@ class TestDuplicates:
         count = m.scan_backlog()
         assert count == 2
         assert len(emitted) == 2
+
+    def test_scan_backlog_defers_a_locked_file(self, tmp_path, monkeypatch):
+        """A file the exclusivity probe refuses is deferred to the poller,
+        not emitted and not lost — the behaviour that fired on Windows CI
+        when a freshly written file was transiently held."""
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        monkeypatch.setattr(
+            W, "_can_open_exclusively",
+            lambda f: not str(f).endswith("locked.mp4"))
+        write_video(tmp_path, "free.mp4")
+        locked = write_video(tmp_path, "locked.mp4")
+        m = WatchFolderMonitor()
+        emitted = []
+        m.files_detected.connect(lambda f: emitted.extend(f))
+        m.set_watch_path(str(tmp_path))
+
+        assert m.scan_backlog() == 1
+        assert len(emitted) == 1
+        assert locked in m._pending_files
 
     def test_backlog_is_not_re_emitted_by_a_later_poll(self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
