@@ -23,14 +23,19 @@ from frameguard.theme import get_theme, ThemeColors
 
 
 def _hex_to_rgb(hex_color: str) -> tuple:
-    """Convert hex color to RGB tuple."""
-    h = hex_color.lstrip('#')
-    # Handle 8-char hex (with alpha) — take first 6
+    """Convert a six/eight-digit CSS hex color to an RGB tuple safely."""
+    if not isinstance(hex_color, str):
+        return (128, 128, 128)
+    h = hex_color.removeprefix("#")
+    # Report PDFs do not support alpha; ignore a valid CSS alpha channel.
     if len(h) == 8:
         h = h[:6]
     if len(h) != 6:
         return (128, 128, 128)
-    return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return (128, 128, 128)
 
 
 def _get_report_colors(theme: ThemeColors = None):
@@ -281,7 +286,8 @@ def _safe_text(text: str) -> str:
 
 
 def generate_report(results: List[QAResult], output_path: str,
-                    preset_label: str = "Custom", editor: str = "") -> str:
+                    preset_label: str = "Custom", editor: str = "",
+                    colors: dict = None) -> str:
     """Generate a styled PDF handoff report.
 
     Returns the output file path.
@@ -300,7 +306,9 @@ def generate_report(results: List[QAResult], output_path: str,
                            (getattr(r, "filename", "") or "").lower()))
     except Exception:
         pass
-    colors = _get_report_colors()
+    # Background runners pass an immutable-at-creation palette so a theme
+    # switch cannot change colors halfway through a long report.
+    colors = dict(colors) if colors is not None else _get_report_colors()
     pdf = HandoffReport(preset_label=preset_label, editor=editor, colors=colors)
     pdf.alias_nb_pages()
     pdf.add_page()

@@ -9,7 +9,20 @@ cross-compilation.
 | Windows 10/11 x64 | `build_installer.bat` | `Output\FrameGuardInstaller.exe` |
 | macOS 12+ | `./build_mac.sh` | `Output/FrameGuard.dmg` |
 
-Both scripts perform the same gated sequence and fail loudly at each step:
+Before pushing any source or packaging change, run the fail-closed staged gate
+from this directory:
+
+```bash
+python3 tools_dev/pre_push.py --profile full
+```
+
+A full run intentionally remains incomplete until fresh independent review JSON
+is supplied on a fingerprint-checked resume. Fast runs can never authorize a
+push; the native arm64 `package` profile adds a clean build and final mounted /
+copied DMG startup smoke. See [`../docs/PRE_PUSH.md`](../docs/PRE_PUSH.md) for
+the evidence format, profiles, resume command, and failure rules.
+
+Both platform build scripts perform the same gated sequence and fail loudly at each step:
 
 ```
 1. Check the host toolchain (Python 3.12)

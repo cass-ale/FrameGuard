@@ -7,6 +7,8 @@ vanish, and duplicate emissions.
 """
 
 import os
+import stat
+from types import SimpleNamespace
 from unittest.mock import mock_open
 
 import pytest
@@ -181,6 +183,120 @@ class TestStability:
         m._emit_batch()
         assert emitted == [path]
 
+    def test_same_size_rewrite_resets_stability(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        path = write_video(tmp_path, "rewrite.mp4")
+        m._poll()
+        m._poll()
+        assert m._pending_files[path]["stable_polls"] == 1
+
+        before = os.stat(path)
+        with open(path, "r+b") as stream:
+            stream.write(b"changed without changing the file length")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        m._poll()
+
+        assert m._pending_files[path]["stable_polls"] == 0
+        m._poll()
+        assert path not in m._batch_queue
+        m._poll()
+        assert path in m._batch_queue
+
+    def test_atomic_same_size_replacement_resets_stability(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        path = write_video(tmp_path, "replace.mp4")
+        m._poll()
+        m._poll()
+
+        replacement = write_video(tmp_path, "replacement.mp4")
+        os.replace(replacement, path)
+        m._poll()
+
+        assert m._pending_files[path]["stable_polls"] == 0
+        m._poll()
+        assert path not in m._batch_queue
+        m._poll()
+        assert path in m._batch_queue
+
+    def test_coarse_timestamp_fallback_remains_part_of_identity(self, monkeypatch):
+        values = [
+            SimpleNamespace(st_mode=stat.S_IFREG, st_size=204800,
+                            st_mtime=10.0, st_ctime=20.0, st_dev=1, st_ino=2),
+            SimpleNamespace(st_mode=stat.S_IFREG, st_size=204800,
+                            st_mtime=11.0, st_ctime=20.0, st_dev=1, st_ino=2),
+        ]
+        monkeypatch.setattr(W.os, "stat", lambda *_args, **_kwargs: values.pop(0))
+
+        first = W._get_file_identity_safe("clip.mp4")
+        second = W._get_file_identity_safe("clip.mp4")
+
+        assert first != second
+        assert first[1] == 10_000_000_000
+        assert second[1] == 11_000_000_000
+
+    def test_locked_same_size_rewrite_must_settle_after_unlock(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        locked = {"value": True}
+        monkeypatch.setattr(W, "_can_open_exclusively", lambda _path: not locked["value"])
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        path = write_video(tmp_path, "locked.mp4")
+        poll_until_stable(m)
+        assert path in m._pending_files
+
+        before = os.stat(path)
+        with open(path, "r+b") as stream:
+            stream.write(b"same-size locked rewrite")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        locked["value"] = False
+        m._poll()
+        assert m._pending_files[path]["stable_polls"] == 0
+        m._poll()
+        assert path not in m._batch_queue
+        m._poll()
+        assert path in m._batch_queue
+
+    def test_replacement_of_emitted_path_is_new_work(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        emitted = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        path = write_video(tmp_path, "reused.mp4")
+        poll_until_stable(m, 3)
+        m._emit_batch()
+        assert emitted == [path]
+
+        replacement = write_video(tmp_path, "new.mp4")
+        os.replace(replacement, path)
+        poll_until_stable(m, 3)
+        m._emit_batch()
+
+        assert emitted == [path, path]
+
+    def test_batch_revalidates_identity_before_emission(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        emitted = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        path = write_video(tmp_path, "queued.mp4")
+        poll_until_stable(m, 3)
+        assert path in m._batch_queue
+
+        replacement = write_video(tmp_path, "replacement.mp4")
+        os.replace(replacement, path)
+        m._emit_batch()
+
+        assert emitted == []
+        assert path in m._pending_files
+
     def test_tiny_files_do_not_pin_burst_mode_forever(self, tmp_path, monkeypatch):
         """A sub-100KB file was re-detected every poll, permanently holding the
         app at 1Hz full-directory scans and making set_poll_interval a no-op."""
@@ -207,6 +323,52 @@ class TestStability:
             m._poll()
         m._emit_batch()
         assert emitted == []
+
+
+class TestSymlinkPolicy:
+    def test_file_symlinks_are_ignored_inside_watch_root(self, tmp_path):
+        watched = tmp_path / "watched"
+        watched.mkdir()
+        external = write_video(tmp_path, "external.mp4")
+        internal = write_video(watched, "internal.mp4")
+        external_link = watched / "external-link.mp4"
+        internal_link = watched / "internal-link.mp4"
+        broken_link = watched / "broken.mp4"
+        try:
+            external_link.symlink_to(external)
+            internal_link.symlink_to(internal)
+            broken_link.symlink_to(watched / "missing.mp4")
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are unavailable on this host")
+
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(watched))
+        found = m._scan_directory()
+
+        assert internal in found
+        assert str(external_link) not in found
+        assert str(internal_link) not in found
+        assert str(broken_link) not in found
+
+    def test_directory_symlinks_and_symlink_roots_are_ignored(self, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        write_video(target, "inside.mp4")
+        linked_dir = tmp_path / "linked.mkv"
+        root_link = tmp_path / "watch-root"
+        try:
+            linked_dir.symlink_to(target, target_is_directory=True)
+            root_link.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("directory symlinks are unavailable on this host")
+
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        assert str(linked_dir) not in m._scan_directory()
+
+        invalid = WatchFolderMonitor()
+        invalid.set_watch_path(str(root_link))
+        assert invalid.watch_path is None
 
 
 class TestBatching:
@@ -388,6 +550,33 @@ class TestFolderLifecycle:
 
         assert len(errors) == 1, f"error repeated {len(errors)} times"
 
+    def test_settled_batch_survives_folder_loss_and_remount(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        folder = tmp_path / "watched"
+        offline = tmp_path / "offline"
+        folder.mkdir()
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(folder))
+        m.start()
+        emitted = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        path = write_video(folder, "queued.mp4")
+        poll_until_stable(m, 3)
+        assert m._batch_queue == [path]
+
+        folder.rename(offline)
+        for _ in range(W.MAX_CONSECUTIVE_ERRORS):
+            m._poll()
+        assert not m.is_active
+        assert m._batch_queue == [path]
+
+        offline.rename(folder)
+        m.start()
+        m._emit_batch()
+
+        assert emitted == [path]
+
     def test_scan_directory_returns_none_rather_than_partial_results(self, tmp_path):
         m = WatchFolderMonitor()
         m._watch_path = str(tmp_path / "does_not_exist")
@@ -494,7 +683,7 @@ class TestMonitorState:
         m.resume()
         assert not m.is_paused and m.is_polling
 
-    def test_stop_clears_the_pending_batch(
+    def test_stop_retains_the_pending_batch(
             self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         m = WatchFolderMonitor()
@@ -504,39 +693,90 @@ class TestMonitorState:
         poll_until_stable(m, 3)
         assert m._batch_queue == [path]
         m.stop()
-        assert m._batch_queue == []
+        assert m._batch_queue == [path]
 
-    def test_stop_does_not_silently_lose_a_queued_file(
+    def test_stop_start_does_not_silently_lose_a_queued_file(
             self, tmp_path, monkeypatch):
-        """Queued files were already in _known_files, so clearing the batch on
-        stop left them marked as seen while never having been scanned.
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        m.start()
+        emitted = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        path = write_video(tmp_path, "x.mp4")
+        poll_until_stable(m, 3)
 
-        Note this only repairs the in-session bookkeeping. start() still
-        re-baselines the folder by design (see
-        test_existing_files_are_not_scanned_on_start), so recovering a file
-        after a full restart is what "Scan files already in this folder" is
-        for.
-        """
+        m.stop()
+        m.start()
+        m._emit_batch()
+
+        assert emitted == [path]
+        assert path in m._emitted_files
+
+    def test_path_change_flushes_settled_work(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        first = tmp_path / "first"
+        second = tmp_path / "second"
+        first.mkdir()
+        second.mkdir()
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(first))
+        emitted = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        path = write_video(first, "x.mp4")
+        poll_until_stable(m, 3)
+
+        m.set_watch_path(str(second))
+
+        assert emitted == [path]
+        assert m.watch_path == str(second)
+
+    def test_reset_flushes_settled_work_before_rebaseline(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        m = WatchFolderMonitor()
+        m.set_watch_path(str(tmp_path))
+        emitted = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        path = write_video(tmp_path, "x.mp4")
+        poll_until_stable(m, 3)
+
+        m.reset()
+
+        assert emitted == [path]
+        assert path in m._emitted_files
+
+    def test_pause_resume_keeps_settled_batch(self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         m = WatchFolderMonitor()
         m.set_watch_path(str(tmp_path))
         m.start()
         path = write_video(tmp_path, "x.mp4")
         poll_until_stable(m, 3)
-        assert path in m._batch_queue
 
-        m.stop()
-        assert path not in m._known_files, \
-            "file was dropped from the batch but left marked as already seen"
-        assert path not in m._emitted_files
+        m.pause()
+        assert m._batch_queue == [path]
+        m.resume()
+        assert m._batch_queue == [path]
+        assert m._settle_timer.isActive()
 
-        # The poller can therefore rediscover it without a restart.
-        m._enabled = True
+    def test_large_backlog_reports_and_emits_every_file(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        paths = [
+            mark_video_settled(write_video(tmp_path, f"clip-{index:03d}.mp4"))
+            for index in range(55)
+        ]
+        m = WatchFolderMonitor()
         emitted = []
-        m.files_detected.connect(lambda f: emitted.extend(f))
-        poll_until_stable(m, 3)
-        m._emit_batch()
-        assert emitted == [path]
+        statuses = []
+        m.files_detected.connect(lambda files: emitted.extend(files))
+        m.status_changed.connect(statuses.append)
+        m.set_watch_path(str(tmp_path))
+
+        assert m.scan_backlog() == len(paths)
+        assert emitted == sorted(paths)
+        assert statuses[-1] == f"Queued {len(paths)} existing file(s)"
 
     def test_default_watch_path_is_sensible(self):
         path = W.get_default_watch_path()

@@ -202,6 +202,214 @@ class TestWindowLevelDrop:
         assert "not a valid" in w.scan_panel.progress_label.text().lower()
 
 
+class TestWatchQueueOwnership:
+    @staticmethod
+    def _install_successful_start(monkeypatch, gui, window, starts):
+        def record_start(_thread):
+            starts.append(list(window._worker._files))
+
+        monkeypatch.setattr(gui.QThread, "start", record_start)
+
+    def test_low_disk_restores_then_retries_batch_exactly_once(
+            self, tmp_path, monkeypatch):
+        import shutil
+        from frameguard import gui
+
+        window = gui.MainWindow()
+        retries = []
+        starts = []
+        free_bytes = {"value": 64 * 1024 * 1024}
+        monkeypatch.setattr(
+            shutil, "disk_usage",
+            lambda _path: shutil._ntuple_diskusage(
+                1024 * 1024 * 1024, 0, free_bytes["value"]),
+        )
+        monkeypatch.setattr(
+            gui.QTimer, "singleShot",
+            staticmethod(lambda delay, callback: retries.append((delay, callback))),
+        )
+        self._install_successful_start(monkeypatch, gui, window, starts)
+        first = str(tmp_path / "first.mov")
+        second = str(tmp_path / "second.mov")
+        third = str(tmp_path / "third.mov")
+
+        try:
+            window._watch_pending_queue = [first, second, first]
+            window._process_watch_queue()
+
+            assert window._watch_pending_queue == [first, second]
+            assert window._watch_dispatch_pending is None
+            assert not window._watch_batch_in_progress
+            assert starts == []
+            assert [delay for delay, _callback in retries] == [1500]
+
+            window._on_watch_files_detected([second, third])
+            assert window._watch_pending_queue == [first, second, third]
+            assert [delay for delay, _callback in retries] == [1500]
+
+            free_bytes["value"] = 512 * 1024 * 1024
+            _delay, retry = retries.pop()
+            retry()
+
+            assert starts == [[first, second, third]]
+            assert window._watch_pending_queue == []
+            assert window._watch_dispatch_pending is None
+            assert window._watch_batch_in_progress
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+    def test_pre_signal_ui_exception_restores_batch_for_retry(
+            self, tmp_path, monkeypatch):
+        import shutil
+        from frameguard import gui
+
+        window = gui.MainWindow()
+        retries = []
+        starts = []
+        original_set_files = window.scan_panel._set_files
+        attempts = {"count": 0}
+
+        def set_files_once_then_succeed(files):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("injected queue UI failure")
+            return original_set_files(files)
+
+        monkeypatch.setattr(
+            shutil, "disk_usage",
+            lambda _path: shutil._ntuple_diskusage(
+                1024 * 1024 * 1024, 0, 512 * 1024 * 1024),
+        )
+        monkeypatch.setattr(window.scan_panel, "_set_files", set_files_once_then_succeed)
+        monkeypatch.setattr(
+            gui.QTimer, "singleShot",
+            staticmethod(lambda delay, callback: retries.append((delay, callback))),
+        )
+        self._install_successful_start(monkeypatch, gui, window, starts)
+        filepath = str(tmp_path / "ui-setup.mov")
+
+        try:
+            window._watch_pending_queue = [filepath]
+            window._process_watch_queue()
+
+            assert window._watch_pending_queue == [filepath]
+            assert not window._watch_batch_in_progress
+            assert starts == []
+            assert [delay for delay, _callback in retries] == [1500]
+
+            retries.pop()[1]()
+
+            assert attempts["count"] == 2
+            assert starts == [[filepath]]
+            assert window._watch_pending_queue == []
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+    def test_worker_setup_exception_restores_batch_for_retry(
+            self, tmp_path, monkeypatch):
+        import shutil
+        from frameguard import gui
+
+        window = gui.MainWindow()
+        retries = []
+        starts = []
+        original_configure = gui.ScanWorker.configure
+        attempts = {"count": 0}
+        filepath = str(tmp_path / "setup.mov")
+        arrived_during_error = str(tmp_path / "nested.mov")
+
+        def configure_once_then_succeed(worker, *args, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("injected setup failure")
+            return original_configure(worker, *args, **kwargs)
+
+        monkeypatch.setattr(
+            shutil, "disk_usage",
+            lambda _path: shutil._ntuple_diskusage(
+                1024 * 1024 * 1024, 0, 512 * 1024 * 1024),
+        )
+        monkeypatch.setattr(gui.ScanWorker, "configure", configure_once_then_succeed)
+        monkeypatch.setattr(
+            gui.QMessageBox, "critical",
+            lambda *_args: window._on_watch_files_detected(
+                [filepath, arrived_during_error, filepath]),
+        )
+        monkeypatch.setattr(
+            gui.QTimer, "singleShot",
+            staticmethod(lambda delay, callback: retries.append((delay, callback))),
+        )
+        self._install_successful_start(monkeypatch, gui, window, starts)
+
+        try:
+            window._watch_pending_queue = [filepath]
+            window._process_watch_queue()
+
+            assert window._watch_pending_queue == [filepath, arrived_during_error]
+            assert not window._watch_batch_in_progress
+            assert starts == []
+            assert [delay for delay, _callback in retries] == [1500]
+
+            retries.pop()[1]()
+
+            assert attempts["count"] == 2
+            assert starts == [[filepath, arrived_during_error]]
+            assert window._watch_pending_queue == []
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+    def test_reentrant_rejection_keeps_batch_for_worker_completion(
+            self, tmp_path, monkeypatch):
+        import shutil
+        from frameguard import gui
+
+        class RunningThread:
+            @staticmethod
+            def isRunning():
+                return True
+
+        window = gui.MainWindow()
+        retries = []
+        starts = []
+        monkeypatch.setattr(
+            shutil, "disk_usage",
+            lambda _path: shutil._ntuple_diskusage(
+                1024 * 1024 * 1024, 0, 512 * 1024 * 1024),
+        )
+        monkeypatch.setattr(
+            gui.QTimer, "singleShot",
+            staticmethod(lambda delay, callback: retries.append((delay, callback))),
+        )
+        self._install_successful_start(monkeypatch, gui, window, starts)
+        filepath = str(tmp_path / "busy.mov")
+
+        try:
+            window._worker_thread = RunningThread()
+            window._watch_pending_queue = [filepath]
+            window._process_watch_queue()
+
+            assert window._watch_pending_queue == [filepath]
+            assert not window._watch_batch_in_progress
+            assert retries == []
+            assert starts == []
+
+            window._worker_thread = None
+            window._process_watch_queue()
+
+            assert starts == [[filepath]]
+            assert window._watch_pending_queue == []
+        finally:
+            window._cleanup_worker()
+            window._watch_monitor.stop()
+            window.hide()
+
+
 class TestResultsPanel:
     def test_results_accumulate_across_scans(self):
         """Previously each new batch replaced the whole history."""
@@ -389,6 +597,12 @@ class TestResetToDefaults:
 
 
 class TestFirstLaunchContract:
+    def test_main_does_not_shadow_startup_theme_resolver(self):
+        """A late local import made the packaged startup call an unbound local."""
+        from frameguard.gui import main
+
+        assert "get_theme" not in main.__code__.co_varnames
+
     def test_os_theme_mapping_is_not_persisted(self):
         from PySide6.QtCore import QSettings
         from frameguard.gui import (

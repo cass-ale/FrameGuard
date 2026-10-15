@@ -325,8 +325,10 @@ class TestGithubReleaseAssetPick:
     ASSETS = [
         {"name": "FrameGuardInstaller.exe",
          "browser_download_url": "https://example.test/win.exe", "size": 10},
-        {"name": "FrameGuard.dmg",
-         "browser_download_url": "https://example.test/mac.dmg", "size": 20},
+        {"name": "FrameGuard-arm64.dmg",
+         "browser_download_url": "https://example.test/arm.dmg", "size": 20},
+        {"name": "FrameGuard-intel.dmg",
+         "browser_download_url": "https://example.test/intel.dmg", "size": 20},
     ]
 
     def test_windows_picks_the_exe(self):
@@ -337,13 +339,13 @@ class TestGithubReleaseAssetPick:
     def test_macos_picks_the_dmg_even_when_the_exe_is_first(self):
         from frameguard.updater import _pick_release_asset
         picked = _pick_release_asset(self.ASSETS, platform="darwin")
-        assert picked["name"] == "FrameGuard.dmg"
+        assert picked["name"] == "FrameGuard-arm64.dmg"
 
     def test_macos_picks_the_dmg_when_it_is_first(self):
         from frameguard.updater import _pick_release_asset
         picked = _pick_release_asset(list(reversed(self.ASSETS)),
                                       platform="darwin")
-        assert picked["name"] == "FrameGuard.dmg"
+        assert picked["name"] == "FrameGuard-arm64.dmg"
 
     def test_no_asset_for_this_platform_returns_none(self):
         from frameguard.updater import _pick_release_asset
@@ -357,15 +359,15 @@ class TestGithubReleaseAssetPick:
             {"name": "FrameGuard-arm64.dmg",
              "browser_download_url": "https://example.test/arm.dmg",
              "size": 1},
-            {"name": "FrameGuard.dmg",
-             "browser_download_url": "https://example.test/mac.dmg",
+            {"name": "FrameGuard-intel.dmg",
+             "browser_download_url": "https://example.test/intel.dmg",
              "size": 2},
         ]
-        # An Intel machine must not be handed the arm64 DMG when the
-        # canonical (un-suffixed) DMG is also on the release.
+        # An Intel machine must not be handed the arm64 DMG when both exact
+        # release assets are present.
         picked = _pick_release_asset(assets, platform="darwin",
                                      machine="x86_64")
-        assert picked["name"] == "FrameGuard.dmg"
+        assert picked["name"] == "FrameGuard-intel.dmg"
 
     def test_arm64_machine_picks_the_arm64_dmg(self):
         from frameguard.updater import _pick_release_asset

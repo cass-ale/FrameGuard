@@ -6,6 +6,7 @@ v0.3: Added strict mode, subprocess cleanup on cancel, psutil child process term
 """
 
 import os
+import subprocess
 import threading
 from typing import List, Optional
 from PySide6.QtCore import QObject, Signal
@@ -17,14 +18,6 @@ from frameguard.core import (
 
 class ScanWorker(QObject):
     """Background worker that runs QA checks and emits progress signals."""
-
-    # PIDs of spawned subprocesses (ffmpeg/ffprobe) to kill on cancel.
-    # Instance-scoped (not class-global): a class-global set leaks PIDs across
-    # scans and risks terminate() hitting a recycled PID owned by another
-    # process. core.py registers via the callbacks below.
-    # Kept as a class attribute name for back-compat with tests that poke it.
-    _active_pids: set[int] = set()
-    _active_pids_lock = threading.Lock()
 
     # Signals
     scan_started = Signal(int)                    # total file count
@@ -48,47 +41,57 @@ class ScanWorker(QObject):
         # H5: configure() race protection
         self._state_lock = threading.Lock()
         self._is_running: bool = False
-        # Per-scan PID set: instance-scoped so a stale PID from a previous
-        # scan (possibly recycled by the OS) can never kill an unrelated
-        # process. The class-level _active_pids is retained for back-compat
-        # with the core.py registration callbacks, which cannot know which
-        # worker instance owns a given ffmpeg invocation.
+        # One ownership registry backs both psutil and direct-Popen cancel
+        # paths. A PID alone is not ownership evidence because the OS may
+        # recycle it after the child exits.
         self._own_pids: set[int] = set()
-        self._own_pids_lock = threading.Lock()
-        # Tracks live Popen handles when psutil is unavailable.
+        self._own_pid_create_times: dict[int, float] = {}
         self._own_procs: list = []
         self._own_procs_lock = threading.Lock()
 
-    # H6: Allow external modules (e.g., core.py) to register PIDs to be terminated on cancel().
-    @classmethod
-    def register_pid(cls, pid: int) -> None:
-        if not pid:
-            return
-        with cls._active_pids_lock:
-            cls._active_pids.add(int(pid))
-
-    @classmethod
-    def unregister_pid(cls, pid: int) -> None:
-        if not pid:
-            return
-        with cls._active_pids_lock:
-            cls._active_pids.discard(int(pid))
-
     def register_proc(self, proc) -> None:
-        """Track a live Popen handle for the psutil-missing fallback path."""
+        """Register a subprocess to this worker and no other worker."""
         if proc is None:
             return
+        pid = getattr(proc, "pid", None)
+        create_time = None
+        if pid:
+            try:
+                import psutil
+                create_time = psutil.Process(pid).create_time()
+            except Exception:
+                pass
         with self._own_procs_lock:
-            self._own_procs.append(proc)
+            cancelled = self._cancel_event.is_set()
+            if not cancelled:
+                if proc not in self._own_procs:
+                    self._own_procs.append(proc)
+                if pid:
+                    self._own_pids.add(int(pid))
+                    if create_time is not None:
+                        self._own_pid_create_times[int(pid)] = create_time
+
+        # Close the registration/cancel race: a process born after cancel's
+        # snapshot must still be stopped immediately.
+        if cancelled:
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except Exception:
+                pass
 
     def unregister_proc(self, proc) -> None:
         if proc is None:
             return
+        pid = getattr(proc, "pid", None)
         with self._own_procs_lock:
             try:
                 self._own_procs.remove(proc)
             except ValueError:
                 pass
+            if pid:
+                self._own_pids.discard(int(pid))
+                self._own_pid_create_times.pop(int(pid), None)
 
     def configure(self, files: List[str], preset: Optional[str] = None,
                   quick: bool = False, naming: bool = False,
@@ -130,72 +133,57 @@ class ScanWorker(QObject):
         """Request cancellation of the current scan and kill subprocesses."""
         self._cancel_event.set()
 
-        # H6: Only terminate specific registered PIDs; do not kill all app children.
-        # M4: After terminate(), wait with timeout, then escalate to kill() if still alive.
+        with self._own_procs_lock:
+            owned = [
+                (proc, self._own_pid_create_times.get(getattr(proc, "pid", None)))
+                for proc in self._own_procs
+            ]
+
         try:
             import psutil
+        except ImportError:
+            psutil = None
+        if psutil is None:
+            process_errors = (OSError, ValueError)
+        else:
+            process_errors = (
+                psutil.NoSuchProcess, psutil.AccessDenied,
+                psutil.TimeoutExpired, OSError, ValueError,
+            )
 
-            with self.__class__._active_pids_lock:
-                pids = list(self.__class__._active_pids)
-
-            for pid in pids:
-                try:
-                    proc = psutil.Process(pid)
-                except psutil.NoSuchProcess:
-                    with self.__class__._active_pids_lock:
-                        self.__class__._active_pids.discard(pid)
+        for popen_proc, expected_create_time in owned:
+            try:
+                # poll() reaps an exited child and prevents acting on a PID
+                # that may already have been recycled.
+                if popen_proc.poll() is not None:
+                    continue
+                if psutil is None:
+                    popen_proc.terminate()
+                    try:
+                        popen_proc.wait(timeout=0.5)
+                    except (subprocess.TimeoutExpired, AttributeError):
+                        if popen_proc.poll() is None:
+                            popen_proc.kill()
                     continue
 
-                try:
-                    proc.terminate()
+                pid = int(popen_proc.pid)
+                proc = psutil.Process(pid)
+                if expected_create_time is not None:
                     try:
-                        proc.wait(timeout=1.5)  # M4: wait after terminate
-                    except psutil.TimeoutExpired:
-                        try:
-                            proc.kill()
-                            proc.wait(timeout=1.5)
-                        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.TimeoutExpired):
-                            pass
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-                finally:
-                    with self.__class__._active_pids_lock:
-                        self.__class__._active_pids.discard(pid)
-
-        except ImportError:
-            # psutil not available: kill tracked Popen handles directly so
-            # cancel still stops a running ffmpeg instead of waiting up to
-            # two hours for the segment to finish on its own. Consult both
-            # the worker's own list and core's live-handle registry (segment
-            # scans register there via _track_proc).
-            with self._own_procs_lock:
-                procs = list(self._own_procs)
-            try:
-                from frameguard.core import get_live_procs
-                procs += [p for p in get_live_procs() if p not in procs]
-            except Exception:
-                pass
-            for proc in procs:
+                        if proc.create_time() != expected_create_time:
+                            continue
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                proc.terminate()
                 try:
-                    proc.terminate()
-                except Exception:
-                    pass
-            # Give them a beat, then escalate.
-            import time as _time
-            _time.sleep(0.5)
-            with self._own_procs_lock:
-                procs = list(self._own_procs)
-            try:
-                from frameguard.core import get_live_procs as _live
-                procs += [p for p in _live() if p not in procs]
-            except Exception:
+                    proc.wait(timeout=1.5)
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.5)
+            except process_errors:
                 pass
-            for proc in procs:
-                try:
-                    if proc.poll() is None:
-                        proc.kill()
-                except Exception:
-                    pass
+            finally:
+                self.unregister_proc(popen_proc)
 
     def run(self):
         """Execute the scan. Called from QThread."""
@@ -250,7 +238,8 @@ class ScanWorker(QObject):
                     quick=self._quick,
                     naming_check=self._naming,
                     progress_callback=progress_cb,
-                    cancel_event=self._cancel_event
+                    cancel_event=self._cancel_event,
+                    process_owner=self,
                 )
 
                 result.finalize()  # Cache overall_status as plain attribute
@@ -282,13 +271,6 @@ class ScanWorker(QObject):
             # H5: clear running state
             with self._state_lock:
                 self._is_running = False
-
-# Register PID callbacks with core.py to avoid circular imports
-try:
-    from frameguard.core import set_pid_callbacks
-    set_pid_callbacks(ScanWorker.register_pid, ScanWorker.unregister_pid)
-except ImportError:
-    pass
 
 
 

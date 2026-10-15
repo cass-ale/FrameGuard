@@ -373,6 +373,70 @@ class TestBuildScripts:
         ]:
             assert token in sh, f"build_mac.sh is missing the {why} step ({token})"
 
+    def test_final_dmg_smoke_runs_before_artifact_copy(self):
+        sh = _read("build_mac.sh")
+        harness = sh.index("tools_dev/macos_package_smoke.py")
+        final_verify = sh.index('verify_dmg "$LOCAL_DMG_PATH" "final"')
+        publish_copy = sh.index('cp -f "$LOCAL_DMG_PATH" "$DMG_PATH"')
+        assert final_verify < harness < publish_copy
+        for contract in (
+            "--expected-arch", "--artifacts-dir", "--qpa cocoa",
+            "mounted and copied bundle", "Detach is unconditional",
+        ):
+            assert contract in sh
+
+    def test_package_smoke_fails_when_both_detach_attempts_fail(self, tmp_path):
+        import importlib.util
+        import plistlib
+
+        path = os.path.join(REPO, "tools_dev", "macos_package_smoke.py")
+        spec = importlib.util.spec_from_file_location("macos_smoke_detach_test", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        dmg = tmp_path / "FrameGuard.dmg"
+        dmg.write_bytes(b"test-image")
+        artifacts = tmp_path / "artifacts"
+        root = tmp_path / "smoke-root"
+        root.mkdir()
+        mountpoint = root / "mount"
+        detach_calls = []
+
+        def fake_run(command, **_kwargs):
+            if command[:2] == ["hdiutil", "attach"]:
+                payload = {"system-entities": [{
+                    "mount-point": str(mountpoint),
+                    "dev-entry": "/dev/disk-test",
+                }]}
+                return subprocess.CompletedProcess(
+                    command, 0, stdout=plistlib.dumps(payload))
+            if command[:2] == ["hdiutil", "detach"]:
+                detach_calls.append(command)
+                raise subprocess.CalledProcessError(1, command)
+            return subprocess.CompletedProcess(command, 0, stdout=b"")
+
+        with mock.patch.object(module.sys, "platform", "darwin"), \
+             mock.patch.object(module.tempfile, "mkdtemp", return_value=str(root)), \
+             mock.patch.object(module, "_run", side_effect=fake_run), \
+             mock.patch.object(module, "_require_layout", return_value=tmp_path / "FrameGuard"), \
+             mock.patch.object(module, "_startup"), \
+             mock.patch.object(module.subprocess, "run", return_value=None):
+            result = module.main([
+                "--dmg", str(dmg),
+                "--expected-arch", "arm64",
+                "--artifacts-dir", str(artifacts),
+            ])
+
+        evidence = json.loads(
+            (artifacts / "macos-package-smoke.json").read_text(encoding="utf-8"))
+        assert result == 1
+        assert evidence["status"] == "failed"
+        assert evidence["detach_attempted"] is True
+        assert evidence["detach_completed"] is False
+        assert evidence["temp_root_removed"] is True
+        assert len(detach_calls) == 2
+        assert not root.exists()
+
     def test_mac_build_state_is_isolated_from_windows(self):
         """A Mac build must coexist with the tested Windows tree."""
         sh = _read("build_mac.sh")

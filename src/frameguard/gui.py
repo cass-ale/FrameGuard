@@ -49,6 +49,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+from dataclasses import dataclass, field
 from typing import List, Optional
 from datetime import datetime
 
@@ -447,8 +448,10 @@ def _crash_log_dir() -> str:
     return path
 
 
-def _reveal_in_file_manager(path: str):
-    """Show a file in Explorer/Finder with it selected."""
+def _reveal_in_file_manager(path: str) -> bool:
+    """Show an existing file in Explorer/Finder with it selected."""
+    if not os.path.exists(path):
+        return False
     try:
         if sys.platform == "win32":
             # /select, requires a backslash path and no shell quoting
@@ -458,10 +461,20 @@ def _reveal_in_file_manager(path: str):
         else:
             subprocess.Popen(["xdg-open", os.path.dirname(path) or "."])
     except OSError:
-        pass
+        return False
+    return True
 
 
 _vlc_path_cache = []
+
+
+def _executable_identity(path: str):
+    """Identity used to invalidate a positive executable cache entry."""
+    try:
+        stat = os.stat(path)
+    except (OSError, TypeError, ValueError):
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
 def find_vlc() -> Optional[str]:
@@ -472,7 +485,14 @@ def find_vlc() -> Optional[str]:
     never took effect until restart.
     """
     if _vlc_path_cache:
-        return _vlc_path_cache[0] or None
+        try:
+            cached_path, cached_identity = _vlc_path_cache[0]
+        except (TypeError, ValueError):
+            _vlc_path_cache.clear()
+        else:
+            if _executable_identity(cached_path) == cached_identity:
+                return cached_path
+            _vlc_path_cache.clear()
 
     found = None
     if sys.platform == "win32":
@@ -515,9 +535,12 @@ def find_vlc() -> Optional[str]:
         found = shutil.which("vlc")
 
     if found:
-        # A stale negative sticks around from before the fix; replace it.
+        # Cache only a path whose file identity can be revalidated. A replaced
+        # or removed executable must be rediscovered before the next launch.
+        identity = _executable_identity(found)
         _vlc_path_cache.clear()
-        _vlc_path_cache.append(found)
+        if identity is not None:
+            _vlc_path_cache.append((found, identity))
         return found
     return None
 
@@ -578,12 +601,21 @@ def open_in_player(path: str) -> str:
     if vlc:
         try:
             proc = subprocess.Popen([vlc, path], env=_player_env())
-            # Popen succeeding only means the process spawned. VLC can still
-            # die instantly (wrong DLLs, broken install); treat that as "VLC
-            # did not open" and fall back instead of reporting success.
+            # Popen succeeding only means the process spawned. Give VLC a
+            # short bounded grace period so a broken install that dies just
+            # after spawn is not reported as a successful handoff.
             try:
-                if proc.poll() is not None:
-                    raise OSError(f"VLC exited immediately (code {proc.poll()})")
+                wait = getattr(proc, "wait", None)
+                if callable(wait):
+                    try:
+                        code = wait(timeout=0.15)
+                    except subprocess.TimeoutExpired:
+                        code = None
+                else:
+                    poll = getattr(proc, "poll", None)
+                    code = poll() if callable(poll) else None
+                if code is not None:
+                    raise OSError(f"VLC exited during launch (code {code})")
             except OSError:
                 raise
             except Exception:
@@ -1645,15 +1677,22 @@ class ScanPanel(QWidget):
         runner = _FileDiscoveryRunner(list(paths))
         self._discovery_runners.append(runner)
         runner.signals.finished.connect(self._on_discovery_finished)
+        runner.signals.error.connect(self._on_discovery_error)
+        runner.signals.terminal.connect(self._release_discovery_runner)
         QThreadPool.globalInstance().start(runner)
 
-    def _on_discovery_finished(self, files):
-        # Runners are tiny; keep only recent ones so the holder list cannot
-        # grow without bound across a long session of folder browsing.
+    def _release_discovery_runner(self, runner):
+        """Release exactly the discovery runner whose terminal signal arrived."""
         try:
-            self._discovery_runners = self._discovery_runners[-8:]
-        except Exception:
+            self._discovery_runners.remove(runner)
+        except ValueError:
             pass
+
+    def _on_discovery_error(self, error):
+        self.file_count_label.setText(f"Could not inspect selection: {error}")
+        self.scan_btn.setEnabled(False)
+
+    def _on_discovery_finished(self, files):
         if files:
             self._set_files(files)
         else:
@@ -2560,7 +2599,13 @@ class ResultsPanel(QWidget):
 
         chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
         if chosen is reveal:
-            _reveal_in_file_manager(result.filepath)
+            if not _reveal_in_file_manager(result.filepath):
+                title = ("File Not Found" if not os.path.exists(result.filepath)
+                         else "Could Not Reveal File")
+                QMessageBox.warning(
+                    self, title,
+                    f"The file could not be revealed at:\n{result.filepath}",
+                )
         elif chosen is play:
             self._play_result(result)
         elif chosen is copy_path:
@@ -3745,6 +3790,8 @@ class SettingsPanel(QWidget):
 class _FileDiscoverySignals(QObject):
     """Signals for file discovery worker."""
     finished = Signal(list)
+    error = Signal(str)
+    terminal = Signal(object)
 
 
 class _FileDiscoveryRunner(QRunnable):
@@ -3757,17 +3804,23 @@ class _FileDiscoveryRunner(QRunnable):
         self.setAutoDelete(True)
 
     def run(self):
-        from frameguard.core import discover_video_files
-        all_files = []
-        for p in self.paths:
-            all_files.extend(discover_video_files(p))
-        self.signals.finished.emit(all_files)
+        try:
+            from frameguard.core import discover_video_files
+            all_files = []
+            for p in self.paths:
+                all_files.extend(discover_video_files(p))
+            self.signals.finished.emit(all_files)
+        except Exception as error:
+            self.signals.error.emit(str(error))
+        finally:
+            self.signals.terminal.emit(self)
 
 
 class _PdfExportSignals(QObject):
     """Signals for PDF export worker."""
     finished = Signal(str)  # output path on success
     error = Signal(str)     # error message on failure
+    terminal = Signal(object)
 
 
 class _PdfExportRunner(QRunnable):
@@ -3775,19 +3828,29 @@ class _PdfExportRunner(QRunnable):
 
     def __init__(self, results, output_path, preset_label=None):
         super().__init__()
-        self.results = results
+        from frameguard.report import _get_report_colors
+
+        self.results = list(results)
         self.output_path = output_path
         self.preset_label = preset_label
+        self.colors = dict(_get_report_colors())
         self.signals = _PdfExportSignals()
         self.setAutoDelete(True)
 
     def run(self):
         try:
             from frameguard.report import generate_report
-            generate_report(self.results, self.output_path, preset_label=self.preset_label)
+            generate_report(
+                self.results,
+                self.output_path,
+                preset_label=self.preset_label,
+                colors=self.colors,
+            )
             self.signals.finished.emit(self.output_path)
         except Exception as e:
             self.signals.error.emit(str(e))
+        finally:
+            self.signals.terminal.emit(self)
 
 
 
@@ -4405,6 +4468,11 @@ class MainWindow(QMainWindow):
         # unguarded, so cancelling any scan before the watcher had ever fired
         # raised AttributeError and tripped the crash handler.
         self._watch_pending_queue: list = []
+        # Files removed from the queue but not yet accepted by a worker thread.
+        # The dispatch keeps ownership until QThread.start() succeeds so every
+        # pre-scan return can put the batch back without loss or duplication.
+        self._watch_dispatch_pending: Optional[list] = None
+        self._watch_retry_scheduled = False
 
         # Logo pixmaps for recoloring
         self._logo_pixmap_original = None
@@ -5094,27 +5162,39 @@ class MainWindow(QMainWindow):
             self._syncing_preset = False
 
 
+    def _queue_watch_files(self, files: list, *, front: bool = False):
+        """Add watch paths once while preserving their first-seen order."""
+        combined = ([*files, *self._watch_pending_queue] if front
+                    else [*self._watch_pending_queue, *files])
+        seen = set()
+        deduplicated = []
+        for filepath in combined:
+            if filepath in seen:
+                continue
+            seen.add(filepath)
+            deduplicated.append(filepath)
+        self._watch_pending_queue = deduplicated
+
     def _on_watch_files_detected(self, files: list):
         """Handle new files detected by watch folder monitor."""
         count = len(files)
-        
-        # If a scan is already running, queue files for later
+        self._queue_watch_files(files)
+
+        # A scan-start error can open a nested Qt event loop. New arrivals join
+        # the queue, but the live dispatch keeps ownership until its slot returns.
+        if self._watch_dispatch_pending is not None:
+            return
+        if self._watch_retry_scheduled:
+            return  # join the existing 1500ms backoff without retrying early
+
+        # If a scan is already running, its terminal path owns the 500ms retry.
         if self._worker_thread and self._worker_thread.isRunning():
-            self._watch_pending_queue.extend(files)
             self.scan_panel.progress_label.setText(
                 f"Watch folder: {count} file{'s' if count != 1 else ''} queued (scan in progress)"
             )
             return
-        
-        # No scan running — process immediately
-        self.scan_panel._set_files(files)
-        self.scan_panel.progress_label.setText(
-            f"Watch folder: {count} new file{'s' if count != 1 else ''} detected"
-        )
-        self._watch_batch_in_progress = True
-        self.scan_panel.scan_requested.emit(
-            files, self.scan_panel.engine_preset() or "", True, False  # quick=True for auto-scan
-        )
+
+        self._process_watch_queue()
     
     def _on_preset_dropped(self, filepath: str):
         """Handle a .fg preset file being dropped onto the app."""
@@ -5153,23 +5233,61 @@ class MainWindow(QMainWindow):
         finally:
             self._syncing_preset = False
     
-    def _process_watch_queue(self):
-        """Process any queued watch folder files after a scan finishes."""
-        if not self._watch_pending_queue:
+    def _schedule_watch_queue_retry(self, delay_ms: int = 1500):
+        """Retry an idle rejected watch batch once, without timer fan-out."""
+        if self._watch_retry_scheduled or not self._watch_pending_queue:
             return
-        
+        if self._worker_thread and self._worker_thread.isRunning():
+            return  # the worker's terminal path schedules the normal 500ms retry
+        self._watch_retry_scheduled = True
+        QTimer.singleShot(delay_ms, self._retry_watch_queue)
+
+    def _retry_watch_queue(self):
+        self._watch_retry_scheduled = False
+        self._process_watch_queue()
+
+    def _restore_rejected_watch_dispatch(self):
+        """Return an unaccepted dispatch to the front of the pending queue."""
+        queued = self._watch_dispatch_pending
+        if queued is None:
+            return
+        self._watch_dispatch_pending = None
+        self._queue_watch_files(queued, front=True)
+        self._watch_batch_in_progress = False
+        count = len(self._watch_pending_queue)
+        self._report_idle_status(
+            f"Watch folder: {count} file{'s' if count != 1 else ''} queued; retrying."
+        )
+        self._schedule_watch_queue_retry(1500)
+
+    def _process_watch_queue(self):
+        """Process queued watch files without releasing them before acceptance."""
+        if not self._watch_pending_queue or self._watch_dispatch_pending is not None:
+            return
+        if self._worker_thread and self._worker_thread.isRunning():
+            return  # completion owns the normal 500ms queue drain
+
         queued = list(self._watch_pending_queue)
         self._watch_pending_queue.clear()
-        
-        count = len(queued)
-        self.scan_panel._set_files(queued)
-        self.scan_panel.progress_label.setText(
-            f"Watch folder: scanning {count} queued file{'s' if count != 1 else ''}"
-        )
+        self._watch_dispatch_pending = queued
         self._watch_batch_in_progress = True
-        self.scan_panel.scan_requested.emit(
-            queued, self.scan_panel.engine_preset() or "", True, False  # quick=True for auto-scan
-        )
+
+        try:
+            count = len(queued)
+            self.scan_panel._set_files(queued)
+            self.scan_panel.progress_label.setText(
+                f"Watch folder: scanning {count} queued file{'s' if count != 1 else ''}"
+            )
+            self.scan_panel.scan_requested.emit(
+                queued, self.scan_panel.engine_preset() or "", True, False
+            )
+        except Exception as exc:
+            print(f"[FrameGuard] Could not dispatch watch-folder batch: {exc}")
+        finally:
+            # The scan slot clears this token only after QThread.start() accepts
+            # ownership. Low disk, re-entry, setup errors, and slot exceptions
+            # all leave it intact and therefore restore the exact batch here.
+            self._restore_rejected_watch_dispatch()
     
     def _on_watch_status_changed(self, status: str):
         """Mirror the monitor's status into the Watch panel."""
@@ -5238,6 +5356,7 @@ class MainWindow(QMainWindow):
         runner.signals.error.connect(
             lambda err: self._report_idle_status(f"Auto-export failed: {err}")
         )
+        runner.signals.terminal.connect(self._release_export_runner)
         QThreadPool.globalInstance().start(runner)
 
 
@@ -5336,6 +5455,8 @@ class MainWindow(QMainWindow):
                 self._watch_monitor.pause()
             
             self._worker_thread.start()
+            if self._watch_dispatch_pending == list(files):
+                self._watch_dispatch_pending = None
         except Exception as e:
             self.scan_panel.set_scanning(False)
             # The watcher is paused inside the try above; without this it stays
@@ -5610,12 +5731,19 @@ class MainWindow(QMainWindow):
         self._export_runners.append(runner)
         runner.signals.finished.connect(self._on_export_finished)
         runner.signals.error.connect(self._on_export_error)
+        runner.signals.terminal.connect(self._release_export_runner)
         QThreadPool.globalInstance().start(runner)
+
+    def _release_export_runner(self, runner):
+        """Release exactly the export whose terminal signal was delivered."""
+        try:
+            self._export_runners.remove(runner)
+        except ValueError:
+            pass
 
     def _reset_export_button(self):
         self.results_panel.export_btn.setText("Export PDF")
         self.results_panel.export_btn.setEnabled(bool(self.results_panel._results))
-        self._export_runners.clear()
 
     def _on_export_finished(self, path: str):
         self._reset_export_button()
@@ -6378,9 +6506,9 @@ class MainWindow(QMainWindow):
 # SPLASH SCREEN (FL Studio-style loading animation)
 # ============================================================================
 
-def get_saved_theme_name() -> str:
+def get_saved_theme_name(settings=None) -> str:
     """Resolve the explicit theme or current OS-mapped first-launch theme."""
-    return resolve_startup_theme()[0]
+    return resolve_startup_theme(settings=settings)[0]
 
 
 class SplashScreen(QWidget):
@@ -6668,6 +6796,145 @@ class SplashScreen(QWidget):
         return 1 - (1 - x) ** 3
 
 
+@dataclass
+class StartupPreflightConfig:
+    """Internal configuration for the bounded real-startup package gate."""
+
+    report_path: str
+    profile_path: str
+    timeout_ms: int = 15000
+    challenge: Optional[str] = None
+    saved_theme: Optional[str] = None
+    legacy_theme: Optional[str] = None
+    fail_at: Optional[str] = None
+    timeout_at: Optional[str] = None
+    cold_file_open_paths: List[str] = field(default_factory=list)
+    warm_file_open_paths: List[str] = field(default_factory=list)
+
+
+class _StartupProbe:
+    """Persist ordered startup evidence atomically after every checkpoint."""
+
+    _TERMINAL = frozenset(("passed", "failed", "timeout"))
+
+    def __init__(self, config: StartupPreflightConfig):
+        import platform
+        import time
+
+        self.config = config
+        self.started = time.monotonic()
+        started_wall_time_ns = time.time_ns()
+        self.stalled = False
+        self.data = {
+            "schema_version": 2,
+            "status": "running",
+            "challenge": config.challenge,
+            "process_id": os.getpid(),
+            "parent_process_id": os.getppid(),
+            "started_wall_time_ns": started_wall_time_ns,
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "executable": sys.executable,
+            "os": platform.platform(),
+            "architecture": platform.machine(),
+            "python": platform.python_version(),
+            "qt_version": "",
+            "qpa": os.environ.get("QT_QPA_PLATFORM", ""),
+            "profile_path": config.profile_path,
+            "theme": None,
+            "duration_ms": 0,
+            "checkpoints": [],
+            "paths": {
+                "cli_requested": [],
+                "cli_delivered": [],
+                "file_open_cold_requested": list(config.cold_file_open_paths),
+                "file_open_warm_requested": list(config.warm_file_open_paths),
+                "file_open_delivered": [],
+            },
+            "event_loop": {
+                "turn_observed": False,
+                "deferred_show_confirmed": False,
+            },
+            "exception": None,
+            "timeout": None,
+        }
+        self._write()
+
+    def _elapsed_ms(self):
+        import time
+        return int((time.monotonic() - self.started) * 1000)
+
+    def _write(self):
+        report = Path(self.config.report_path)
+        report.parent.mkdir(parents=True, exist_ok=True)
+        temporary = report.with_name(f".{report.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8") as stream:
+                json.dump(self.data, stream, indent=2, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, report)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def checkpoint(self, name):
+        if self.data["status"] in self._TERMINAL:
+            return
+        if not any(item["name"] == name for item in self.data["checkpoints"]):
+            self.data["checkpoints"].append({
+                "name": name,
+                "elapsed_ms": self._elapsed_ms(),
+            })
+        if name == "event_loop_turn":
+            self.data["event_loop"]["turn_observed"] = True
+        elif name == "deferred_show_confirmed":
+            self.data["event_loop"]["deferred_show_confirmed"] = True
+        if self.config.timeout_at == name:
+            self.stalled = True
+        self.data["duration_ms"] = self._elapsed_ms()
+        self._write()
+        if self.config.fail_at == name:
+            raise RuntimeError(f"Injected startup failure at {name}")
+
+    def set_runtime(self, app):
+        from PySide6 import __version__ as qt_version
+        self.data["qt_version"] = qt_version
+        self.data["qpa"] = app.platformName()
+        self._write()
+
+    def deliver_file_open(self, paths):
+        self.data["paths"]["file_open_delivered"].extend(paths)
+        self._write()
+
+    def deliver_cli(self, paths):
+        self.data["paths"]["cli_delivered"].extend(paths)
+        self._write()
+
+    def finish(self, status, exception=None, timeout_checkpoint=None):
+        import traceback
+
+        if self.data["status"] in self._TERMINAL:
+            return
+        self.data["status"] = status
+        self.data["duration_ms"] = self._elapsed_ms()
+        if exception is not None:
+            self.data["exception"] = {
+                "type": type(exception).__name__,
+                "message": str(exception),
+                "traceback": "".join(traceback.format_exception(
+                    type(exception), exception, exception.__traceback__)),
+            }
+        if status == "timeout":
+            self.data["timeout"] = {
+                "limit_ms": self.config.timeout_ms,
+                "checkpoint": timeout_checkpoint,
+            }
+        self._write()
+
+
 class _FileOpenFilter(QObject):
     """Queue macOS Apple-Event file opens until MainWindow is ready.
 
@@ -6676,10 +6943,11 @@ class _FileOpenFilter(QObject):
     consumed before the window exists.
     """
 
-    def __init__(self, window=None, parent=None):
+    def __init__(self, window=None, parent=None, on_delivery=None):
         super().__init__(parent)
         self._window = window
         self._pending_paths = []
+        self._on_delivery = on_delivery
 
     def set_window(self, window):
         self._window = window
@@ -6691,6 +6959,8 @@ class _FileOpenFilter(QObject):
     def _deliver(self, paths):
         if self._window is None or not paths:
             return
+        if self._on_delivery is not None:
+            self._on_delivery(paths)
         self._window.open_paths(paths)
         self._window.show()
         self._window.raise_()
@@ -6709,147 +6979,262 @@ class _FileOpenFilter(QObject):
         return super().eventFilter(obj, event)
 
 
-def main(dev_mode: bool = False):
-    """Launch FrameGuard Desktop application.
-    
-    Args:
-        dev_mode: If True, watches theme.py for changes and hot-reloads stylesheet.
-                  Start with: python main.py --dev
-    """
-    from PySide6.QtWidgets import QApplication
-    from PySide6.QtGui import QIcon
-    from PySide6.QtCore import QFileSystemWatcher
-    import sys
-    import os
+def main(dev_mode: bool = False,
+         startup_preflight: Optional[StartupPreflightConfig] = None) -> int:
+    """Launch FrameGuard through the same sequence used by package gates."""
+    global QSettings
+    from PySide6.QtCore import (
+        QCoreApplication, QFileSystemWatcher, QSettings as QtQSettings,
+        QtMsgType, qInstallMessageHandler,
+    )
+    from PySide6.QtGui import QFileOpenEvent, QIcon
+    from PySide6.QtWidgets import QApplication, QComboBox
 
-    # High-DPI scaling (Qt6 enables this by default, but be explicit)
-    os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("FrameGuard Desktop")
-
-    # Install before the splash or any processEvents() call. Finder can deliver
-    # a cold-launch QEvent.FileOpen as soon as QApplication exists.
-    file_open_filter = _FileOpenFilter(parent=app)
-    app.installEventFilter(file_open_filter)
-
-    # FrameGuard outlives its main window:
-    # active hides it to the tray. With Qt's default of quitting once the last
-    # window closes, dismissing any dialog while the main window was hidden
-    # terminated the whole app — reported as "app unexpectedly quit when
-    # switching windows". Shutdown is now explicit (MainWindow.closeEvent and
-    # _tray_quit) rather than a side effect of window bookkeeping.
-    app.setQuitOnLastWindowClosed(False)
-
-    # Resolve the effective palette before creating or showing any top-level
-    # surface, including the splash and platform-native window frame.
-    startup_theme = get_saved_theme_name()
-    set_current_theme(startup_theme)
-    _apply_application_palette(get_theme(startup_theme), app)
-    app.setStyleSheet(generate_stylesheet())
-    
-    # Show splash screen immediately (before heavy imports)
-    splash = SplashScreen()
-    splash.show()
-    splash.set_status("Initializing...", 5)
-
-    # --- Stylesheet parse error diagnostic ---
-    from PySide6.QtCore import qInstallMessageHandler, QtMsgType
-
-    def _qt_message_handler(mode, context, message):
-        # In a frozen --windowed build sys.stderr is None; printing would raise
-        # inside the message handler and Qt would recurse on the failure.
-        if sys.stderr is None:
-            return
-        if "Could not parse" in message:
-            sys.stderr.write(f"[QSS ERROR] {message}\n")
-        elif mode == QtMsgType.QtWarningMsg and "stylesheet" in message.lower():
-            sys.stderr.write(f"[QSS WARNING] {message}\n")
-
-    qInstallMessageHandler(_qt_message_handler)
+    probe = _StartupProbe(startup_preflight) if startup_preflight else None
+    app = None
     try:
-        from frameguard import __version__ as _ver
-        app.setApplicationVersion(_ver)
-    except ImportError:
-        app.setApplicationVersion(APP_VERSION)
-    app.setOrganizationName(_SETTINGS_ORG)
-    app.setOrganizationDomain("caprilaria.com")
+        # High-DPI scaling (Qt6 enables this by default, but be explicit).
+        os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 
-    # Set app icon
-    icon_paths = [
-        # Frozen mode: icon at app root (copied by installer)
-        os.path.join(os.path.dirname(sys.executable), "frameguard.ico") if getattr(sys, 'frozen', False) else "",
-        # Frozen mode: icon in _internal/assets (bundled by PyInstaller)
-        os.path.join(getattr(sys, '_MEIPASS', ''), "assets", "frameguard.ico") if getattr(sys, 'frozen', False) else "",
-        # Dev mode paths
-        os.path.join(os.path.dirname(__file__), "..", "assets", "frameguard.ico"),
-        os.path.join(os.path.dirname(__file__), "assets", "frameguard.ico"),
-    ]
-    for icon_path in icon_paths:
-        if os.path.exists(icon_path):
-            app.setWindowIcon(QIcon(icon_path))
-            break
+        startup_settings = None
+        if startup_preflight:
+            settings_root = os.path.join(startup_preflight.profile_path, "settings")
+            os.makedirs(settings_root, exist_ok=True)
+            QtQSettings.setDefaultFormat(QtQSettings.IniFormat)
+            QtQSettings.setPath(
+                QtQSettings.IniFormat, QtQSettings.UserScope, settings_root)
+            settings_file = os.path.join(settings_root, "startup.ini")
 
-    splash.set_status("Loading themes...", 30)
-    # Keep the splash in step in case the saved theme changed since it was built.
-    splash.set_theme(startup_theme)
-    splash.set_status("Applying stylesheet...", 50)
+            class _PreflightSettings(QtQSettings):
+                def __init__(self, *args, **kwargs):
+                    super().__init__(settings_file, QtQSettings.IniFormat)
 
+            # Every GUI settings read in this bounded process uses the same
+            # isolated store, including reads inside SplashScreen/MainWindow.
+            QSettings = _PreflightSettings
+            startup_settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+            seed = startup_settings
+            if startup_preflight.saved_theme is not None:
+                seed.setValue(_THEME_KEY, startup_preflight.saved_theme)
+            if startup_preflight.legacy_theme is not None:
+                seed.setValue(_LEGACY_THEME_KEY, startup_preflight.legacy_theme)
+            seed.sync()
 
-    # Create and show main window
-    splash.set_status("Building interface...", 70)
-    window = MainWindow()
-    file_open_filter.set_window(window)
-    try:
-        app.styleHints().colorSchemeChanged.connect(
-            window._on_system_color_scheme_changed)
-    except AttributeError:
-        pass
-    splash.set_status("Ready!", 100)
+        app = QApplication(sys.argv)
+        app.setApplicationName("FrameGuard Desktop")
+        if probe:
+            probe.set_runtime(app)
+            probe.checkpoint("application_created")
 
-    # Fade out splash and show main window
-    from PySide6.QtCore import QTimer as _QT
-    _QT.singleShot(300, lambda: (splash.fade_out(), window.show()))
+        # Install before the splash or any processEvents() call. Finder can
+        # deliver a cold-launch QFileOpenEvent as soon as QApplication exists.
+        file_open_filter = _FileOpenFilter(
+            parent=app,
+            on_delivery=probe.deliver_file_open if probe else None,
+        )
+        app.installEventFilter(file_open_filter)
+        if probe:
+            probe.checkpoint("file_open_filter_installed")
+            for path in startup_preflight.cold_file_open_paths:
+                QCoreApplication.sendEvent(app, QFileOpenEvent(path))
 
-    # Files passed on the command line (double-click a .fg, "Open with",
-    # or drag onto the exe). Deferred so the window exists first.
-    cli_paths = [a for a in sys.argv[1:]
-                 if not a.startswith("-") and os.path.exists(a)]
-    if cli_paths:
-        _QT.singleShot(400, lambda: window.open_paths(cli_paths))
+        # FrameGuard outlives its main window; shutdown is explicit.
+        app.setQuitOnLastWindowClosed(False)
+        if probe:
+            probe.checkpoint("quit_policy_configured")
 
-    # Initial combo popup styling (Windows needs QPalette, not just CSS)
-    from PySide6.QtWidgets import QComboBox
-    from frameguard.theme import get_theme
-    t = get_theme()
-    for combo in window.findChildren(QComboBox):
-        _style_combobox_popup(combo, t)
+        # Resolve the palette before creating or showing a top-level surface.
+        startup_theme = get_saved_theme_name(settings=startup_settings)
+        set_current_theme(startup_theme)
+        if probe:
+            probe.data["theme"] = startup_theme
+            probe.checkpoint("theme_resolved")
+        _apply_application_palette(get_theme(startup_theme), app)
+        if probe:
+            probe.checkpoint("palette_applied")
+        app.setStyleSheet(generate_stylesheet())
+        if probe:
+            probe.checkpoint("stylesheet_applied")
 
-    # --- DEV MODE: Hot-reload stylesheet on theme.py changes ---
-    if dev_mode:
-        theme_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "theme.py")
+        splash = SplashScreen()
+        splash.show()
+        splash.set_status("Initializing...", 5)
+        if probe:
+            probe.checkpoint("splash_shown")
 
-        if os.path.exists(theme_file):
-            watcher = QFileSystemWatcher([theme_file])
-            
-            def _reload_stylesheet(path):
-                """Hot-reload the stylesheet when theme.py changes."""
-                try:
-                    import importlib
-                    import frameguard.theme as theme_mod
-                    importlib.reload(theme_mod)
-                    new_css = theme_mod.generate_stylesheet()
-                    app.setStyleSheet(new_css)
-                    print(f"[DEV] Stylesheet reloaded ({len(new_css):,} chars)")
-                except Exception as e:
-                    print(f"[DEV] Reload failed: {e}")
-            
-            watcher.fileChanged.connect(_reload_stylesheet)
-            # Keep reference so it's not garbage collected
-            window._dev_watcher = watcher
-            print(f"[DEV] Watching: {theme_file}")
-            print("[DEV] Edit theme.py and save — changes appear instantly")
-        else:
-            print("[DEV] WARNING: Could not find theme.py to watch")
+        # Stylesheet parse diagnostics intentionally retain the normal startup
+        # order; moving them earlier belongs to the separate GUI-lifecycle audit.
+        def _qt_message_handler(mode, context, message):
+            if sys.stderr is None:
+                return
+            if "Could not parse" in message:
+                sys.stderr.write(f"[QSS ERROR] {message}\n")
+            elif (mode == QtMsgType.QtWarningMsg
+                  and "stylesheet" in message.lower()):
+                sys.stderr.write(f"[QSS WARNING] {message}\n")
 
-    sys.exit(app.exec())
+        qInstallMessageHandler(_qt_message_handler)
+        if probe:
+            probe.checkpoint("qt_diagnostics_installed")
+        try:
+            from frameguard import __version__ as _ver
+            app.setApplicationVersion(_ver)
+        except ImportError:
+            app.setApplicationVersion(APP_VERSION)
+        app.setOrganizationName(_SETTINGS_ORG)
+        app.setOrganizationDomain("caprilaria.com")
+        if probe:
+            probe.checkpoint("metadata_set")
+
+        icon_paths = [
+            os.path.join(os.path.dirname(sys.executable), "frameguard.ico")
+            if getattr(sys, "frozen", False) else "",
+            os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "frameguard.ico")
+            if getattr(sys, "frozen", False) else "",
+            os.path.join(os.path.dirname(__file__), "..", "assets", "frameguard.ico"),
+            os.path.join(os.path.dirname(__file__), "assets", "frameguard.ico"),
+        ]
+        for icon_path in icon_paths:
+            if os.path.exists(icon_path):
+                app.setWindowIcon(QIcon(icon_path))
+                break
+        if probe:
+            probe.checkpoint("icon_resolved")
+
+        splash.set_status("Loading themes...", 30)
+        splash.set_theme(startup_theme)
+        splash.set_status("Applying stylesheet...", 50)
+        splash.set_status("Building interface...", 70)
+        window = MainWindow()
+        if probe:
+            probe.checkpoint("window_constructed")
+        file_open_filter.set_window(window)
+        if probe:
+            probe.checkpoint("file_open_attached")
+            for path in startup_preflight.warm_file_open_paths:
+                QCoreApplication.sendEvent(app, QFileOpenEvent(path))
+        try:
+            app.styleHints().colorSchemeChanged.connect(
+                window._on_system_color_scheme_changed)
+        except AttributeError:
+            pass
+        if probe:
+            probe.checkpoint("color_scheme_connected")
+        splash.set_status("Ready!", 100)
+
+        def _guard_preflight(callback):
+            if not probe:
+                callback()
+                return
+            try:
+                callback()
+            except Exception as exc:
+                probe.finish("failed", exception=exc)
+                app.exit(1)
+
+        def _show_window():
+            splash.fade_out()
+            window.show()
+            if probe:
+                if not window.isVisible():
+                    raise RuntimeError("Deferred startup show did not make the window visible")
+                probe.checkpoint("deferred_show_confirmed")
+
+        QTimer.singleShot(300, lambda: _guard_preflight(_show_window))
+        if probe:
+            probe.checkpoint("deferred_show_scheduled")
+
+        cli_paths = [
+            argument for argument in sys.argv[1:]
+            if not argument.startswith("-") and os.path.exists(argument)
+        ]
+        if probe:
+            probe.data["paths"]["cli_requested"] = list(cli_paths)
+
+        def _deliver_cli_paths():
+            window.open_paths(cli_paths)
+            if probe:
+                probe.deliver_cli(cli_paths)
+                probe.checkpoint("cli_paths_delivered")
+
+        if cli_paths:
+            QTimer.singleShot(
+                400, lambda: _guard_preflight(_deliver_cli_paths))
+        if probe:
+            probe.checkpoint("cli_paths_scheduled")
+
+        t = get_theme()
+        for combo in window.findChildren(QComboBox):
+            _style_combobox_popup(combo, t)
+        if probe:
+            probe.checkpoint("comboboxes_styled")
+
+        if dev_mode:
+            theme_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "theme.py")
+            if os.path.exists(theme_file):
+                watcher = QFileSystemWatcher([theme_file])
+
+                def _reload_stylesheet(path):
+                    try:
+                        import importlib
+                        import frameguard.theme as theme_mod
+                        importlib.reload(theme_mod)
+                        new_css = theme_mod.generate_stylesheet()
+                        app.setStyleSheet(new_css)
+                        print(f"[DEV] Stylesheet reloaded ({len(new_css):,} chars)")
+                    except Exception as exc:
+                        print(f"[DEV] Reload failed: {exc}")
+
+                watcher.fileChanged.connect(_reload_stylesheet)
+                window._dev_watcher = watcher
+                print(f"[DEV] Watching: {theme_file}")
+                print("[DEV] Edit theme.py and save - changes appear instantly")
+            else:
+                print("[DEV] WARNING: Could not find theme.py to watch")
+
+        if probe:
+            def _event_loop_turn():
+                probe.checkpoint("event_loop_turn")
+
+            def _complete_preflight():
+                if probe.stalled or probe.data["status"] != "running":
+                    return
+                if not probe.data["event_loop"]["turn_observed"]:
+                    raise RuntimeError("Qt event loop did not process a turn")
+                if not probe.data["event_loop"]["deferred_show_confirmed"]:
+                    raise RuntimeError("Deferred startup show callback was not confirmed")
+                probe.checkpoint("preflight_passed")
+                probe.finish("passed")
+                app.exit(0)
+
+            def _watchdog():
+                if probe.data["status"] != "running":
+                    return
+                last = (probe.data["checkpoints"][-1]["name"]
+                        if probe.data["checkpoints"] else None)
+                probe.finish(
+                    "timeout",
+                    timeout_checkpoint=startup_preflight.timeout_at or last,
+                )
+                app.exit(124)
+
+            QTimer.singleShot(0, lambda: _guard_preflight(_event_loop_turn))
+            QTimer.singleShot(450, lambda: _guard_preflight(_complete_preflight))
+            QTimer.singleShot(startup_preflight.timeout_ms, _watchdog)
+            probe.checkpoint("event_loop_entered")
+
+        exit_code = app.exec()
+        if probe and probe.data["status"] == "running":
+            error = RuntimeError(
+                f"Qt event loop exited before startup preflight completed ({exit_code})")
+            probe.finish("failed", exception=error)
+            return 1
+        return int(exit_code)
+    except Exception as exc:
+        if probe:
+            probe.finish("failed", exception=exc)
+            if app is not None:
+                app.exit(1)
+            return 1
+        raise

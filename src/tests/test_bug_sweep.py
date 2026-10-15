@@ -5,6 +5,8 @@ offscreen Qt platform plugin. No test touches the network or real media files:
 ffmpeg interaction is mocked at the subprocess boundary.
 """
 
+import io
+import subprocess
 import threading
 from unittest import mock
 
@@ -19,6 +21,7 @@ from frameguard.core import (
     check_severity,
     discover_video_files,
     result_severity,
+    run_deep_scan,
     run_ffprobe,
 )
 
@@ -34,6 +37,67 @@ def _cfg(**overrides):
 def _finalized(name, outcome="fail", **kw):
     from conftest import make_result
     return make_result(name, outcome, **kw)
+
+
+class _GeneratedBinaryStream:
+    """Lazy prefix + repeated bytes + suffix stream with no newline."""
+
+    def __init__(self, prefix=b"", noise_bytes=0, suffix=b""):
+        self.prefix = prefix
+        self.noise_bytes = noise_bytes
+        self.suffix = suffix
+        self.max_read_size = 0
+        self.closed = False
+
+    def __iter__(self):
+        raise AssertionError("capture must use bounded binary reads, not line iteration")
+
+    def read(self, size=-1):
+        assert size > 0, "capture must request a bounded chunk"
+        self.max_read_size = max(self.max_read_size, size)
+        if self.closed:
+            return b""
+        out = bytearray()
+        if self.prefix and len(out) < size:
+            take = min(size - len(out), len(self.prefix))
+            out += self.prefix[:take]
+            self.prefix = self.prefix[take:]
+        if self.noise_bytes and len(out) < size:
+            take = min(size - len(out), self.noise_bytes)
+            out += b"x" * take
+            self.noise_bytes -= take
+        if not self.noise_bytes and self.suffix and len(out) < size:
+            take = min(size - len(out), len(self.suffix))
+            out += self.suffix[:take]
+            self.suffix = self.suffix[take:]
+        return bytes(out)
+
+    def close(self):
+        self.closed = True
+
+
+class _BinaryProc:
+    _next_pid = 10000
+
+    def __init__(self, stderr, stdout=b"out_time_us=1000000\nprogress=end\n",
+                 returncode=0):
+        type(self)._next_pid += 1
+        self.pid = type(self)._next_pid
+        self.stderr = stderr
+        self.stdout = io.BytesIO(stdout)
+        self.returncode = returncode
+        self.killed = 0
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        self.killed += 1
+        self.returncode = -9
+        self.stderr.close()
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +140,19 @@ class TestSingleTerminalEmit:
         w.run()
         assert terminals == ["error"]
 
+    def test_worker_passes_itself_as_the_scan_process_owner(self, tmp_path):
+        from frameguard.worker import ScanWorker
+
+        worker = ScanWorker()
+        worker.configure(files=[str(tmp_path / "owned.mov")])
+        result = QAResult("owned.mov")
+        with mock.patch("frameguard.tools.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.tools.get_ffprobe_path", return_value="ffprobe"), \
+             mock.patch("frameguard.worker.run_qa_checks", return_value=result) as run:
+            worker.run()
+
+        assert run.call_args.kwargs["process_owner"] is worker
+
     def test_missing_tools_is_a_clear_error(self, tmp_path):
         """Popen(None) used to raise TypeError mid-scan, surfacing as a cryptic
         per-file 'Internal Error' instead of a clear missing-tools message."""
@@ -104,14 +181,23 @@ class TestCancelWithoutPsutil:
         killed = []
 
         class _FakeProc:
+            def __init__(self):
+                self.alive = True
+
             def terminate(self):
                 killed.append("terminate")
+                self.alive = False
 
             def poll(self):
-                return 0  # already exited after terminate
+                return None if self.alive else 0
+
+            def wait(self, timeout=None):
+                self.alive = False
+                return 0
 
             def kill(self):
                 killed.append("kill")
+                self.alive = False
 
         w.register_proc(_FakeProc())
 
@@ -125,29 +211,38 @@ class TestCancelWithoutPsutil:
 
         assert "terminate" in killed
 
-    def test_cancel_reaches_core_live_handles(self):
-        """Segment scans register in core's live-handle registry; the
-        psutil-missing fallback must consult it, not just the worker list."""
+    def test_cancel_does_not_reach_another_workers_core_handle(self):
+        """The no-psutil fallback must never append every globally live proc."""
         import builtins
         from frameguard import core as C
         from frameguard.worker import ScanWorker
 
-        w = ScanWorker()
+        owner = ScanWorker()
+        other = ScanWorker()
         real_import = builtins.__import__
-        killed = []
 
         class _FakeProc:
+            def __init__(self, pid):
+                self.pid = pid
+                self.terminated = 0
+
             def terminate(self):
-                killed.append("terminate")
+                self.terminated += 1
 
             def poll(self):
+                return None
+
+            def wait(self, timeout=None):
                 return 0
 
             def kill(self):
-                killed.append("kill")
+                pass
 
-        proc = _FakeProc()
-        C._track_proc(proc)
+        owned_proc = _FakeProc(1001)
+        other_proc = _FakeProc(2002)
+        owner.register_proc(owned_proc)
+        other.register_proc(other_proc)
+        C._track_proc(other_proc)
         try:
             def _no_psutil(name, *args, **kwargs):
                 if name == "psutil":
@@ -155,11 +250,231 @@ class TestCancelWithoutPsutil:
                 return real_import(name, *args, **kwargs)
 
             with mock.patch.object(builtins, "__import__", _no_psutil):
-                w.cancel()
+                owner.cancel()
         finally:
-            C._untrack_proc(proc)
+            C._untrack_proc(other_proc)
 
-        assert "terminate" in killed
+        assert owned_proc.terminated == 1
+        assert other_proc.terminated == 0
+
+    def test_exited_owned_process_is_not_terminated_as_a_reused_pid(self):
+        import builtins
+        from frameguard.worker import ScanWorker
+
+        worker = ScanWorker()
+        real_import = builtins.__import__
+
+        class _ExitedProc:
+            pid = 31337
+            terminated = 0
+
+            def poll(self):
+                return 0
+
+            def terminate(self):
+                self.terminated += 1
+
+        proc = _ExitedProc()
+        worker.register_proc(proc)
+
+        def _no_psutil(name, *args, **kwargs):
+            if name == "psutil":
+                raise ImportError("No module named 'psutil'")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", _no_psutil):
+            worker.cancel()
+
+        assert proc.terminated == 0
+
+    def test_registration_after_cancel_terminates_the_late_process(self):
+        import builtins
+        from frameguard.worker import ScanWorker
+
+        worker = ScanWorker()
+        real_import = builtins.__import__
+
+        class _LateProc:
+            pid = 41414
+            terminated = 0
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated += 1
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        def _no_psutil(name, *args, **kwargs):
+            if name == "psutil":
+                raise ImportError("No module named 'psutil'")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch.object(builtins, "__import__", _no_psutil):
+            worker.cancel()
+        proc = _LateProc()
+        worker.register_proc(proc)
+        assert proc.terminated == 1
+
+        with mock.patch.object(builtins, "__import__", _no_psutil):
+            worker.cancel()
+        assert proc.terminated == 1
+
+
+class TestPerWorkerPsutilOwnership:
+    def test_cancel_terminates_only_the_calling_workers_pid(self, monkeypatch):
+        import types
+        from frameguard.worker import ScanWorker
+
+        owner = ScanWorker()
+        other = ScanWorker()
+
+        class _Popen:
+            def __init__(self, pid):
+                self.pid = pid
+                self.alive = True
+
+            def poll(self):
+                return None if self.alive else 0
+
+        owned_proc = _Popen(501)
+        other_proc = _Popen(502)
+        owner.register_proc(owned_proc)
+        other.register_proc(other_proc)
+        terminated = []
+
+        class _PsutilProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def terminate(self):
+                terminated.append(self.pid)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                terminated.append(-self.pid)
+
+        fake_psutil = types.SimpleNamespace(
+            Process=_PsutilProc,
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+            AccessDenied=type("AccessDenied", (Exception,), {}),
+            TimeoutExpired=type("TimeoutExpired", (Exception,), {}),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+        owner.cancel()
+        assert terminated == [owned_proc.pid]
+
+    def test_create_time_mismatch_protects_a_reused_pid(self, monkeypatch):
+        import types
+        from frameguard.worker import ScanWorker
+
+        create_time = {601: 1.0}
+        terminated = []
+
+        class _PsutilProc:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def create_time(self):
+                return create_time[self.pid]
+
+            def terminate(self):
+                terminated.append(self.pid)
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                terminated.append(-self.pid)
+
+        fake_psutil = types.SimpleNamespace(
+            Process=_PsutilProc,
+            NoSuchProcess=type("NoSuchProcess", (Exception,), {}),
+            AccessDenied=type("AccessDenied", (Exception,), {}),
+            TimeoutExpired=type("TimeoutExpired", (Exception,), {}),
+        )
+        monkeypatch.setitem(__import__("sys").modules, "psutil", fake_psutil)
+
+        class _Popen:
+            pid = 601
+
+            def poll(self):
+                return None
+
+        worker = ScanWorker()
+        worker.register_proc(_Popen())
+        create_time[601] = 2.0
+        worker.cancel()
+        assert terminated == []
+
+
+class TestBlockingProbeCancellation:
+    def test_cancel_interrupts_owned_ffprobe_without_touching_other_workers(self):
+        import builtins
+        from frameguard.worker import ScanWorker
+
+        owner = ScanWorker()
+        other = ScanWorker()
+        started = threading.Event()
+        stopped = threading.Event()
+        real_import = builtins.__import__
+
+        class _BlockingProc:
+            def __init__(self, pid):
+                self.pid = pid
+                self.returncode = None
+                self.terminated = 0
+
+            def communicate(self, timeout=None):
+                started.set()
+                assert stopped.wait(2), "owned ffprobe was not cancelled"
+                self.returncode = -15
+                return "", ""
+
+            def poll(self):
+                return None if not stopped.is_set() else self.returncode
+
+            def terminate(self):
+                self.terminated += 1
+                stopped.set()
+
+            def kill(self):
+                stopped.set()
+
+        owned_proc = _BlockingProc(701)
+        other_proc = _BlockingProc(702)
+        other.register_proc(other_proc)
+        result = []
+
+        with mock.patch("frameguard.core.get_ffprobe_path", return_value="ffprobe"), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=owned_proc):
+            thread = threading.Thread(
+                target=lambda: result.append(run_ffprobe(
+                    "clip.mp4", owner, owner._cancel_event)))
+            thread.start()
+            assert started.wait(1)
+
+            def _no_psutil(name, *args, **kwargs):
+                if name == "psutil":
+                    raise ImportError("No module named 'psutil'")
+                return real_import(name, *args, **kwargs)
+
+            with mock.patch.object(builtins, "__import__", _no_psutil):
+                owner.cancel()
+            thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert result == [None]
+        assert owned_proc.terminated == 1
+        assert other_proc.terminated == 0
 
 
 class TestStderrCap:
@@ -175,6 +490,300 @@ class TestStderrCap:
     def test_small_stderr_passes_through_untouched(self):
         capped, truncated = _cap_stderr_text("a\nb\nc", _cfg())
         assert (capped, truncated) == ("a\nb\nc", 0)
+
+    def test_early_evidence_survives_line_and_character_caps(self):
+        evidence = (
+            "[h264] Invalid NAL unit size (-1 > 100).\n"
+            "black_start:5 black_end:15 black_duration:10\n"
+            "silence_start: 6\nsilence_end: 14 | silence_duration: 8"
+        )
+        noise = "\n".join(f"frame={i} " + "x" * 80 for i in range(200))
+        capped, truncated = _cap_stderr_text(
+            evidence + "\n" + noise,
+            _cfg(deep_scan_max_stderr_lines=8, deep_scan_max_stderr_chars=600),
+        )
+
+        assert truncated > 0
+        assert len(capped.splitlines()) <= 8
+        assert len(capped) <= 600
+        assert "Invalid NAL unit size" in capped
+        assert "black_start:5" in capped and "black_end:15" in capped
+        assert "silence_start: 6" in capped and "silence_end: 14" in capped
+
+    def test_evidence_allocation_keeps_first_recent_and_deduplicates(self):
+        lines = [
+            "black_start:0 black_end:1 black_duration:1",
+            *(f"black_start:{i} black_end:{i + 1} black_duration:1"
+              for i in range(1, 40)),
+            "freeze_start:20 freeze_end:25 freeze_duration:5",
+            "[h264] Invalid NAL unit size (-1 > 100).",
+            "[h264] Invalid NAL unit size (-1 > 100).",
+            *(f"black_start:{100 + i} black_end:{101 + i} black_duration:1"
+              for i in range(40)),
+            "frame=500",
+        ]
+        capped, truncated = _cap_stderr_text(
+            "\n".join(lines),
+            _cfg(deep_scan_max_stderr_lines=10,
+                 deep_scan_max_stderr_chars=1200),
+        )
+
+        assert truncated > 0
+        assert capped.count("Invalid NAL unit size") == 1
+        assert "freeze_start:20" in capped
+        assert "black_start:0" in capped
+        assert "black_start:139" in capped
+        assert capped.count("black_start:") == 2
+        assert "frame=500" in capped
+
+    def test_segment_multimegabyte_unterminated_record_uses_bounded_binary_reads(self):
+        stream = _GeneratedBinaryStream(
+            prefix=(b"\xffblack_start:5 black_end:15 black_duration:10 "),
+            noise_bytes=3 * 1024 * 1024,
+            suffix=(b" freeze_start:20 freeze_end:25 freeze_duration:5 "
+                    b"Invalid NAL unit size (-1 > 100). frame=300"),
+        )
+        proc = _BinaryProc(stream)
+        cfg = _cfg(deep_scan_max_stderr_lines=10,
+                   deep_scan_max_stderr_chars=1200)
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
+            captured = _run_segment_filter_scan(
+                "clip.mp4", 0, 30, "blackdetect", None, False, cfg)
+
+        assert captured is not None
+        assert stream.max_read_size <= 64 * 1024
+        assert captured.peak_pending_chars <= 70 * 1024
+        assert len(captured) <= 1200
+        assert "\ufffdblack_start:5" in captured
+        assert "freeze_start:20" in captured
+        assert "Invalid NAL unit size" in captured
+
+    def test_late_distinct_evidence_survives_category_pressure_end_to_end(self):
+        def noisy_stream():
+            early_black = b"".join(
+                f"black_start:{i} black_end:{i + 1} black_duration:1\n".encode()
+                for i in range(40)
+            )
+            late_distinct = (
+                b"freeze_start:20 freeze_end:25 freeze_duration:5\n"
+                b"[h264] Invalid NAL unit size (-1 > 100).\n"
+            )
+            later_black = b"".join(
+                f"black_start:{100 + i} black_end:{101 + i} black_duration:1\n".encode()
+                for i in range(40)
+            )
+            return io.BytesIO(early_black + late_distinct + later_black + b"frame=500\n")
+
+        procs = []
+
+        def make_proc(*args, **kwargs):
+            proc = _BinaryProc(noisy_stream())
+            procs.append(proc)
+            return proc
+
+        result = QAResult("clip.mp4")
+        cfg = _cfg(
+            segment_enabled=True, segment_count=2, segment_min_duration=1,
+            deep_scan_max_stderr_lines=10, deep_scan_max_stderr_chars=1200,
+        )
+        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
+             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
+             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", side_effect=make_proc):
+            run_deep_scan(
+                "clip.mp4", result, cfg,
+                probe_data={"streams": [{"codec_type": "video"}]},
+            )
+
+        result.finalize()
+        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
+        freeze = next(c for c in result.checks if c[0] == "Freeze Frames")
+        assert len(procs) == 2
+        assert decode[1] == "FAIL", result.checks
+        assert freeze[1] in ("WARN", "FAIL"), result.checks
+
+    def test_single_pass_multimegabyte_unterminated_record_changes_verdict(self):
+        stream = _GeneratedBinaryStream(
+            prefix=b"header \xff ",
+            noise_bytes=3 * 1024 * 1024,
+            suffix=(b" freeze_start:20 freeze_end:25 freeze_duration:5 "
+                    b"Invalid NAL unit size (-1 > 100). frame=300"),
+        )
+        proc = _BinaryProc(stream)
+        result = QAResult("clip.mp4")
+        cfg = _cfg(
+            segment_enabled=False,
+            deep_scan_max_stderr_lines=10,
+            deep_scan_max_stderr_chars=1200,
+        )
+        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
+             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
+             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
+            run_deep_scan(
+                "clip.mp4", result, cfg,
+                probe_data={"streams": [{"codec_type": "video"}]},
+            )
+
+        result.finalize()
+        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
+        freeze = next(c for c in result.checks if c[0] == "Freeze Frames")
+        assert stream.max_read_size <= 64 * 1024
+        assert decode[1] == "FAIL", result.checks
+        assert freeze[1] in ("WARN", "FAIL"), result.checks
+
+    def test_segment_capture_is_bounded_while_process_is_running(self):
+        class _NoisyStderr:
+            def __init__(self, line_factory, drained):
+                self._lines = iter(line_factory())
+                self._pending = b""
+                self._drained = drained
+
+            def read(self, size=-1):
+                assert size > 0
+                while len(self._pending) < size:
+                    try:
+                        self._pending += next(self._lines).encode()
+                    except StopIteration:
+                        break
+                chunk, self._pending = self._pending[:size], self._pending[size:]
+                if not chunk:
+                    self._drained.set()
+                return chunk
+
+            def close(self):
+                self._pending = b""
+                self._drained.set()
+
+        class _NoisyProc:
+            pid = 8181
+            returncode = 0
+
+            def __init__(self):
+                self.communicate_called = False
+                self.drained = threading.Event()
+                self.stderr = _NoisyStderr(self._lines, self.drained)
+
+            def _lines(self):
+                yield "black_start:5 black_end:15 black_duration:10\n"
+                for i in range(20_000):
+                    yield f"frame={i} " + "x" * 100 + "\n"
+                yield "[h264] Invalid NAL unit size (-1 > 100).\n"
+                yield "frame= 20000 fps=30\n"
+
+            def communicate(self, timeout=None):
+                self.communicate_called = True
+                return "", "".join(self._lines())
+
+            def wait(self, timeout=None):
+                assert self.drained.wait(2), "stderr reader did not drain the pipe"
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        proc = _NoisyProc()
+        cfg = _cfg(deep_scan_max_stderr_lines=8,
+                   deep_scan_max_stderr_chars=600)
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
+            captured = _run_segment_filter_scan(
+                "clip.mp4", 0, 10, "blackdetect", None, False, cfg)
+
+        assert not proc.communicate_called
+        assert len(captured.splitlines()) <= 8
+        assert len(captured) <= 600
+        assert getattr(captured, "truncated_records", 0) > 0
+        assert captured.peak_lines <= 8
+        assert captured.peak_chars <= 600
+        assert "black_start:5" in captured
+        assert "Invalid NAL unit size" in captured
+        assert "frame= 20000" in captured
+
+    def test_segment_capture_evidence_reaches_end_to_end_verdict(self):
+        class _NoisyProc:
+            _next_pid = 9000
+
+            def __init__(self):
+                type(self)._next_pid += 1
+                self.pid = type(self)._next_pid
+                self.returncode = 0
+                self.stderr = io.BytesIO(b"".join([
+                    b"black_start:5 black_end:15 black_duration:10\n",
+                    *(f"frame={i} ".encode() + b"x" * 100 + b"\n"
+                      for i in range(500)),
+                    b"[h264] Invalid NAL unit size (-1 > 100).\n",
+                    b"frame= 500 fps=30\n",
+                ]))
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        result = QAResult("clip.mp4")
+        procs = []
+
+        def make_proc(*args, **kwargs):
+            proc = _NoisyProc()
+            procs.append(proc)
+            return proc
+
+        cfg = _cfg(
+            segment_enabled=True, segment_count=2, segment_min_duration=1,
+            deep_scan_max_stderr_lines=6, deep_scan_max_stderr_chars=500,
+        )
+        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
+             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
+             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", side_effect=make_proc):
+            run_deep_scan(
+                "clip.mp4", result, cfg,
+                probe_data={"streams": [{"codec_type": "video"}]},
+            )
+
+        result.finalize()
+        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
+        black = next(c for c in result.checks if c[0] == "Black Frames")
+        assert len(procs) == 2
+        assert decode[1] == "FAIL", result.checks
+        assert black[1] in ("WARN", "FAIL"), result.checks
+        assert result.metadata["deep_scan_stderr_truncated_lines"] > 0
+
+    def test_segmented_scan_verdict_keeps_early_defect_evidence(self):
+        result = QAResult("clip.mp4")
+        early = (
+            "[h264] Invalid NAL unit size (-1 > 100).\n"
+            "black_start:5 black_end:15 black_duration:10\n"
+        )
+        noise = "\n".join(f"frame={i} " + "x" * 100 for i in range(100))
+        cfg = _cfg(
+            segment_enabled=True, segment_count=2, segment_min_duration=1,
+            deep_scan_max_stderr_lines=6, deep_scan_max_stderr_chars=500,
+        )
+        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
+             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core._run_segment_filter_scan",
+                        return_value=early + noise):
+            run_deep_scan(
+                "clip.mp4", result, cfg,
+                probe_data={"streams": [{"codec_type": "video"}]},
+            )
+
+        result.finalize()
+        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
+        black = next(c for c in result.checks if c[0] == "Black Frames")
+        assert decode[1] == "FAIL", result.checks
+        assert black[1] in ("WARN", "FAIL"), result.checks
+        assert result.metadata["deep_scan_stderr_truncated_lines"] > 0
 
     def test_segment_scan_returns_none_immediately_when_cancelled(self):
         """A pre-set cancel_event must not spawn ffmpeg at all."""
@@ -195,6 +804,145 @@ class TestStderrCap:
                                                None, False, _cfg())
         assert out is None
         popen.assert_not_called()
+
+    def test_segment_timeout_kills_process_and_unblocks_stderr_reader(self):
+        stopped = threading.Event()
+        reader_started = threading.Event()
+
+        class _BlockingStderr:
+            def read(self, size=-1):
+                assert size > 0
+                reader_started.set()
+                stopped.wait(2)
+                return b""
+
+            def close(self):
+                stopped.set()
+
+        class _TimedOutProc:
+            pid = 9191
+            returncode = None
+            stderr = _BlockingStderr()
+
+            def __init__(self):
+                self.killed = 0
+
+            def wait(self, timeout=None):
+                if not stopped.is_set():
+                    raise subprocess.TimeoutExpired("ffmpeg", timeout)
+                self.returncode = -9
+                return self.returncode
+
+            def kill(self):
+                self.killed += 1
+                stopped.set()
+
+        proc = _TimedOutProc()
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=proc) as popen:
+            out = _run_segment_filter_scan(
+                "x.mp4", 0, 10, "blackdetect", None, False, _cfg())
+
+        assert reader_started.is_set()
+        assert out is None
+        assert proc.killed == 1
+        assert popen.call_args.kwargs["stdout"] is subprocess.DEVNULL
+
+    def test_segment_cancel_terminates_owner_and_joins_stderr_reader(self):
+        import builtins
+        from frameguard.worker import ScanWorker
+
+        stopped = threading.Event()
+        reader_started = threading.Event()
+        real_import = builtins.__import__
+
+        class _BlockingStderr:
+            def read(self, size=-1):
+                assert size > 0
+                reader_started.set()
+                stopped.wait(2)
+                return b""
+
+            def close(self):
+                stopped.set()
+
+        class _CancellableProc:
+            pid = 9292
+            returncode = None
+            stderr = _BlockingStderr()
+
+            def __init__(self):
+                self.terminated = 0
+
+            def wait(self, timeout=None):
+                assert stopped.wait(2), "cancel did not stop segment process"
+                self.returncode = -15
+                return self.returncode
+
+            def poll(self):
+                return None if not stopped.is_set() else self.returncode
+
+            def terminate(self):
+                self.terminated += 1
+                stopped.set()
+
+            def kill(self):
+                stopped.set()
+
+        owner = ScanWorker()
+        proc = _CancellableProc()
+        output = []
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
+            thread = threading.Thread(target=lambda: output.append(
+                _run_segment_filter_scan(
+                    "x.mp4", 0, 10, "blackdetect", None, False, _cfg(),
+                    cancel_event=owner._cancel_event, process_owner=owner)))
+            thread.start()
+            assert reader_started.wait(1)
+
+            def _no_psutil(name, *args, **kwargs):
+                if name == "psutil":
+                    raise ImportError("No module named 'psutil'")
+                return real_import(name, *args, **kwargs)
+
+            with mock.patch.object(builtins, "__import__", _no_psutil):
+                owner.cancel()
+            thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert output == [None]
+        assert proc.terminated == 1
+
+    def test_segment_process_is_registered_to_its_explicit_owner(self):
+        from frameguard.worker import ScanWorker
+
+        worker = ScanWorker()
+
+        class _Proc:
+            pid = 9090
+            returncode = 0
+            stderr = io.BytesIO(b"frame= 10\n")
+
+            def wait(self, timeout=None):
+                return self.returncode
+
+        proc = _Proc()
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+             mock.patch("frameguard.core.subprocess.Popen", return_value=proc), \
+             mock.patch.object(worker, "register_proc", wraps=worker.register_proc) as register, \
+             mock.patch.object(worker, "unregister_proc", wraps=worker.unregister_proc) as unregister:
+            out = _run_segment_filter_scan(
+                "x.mp4", 0, 10, "blackdetect", None, False, _cfg(),
+                process_owner=worker,
+            )
+
+        assert out == "frame= 10"
+        register.assert_called_once_with(proc)
+        unregister.assert_called_once_with(proc)
 
 
 class TestSafeDiscovery:

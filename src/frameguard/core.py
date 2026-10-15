@@ -11,30 +11,21 @@ import frameguard as _package
 __version__ = _package.__version__
 
 import subprocess
+import codecs
 import json
+import math
 import os
 import re
 import threading
+from collections import deque
 from typing import Optional, List, Dict, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# H6 integration: PID registration (optional)
-# PID registration callbacks (set by worker.py to avoid circular import)
-_pid_register_cb = None
-_pid_unregister_cb = None
-
-# Live Popen handles for the psutil-missing cancel path. worker.cancel()
-# kills these directly when psutil is unavailable; without them cancel would
-# wait for every segment to finish on its own (up to two hours).
+# Live handles remain observable for diagnostics, but cancellation never reads
+# this global set. Every cancellable scan subprocess is registered explicitly
+# with the ScanWorker that owns it.
 _live_procs: set = set()
 _live_procs_lock = threading.Lock()
-
-
-def set_pid_callbacks(register_fn, unregister_fn):
-    """Called by worker.py to register PID tracking callbacks."""
-    global _pid_register_cb, _pid_unregister_cb
-    _pid_register_cb = register_fn
-    _pid_unregister_cb = unregister_fn
 
 
 def _track_proc(proc) -> None:
@@ -52,9 +43,46 @@ def _untrack_proc(proc) -> None:
 
 
 def get_live_procs() -> list:
-    """Snapshot of live ffmpeg/ffprobe handles (psutil-missing cancel path)."""
+    """Snapshot of live scan subprocesses for diagnostics only."""
     with _live_procs_lock:
         return list(_live_procs)
+
+
+def _register_owned_proc(proc, process_owner=None) -> None:
+    _track_proc(proc)
+    if process_owner is not None:
+        process_owner.register_proc(proc)
+
+
+def _unregister_owned_proc(proc, process_owner=None) -> None:
+    _untrack_proc(proc)
+    if process_owner is not None:
+        process_owner.unregister_proc(proc)
+
+
+def _run_owned_subprocess(cmd: list, timeout: float, process_owner=None,
+                          cancel_event: Optional[threading.Event] = None):
+    """Run a capture subprocess registered to one scan owner."""
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=_get_clean_env(), **_subprocess_kwargs())
+        _register_owned_proc(proc, process_owner)
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                pass
+        raise
+    finally:
+        _unregister_owned_proc(proc, process_owner)
 
 # Tool detection (optional — graceful fallback if tools.py not available)
 try:
@@ -561,7 +589,8 @@ class QAResult:
 
 
 
-def run_ffprobe(filepath: str) -> Optional[dict]:
+def run_ffprobe(filepath: str, process_owner=None,
+                cancel_event: Optional[threading.Event] = None) -> Optional[dict]:
     """Run FFprobe on a file and return parsed JSON output."""
     ffprobe = get_ffprobe_path()
     if not ffprobe:
@@ -589,40 +618,60 @@ def run_ffprobe(filepath: str) -> Optional[dict]:
         "-show_format", "-show_streams", "-show_entries",
     ]
     try:
-        result = subprocess.run(base_cmd + [entries, filepath],
-                                capture_output=True, text=True, timeout=120,
-                                env=_get_clean_env(), **_subprocess_kwargs())
+        result = _run_owned_subprocess(
+            base_cmd + [entries, filepath], 120, process_owner, cancel_event)
+        if result is None:
+            return None
         if result.returncode != 0:
             # An ffprobe too old to know the side-data section must not take
             # probing down with it: retry with the original field list.
-            result = subprocess.run(base_cmd + [legacy_entries, filepath],
-                                    capture_output=True, text=True, timeout=120,
-                                    env=_get_clean_env(), **_subprocess_kwargs())
-        if result.returncode != 0:
+            result = _run_owned_subprocess(
+                base_cmd + [legacy_entries, filepath], 120,
+                process_owner, cancel_event)
+        if result is None or result.returncode != 0:
             return None
         return json.loads(result.stdout)
     except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, TypeError, OSError):
         return None
 
 
+def _safe_float(value, default=None):
+    """Return a finite float for scalar metadata, otherwise ``default``."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return parsed if math.isfinite(parsed) else default
+
+
+def _safe_int(value, default=None):
+    """Return an integer for scalar metadata, otherwise ``default``."""
+    parsed = _safe_float(value)
+    if parsed is None or not parsed.is_integer():
+        return default
+    try:
+        return int(parsed)
+    except (ValueError, OverflowError):
+        return default
+
+
 def parse_frame_rate(rate_str: str) -> float:
     if not rate_str or rate_str == "0/0":
         return 0.0
-    parts = rate_str.split("/")
-    if len(parts) == 2:
-        try:
-            num, den = float(parts[0]), float(parts[1])
-            if den != 0:
+    if isinstance(rate_str, str):
+        parts = rate_str.split("/")
+        if len(parts) == 2:
+            num = _safe_float(parts[0])
+            den = _safe_float(parts[1])
+            if num is not None and den not in (None, 0):
                 return round(num / den, 4)
-        except ValueError:
-            pass
-    try:
-        return float(rate_str)
-    except ValueError:
-        return 0.0
+    return _safe_float(rate_str, 0.0)
 
 
-def get_file_duration(filepath: str) -> float:
+def get_file_duration(filepath: str, process_owner=None,
+                      cancel_event: Optional[threading.Event] = None) -> float:
     ffprobe = get_ffprobe_path()
     if not ffprobe:
         return 0.0
@@ -633,10 +682,11 @@ def get_file_duration(filepath: str) -> float:
         filepath
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=_get_clean_env(), **_subprocess_kwargs())
-        if result.returncode != 0:
+        result = _run_owned_subprocess(
+            cmd, 60, process_owner, cancel_event)
+        if result is None or result.returncode != 0:
             return 0.0
-        return float(result.stdout.strip())
+        return _safe_float(result.stdout.strip(), 0.0)
     except (subprocess.TimeoutExpired, ValueError, FileNotFoundError, TypeError, OSError):
         return 0.0
 
@@ -844,9 +894,8 @@ def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
     if not bitrate_str:
         result.add_warn("Bitrate", "Could not determine bitrate.")
         return
-    try:
-        bitrate_bps = int(bitrate_str)
-    except (ValueError, TypeError):
+    bitrate_bps = _safe_int(bitrate_str)
+    if bitrate_bps is None or bitrate_bps < 0:
         result.add_warn("Bitrate", f"Could not parse bitrate: {bitrate_str}")
         return
     # v1.6 FIX: Subtract audio bitrate when using format-level total
@@ -854,10 +903,9 @@ def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
         audio_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]
         total_audio_bps = 0
         for a_stream in audio_streams:
-            try:
-                total_audio_bps += int(a_stream.get("bit_rate", 0))
-            except (ValueError, TypeError):
-                pass
+            audio_bps = _safe_int(a_stream.get("bit_rate"), 0)
+            if audio_bps > 0:
+                total_audio_bps += audio_bps
         if total_audio_bps > 0:
             bitrate_bps = max(bitrate_bps - total_audio_bps, 0)
     bitrate_mbps = bitrate_bps / 1_000_000
@@ -867,7 +915,7 @@ def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
     # If format-level subtraction yielded implausibly low video bitrate,
     # but original format bitrate was above minimum, issue WARN not FAIL
     if is_format_level and bitrate_mbps < 1.0:
-        orig_bps = int(probe_data.get("format", {}).get("bit_rate", 0))
+        orig_bps = _safe_int(probe_data.get("format", {}).get("bit_rate"), 0)
         orig_mbps = orig_bps / 1_000_000
         if orig_mbps >= min_br:
             result.add_warn("Bitrate", f"Video bitrate ~{bitrate_mbps:.1f} Mbps after subtracting audio "
@@ -900,11 +948,8 @@ def check_audio(probe_data: dict, result: QAResult, cfg: dict):
         return
     audio = audio_streams[0]
     codec = audio.get("codec_name", "unknown").lower()
-    try:
-        sample_rate = int(audio.get("sample_rate", 0))
-    except (ValueError, TypeError):
-        sample_rate = 0
-    channels = audio.get("channels", 0)
+    sample_rate = _safe_int(audio.get("sample_rate"), 0)
+    channels = _safe_int(audio.get("channels"), 0)
     channel_layout = audio.get("channel_layout", "unknown")
     result.set_metadata("audio_codec", codec)
     result.set_metadata("audio_sample_rate", sample_rate)
@@ -937,9 +982,8 @@ def check_duration(probe_data: dict, result: QAResult, cfg: dict):
     if not duration_str:
         result.add_warn("Duration", "Could not determine file duration.")
         return
-    try:
-        duration = float(duration_str)
-    except (ValueError, TypeError):
+    duration = _safe_float(duration_str)
+    if duration is None or duration < 0:
         result.add_warn("Duration", f"Could not parse duration: {duration_str}")
         return
     hours = int(duration // 3600)
@@ -984,16 +1028,15 @@ def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
     v_dur_str = video_streams[0].get("duration")
     a_dur_str = audio_streams[0].get("duration")
     if not v_dur_str or not a_dur_str:
-        result.add_skip("A/V Duration", "Per-stream duration not available.")
+        result.add_warn("A/V Duration", "Per-stream duration not available.")
         return
-    try:
-        v_dur = float(v_dur_str)
-        a_dur = float(a_dur_str)
-    except (ValueError, TypeError):
-        result.add_skip("A/V Duration", "Could not parse durations.")
+    v_dur = _safe_float(v_dur_str)
+    a_dur = _safe_float(a_dur_str)
+    if v_dur is None or a_dur is None:
+        result.add_warn("A/V Duration", "Could not parse durations.")
         return
-    if v_dur == 0 or a_dur == 0:
-        result.add_skip("A/V Duration", "Duration data unavailable.")
+    if v_dur <= 0 or a_dur <= 0:
+        result.add_warn("A/V Duration", "Duration data unavailable.")
         return
     # Compare stream ENDS, not raw durations. Streams routinely start at
     # different offsets (an audio stream beginning 40 ms in, a video
@@ -1062,27 +1105,21 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     vs = video_streams[0]
     nb_frames_str = vs.get("nb_frames")
     if not nb_frames_str or nb_frames_str == "N/A":
-        result.add_skip("Frame Count", "nb_frames not available in container metadata.")
+        result.add_warn("Frame Count", "nb_frames not available in container metadata.")
         return
-    try:
-        actual_frames = int(nb_frames_str)
-    except (ValueError, TypeError):
-        result.add_skip("Frame Count", f"Could not parse frame count: {nb_frames_str}")
+    actual_frames = _safe_int(nb_frames_str)
+    if actual_frames is None or actual_frames < 0:
+        result.add_warn("Frame Count", f"Could not parse frame count: {nb_frames_str}")
         return
     # v1.6: Use video stream duration first (not format duration)
     duration_str = vs.get("duration")
     if not duration_str:
         duration_str = probe_data.get("format", {}).get("duration")
-    r_frame_rate = vs.get("r_frame_rate", "0/1")
-    try:
-        num, den = r_frame_rate.split("/")
-        fps = float(num) / float(den) if float(den) != 0 else 0
-    except (ValueError, ZeroDivisionError):
-        fps = 0
-    if not duration_str or fps == 0:
-        result.add_skip("Frame Count", "Cannot determine expected frame count.")
+    fps = parse_frame_rate(vs.get("r_frame_rate", "0/1"))
+    duration = _safe_float(duration_str)
+    if duration is None or duration <= 0 or fps <= 0:
+        result.add_warn("Frame Count", "Cannot determine expected frame count.")
         return
-    duration = float(duration_str)
     expected_frames = int(round(duration * fps))
     diff = abs(expected_frames - actual_frames)
     tolerance = max(2, int(fps * 0.1))
@@ -1160,29 +1197,240 @@ def _extract_decode_errors(stderr_clean: str) -> list:
     return errors
 
 
-def _cap_stderr_text(text: str, cfg: dict) -> tuple:
-    """Bound deep-scan stderr memory: keep the tail, count what was dropped.
+_STDERR_EVIDENCE_ORDER = ("decode", "freeze", "silence", "black")
+_STDERR_EVIDENCE_TOKENS = {
+    "black": ("black_start", "black_end", "black_duration"),
+    "freeze": ("freeze_start", "freeze_end", "freeze_duration"),
+    "silence": ("silence_start", "silence_end", "silence_duration"),
+}
+_STDERR_READ_CHUNK_BYTES = 64 * 1024
+_STDERR_RECORD_FRAGMENT_CHARS = 4096
+_STDERR_RECORD_OVERLAP_CHARS = 128
 
-    Long 4K files at ``-v info`` produce hundreds of MB of ffmpeg chatter;
-    holding it all (``stderr_lines[]`` + ``"\\n".join(segment_results)``)
-    OOM'd Windows on deep scans. The detect-filter findings we parse live
-    throughout the log, but the tail holds the final verdict lines, so keep
-    the tail and record the truncation in metadata.
-    """
-    max_lines = int(cfg.get("deep_scan_max_stderr_lines", 5000) or 5000)
-    max_chars = int(cfg.get("deep_scan_max_stderr_chars", 512 * 1024) or 512 * 1024)
+
+def _stderr_evidence_categories(line: str) -> tuple:
+    categories = []
+    if _extract_decode_errors(line):
+        categories.append("decode")
+    for category in ("freeze", "silence", "black"):
+        if any(token in line for token in _STDERR_EVIDENCE_TOKENS[category]):
+            categories.append(category)
+    return tuple(categories)
+
+
+def _stderr_line_is_evidence(line: str) -> bool:
+    return bool(_stderr_evidence_categories(line))
+
+
+def _clip_stderr_line(line: str, limit: int) -> str:
+    if len(line) <= limit:
+        return line
+    marker = " ...[truncated]... "
+    if limit <= len(marker):
+        return line[:limit]
+    head = (limit - len(marker)) // 2
+    return line[:head] + marker + line[-(limit - len(marker) - head):]
+
+
+def _clip_evidence_line(line: str, categories: tuple, limit: int) -> str:
+    """Keep parseable snippets for every semantic category in a long record."""
+    if len(line) <= limit:
+        return line
+    per_category = max(1, (limit - max(0, len(categories) - 1) * 3)
+                       // max(1, len(categories)))
+    snippets = []
+    for category in categories:
+        if category == "decode":
+            positions = [line.find(pattern) for pattern in DECODE_ERROR_PATTERNS
+                         if line.find(pattern) >= 0]
+        else:
+            positions = [line.find(token)
+                         for token in _STDERR_EVIDENCE_TOKENS[category]
+                         if line.find(token) >= 0]
+        start = max(0, min(positions) - 16) if positions else 0
+        snippets.append(line[start:start + per_category])
+    return " | ".join(snippets)[:limit]
+
+
+def _cap_stderr_text(text: str, cfg: dict) -> tuple:
+    """Bound completed stderr with the same category allocation as capture."""
+    max_lines = max(1, int(cfg.get("deep_scan_max_stderr_lines", 5000) or 5000))
+    max_chars = max(1, int(cfg.get("deep_scan_max_stderr_chars", 512 * 1024)
+                           or 512 * 1024))
     if not text:
         return "", 0
-    lines = text.split("\n")
-    truncated = 0
-    if len(lines) > max_lines:
-        truncated += len(lines) - max_lines
-        lines = lines[-max_lines:]
-        text = "\n".join(lines)
-    if len(text) > max_chars:
-        text = text[-max_chars:]
-        truncated += 1
-    return text, truncated
+    lines = text.splitlines()
+    if len(lines) <= max_lines and len(text) <= max_chars:
+        return text, 0
+    capture = _BoundedStderrCapture(cfg)
+    for line in lines:
+        capture.add(line)
+    capped = capture.result()
+    return str(capped), capped.truncated_records
+
+
+class _CapturedStderr(str):
+    def __new__(cls, text: str, truncated_records: int,
+                peak_lines: int, peak_chars: int,
+                peak_pending_chars: int):
+        value = super().__new__(cls, text)
+        value.truncated_records = truncated_records
+        value.peak_lines = peak_lines
+        value.peak_chars = peak_chars
+        value.peak_pending_chars = peak_pending_chars
+        return value
+
+
+class _BoundedStderrCapture:
+    """Keep first/recent semantic evidence per category plus a late tail."""
+
+    def __init__(self, cfg: dict):
+        self.max_lines = max(
+            1, int(cfg.get("deep_scan_max_stderr_lines", 5000) or 5000))
+        self.max_chars = max(
+            1, int(cfg.get("deep_scan_max_stderr_chars", 512 * 1024)
+                   or 512 * 1024))
+        evidence_slots = max(1, min(self.max_lines, 8))
+        separators = max(0, evidence_slots - 1)
+        self._evidence_line_limit = max(
+            1, (self.max_chars - separators) // evidence_slots)
+        self._evidence = {}
+        self._tail = deque()
+        self._tail_chars = 0
+        self._sequence = 0
+        self.truncated_records = 0
+        self.peak_lines = 0
+        self.peak_chars = 0
+        self.peak_pending_chars = 0
+
+    def note_fragment_split(self) -> None:
+        self.truncated_records += 1
+
+    def _allocated_evidence(self) -> list:
+        allocated = []
+        seen = set()
+        # One recent representative for every distinct category comes first;
+        # remaining slots preserve the earliest representative for each.
+        for position in (-1, 0):
+            for category in _STDERR_EVIDENCE_ORDER:
+                entries = self._evidence.get(category, [])
+                if not entries:
+                    continue
+                entry = entries[position]
+                if entry[0] in seen:
+                    continue
+                seen.add(entry[0])
+                allocated.append(entry)
+                if len(allocated) >= self.max_lines:
+                    return allocated
+        return allocated
+
+    def _entries(self) -> list:
+        return sorted([*self._allocated_evidence(), *self._tail])
+
+    def _retained_count(self) -> int:
+        return len(self._allocated_evidence()) + len(self._tail)
+
+    def _joined_chars(self) -> int:
+        evidence = self._allocated_evidence()
+        count = len(evidence) + len(self._tail)
+        return (sum(len(entry[1]) for entry in evidence)
+                + self._tail_chars + max(0, count - 1))
+
+    def _prune_unallocated_evidence(self) -> None:
+        retained = {entry[0] for entry in self._allocated_evidence()}
+        for category in list(self._evidence):
+            entries = [entry for entry in self._evidence[category]
+                       if entry[0] in retained]
+            if entries:
+                self._evidence[category] = entries
+            else:
+                del self._evidence[category]
+
+    def add(self, line: str) -> None:
+        line = line.rstrip("\r\n")
+        categories = _stderr_evidence_categories(line)
+        limit = self._evidence_line_limit if categories else self.max_chars
+        clipped = (_clip_evidence_line(line, categories, limit)
+                   if categories else _clip_stderr_line(line, limit))
+        if len(clipped) < len(line):
+            self.truncated_records += 1
+        entry = (self._sequence, clipped)
+        self._sequence += 1
+
+        if categories:
+            added = False
+            for category in categories:
+                entries = self._evidence.setdefault(category, [])
+                if any(existing[1] == clipped for existing in entries):
+                    continue
+                if len(entries) == 2:
+                    entries.pop()
+                    self.truncated_records += 1
+                entries.append(entry)
+                added = True
+            if not added:
+                return
+            self._prune_unallocated_evidence()
+        else:
+            self._tail.append(entry)
+            self._tail_chars += len(clipped)
+
+        while (self._retained_count() > self.max_lines
+               or self._joined_chars() > self.max_chars):
+            if not self._tail:
+                break
+            discarded = self._tail.popleft()
+            self._tail_chars -= len(discarded[1])
+            self.truncated_records += 1
+
+        self.peak_lines = max(self.peak_lines, self._retained_count())
+        self.peak_chars = max(self.peak_chars, self._joined_chars())
+
+    def result(self) -> _CapturedStderr:
+        entries = self._entries()
+        return _CapturedStderr(
+            "\n".join(line for _, line in entries),
+            self.truncated_records,
+            self.peak_lines,
+            self.peak_chars,
+            self.peak_pending_chars,
+        )
+
+
+def _drain_binary_records(stream, on_record: Callable[[str], None]) -> int:
+    """Decode a binary pipe incrementally and split overlong records safely."""
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+    peak_pending = 0
+
+    def consume(text: str, final: bool = False) -> None:
+        nonlocal pending, peak_pending
+        pending += text
+        peak_pending = max(peak_pending, len(pending))
+        while "\n" in pending:
+            line, pending = pending.split("\n", 1)
+            on_record(line.rstrip("\r"))
+        while len(pending) > _STDERR_RECORD_FRAGMENT_CHARS:
+            on_record(pending[:_STDERR_RECORD_FRAGMENT_CHARS])
+            pending = pending[
+                _STDERR_RECORD_FRAGMENT_CHARS - _STDERR_RECORD_OVERLAP_CHARS:]
+            if hasattr(on_record, "__self__") and hasattr(
+                    on_record.__self__, "note_fragment_split"):
+                on_record.__self__.note_fragment_split()
+        if final and pending:
+            on_record(pending.rstrip("\r"))
+            pending = ""
+
+    while True:
+        chunk = stream.read(_STDERR_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", errors="replace")
+        consume(decoder.decode(chunk))
+    consume(decoder.decode(b"", final=True), final=True)
+    return peak_pending
 
 
 def _merge_event_intervals(events: list, join_gap: float = 0.25) -> list:
@@ -1463,7 +1711,8 @@ def _get_optimal_hwaccel(cfg: dict, probe_file: Optional[str] = None) -> List[st
 def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
                              vf_str: str, af_str: Optional[str], has_audio: bool,
                              cfg: dict,
-                             cancel_event: Optional[threading.Event] = None) -> Optional[str]:
+                             cancel_event: Optional[threading.Event] = None,
+                             process_owner=None) -> Optional[str]:
     """Run a filter scan on a time segment. Returns stderr text, or None on failure.
 
     Uses ``-ss`` before ``-i`` for fast input seeking, which resets output PTS
@@ -1493,17 +1742,48 @@ def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
     cmd += ["-f", "null", "-"]
 
     proc = None
+    stderr_thread = None
+    stderr_started = False
     try:
-        # Popen rather than run() so the PID can be registered: cancel() kills
-        # registered PIDs, and segment scans previously registered none — so
-        # Cancel did nothing until every segment finished on its own (up to
-        # two hours on a long 4K file).
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, env=_get_clean_env(), **_subprocess_kwargs())
-        _track_proc(proc)
-        if _pid_register_cb:
-            _pid_register_cb(proc.pid)
-        _, stderr = proc.communicate(timeout=_calc_timeout(duration, cfg))
+        # stdout is unused. Sending it to DEVNULL leaves one pipe to drain and
+        # avoids the classic two-pipe deadlock while stderr is consumed live.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=False, bufsize=0, env=_get_clean_env(), **_subprocess_kwargs())
+        _register_owned_proc(proc, process_owner)
+        capture = _BoundedStderrCapture(cfg)
+        reader_errors = []
+
+        def _drain_stderr():
+            try:
+                capture.peak_pending_chars = _drain_binary_records(
+                    proc.stderr, capture.add)
+            except (OSError, ValueError, TypeError, AssertionError) as exc:
+                reader_errors.append(exc)
+
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+        stderr_started = True
+
+        def _join_stderr_reader() -> bool:
+            stderr_thread.join(timeout=5)
+            if stderr_thread.is_alive():
+                # A completed/killed child must close its pipe. Refuse a
+                # partial clean result if an abnormal stream stays blocked.
+                try:
+                    proc.stderr.close()
+                except (OSError, ValueError):
+                    pass
+                stderr_thread.join(timeout=1)
+            return not stderr_thread.is_alive()
+
+        proc.wait(timeout=_calc_timeout(duration, cfg))
+        if not _join_stderr_reader():
+            return None
+        if reader_errors and not (cancel_event and cancel_event.is_set()):
+            return None
+
+        stderr = capture.result()
         if cancel_event is not None and cancel_event.is_set():
             return None
         if proc.returncode:
@@ -1527,21 +1807,26 @@ def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
         if proc:
             proc.kill()
             try:
-                proc.communicate(timeout=5)
+                proc.wait(timeout=5)
             except (subprocess.TimeoutExpired, OSError, ValueError):
                 pass
+            if stderr_thread is not None and stderr_started:
+                _join_stderr_reader()
         return None
     except (OSError, ValueError, TypeError):
+        if proc:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                pass
+            if stderr_thread is not None and stderr_started:
+                _join_stderr_reader()
         return None
     finally:
         # None (not "") so the caller can tell a failed segment apart from a
         # clean one — an empty string would look like "no events found".
-        _untrack_proc(proc)
-        if proc and _pid_unregister_cb:
-            try:
-                _pid_unregister_cb(proc.pid)
-            except Exception:
-                pass
+        _unregister_owned_proc(proc, process_owner)
 
 
 # ============================================================================
@@ -1552,7 +1837,8 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                   progress_callback: Optional[Callable] = None,
                   cancel_event: Optional[threading.Event] = None,
                   quick: bool = False,
-                  probe_data: Optional[dict] = None):
+                  probe_data: Optional[dict] = None,
+                  process_owner=None):
     """
     Run FFmpeg-based deep scan for frame-level defects.
 
@@ -1563,7 +1849,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     repeat scans of the same file with the same settings produce the same
     findings, and an event lying across a segment join is still detected.
     """
-    duration = get_file_duration(filepath)
+    duration = get_file_duration(filepath, process_owner, cancel_event)
     if duration <= 0:
         result.add_skip("Deep Scan", "Could not determine file duration.")
         return
@@ -1596,7 +1882,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 
     # v0.4.2: Reuse probe_data from caller to avoid redundant FFprobe call
     if probe_data is None:
-        probe_data = run_ffprobe(filepath)
+        probe_data = run_ffprobe(filepath, process_owner, cancel_event)
     audio_streams = [s for s in (probe_data or {}).get("streams", []) if s.get("codec_type") == "audio"]
     has_audio = len(audio_streams) > 0
 
@@ -1659,6 +1945,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 
         try:
             segment_results = []
+            segment_capture_truncated = 0
             failed_segments = 0
             cancelled = False
 
@@ -1672,7 +1959,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                     seg_executor.submit(
                         _run_segment_filter_scan, filepath,
                         seg_start, seg_end, vf_str, seg_af_str, has_audio, cfg,
-                        cancel_event
+                        cancel_event, process_owner
                     ): idx
                     for idx, (seg_start, seg_end) in enumerate(segments)
                 }
@@ -1694,6 +1981,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                     if seg_stderr is None:
                         failed_segments += 1
                         seg_stderr = ""
+                    else:
+                        segment_capture_truncated += getattr(
+                            seg_stderr, "truncated_records", 0)
                     # -ss before -i zeroes the segment's PTS, so shift every
                     # reported timestamp back onto the whole-file timeline.
                     segment_results.append((idx, _offset_event_times(seg_stderr, segments[idx][0])))
@@ -1728,8 +2018,10 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
             segment_results.sort(key=lambda x: x[0])
             stderr_text, truncated = _cap_stderr_text(
                 "\n".join(r[1] for r in segment_results), cfg)
-            if truncated:
-                result.set_metadata("deep_scan_stderr_truncated_lines", truncated)
+            total_truncated = segment_capture_truncated + truncated
+            if total_truncated:
+                result.set_metadata(
+                    "deep_scan_stderr_truncated_lines", total_truncated)
 
         except Exception as e:
             result.add_warn("Filter Scan", f"Segment scan failed: {str(e)[:100]}. Falling back to single-pass.")
@@ -1756,96 +2048,121 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         try:
             proc = subprocess.Popen(
                 filter_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                universal_newlines=True, bufsize=1, env=_get_clean_env(), **_subprocess_kwargs()
+                text=False, bufsize=0, env=_get_clean_env(),
+                **_subprocess_kwargs()
             )
-            _track_proc(proc)
-            if _pid_register_cb:
-                _pid_register_cb(proc.pid)
-
-            max_lines = int(cfg.get("deep_scan_max_stderr_lines", 5000) or 5000)
-            stderr_lines = []
-            stderr_dropped = 0
-
-            def _read_stderr_combined(p, lines):
-                nonlocal stderr_dropped
-                for line in p.stderr:
-                    if cancel_event and cancel_event.is_set():
-                        break
-                    lines.append(line)
-                    # Bound memory: keep the tail, count the head we drop.
-                    # Long files at -v info otherwise accumulate 100s of MB.
-                    if len(lines) > max_lines:
-                        del lines[0:len(lines) - max_lines]
-                        stderr_dropped += 1
-
-            stderr_thread = threading.Thread(target=_read_stderr_combined, args=(proc, stderr_lines), daemon=True)
-            stderr_thread.start()
-
+            _register_owned_proc(proc, process_owner)
+            capture = _BoundedStderrCapture(cfg)
+            stderr_errors = []
+            stdout_errors = []
             decode_progressed = False
+
+            def _read_stderr_combined():
+                try:
+                    capture.peak_pending_chars = _drain_binary_records(
+                        proc.stderr, capture.add)
+                except (OSError, ValueError, TypeError, AssertionError) as exc:
+                    stderr_errors.append(exc)
+
+            def _handle_progress_record(line: str):
+                nonlocal decode_progressed
+                line = line.strip()
+                if line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=", 1)[1])
+                        if us > 0:
+                            decode_progressed = True
+                        if progress_callback:
+                            progress_callback(
+                                "filter", us / 1_000_000, duration,
+                                "Deep Scan [combined]")
+                    except (ValueError, IndexError):
+                        pass
+
+            def _read_stdout_progress():
+                try:
+                    _drain_binary_records(proc.stdout, _handle_progress_record)
+                except (OSError, ValueError, TypeError, AssertionError) as exc:
+                    stdout_errors.append(exc)
+
+            stderr_thread = threading.Thread(
+                target=_read_stderr_combined, daemon=True)
+            stdout_thread = threading.Thread(
+                target=_read_stdout_progress, daemon=True)
+            stderr_thread.start()
+            stdout_thread.start()
+
+            def _join_reader(thread, stream) -> bool:
+                thread.join(timeout=5)
+                if thread.is_alive():
+                    try:
+                        stream.close()
+                    except (OSError, ValueError):
+                        pass
+                    thread.join(timeout=1)
+                return not thread.is_alive()
+
             try:
-                for line in proc.stdout:
-                    if cancel_event and cancel_event.is_set():
-                        proc.kill()
-                        proc.wait()
-                        _untrack_proc(proc)
-                        if _pid_unregister_cb:
-                            _pid_unregister_cb(proc.pid)
-                        return
-                    line = line.strip()
-                    if line.startswith("out_time_us="):
-                        try:
-                            us = int(line.split("=")[1])
-                            if us > 0:
-                                decode_progressed = True
-                            if progress_callback:
-                                progress_callback("filter", us / 1_000_000, duration, "Deep Scan [combined]")
-                        except (ValueError, IndexError):
-                            pass
-
                 returncode = proc.wait(timeout=timeout)
-                stderr_thread.join(timeout=10)
-                stderr_text, _extra_trunc = _cap_stderr_text("".join(stderr_lines), cfg)
-                if stderr_dropped or _extra_trunc:
-                    result.set_metadata(
-                        "deep_scan_stderr_truncated_lines",
-                        stderr_dropped + _extra_trunc)
-
-                if returncode and not decode_progressed and not any(
-                        tok in stderr_text for tok in (
-                            "black_start", "freeze_start", "silence_start")):
-                    # FFmpeg exited without decoding a single frame. Parsing
-                    # the (event-free) stderr below would report every
-                    # frame-level check as a clean PASS for a file that was
-                    # never actually decoded — the scan must say so instead.
-                    if hwaccel_args and _stderr_shows_device_failure(stderr_text):
-                        _hwaccel_failed_methods.add(hwaccel_args[1])
-                    result.add_warn(
-                        "Deep Scan",
-                        f"FFmpeg could not decode this file (exit code "
-                        f"{returncode}); frame-level checks were not run. "
-                        f"The file may be corrupt or use an unsupported codec.",
-                        confidence=40,
-                    )
-                    return
-
             except subprocess.TimeoutExpired:
                 proc.kill()
-                proc.wait()
-                result.add_warn("Deep Scan", f"Scan timed out after {int(timeout)}s.")
+                try:
+                    proc.wait(timeout=5)
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    pass
+                _join_reader(stderr_thread, proc.stderr)
+                _join_reader(stdout_thread, proc.stdout)
+                result.add_warn(
+                    "Deep Scan", f"Scan timed out after {int(timeout)}s.")
                 if progress_callback:
-                    progress_callback("filter", duration, duration, "Deep Scan [combined]")
+                    progress_callback(
+                        "filter", duration, duration, "Deep Scan [combined]")
                 return
-            finally:
-                _untrack_proc(proc)
-                if _pid_unregister_cb:
-                    try:
-                        _pid_unregister_cb(proc.pid)
-                    except Exception:
-                        pass
+
+            readers_done = (
+                _join_reader(stderr_thread, proc.stderr)
+                and _join_reader(stdout_thread, proc.stdout)
+            )
+            if cancel_event and cancel_event.is_set():
+                return
+            if not readers_done or stderr_errors or stdout_errors:
+                result.add_warn(
+                    "Deep Scan",
+                    "FFmpeg output could not be read completely; frame-level "
+                    "checks were not treated as clean.",
+                    confidence=40,
+                )
+                return
+
+            stderr_text = capture.result()
+            if stderr_text.truncated_records:
+                result.set_metadata(
+                    "deep_scan_stderr_truncated_lines",
+                    stderr_text.truncated_records)
+
+            if returncode and not decode_progressed and not any(
+                    tok in stderr_text for tok in (
+                        "black_start", "freeze_start", "silence_start")):
+                # FFmpeg exited without decoding a single frame. Parsing the
+                # (event-free) stderr below would report every frame-level
+                # check as a clean PASS for a file that never decoded.
+                if hwaccel_args and _stderr_shows_device_failure(stderr_text):
+                    _hwaccel_failed_methods.add(hwaccel_args[1])
+                result.add_warn(
+                    "Deep Scan",
+                    f"FFmpeg could not decode this file (exit code "
+                    f"{returncode}); frame-level checks were not run. "
+                    f"The file may be corrupt or use an unsupported codec.",
+                    confidence=40,
+                )
+                return
 
         except FileNotFoundError:
             result.add_skip("Deep Scan", "FFmpeg not found.")
             return
+        finally:
+            if 'proc' in locals():
+                _unregister_owned_proc(proc, process_owner)
 
     if progress_callback:
         progress_callback("filter", duration, duration, "Deep Scan [combined]")
@@ -1953,7 +2270,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 # MEDIAINFO ENRICHED METADATA (Check 20)
 # ============================================================================
 
-def run_mediainfo_enrichment(filepath: str, result: QAResult, cfg: dict):
+def run_mediainfo_enrichment(filepath: str, result: QAResult, cfg: dict,
+                             process_owner=None,
+                             cancel_event: Optional[threading.Event] = None):
     """Check 20: Use MediaInfo for enriched metadata extraction.
     Adds writing library, encoding settings, and commercial format names
     that FFprobe may not expose. Also cross-validates key fields.
@@ -1971,8 +2290,9 @@ def run_mediainfo_enrichment(filepath: str, result: QAResult, cfg: dict):
 
     try:
         cmd = [mi_path, "--Output=JSON", filepath]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60, env=_get_clean_env(), **_subprocess_kwargs())
-        if proc.returncode != 0:
+        proc = _run_owned_subprocess(
+            cmd, 60, process_owner, cancel_event)
+        if proc is None or proc.returncode != 0:
             return
 
         mi_data = json.loads(proc.stdout)
@@ -2045,7 +2365,8 @@ def run_qa_checks(filepath: str, cfg: dict = None,
                   strict: bool = False, naming_check: bool = False,
                   quick: bool = False,
                   progress_callback: Optional[Callable] = None,
-                  cancel_event: Optional[threading.Event] = None) -> QAResult:
+                  cancel_event: Optional[threading.Event] = None,
+                  process_owner=None) -> QAResult:
     """
     Run all QA checks on a single file.
     Wrapped in try/except for per-file error isolation (v1.4 parity).
@@ -2073,7 +2394,7 @@ def run_qa_checks(filepath: str, cfg: dict = None,
         if cancel_event and cancel_event.is_set():
             return result
 
-        probe_data = run_ffprobe(filepath)
+        probe_data = run_ffprobe(filepath, process_owner, cancel_event)
         if probe_data is None:
             result.add_fail("FFprobe", "FFprobe failed to read the file. "
                            "Possible causes: file is corrupt, codec not supported by installed FFmpeg, "
@@ -2113,14 +2434,17 @@ def run_qa_checks(filepath: str, cfg: dict = None,
                       progress_callback=progress_callback,
                       cancel_event=cancel_event,
                       quick=quick,
-                      probe_data=probe_data)
+                      probe_data=probe_data,
+                      process_owner=process_owner)
 
         # --- Multi-tool checks (v0.4.1 — run in parallel for speed) ---
         if cancel_event and cancel_event.is_set():
             return result
         with ThreadPoolExecutor(max_workers=2) as tool_executor:
             # REMOVED v0.4.4: mc_future = tool_executor.submit(run_mediaconch_check, filepath, result, cfg)
-            mi_future = tool_executor.submit(run_mediainfo_enrichment, filepath, result, cfg)
+            mi_future = tool_executor.submit(
+                run_mediainfo_enrichment, filepath, result, cfg,
+                process_owner, cancel_event)
             # REMOVED v0.4.4: ss_future = tool_executor.submit(
                 # REMOVED v0.4.4: run_signalstats_check, filepath, result, cfg,
                 # REMOVED v0.4.4: file_duration, cancel_event

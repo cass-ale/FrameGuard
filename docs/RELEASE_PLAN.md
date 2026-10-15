@@ -1,8 +1,9 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.7 · **Date:** 2026-10-15 · **Status:** v0.7.3 native Windows
-responsive-contract recovery; immutable failed v0.7.0 through v0.7.2 tags are
-preserved and the next remote operation atomically pushes `main` and `v0.7.3`.
+**Version:** 1.8 · **Date:** 2026-10-15 · **Status:** v0.8.0 shipped-path
+reliability release; the exact source, toolchain, evidence, and arm64 package
+fingerprints must pass the fail-closed package preflight before `main` and
+`v0.8.0` are pushed.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live

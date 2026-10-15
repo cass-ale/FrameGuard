@@ -317,7 +317,10 @@ def _get_tool_version(path: str, name: str) -> Tuple[Optional[str], Tuple[int, .
             )
             if result.returncode != 0:
                 return None, ()
-            first_line = result.stdout.strip().split("\n")[0]
+            output = (result.stdout or "").strip()
+            if not output:
+                return None, ()
+            first_line = output.split("\n", 1)[0]
             version_tuple = _parse_version(first_line)
             return first_line, version_tuple
 
@@ -328,7 +331,9 @@ def _get_tool_version(path: str, name: str) -> Tuple[Optional[str], Tuple[int, .
             )
             if result.returncode != 0:
                 return None, ()
-            ver_str = result.stdout.strip()
+            ver_str = (result.stdout or "").strip()
+            if not ver_str:
+                return None, ()
             version_tuple = _parse_version(ver_str)
             return ver_str, version_tuple
 
@@ -339,7 +344,9 @@ def _get_tool_version(path: str, name: str) -> Tuple[Optional[str], Tuple[int, .
             )
             if result.returncode != 0:
                 return None, ()
-            ver_str = result.stdout.strip()
+            ver_str = (result.stdout or "").strip()
+            if not ver_str:
+                return None, ()
             version_tuple = _parse_version(ver_str)
             return ver_str, version_tuple
 
@@ -459,6 +466,23 @@ _caps_cache: dict = {}
 _caps_lock = threading.Lock()
 
 
+def _ffmpeg_cache_key(ffmpeg_path: str) -> tuple:
+    """Identify the resolved executable, including replacement boundaries."""
+    resolved = os.path.realpath(os.path.abspath(ffmpeg_path))
+    try:
+        stat = os.stat(resolved)
+        return (resolved, stat.st_dev, stat.st_ino, stat.st_size,
+                stat.st_mtime_ns)
+    except OSError:
+        return (resolved, None, None, None, None)
+
+
+def _copy_capabilities(caps: dict) -> dict:
+    copied = dict(caps)
+    copied["hwaccel_methods"] = list(caps.get("hwaccel_methods", []))
+    return copied
+
+
 def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
     """Detect FFmpeg build capabilities relevant to FrameGuard.
 
@@ -484,14 +508,18 @@ def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
             "has_ebur128": False,
         }
 
-    cached = _caps_cache.get(ffmpeg_path)
+    cache_key = _ffmpeg_cache_key(ffmpeg_path)
+    cached = _caps_cache.get(cache_key)
     if cached is not None:
-        return dict(cached)
+        return _copy_capabilities(cached)
 
     with _caps_lock:
-        cached = _caps_cache.get(ffmpeg_path)
+        # Re-resolve after waiting: another thread or updater may have replaced
+        # the executable while this caller was blocked on the probe lock.
+        cache_key = _ffmpeg_cache_key(ffmpeg_path)
+        cached = _caps_cache.get(cache_key)
         if cached is not None:
-            return dict(cached)
+            return _copy_capabilities(cached)
 
         caps = {
             "has_libvmaf": False,
@@ -508,6 +536,9 @@ def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
                 timeout=10, env=_get_clean_env(), **_subprocess_kwargs()
             )
             filter_text = result.stdout or ""
+            if getattr(result, "returncode", 0) != 0 or not filter_text.strip():
+                logger.warning("FFmpeg filter capability probe failed")
+                return _copy_capabilities(caps)
             caps["has_libvmaf"] = "libvmaf" in filter_text
             caps["has_signalstats"] = "signalstats" in filter_text
             caps["has_ebur128"] = "ebur128" in filter_text
@@ -518,7 +549,11 @@ def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
                 capture_output=True, text=True,
                 timeout=10, env=_get_clean_env(), **_subprocess_kwargs()
             )
-            lines = (result.stdout or "").strip().split("\n")
+            hwaccel_text = result.stdout or ""
+            if getattr(result, "returncode", 0) != 0 or not hwaccel_text.strip():
+                logger.warning("FFmpeg hwaccel capability probe failed")
+                return _copy_capabilities(caps)
+            lines = hwaccel_text.strip().split("\n")
             # First line is "Hardware acceleration methods:", rest are method names
             if len(lines) > 1:
                 caps["hwaccel_methods"] = [
@@ -528,10 +563,10 @@ def detect_ffmpeg_capabilities(ffmpeg_path: Optional[str] = None) -> dict:
 
         except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
             logger.warning(f"Could not detect FFmpeg capabilities: {e}")
-            return caps  # don't cache a failed probe
+            return _copy_capabilities(caps)  # don't cache a failed probe
 
-        _caps_cache[ffmpeg_path] = caps
-        return dict(caps)
+        _caps_cache[cache_key] = _copy_capabilities(caps)
+        return _copy_capabilities(caps)
 
 
 # ============================================================================

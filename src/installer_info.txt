@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.7.3
+FrameGuard Desktop v0.8.0
 Video QA for XR Deliverables
 
 
@@ -22,37 +22,28 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.7.3
+WHAT'S NEW IN v0.8.0
 
-  Native Windows validation
-    - Responsive layout contracts now test the intended target width directly,
-      independent of a hosted desktop's physical maximum window size.
-    - Windows automation
-    - Windows automation now uses Qt's native Windows backend and verifies font
-      glyph support before testing; the offscreen backend produced unusable
-      placeholder glyphs and invalid text metrics on hosted Windows runners.
-    - Intel macOS receives enough time to complete the same full suite instead
-      of being cancelled halfway through a healthy run.
-    - The resolved application font
-      preventing unusable fallback glyphs and mismatched text metrics on clean
-      Windows profiles and headless validation systems.
-    - Windows caption controls, Results summary metrics and Checks headings now
-      reserve space from their realized font metrics.
-    - A shutdown-time update check can no longer emit through a deleted Qt
-      signal source.
-    - Every application-owned control
-      all 15 themes, including disabled, focused, selected and error states.
-    - First launch follows the operating system appearance and opens with
-      screen-safe geometry without creating an output folder prematurely.
-    - Scan, Watch Folder and Settings adapt cleanly to short or narrow screens.
-    - Results and Checks tables use actual font metrics so headers, long names,
-      summaries and failure counts remain readable at supported DPI scales.
-    - macOS keeps its native title bar and window behavior; Windows preserves
-      DWM, resize, Aero Snap, Snap Layouts and the native system menu.
-    - Keyboard focus, accessible names, label buddies, contrast and practical
-      interaction targets have automated coverage.
-    - CI renders populated interfaces at three sizes and four DPI scales and
-      preserves JSON and screenshot evidence for any regression.
+  Shipped-path reliability
+    - Source, frozen, installed and mounted applications now exercise the same
+      bounded startup path before a release can be published.
+    - Scan cancellation is isolated per worker, malformed media metadata fails
+      safely, and FFmpeg diagnostics remain memory-bounded without discarding
+      early or late defect evidence.
+    - Watch folders distinguish same-size rewrites and replacements, reject
+      unsafe symlinks, and preserve queued files across low-disk interruptions.
+    - Presets, PDF exports, media launching and updater downloads now use
+      deterministic limits, integrity checks, cancellation and cleanup.
+    - Full-installer updates require exact platform assets and published
+      SHA-256 evidence before an installer can run.
+
+  Systematic pre-push proof
+    - One fail-closed command fingerprints the exact source tree, toolchain,
+      logs, manifests, independent review and final package bytes.
+    - Fast checks can never authorize a push; full and package profiles require
+      every mandatory stage and fresh independent approval.
+    - The release candidate passed the complete suite, repeated timing stress,
+      the 120-state rendered UI matrix and final arm64 DMG startup checks.
 
 
 BEFORE YOU INSTALL

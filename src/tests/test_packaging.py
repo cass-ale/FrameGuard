@@ -166,6 +166,47 @@ class TestPackaging:
         assert '"LSMinimumSystemVersion": "12.0"' in spec
         assert "6.12 requires macOS 14.4" in constraints
 
+    def test_builders_require_real_source_and_frozen_startup_preflights(self):
+        for script in ("build_mac.sh", "build_installer.bat"):
+            body = _read(script)
+            assert "tools_dev/startup_smoke.py" in body.replace("\\", "/")
+            assert "--entrypoint main.py" in body
+            assert "--expect-frozen" in body
+            assert body.index("--entrypoint main.py") < body.index("--expect-frozen")
+            assert "--selftest" in body, "component diagnostic should remain available"
+
+    def test_pyinstaller_warnings_gate_required_third_party_modules(self, tmp_path):
+        import subprocess
+        import sys
+
+        checker = os.path.join(REPO, "tools_dev", "check_pyinstaller_warnings.py")
+        warning = tmp_path / "warn.txt"
+        warning.write_text("missing module named 'PySide6.QtWidgets'\n", encoding="utf-8")
+        failed = subprocess.run(
+            [sys.executable, checker, str(warning), "--platform", "darwin"],
+            capture_output=True, text=True, timeout=10)
+        assert failed.returncode == 1
+        assert "PySide6.QtWidgets" in failed.stderr
+
+        warning.write_text("missing module named 'winreg' imported by platform\n",
+                           encoding="utf-8")
+        passed = subprocess.run(
+            [sys.executable, checker, str(warning), "--platform", "darwin"],
+            capture_output=True, text=True, timeout=10)
+        assert passed.returncode == 0
+
+    def test_smoke_harnesses_are_checked_in_and_parseable(self):
+        import ast
+
+        for name in ("startup_smoke.py", "macos_package_smoke.py"):
+            path = os.path.join(REPO, "tools_dev", name)
+            assert os.path.isfile(path)
+            ast.parse(open(path, encoding="utf-8").read())
+        windows = _read(os.path.join("tools_dev", "windows_installer_smoke.ps1"))
+        for contract in ("/VERYSILENT", "FrameGuard.exe", "ffmpeg.exe",
+                         "FrameGuard.Preset", "unins000.exe", "startup_smoke.py"):
+            assert contract in windows
+
 
 class TestToolDiscovery:
     def test_candidate_dirs_include_the_source_tree(self):

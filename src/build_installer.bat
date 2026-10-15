@@ -166,6 +166,12 @@ if "!SKIP_TESTS!"=="1" (
         if not defined CI pause
         exit /b 1
     )
+    "%PY%" tools_dev\startup_smoke.py --executable "%PY%" --entrypoint main.py --artifacts-dir "Output\build-logs\startup-source" --label "source-startup" --qpa windows --timeout 30
+    if errorlevel 1 (
+        echo ERROR: Source failed the real startup preflight.
+        echo        Evidence: Output\build-logs\startup-source
+        exit /b 1
+    )
     set "QT_QPA_PLATFORM="
     set "FRAMEGUARD_TEST_MODE="
 )
@@ -186,6 +192,11 @@ if errorlevel 1 (
 )
 if exist "build\frameguard\warn-frameguard.txt" (
     copy /y "build\frameguard\warn-frameguard.txt" "Output\build-logs\warn-frameguard-windows.txt" >nul
+    "%PY%" tools_dev\check_pyinstaller_warnings.py "build\frameguard\warn-frameguard.txt" --platform win32
+    if errorlevel 1 (
+        echo ERROR: PyInstaller omitted a required runtime dependency.
+        exit /b 1
+    )
     findstr /i /c:"missing module named 'frameguard." "build\frameguard\warn-frameguard.txt" >nul
     if not errorlevel 1 (
         echo ERROR: PyInstaller reported a missing FrameGuard module.
@@ -220,21 +231,31 @@ if errorlevel 1 (
 )
 
 REM --- Step 8: Smoke test ---
-REM --selftest imports every module, builds the main window, resolves FFmpeg
-REM and returns a real exit code. The old check only asked whether the process
-REM was still alive, which passes even when the app is stuck behind a modal
-REM error dialog.
+REM Keep the direct-construction component diagnostic, but do not treat it as
+REM proof that the production startup preamble or event loop works.
 echo.
 echo [8/9] Smoke testing the build...
 "dist\FrameGuard\FrameGuard.exe" --selftest
 if errorlevel 1 (
     echo.
-    echo ERROR: The built exe failed its self-test. Do not ship this build.
+    echo ERROR: The built exe failed its component self-test. Do not ship this build.
     echo        Reproduce with: dist\FrameGuard\FrameGuard.exe --selftest
     if not defined CI pause
     exit /b 1
 )
-echo       Smoke test passed.
+echo       Component self-test passed.
+
+REM Exercise frameguard.gui.main() with internal and external watchdogs and
+REM require ordered atomic JSON evidence from the frozen windowed executable.
+"%PY%" tools_dev\startup_smoke.py --executable "dist\FrameGuard\FrameGuard.exe" --artifacts-dir "Output\build-logs\startup-exe" --label "frozen-exe-startup" --expect-frozen --qpa windows --timeout 30
+if errorlevel 1 (
+    echo.
+    echo ERROR: The built exe failed the real startup preflight. Do not ship this build.
+    echo        Evidence: Output\build-logs\startup-exe
+    if not defined CI pause
+    exit /b 1
+)
+echo       Real startup preflight passed.
 
 REM --- Step 9: Inno Setup ---
 echo.
@@ -271,6 +292,18 @@ if not exist "Output\FrameGuardInstaller.exe" (
     if not defined CI pause
     exit /b 1
 )
+
+REM The installer is the shipped artifact, so install it silently into a fresh
+REM temp root, verify its layout/association/uninstaller, run the installed
+REM executable's real startup preflight, and uninstall before declaring success.
+powershell -NoProfile -ExecutionPolicy Bypass -File "tools_dev\windows_installer_smoke.ps1" -Installer "Output\FrameGuardInstaller.exe" -ArtifactsDir "Output\build-logs\installed-smoke" -Python "%PY%"
+if errorlevel 1 (
+    echo ERROR: The final installer failed installed-artifact smoke. Do not ship this build.
+    echo        Evidence: Output\build-logs\installed-smoke
+    if not defined CI pause
+    exit /b 1
+)
+echo       Final installed-artifact smoke passed.
 
 REM --- Publish a differential-update release ---
 REM Lets existing users update by downloading only the files that changed,

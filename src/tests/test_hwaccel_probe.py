@@ -10,11 +10,14 @@ the return-code backstops, the update-manifest path-escape refusal, and
 the version validator's coverage of every version literal that ships.
 """
 
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from unittest import mock
 
 import pytest
@@ -48,6 +51,154 @@ def _clean_hwaccel_state():
     yield
     core._hwaccel_failed_methods.clear()
     core._hwaccel_probe_cache.clear()
+
+
+# ---------------------------------------------------------------------------
+# Tool registry and FFmpeg capability cache boundaries
+# ---------------------------------------------------------------------------
+
+class _ToolResult:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.stderr = ""
+        self.returncode = returncode
+
+
+def _capability_run(args, **_kwargs):
+    if "-filters" in args:
+        return _ToolResult("libvmaf signalstats ebur128")
+    return _ToolResult("Hardware acceleration methods:\nvideotoolbox\n")
+
+
+class TestToolCapabilityCache:
+    @pytest.fixture(autouse=True)
+    def _clean_tool_state(self):
+        from frameguard import tools
+
+        old_registry = tools._registry
+        tools._registry = None
+        tools._caps_cache.clear()
+        yield
+        tools._registry = old_registry
+        tools._caps_cache.clear()
+
+    def test_nested_capability_values_are_defensive_copies(self, monkeypatch):
+        from frameguard import tools
+
+        monkeypatch.setattr(tools.subprocess, "run", _capability_run)
+        first = tools.detect_ffmpeg_capabilities("/fake/ffmpeg")
+        first["hwaccel_methods"].append("caller-mutation")
+
+        second = tools.detect_ffmpeg_capabilities("/fake/ffmpeg")
+        assert second["hwaccel_methods"] == ["videotoolbox"]
+
+    def test_nonzero_probe_is_transient_and_not_cached(self, monkeypatch):
+        from frameguard import tools
+
+        failed = True
+        calls = []
+
+        def fake_run(args, **kwargs):
+            calls.append(args)
+            if failed:
+                return _ToolResult(returncode=1)
+            return _capability_run(args, **kwargs)
+
+        monkeypatch.setattr(tools.subprocess, "run", fake_run)
+        first = tools.detect_ffmpeg_capabilities("/fake/ffmpeg")
+        assert first["has_libvmaf"] is False
+        assert tools._caps_cache == {}
+
+        failed = False
+        second = tools.detect_ffmpeg_capabilities("/fake/ffmpeg")
+        assert second["has_libvmaf"] is True
+        assert len(calls) >= 3
+
+    def test_force_refresh_finds_tool_that_appears_mid_session(self, monkeypatch):
+        from frameguard import tools
+
+        present = False
+
+        def fake_detect(name, required=True):
+            info = tools.ToolInfo(name, required=required)
+            if present:
+                info.found = True
+                info.path = f"/new/{name}"
+                info.version = "1.0"
+                info.version_tuple = (1, 0)
+                info.meets_minimum = True
+            return info
+
+        monkeypatch.setattr(tools, "_detect_tool", fake_detect)
+        assert tools.check_all_tools().ffmpeg.path is None
+        present = True
+        refreshed = tools.check_all_tools(force_refresh=True)
+        assert refreshed.ffmpeg.path == "/new/ffmpeg"
+
+    def test_binary_replacement_invalidates_capability_cache(self, monkeypatch, tmp_path):
+        from frameguard import tools
+
+        binary = tmp_path / "ffmpeg"
+        binary.write_bytes(b"first")
+        binary.chmod(0o755)
+        generation = {"filters": "signalstats"}
+        calls = []
+
+        def fake_run(args, **_kwargs):
+            calls.append(args)
+            if "-filters" in args:
+                return _ToolResult(generation["filters"])
+            return _ToolResult("Hardware acceleration methods:\n")
+
+        monkeypatch.setattr(tools.subprocess, "run", fake_run)
+        first = tools.detect_ffmpeg_capabilities(str(binary))
+        assert first["has_signalstats"] is True
+        assert first["has_libvmaf"] is False
+
+        binary.write_bytes(b"second-generation-is-different")
+        generation["filters"] = "libvmaf"
+        second = tools.detect_ffmpeg_capabilities(str(binary))
+        assert second["has_libvmaf"] is True
+        assert len(calls) == 4
+
+    @pytest.mark.parametrize("name", ["ffmpeg", "mediaconch", "mediainfo"])
+    def test_empty_version_output_is_a_failed_probe_not_an_exception(
+            self, monkeypatch, name):
+        from frameguard import tools
+
+        monkeypatch.setattr(
+            tools.subprocess, "run", lambda *args, **kwargs: _ToolResult(""))
+        assert tools._get_tool_version(f"/fake/{name}", name) == (None, ())
+
+    def test_concurrent_capability_requests_share_one_probe(self, monkeypatch):
+        from frameguard import tools
+
+        calls = []
+        calls_lock = threading.Lock()
+
+        def slow_run(args, **kwargs):
+            with calls_lock:
+                calls.append(args)
+            time.sleep(0.02)
+            return _capability_run(args, **kwargs)
+
+        monkeypatch.setattr(tools.subprocess, "run", slow_run)
+        barrier = threading.Barrier(6)
+        results = []
+
+        def probe():
+            barrier.wait()
+            results.append(tools.detect_ffmpeg_capabilities("/fake/ffmpeg"))
+
+        threads = [threading.Thread(target=probe) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        assert len(results) == 6
+        assert len(calls) == 2
+        assert all(r == results[0] for r in results)
 
 
 # ---------------------------------------------------------------------------
@@ -135,11 +286,11 @@ class TestHwaccelSelection:
 class _FakeProc:
     def __init__(self, returncode, stderr):
         self.returncode = returncode
-        self._stderr = stderr
+        self.stderr = io.BytesIO(stderr.encode("utf-8"))
         self.pid = 4242
 
-    def communicate(self, timeout=None):
-        return "", self._stderr
+    def wait(self, timeout=None):
+        return self.returncode
 
     def kill(self):
         pass

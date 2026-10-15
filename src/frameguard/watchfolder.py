@@ -16,10 +16,11 @@ Features:
 """
 
 import os
+import stat
 import sys
 import time
 from pathlib import Path
-from typing import Set, List, Optional, Dict
+from typing import Set, List, Optional, Dict, Tuple
 
 from PySide6.QtCore import QObject, Signal, QTimer
 
@@ -95,16 +96,54 @@ def _is_video_file(filepath: str, scannable_only: bool = True) -> bool:
     return ext in (SCANNABLE_EXTENSIONS if scannable_only else VIDEO_EXTENSIONS)
 
 
-def _get_file_size_safe(filepath: str) -> int:
-    """Get file size, returning -1 when it cannot be read.
+FileIdentity = Tuple[int, int, int, Optional[int], Optional[int]]
 
-    -1 rather than 0 so a permissions error is distinguishable from a genuinely
-    empty file; treating both as 0 made unreadable files look 'stable'.
+
+def _timestamp_ns(info, ns_attr: str, seconds_attr: str) -> int:
+    """Read a stat timestamp at the best precision exposed by the filesystem."""
+    value = getattr(info, ns_attr, None)
+    if value is not None:
+        return int(value)
+    return int(float(getattr(info, seconds_attr)) * 1_000_000_000)
+
+
+def _get_file_identity_safe(filepath: str) -> Optional[FileIdentity]:
+    """Return stability-relevant identity without following a symlink.
+
+    Nanosecond mtime catches same-size in-place rewrites; ctime covers hosts
+    where mtime preservation is common, and device/inode catches atomic
+    same-name replacements. Filesystems that do not expose device/inode still
+    retain the size and best available timestamp checks.
     """
     try:
-        return os.path.getsize(filepath)
+        info = os.stat(filepath, follow_symlinks=False)
     except OSError:
-        return -1
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        return None
+
+    device = getattr(info, "st_dev", None)
+    inode = getattr(info, "st_ino", None)
+    if not device or not inode:
+        device = inode = None
+    return (
+        int(info.st_size),
+        _timestamp_ns(info, "st_mtime_ns", "st_mtime"),
+        _timestamp_ns(info, "st_ctime_ns", "st_ctime"),
+        int(device) if device is not None else None,
+        int(inode) if inode is not None else None,
+    )
+
+
+def _get_file_size_safe(filepath: str) -> int:
+    """Get regular-file size, returning -1 when it cannot be read safely."""
+    identity = _get_file_identity_safe(filepath)
+    return identity[0] if identity is not None else -1
+
+
+def _is_watch_directory(path: Optional[str]) -> bool:
+    """A watch root must be a real directory, never a symlink target."""
+    return bool(path) and not os.path.islink(path) and os.path.isdir(path)
 
 
 def _can_open_exclusively(filepath: str) -> bool:
@@ -137,13 +176,13 @@ def _looks_complete(filepath: str) -> bool:
     mark files as emitted, the resulting bogus FAIL was permanent: neither the
     poller nor a later Sync would ever look at the file again.
     """
-    if _get_file_size_safe(filepath) < MIN_FILE_SIZE_BYTES:
+    identity = _get_file_identity_safe(filepath)
+    if identity is None or identity[0] < MIN_FILE_SIZE_BYTES:
         return False
-    try:
-        age = time.time() - os.path.getmtime(filepath)
-    except OSError:
-        return False
-    return age >= MIN_STABLE_SECONDS and _can_open_exclusively(filepath)
+    age = time.time() - (identity[1] / 1_000_000_000)
+    return (age >= MIN_STABLE_SECONDS
+            and _can_open_exclusively(filepath)
+            and _get_file_identity_safe(filepath) == identity)
 
 
 class WatchFolderMonitor(QObject):
@@ -167,8 +206,9 @@ class WatchFolderMonitor(QObject):
         super().__init__(parent)
         self._watch_path: Optional[str] = None
         self._known_files: Set[str] = set()       # All files we've seen (prevents re-detection)
+        self._known_identities: Dict[str, FileIdentity] = {}
         self._emitted_files: Set[str] = set()     # Files we've actually emitted for scanning
-        # filepath -> {"size", "stable_polls", "first_seen", "last_change"}
+        # filepath -> identity/stability timestamps and counters
         self._pending_files: Dict[str, dict] = {}
         self._batch_queue: List[str] = []          # Accumulated stable files waiting to emit
         self._batch_started_at: float = 0.0        # for MAX_BATCH_AGE_MS
@@ -211,13 +251,37 @@ class WatchFolderMonitor(QObject):
         """The currently monitored directory."""
         return self._watch_path
 
+    def _set_known_files(self, files: Set[str]):
+        """Baseline paths together with the identities that made them known."""
+        identities = {}
+        for filepath in files:
+            identity = _get_file_identity_safe(filepath)
+            if identity is not None:
+                identities[filepath] = identity
+        self._known_files = set(identities)
+        self._known_identities = identities
+
+    @staticmethod
+    def _new_pending_state(now: float) -> dict:
+        return {
+            "identity": None,
+            "size": -1,
+            "stable_polls": 0,
+            "first_seen": now,
+        }
+
     def set_watch_path(self, path: str):
         """Set the directory to monitor."""
-        if path and os.path.isdir(path):
+        # A settled batch belongs to the old path and must not disappear merely
+        # because the operator browsed to another folder.
+        if self._batch_queue:
+            self._emit_batch()
+
+        if _is_watch_directory(path):
             self._watch_path = path
-            # Initialize known files (don't trigger on existing files)
+            # Initialize known files (don't trigger on existing files).
             found = self._scan_directory()
-            self._known_files = found if found is not None else set()
+            self._set_known_files(found if found is not None else set())
             self._emitted_files = set(self._known_files)  # Mark existing as "already handled"
             self._pending_files.clear()
             self._batch_queue.clear()
@@ -241,37 +305,31 @@ class WatchFolderMonitor(QObject):
         if not self._watch_path:
             self.error.emit("No watch folder configured")
             return
-        if not os.path.isdir(self._watch_path):
+        if not _is_watch_directory(self._watch_path):
             self.error.emit(f"Folder not found: {self._watch_path}")
             return
-        
+
         self._enabled = True
-        found = self._scan_directory()
-        self._known_files = found if found is not None else set()
-        self._emitted_files = set(self._known_files)
-        self._pending_files.clear()
-        self._batch_queue.clear()
+        retained_work = bool(self._pending_files or self._batch_queue)
+        if not retained_work:
+            found = self._scan_directory()
+            self._set_known_files(found if found is not None else set())
+            self._emitted_files = set(self._known_files)
         self._in_burst_mode = False
         # Without this, restarting after a share dropped out began already at
         # the error ceiling, so the first hiccup stopped watching again
         # immediately and the operator saw the toggle switch itself back off.
         self._consecutive_errors = 0
         self._timer.start(self._poll_interval)
-        self.status_changed.emit(f"Active \u2014 monitoring {self._watch_path}")
+        if self._batch_queue:
+            self._settle_timer.start(BATCH_SETTLE_MS)
+        self.status_changed.emit(f"Active — monitoring {self._watch_path}")
 
     def stop(self):
-        """Stop monitoring."""
+        """Stop monitoring while retaining in-session work for a later start."""
         self._enabled = False
         self._timer.stop()
         self._settle_timer.stop()
-        self._pending_files.clear()
-        # Files sitting in the batch queue were already added to _known_files,
-        # so simply dropping the queue meant the poller would never see them
-        # again and they were silently never scanned. Un-know them so a later
-        # sync or backlog scan can still find them.
-        self._known_files.difference_update(self._batch_queue)
-        self._batch_queue.clear()
-        self._batch_started_at = 0.0
         self._in_burst_mode = False
         self.status_changed.emit("Stopped")
     
@@ -306,7 +364,7 @@ class WatchFolderMonitor(QObject):
         poller's pending set instead, so they are scanned once they settle
         rather than being scanned truncated and marked done forever.
         """
-        if not self._watch_path or not os.path.isdir(self._watch_path):
+        if not _is_watch_directory(self._watch_path):
             self.error.emit("No valid watch folder to sync")
             return
 
@@ -329,12 +387,15 @@ class WatchFolderMonitor(QObject):
 
         now = time.time()
         for f in still_writing:
-            self._pending_files.setdefault(
-                f, {"size": -1, "stable_polls": 0, "first_seen": now})
+            self._pending_files.setdefault(f, self._new_pending_state(now))
 
         if missed_files:
             # Mark them as known and emitted
             self._known_files.update(missed_files)
+            self._known_identities.update({
+                f: identity for f in missed_files
+                if (identity := _get_file_identity_safe(f)) is not None
+            })
             self._emitted_files.update(missed_files)
             # Clear from pending if they were there
             for f in missed_files:
@@ -361,7 +422,7 @@ class WatchFolderMonitor(QObject):
         part-way used to hand back whatever it had collected, which then pruned
         live stability state for every file it hadn't reached yet.
         """
-        if not self._watch_path or not os.path.isdir(self._watch_path):
+        if not _is_watch_directory(self._watch_path):
             return None
 
         files = set()
@@ -369,7 +430,9 @@ class WatchFolderMonitor(QObject):
             with os.scandir(self._watch_path) as it:
                 for entry in it:
                     try:
-                        if entry.is_file() and _is_video_file(entry.path):
+                        if (not entry.is_symlink()
+                                and entry.is_file(follow_symlinks=False)
+                                and _is_video_file(entry.path)):
                             files.add(entry.path)
                     except OSError:
                         continue  # entry vanished mid-iteration
@@ -409,7 +472,7 @@ class WatchFolderMonitor(QObject):
         # A folder that has been deleted, renamed or unmounted used to return
         # here silently, leaving the UI claiming "Active - monitoring ..."
         # forever while nothing was watched.
-        if not os.path.isdir(self._watch_path):
+        if not _is_watch_directory(self._watch_path):
             self._consecutive_errors += 1
             if self._consecutive_errors == 1:
                 self.error.emit(
@@ -425,6 +488,33 @@ class WatchFolderMonitor(QObject):
         if current_files is None:            # scandir failed; already reported
             return
         self._consecutive_errors = 0
+
+        now = time.time()
+        current_identities = {
+            filepath: identity for filepath in current_files
+            if (identity := _get_file_identity_safe(filepath)) is not None
+        }
+        current_files = set(current_identities)
+
+        # A pathname is not an identity. Replacements of a previously emitted
+        # or queued file must settle as new work rather than inheriting history.
+        replaced_files = {
+            filepath for filepath in current_files & self._known_files
+            if self._known_identities.get(filepath) != current_identities[filepath]
+        }
+        if replaced_files:
+            self._batch_queue = [
+                filepath for filepath in self._batch_queue
+                if filepath not in replaced_files
+            ]
+            if not self._batch_queue:
+                self._batch_started_at = 0.0
+                self._settle_timer.stop()
+            for filepath in replaced_files:
+                self._known_files.discard(filepath)
+                self._known_identities.pop(filepath, None)
+                self._emitted_files.discard(filepath)
+                self._pending_files[filepath] = self._new_pending_state(now)
 
         new_files = current_files - self._known_files
 
@@ -444,18 +534,19 @@ class WatchFolderMonitor(QObject):
 
         # Every unseen file joins the pending set; stability is decided in one
         # place below rather than in two near-duplicate loops.
-        now = time.time()
         for filepath in new_files:
-            self._pending_files.setdefault(
-                filepath, {"size": -1, "stable_polls": 0, "first_seen": now})
+            self._pending_files.setdefault(filepath, self._new_pending_state(now))
 
         newly_stable = []
+        stable_identities = {}
         for filepath, state in list(self._pending_files.items()):
-            size = _get_file_size_safe(filepath)
-            if size < 0:
+            identity = current_identities.get(filepath)
+            if identity is None:
                 continue  # unreadable right now; try again next poll
+            size = identity[0]
 
-            if size != state["size"]:
+            if identity != state.get("identity"):
+                state["identity"] = identity
                 state["size"] = size
                 state["stable_polls"] = 0
                 state["last_change"] = now
@@ -478,15 +569,19 @@ class WatchFolderMonitor(QObject):
                 # emitted, so it is never scanned.
                 del self._pending_files[filepath]
                 self._known_files.add(filepath)
+                self._known_identities[filepath] = identity
                 self._emitted_files.add(filepath)
                 continue
 
-            if _can_open_exclusively(filepath):
+            if (_can_open_exclusively(filepath)
+                    and _get_file_identity_safe(filepath) == identity):
                 newly_stable.append(filepath)
+                stable_identities[filepath] = identity
                 del self._pending_files[filepath]
 
         if newly_stable:
             self._known_files.update(newly_stable)
+            self._known_identities.update(stable_identities)
             if not self._batch_queue:
                 self._batch_started_at = now
             self._batch_queue.extend(newly_stable)
@@ -517,15 +612,31 @@ class WatchFolderMonitor(QObject):
             self._emit_batch()
 
     def _emit_batch(self):
-        """Emit the collected batch of files."""
+        """Emit only paths whose identity still matches the settled batch."""
         self._exit_burst_mode()
         if not self._batch_queue:
             return
-        files_to_emit = list(self._batch_queue)
+
+        queued = list(self._batch_queue)
         self._batch_queue.clear()
         self._batch_started_at = 0.0
-        self._emitted_files.update(files_to_emit)
-        self.files_detected.emit(files_to_emit)
+        files_to_emit = []
+        now = time.time()
+        for filepath in queued:
+            current = _get_file_identity_safe(filepath)
+            if current is not None and current == self._known_identities.get(filepath):
+                files_to_emit.append(filepath)
+                continue
+
+            self._known_files.discard(filepath)
+            self._known_identities.pop(filepath, None)
+            self._emitted_files.discard(filepath)
+            if current is not None:
+                self._pending_files[filepath] = self._new_pending_state(now)
+
+        if files_to_emit:
+            self._emitted_files.update(files_to_emit)
+            self.files_detected.emit(files_to_emit)
 
     def reset(self):
         """Forget everything seen so far and re-baseline on the current folder.
@@ -533,8 +644,10 @@ class WatchFolderMonitor(QObject):
         Next poll treats all current files as known, so nothing is re-scanned
         until genuinely new files arrive.
         """
+        if self._batch_queue:
+            self._emit_batch()
         found = self._scan_directory()
-        self._known_files = found if found is not None else set()
+        self._set_known_files(found if found is not None else set())
         self._emitted_files = set(self._known_files)
         self._pending_files.clear()
         self._batch_queue.clear()
@@ -573,8 +686,7 @@ class WatchFolderMonitor(QObject):
 
         now = time.time()
         for f in still_writing:
-            self._pending_files.setdefault(
-                f, {"size": -1, "stable_polls": 0, "first_seen": now})
+            self._pending_files.setdefault(f, self._new_pending_state(now))
 
         if not backlog:
             if still_writing:
@@ -587,6 +699,10 @@ class WatchFolderMonitor(QObject):
             return 0
 
         self._known_files.update(backlog)
+        self._known_identities.update({
+            f: identity for f in backlog
+            if (identity := _get_file_identity_safe(f)) is not None
+        })
         self._emitted_files.update(backlog)
         for f in backlog:
             self._pending_files.pop(f, None)

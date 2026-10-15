@@ -81,8 +81,95 @@ def _show_error(msg: str):
         pass
 
 
+def _extract_startup_preflight(argv):
+    """Remove hidden startup-gate options before Qt sees the argument list."""
+    scalar = {
+        "--startup-preflight": "report_path",
+        "--startup-preflight-profile": "profile_path",
+        "--startup-timeout-ms": "timeout_ms",
+        "--startup-challenge": "challenge",
+        "--startup-preflight-theme": "saved_theme",
+        "--startup-preflight-legacy-theme": "legacy_theme",
+        "--startup-fail-at": "fail_at",
+        "--startup-timeout-at": "timeout_at",
+    }
+    repeated = {
+        "--startup-file-open-cold": "cold_file_open_paths",
+        "--startup-file-open-warm": "warm_file_open_paths",
+    }
+    options = {
+        "cold_file_open_paths": [],
+        "warm_file_open_paths": [],
+    }
+    cleaned = [argv[0]]
+    index = 1
+    while index < len(argv):
+        argument = argv[index]
+        key = scalar.get(argument) or repeated.get(argument)
+        if key is None:
+            cleaned.append(argument)
+            index += 1
+            continue
+        if index + 1 >= len(argv):
+            raise ValueError(f"{argument} requires a value")
+        value = argv[index + 1]
+        if argument in repeated:
+            options[key].append(value)
+        else:
+            options[key] = value
+        index += 2
+
+    report_path = options.get("report_path")
+    supporting_options = set(options) - {
+        "report_path", "cold_file_open_paths", "warm_file_open_paths"
+    }
+    if not report_path and (
+            any(options[name] for name in supporting_options)
+            or options["cold_file_open_paths"]
+            or options["warm_file_open_paths"]):
+        raise ValueError("startup preflight options require --startup-preflight")
+    if report_path:
+        report_path = os.path.abspath(report_path)
+        options["report_path"] = report_path
+        profile = options.get("profile_path")
+        if not profile:
+            profile = os.path.join(
+                os.path.dirname(report_path), f"profile-{os.getpid()}")
+        profile = os.path.abspath(profile)
+        options["profile_path"] = profile
+        timeout_text = options.get("timeout_ms", "15000")
+        try:
+            timeout_ms = int(timeout_text)
+        except ValueError as exc:
+            raise ValueError("--startup-timeout-ms must be an integer") from exc
+        if not 100 <= timeout_ms <= 120000:
+            raise ValueError("--startup-timeout-ms must be between 100 and 120000")
+        options["timeout_ms"] = timeout_ms
+
+        os.makedirs(profile, exist_ok=True)
+        isolated = {
+            "HOME": profile,
+            "USERPROFILE": profile,
+            "XDG_CONFIG_HOME": os.path.join(profile, "config"),
+            "XDG_DATA_HOME": os.path.join(profile, "data"),
+            "XDG_CACHE_HOME": os.path.join(profile, "cache"),
+            "APPDATA": os.path.join(profile, "appdata"),
+            "LOCALAPPDATA": os.path.join(profile, "localappdata"),
+        }
+        for name, value in isolated.items():
+            os.environ[name] = value
+            os.makedirs(value, exist_ok=True)
+    return options, cleaned
+
+
 try:
-    from frameguard.gui import main
+    _STARTUP_OPTIONS, sys.argv[:] = _extract_startup_preflight(sys.argv)
+except (OSError, ValueError) as e:
+    _show_error(f"[FrameGuard] Invalid startup preflight: {e}")
+    sys.exit(2)
+
+try:
+    from frameguard.gui import StartupPreflightConfig, main
 except ImportError as e:
     _show_error(
         f"[FrameGuard] Missing dependency: {e}\n\n"
@@ -246,5 +333,9 @@ if __name__ == "__main__":
     dev_mode = "--dev" in sys.argv
     if dev_mode:
         print("[DEV MODE] Hot-reload enabled - theme.py changes will apply live")
-    main(dev_mode=dev_mode)
+
+    startup_preflight = None
+    if _STARTUP_OPTIONS.get("report_path"):
+        startup_preflight = StartupPreflightConfig(**_STARTUP_OPTIONS)
+    sys.exit(main(dev_mode=dev_mode, startup_preflight=startup_preflight))
 

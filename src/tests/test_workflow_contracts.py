@@ -57,6 +57,29 @@ def test_push_and_pull_requests_run_the_full_supported_runner_matrix():
     assert "python -m pytest --verbose" in TESTS_WORKFLOW
 
 
+def test_source_and_final_artifact_startup_gates_precede_uploads():
+    test_job = _job(TESTS_WORKFLOW, "test")
+    source_gate = test_job.index("tools_dev/startup_smoke.py")
+    assert test_job.index("python -m pytest --verbose") < source_gate
+    assert source_gate < test_job.index("tools_dev/gui_audit.py --matrix")
+    assert "src/startup-evidence/" in test_job
+
+    windows = _job(RELEASE_WORKFLOW, "build-windows")
+    installer_smoke = windows.index("tools_dev/windows_installer_smoke.ps1")
+    installer_upload = windows.index("name: Upload the installer")
+    assert installer_smoke < installer_upload
+    assert "Build and installed-smoke the installer" in windows
+    assert "run: build_installer.bat --skip-delta" in windows
+    assert "--skip-installer-smoke" not in windows
+    assert "Output/FrameGuardInstaller.exe" in windows
+
+    mac = _job(RELEASE_WORKFLOW, "build-macos")
+    dmg_smoke = mac.index("tools_dev/macos_package_smoke.py")
+    dmg_upload = mac.index("name: Upload the DMG")
+    assert dmg_smoke < dmg_upload
+    assert '--expected-arch "${{ matrix.target_arch }}"' in mac
+
+
 def test_visual_evidence_uses_fresh_dpi_processes_and_preserves_failures():
     test_job = _job(TESTS_WORKFLOW, "test")
     assert "FRAMEGUARD_VISUAL_ARTIFACTS: visual-test-artifacts" in test_job

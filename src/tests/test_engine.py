@@ -6,6 +6,8 @@ Every deep scan therefore found nothing and reported a clean pass.
 """
 
 import subprocess
+from copy import deepcopy
+from unittest import mock
 
 import pytest
 
@@ -108,6 +110,74 @@ class TestQAResult:
         r.add_warn("Color Space", "bt601")
         r.finalize()
         assert r.status == "PASS"
+
+
+class TestMalformedMetadata:
+    def _probe(self):
+        return {
+            "streams": [
+                {
+                    "codec_type": "video", "codec_name": "h264",
+                    "width": 640, "height": 360,
+                    "r_frame_rate": "30/1", "avg_frame_rate": "30/1",
+                    "nb_frames": "1200", "duration": "40.0",
+                    "bit_rate": "2000000",
+                },
+                {
+                    "codec_type": "audio", "codec_name": "aac",
+                    "sample_rate": "48000", "channels": "2",
+                    "channel_layout": "stereo", "duration": "40.0",
+                    "bit_rate": "128000",
+                },
+            ],
+            "format": {"duration": "40.0", "bit_rate": "2128000"},
+        }
+
+    def _scan(self, tmp_path, probe):
+        target = tmp_path / "metadata.mp4"
+        target.write_bytes(b"not-empty")
+        with mock.patch("frameguard.core.run_ffprobe", return_value=probe), \
+             mock.patch("frameguard.core.run_deep_scan"), \
+             mock.patch("frameguard.core.run_mediainfo_enrichment"):
+            result = run_qa_checks(str(target), cfg=_cfg())
+        result.finalize()
+        return result
+
+    @pytest.mark.parametrize("mutate,check_name", [
+        (lambda p: p["streams"][0].update(r_frame_rate=[], avg_frame_rate={}),
+         "Frame Rate"),
+        (lambda p: p["streams"][0].update(nb_frames={}), "Frame Count"),
+        (lambda p: p["streams"][0].pop("nb_frames"), "Frame Count"),
+        (lambda p: (p["streams"][0].update(duration={}),
+                    p["format"].update(duration={})), "Frame Count"),
+        (lambda p: p["streams"][1].update(channels="stereo"), "Audio Channels"),
+        (lambda p: p["streams"][0].update(bit_rate={"bad": 1}), "Bitrate"),
+        (lambda p: p["streams"][1].update(duration={}), "A/V Duration"),
+        (lambda p: p["streams"][1].pop("duration"), "A/V Duration"),
+    ], ids=[
+        "wrong-type-frame-rate", "wrong-type-frame-count", "missing-frame-count",
+        "wrong-type-duration", "wrong-type-audio-channels", "wrong-type-bitrate",
+        "wrong-type-av-duration", "missing-av-duration",
+    ])
+    def test_malformed_critical_metadata_is_flagged_without_internal_error(
+            self, tmp_path, mutate, check_name):
+        probe = self._probe()
+        mutate(probe)
+        result = self._scan(tmp_path, probe)
+
+        assert _check(result, "Internal Error") is None, result.checks
+        check = _check(result, check_name)
+        assert check is not None and check["status"] in ("WARN", "FAIL"), result.checks
+        assert result.status != "PASS", result.checks
+
+    def test_valid_numeric_strings_keep_normal_outcomes(self, tmp_path):
+        result = self._scan(tmp_path, deepcopy(self._probe()))
+
+        assert _check(result, "Internal Error") is None
+        assert _check(result, "Frame Rate")["status"] == "PASS"
+        assert _check(result, "Audio Channels")["status"] == "PASS"
+        assert _check(result, "A/V Duration")["status"] == "PASS"
+        assert _check(result, "Frame Count")["status"] == "PASS"
 
 
 class TestTimestampOffset:

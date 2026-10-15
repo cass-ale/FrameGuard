@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Optional, Dict, List
 
@@ -25,6 +26,8 @@ from typing import Optional, Dict, List
 PRESET_FORMAT_VERSION = 2
 FG_EXTENSION = ".fg"
 LEGACY_EXTENSION = ".json"
+MAX_PRESET_BYTES = 1_000_000
+MAX_PRESET_NESTING = 64
 
 # The scan parameters a preset is allowed to carry, keyed exactly as
 # ``core.DEFAULT_CONFIG`` keys them. Anything not listed here (themes, window
@@ -135,8 +138,81 @@ def get_presets_dir() -> Path:
 
 
 def _sanitize_filename(name: str) -> str:
-    """Convert a preset name to a safe filename."""
-    return re.sub(r"[^a-zA-Z0-9_\-]", "_", name.lower()).strip("_")
+    """Convert a normalized preset name to a safe, portable filename."""
+    normalized = unicodedata.normalize("NFKC", name)
+    return re.sub(r"[^a-zA-Z0-9_\-]", "_", normalized.lower()).strip("_")
+
+
+def _filename_key(path: Path) -> str:
+    """Model case/Unicode-insensitive filesystems on every platform."""
+    return unicodedata.normalize("NFKC", path.name).casefold()
+
+
+def _available_preset_path(directory: Path, safe_name: str) -> Path:
+    """Choose a deterministic non-colliding destination without overwriting."""
+    existing = set()
+    try:
+        existing = {_filename_key(path) for path in directory.iterdir()}
+    except FileNotFoundError:
+        pass
+
+    stem = safe_name or "preset"
+    suffix = 1
+    while True:
+        numbered = stem if suffix == 1 else f"{stem}_{suffix}"
+        candidate = directory / f"{numbered}{FG_EXTENSION}"
+        if _filename_key(candidate) not in existing:
+            return candidate
+        suffix += 1
+
+
+def _iter_preset_files(directory: Path) -> List[Path]:
+    """Return preset files in deterministic cross-filesystem order."""
+    if not directory.is_dir():
+        return []
+    files = [
+        path for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in (FG_EXTENSION, LEGACY_EXTENSION)
+    ]
+    return sorted(files, key=lambda path: (_filename_key(path), path.name))
+
+
+class _DuplicateJsonKey(ValueError):
+    pass
+
+
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateJsonKey(key)
+        result[key] = value
+    return result
+
+
+def _within_nesting_limit(value, limit: int = MAX_PRESET_NESTING) -> bool:
+    """Check JSON depth iteratively so validation cannot overflow Python's stack."""
+    pending = [(value, 1)]
+    while pending:
+        current, depth = pending.pop()
+        if depth > limit:
+            return False
+        if isinstance(current, dict):
+            pending.extend((child, depth + 1) for child in current.values())
+        elif isinstance(current, list):
+            pending.extend((child, depth + 1) for child in current)
+    return True
+
+
+def _load_preset_json(filepath: str):
+    """Read at most the preset byte ceiling and parse hostile JSON safely."""
+    with open(filepath, "rb") as stream:
+        raw = stream.read(MAX_PRESET_BYTES + 1)
+    if len(raw) > MAX_PRESET_BYTES:
+        return None
+    text = raw.decode("utf-8")
+    data = json.loads(text, object_pairs_hook=_reject_duplicate_keys)
+    return data if _within_nesting_limit(data) else None
 
 
 def export_preset(name: str, config: dict, output_path: Optional[str] = None) -> str:
@@ -176,8 +252,9 @@ def export_preset(name: str, config: dict, output_path: Optional[str] = None) ->
     }
 
     if output_path is None:
-        safe_name = _sanitize_filename(name)
-        output_path = str(get_user_presets_dir() / f"{safe_name}{FG_EXTENSION}")
+        user_dir = get_user_presets_dir()
+        output_path = str(_available_preset_path(
+            user_dir, _sanitize_filename(name) or "preset"))
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
@@ -195,13 +272,7 @@ def import_preset(filepath: str) -> Optional[Dict]:
         engine key names.
     """
     try:
-        # Reject absurdly large files (> 1MB — presets should be < 10KB)
-        if os.path.getsize(filepath) > 1_000_000:
-            return None
-
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
+        data = _load_preset_json(filepath)
         if not isinstance(data, dict) or not isinstance(data.get("config"), dict):
             return None
 
@@ -216,7 +287,8 @@ def import_preset(filepath: str) -> Optional[Dict]:
             "format_version": data.get("format_version", 0),
             "source_path": filepath,
         }
-    except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError,
+            RecursionError, ValueError):
         return None
 
 
@@ -233,13 +305,20 @@ def save_imported_preset(filepath: str) -> Optional[Dict]:
     if not preset:
         return None
 
-    safe_name = _sanitize_filename(preset["name"]) or "preset"
-    dest = get_user_presets_dir() / f"{safe_name}{FG_EXTENSION}"
+    try:
+        safe_name = _sanitize_filename(preset["name"]) or "preset"
+        user_dir = get_user_presets_dir()
+        source = Path(filepath).resolve()
+        base_dest = user_dir / f"{safe_name}{FG_EXTENSION}"
+        dest = (base_dest if source == base_dest.resolve()
+                else _available_preset_path(user_dir, safe_name))
 
-    # Always re-export rather than copying: this upgrades legacy key spellings
-    # in place and guarantees the stored copy matches the current schema.
-    if str(Path(filepath).resolve()) != str(dest.resolve()):
-        export_preset(preset["name"], preset["config"], str(dest))
+        # Always re-export rather than copying: this upgrades legacy key
+        # spellings and guarantees the stored copy matches the current schema.
+        if source != dest.resolve():
+            export_preset(preset["name"], preset["config"], str(dest))
+    except (OSError, ValueError):
+        return None
 
     preset["path"] = str(dest)
     return preset
@@ -253,30 +332,48 @@ def list_available_presets() -> List[Dict]:
     Returns:
         List of dicts with 'name', 'path', 'config', 'source' for each preset.
     """
-    presets = {}  # keyed by name (deduplication)
-    
-    # Load bundled presets first
-    bundled_dir = get_bundled_presets_dir()
-    if bundled_dir.exists():
-        for preset_file in sorted(bundled_dir.glob(f"*{LEGACY_EXTENSION}")) + \
-                           sorted(bundled_dir.glob(f"*{FG_EXTENSION}")):
-            preset = import_preset(str(preset_file))
-            if preset:
-                preset["path"] = str(preset_file)
-                preset["source"] = "bundled"
-                presets[preset["name"]] = preset
-    
-    # Load user presets (override bundled if same name)
-    user_dir = get_user_presets_dir()
-    for preset_file in sorted(user_dir.glob(f"*{FG_EXTENSION}")) + \
-                       sorted(user_dir.glob(f"*{LEGACY_EXTENSION}")):
+    presets = []
+    by_name = {}
+
+    def add_file(preset_file: Path, source: str):
         preset = import_preset(str(preset_file))
-        if preset:
-            preset["path"] = str(preset_file)
-            preset["source"] = "imported"
-            presets[preset["name"]] = preset
-    
-    return list(presets.values())
+        if not preset:
+            return
+        preset["path"] = str(preset_file)
+        preset["source"] = source
+        name = preset["name"]
+        previous = by_name.get(name)
+        if previous is not None and source == "imported" \
+                and presets[previous]["source"] == "bundled":
+            # An intentionally same-named user preset overrides the shipped one.
+            presets[previous] = preset
+            return
+        if previous is not None:
+            # Preserve same-source collisions instead of silently hiding one.
+            base = name
+            number = 2
+            while preset["name"] in by_name:
+                preset["name"] = f"{base} ({number})"
+                number += 1
+            name = preset["name"]
+        by_name[name] = len(presets)
+        presets.append(preset)
+
+    try:
+        bundled_files = _iter_preset_files(get_bundled_presets_dir())
+    except OSError:
+        bundled_files = []
+    for preset_file in bundled_files:
+        add_file(preset_file, "bundled")
+
+    try:
+        user_files = _iter_preset_files(get_user_presets_dir())
+    except OSError:
+        user_files = []
+    for preset_file in user_files:
+        add_file(preset_file, "imported")
+
+    return presets
 
 
 def is_preset_file(filepath: str) -> bool:

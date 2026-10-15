@@ -219,7 +219,7 @@ jobs:
                    (Get-Command iscc -ErrorAction SilentlyContinue)
           if (-not $found) { throw "Inno Setup (ISCC.exe) is not available." }
 
-      - name: Build the installer (full gated build)
+      - name: Build and installed-smoke the installer (full gated build)
         timeout-minutes: 45
         shell: cmd
         # build_installer.bat guards its `pause` calls with
@@ -231,6 +231,15 @@ jobs:
         run: |
           if not exist "Output\FrameGuardInstaller.exe" exit /b 1
           dir Output
+
+      - name: Smoke test the final Windows installer
+        timeout-minutes: 5
+        shell: pwsh
+        run: >-
+          ./tools_dev/windows_installer_smoke.ps1
+          -Installer Output/FrameGuardInstaller.exe
+          -ArtifactsDir Output/build-logs/installed-smoke
+          -Python ./.buildenv/Scripts/python.exe
 
       - name: Generate the SBOM from the frozen build environment
         # Non-gating by design (RELEASE_PLAN D8): a broken SBOM tool must
@@ -386,6 +395,16 @@ jobs:
           BUNDLE="$FRAMEGUARD_MAC_BUILD_ROOT/dist/FrameGuard.app"
           test -d "$BUNDLE"
           codesign --verify --deep --strict "$BUNDLE"
+
+      - name: Smoke test the final mounted and copied DMG
+        timeout-minutes: 5
+        run: >-
+          "$FRAMEGUARD_MAC_BUILD_ROOT/venv/bin/python"
+          tools_dev/macos_package_smoke.py
+          --dmg Output/FrameGuard.dmg
+          --expected-arch "${{ matrix.target_arch }}"
+          --artifacts-dir "$FRAMEGUARD_MAC_BUILD_ROOT/logs/workflow-dmg-smoke"
+          --qpa cocoa
 
       - name: Generate the SBOM from the frozen build environment
         if: matrix.label == 'arm64' # identical dependency set on Intel

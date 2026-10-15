@@ -14,7 +14,12 @@ share, or static HTTP host that provides manifest.json + files/ for differential
 updates. No differential channel is enabled by default.
 """
 
+import hashlib
+import hmac
+import multiprocessing
 import os
+import re
+import shutil
 import sys
 import json
 import subprocess
@@ -36,6 +41,57 @@ _SETTINGS_APP = "FrameGuard Desktop"
 _CHECK_INTERVAL_HOURS = 24  # How often to auto-check (hours)
 _INSTALLER_FILENAME = "FrameGuardInstaller.exe"
 _VERSION_FILENAME = "version.json"
+
+# Full installers include Qt and media tooling. Two GiB leaves headroom for the
+# current artifacts while putting a hard ceiling on unknown-length responses.
+MAX_INSTALLER_BYTES = 2 * 1024 * 1024 * 1024
+_MAX_RELEASE_METADATA_BYTES = 2 * 1024 * 1024
+_MAX_CHECKSUM_BYTES = 1024 * 1024
+_COPY_CHUNK_SIZE = 256 * 1024
+_DOWNLOAD_TIMEOUT_SECONDS = 30
+_MAX_DOWNLOAD_SECONDS = 30 * 60
+_MAX_LOCAL_COPY_SECONDS = 30 * 60
+_LOCAL_COPY_POLL_SECONDS = 0.05
+_LOCAL_COPY_STOP_SECONDS = 1.0
+_MIN_FREE_SPACE_BYTES = 64 * 1024 * 1024
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
+
+
+def _copy_local_installer_worker(source: str, destination: str,
+                                 expected_size: int, expected_sha256: str,
+                                 connection):
+    """Copy/hash in a disposable process so blocked filesystem I/O is killable."""
+    try:
+        copied = 0
+        hasher = hashlib.sha256()
+        with open(source, "rb") as input_file, open(destination, "xb") as output:
+            while True:
+                chunk = input_file.read(_COPY_CHUNK_SIZE)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > expected_size:
+                    raise RuntimeError(
+                        "Installer exceeds trusted local size metadata.")
+                output.write(chunk)
+                hasher.update(chunk)
+                connection.send(("progress", copied))
+        if copied != expected_size:
+            raise RuntimeError("Installer copy was truncated.")
+        if not hmac.compare_digest(hasher.hexdigest(), expected_sha256):
+            raise RuntimeError("Installer integrity verification failed.")
+        connection.send(("done", copied))
+    except BaseException as error:
+        try:
+            connection.send(("error", str(error)[:500]))
+        except (BrokenPipeError, EOFError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
+_LOCAL_COPY_WORKER_TARGET = _copy_local_installer_worker
 
 # The repository releases live in. GitHub Releases is the zero-configuration,
 # architecture-aware update source and carries the complete installers.
@@ -144,6 +200,9 @@ class UpdateInfo:
     file_size_mb: float = 0.0
     is_newer: bool = False
     source_path: str = ""
+    sha256: str = ""
+    size_bytes: int = 0
+    asset_name: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -159,21 +218,21 @@ def get_current_version() -> str:
         return "0.0.0"
 
 
-def _parse_version(version_str: str) -> tuple:
-    """Parse version string to comparable tuple."""
-    clean = version_str.strip().lstrip("v")
-    parts = []
-    for p in clean.split("."):
-        try:
-            parts.append(int(p))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
+def _parse_version(version_str: str) -> Optional[tuple]:
+    """Parse a complete stable three-part version, or return None."""
+    if not isinstance(version_str, str):
+        return None
+    match = _VERSION_RE.fullmatch(version_str.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
 
 
 def _is_newer(remote: str, local: str) -> bool:
-    """Check if remote version is newer than local."""
-    return _parse_version(remote) > _parse_version(local)
+    """Check if two valid stable versions show a newer remote release."""
+    remote_parts = _parse_version(remote)
+    local_parts = _parse_version(local)
+    return bool(remote_parts and local_parts and remote_parts > local_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -186,101 +245,169 @@ def _is_newer(remote: str, local: str) -> bool:
 
 def _pick_release_asset(assets, platform: Optional[str] = None,
                         machine: Optional[str] = None):
-    """Pick the release asset THIS machine can actually install.
-
-    A GitHub Release carries every platform's installer
-    (FrameGuardInstaller.exe, FrameGuard-arm64.dmg, FrameGuard-intel.dmg).
-    Taking the first asset that merely looks like an installer hands a
-    Mac user the Windows .exe — and hands an Intel Mac the arm64 DMG —
-    so selection is by platform AND architecture, preferring the asset
-    named for this machine, then the canonical installer name, and never
-    crossing platforms or architectures when a match exists.
-    """
-    platform = sys.platform if platform is None else platform
-    if platform != "darwin":
-        candidates = [
-            a for a in assets
-            if str(a.get("name", "")).lower().endswith(".exe")
-        ]
-        if not candidates:
-            return None
-        for asset in candidates:
-            if str(asset.get("name", "")).lower() == _INSTALLER_FILENAME.lower():
-                return asset
-        return candidates[0]
-
-    if machine is None:
-        import platform as _platform
-        machine = _platform.machine()
-    machine = machine.lower()
-    arm = machine in ("arm64", "aarch64")
-    want = ("arm64",) if arm else ("intel", "x86_64")
-    other = ("intel", "x86_64") if arm else ("arm64",)
-    dmgs = [
-        a for a in assets
-        if str(a.get("name", "")).lower().endswith(".dmg")
-    ]
-    if not dmgs:
+    """Return one exact installer asset for this platform and architecture."""
+    if not isinstance(assets, list):
         return None
-    def _name(a):
-        return str(a.get("name", "")).lower()
-    for asset in dmgs:  # named for this architecture
-        if any(tag in _name(asset) for tag in want):
-            return asset
-    for asset in dmgs:  # the canonical, un-suffixed DMG
-        if _name(asset) == "FrameGuard.dmg".lower():
-            return asset
-    for asset in dmgs:  # any DMG not named for the other architecture
-        if not any(tag in _name(asset) for tag in other):
-            return asset
-    return None
+    platform = sys.platform if platform is None else platform
+    if platform == "darwin":
+        if machine is None:
+            import platform as _platform
+            machine = _platform.machine()
+        machine = str(machine).lower()
+        if machine in ("arm64", "aarch64"):
+            expected = "FrameGuard-arm64.dmg"
+        elif machine in ("x86_64", "amd64", "intel"):
+            expected = "FrameGuard-intel.dmg"
+        else:
+            return None
+    else:
+        expected = _INSTALLER_FILENAME
+
+    matches = [
+        asset for asset in assets
+        if isinstance(asset, dict)
+        and str(asset.get("name", "")).casefold() == expected.casefold()
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _read_bounded(response, maximum: int) -> bytes:
+    """Read a small HTTP response without trusting its Content-Length."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = response.read(min(64 * 1024, maximum + 1 - total))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum:
+            raise RuntimeError("Update metadata response is too large.")
+
+
+def _http_status_ok(response) -> bool:
+    status = getattr(response, "status", None)
+    if status is None:
+        getcode = getattr(response, "getcode", None)
+        status = getcode() if callable(getcode) else 200
+    return 200 <= int(status) < 300
+
+
+def _normalise_sha256(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    if value.lower().startswith("sha256:"):
+        value = value.split(":", 1)[1].strip()
+    return value.lower() if _SHA256_RE.fullmatch(value) else ""
+
+
+def _checksum_from_release(assets, filename: str) -> str:
+    """Resolve filename from the release's single SHA256SUMS.txt asset."""
+    checksum_assets = [
+        asset for asset in assets
+        if isinstance(asset, dict)
+        and str(asset.get("name", "")).casefold() == "sha256sums.txt"
+    ]
+    if len(checksum_assets) != 1:
+        return ""
+    url = str(checksum_assets[0].get("browser_download_url", ""))
+    if not url.lower().startswith("https://"):
+        return ""
+
+    import urllib.request
+
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "FrameGuard-Updater"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        if not _http_status_ok(response):
+            return ""
+        text = _read_bounded(response, _MAX_CHECKSUM_BYTES).decode(
+            "utf-8", errors="strict")
+
+    matches = []
+    for line in text.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        digest = _normalise_sha256(parts[0])
+        listed_name = parts[1].lstrip("* ")
+        if digest and listed_name == filename:
+            matches.append(digest)
+    return matches[0] if len(matches) == 1 else ""
 
 
 def check_github_for_update() -> Optional["UpdateInfo"]:
-    """Check GitHub Releases API for a newer version.
-
-    Looks for the latest release and compares version tags.
-    The release should carry FrameGuardInstaller.exe (Windows) and
-    FrameGuard.dmg (macOS); _pick_release_asset chooses per platform.
-    """
+    """Check GitHub Releases for one integrity-verifiable stable installer."""
     try:
         import urllib.request
-        import json
-        
+
         req = urllib.request.Request(
             GITHUB_RELEASES_URL,
-            headers={"Accept": "application/vnd.github.v3+json", "User-Agent": "FrameGuard-Updater"}
+            headers={"Accept": "application/vnd.github.v3+json",
+                     "User-Agent": "FrameGuard-Updater"},
         )
         with urllib.request.urlopen(req, timeout=10) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        
-        tag = data.get("tag_name", "").lstrip("v")
-        body = data.get("body", "")
-        
-        # Find the installer asset for this platform
-        asset = _pick_release_asset(data.get("assets", []))
-        installer_url = asset.get("browser_download_url", "") if asset else ""
-        file_size = (asset.get("size", 0) / (1024 * 1024)) if asset else 0
-        
-        if not tag or not installer_url:
+            if not _http_status_ok(response):
+                return None
+            data = json.loads(
+                _read_bounded(response, _MAX_RELEASE_METADATA_BYTES).decode(
+                    "utf-8", errors="strict"))
+
+        if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
             return None
-        
-        local_ver = get_current_version()
+        raw_tag = data.get("tag_name", "")
+        parsed_tag = _parse_version(raw_tag)
+        if not parsed_tag:
+            return None
+        tag = ".".join(str(part) for part in parsed_tag)
+        assets = data.get("assets", [])
+        asset = _pick_release_asset(assets)
+        if asset is None:
+            return None
+
+        name = str(asset.get("name", ""))
+        installer_url = str(asset.get("browser_download_url", ""))
+        if not installer_url.lower().startswith("https://"):
+            return None
+        size = asset.get("size")
+        if not isinstance(size, int) or isinstance(size, bool) \
+                or size <= 0 or size > MAX_INSTALLER_BYTES:
+            return None
+
+        digest = _normalise_sha256(asset.get("digest"))
+        if not digest:
+            digest = _checksum_from_release(assets, name)
+        if not digest:
+            return None
+
+        body = data.get("body", "")
+        if not isinstance(body, str):
+            body = ""
         return UpdateInfo(
             version=tag,
             installer_path=installer_url,
             changelog=body[:500],
-            file_size_mb=round(file_size, 1),
-            is_newer=_is_newer(tag, local_ver),
+            file_size_mb=round(size / (1024 * 1024), 1),
+            is_newer=_is_newer(tag, get_current_version()),
             source_path="GitHub Releases",
+            sha256=digest,
+            size_bytes=size,
+            asset_name=name,
         )
     except Exception:
         return None
 
 
 def installer_filename() -> str:
-    """Name of the installer artifact this platform can actually apply."""
-    return "FrameGuard.dmg" if sys.platform == "darwin" else _INSTALLER_FILENAME
+    """Exact release asset name this platform and architecture can apply."""
+    if sys.platform != "darwin":
+        return _INSTALLER_FILENAME
+    import platform as _platform
+    machine = _platform.machine().lower()
+    return ("FrameGuard-arm64.dmg"
+            if machine in ("arm64", "aarch64")
+            else "FrameGuard-intel.dmg")
 
 
 def get_default_search_paths() -> List[str]:
@@ -337,13 +464,23 @@ def _check_path_for_update(update_dir: str) -> Optional[UpdateInfo]:
             # "Installer not found" a few clicks later.
             return None
 
+        digest = _normalise_sha256(data.get("sha256"))
+        if not digest:
+            return None
+        size = os.path.getsize(installer_path)
+        if size <= 0 or size > MAX_INSTALLER_BYTES:
+            return None
+
         return UpdateInfo(
             version=remote_ver,
             installer_path=installer_path,
             changelog=data.get("changelog", ""),
-            file_size_mb=data.get("file_size_mb", 0),
+            file_size_mb=round(size / (1024 * 1024), 1),
             is_newer=_is_newer(remote_ver, local_ver),
             source_path=update_dir,
+            sha256=digest,
+            size_bytes=size,
+            asset_name=os.path.basename(installer_path),
         )
     except (json.JSONDecodeError, OSError, KeyError):
         return None
@@ -379,6 +516,12 @@ class UpdateManager(QObject):
         self._check_lock = threading.Lock()
         self._settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         self._last_found_update: Optional[UpdateInfo] = None
+        self._cancel_event = threading.Event()
+        self._apply_lock = threading.Lock()
+        self._applying = False
+        self._local_copy_process = None
+        # Successful launch hands staging ownership to the external installer.
+        self._retained_staging_dirs = set()
         
         # Auto-check timer (fires once after startup delay)
         self._startup_timer = QTimer(self)
@@ -484,22 +627,23 @@ class UpdateManager(QObject):
         return self._last_found_update
     
     def apply_update(self, info: UpdateInfo = None):
-        """Download/copy the installer and launch it, then close the app.
-        
-        This is the "Update & Restart" action:
-        1. Copy installer to temp (with progress)
-        2. Launch installer with /SILENT flag
-        3. Close this application
-        """
+        """Verify, stage, and launch one full installer in the background."""
         if info is None:
             info = self._last_found_update
         if info is None:
             self._emit(self.check_failed, "No update information available.")
             return
-        
-        # Run in background thread
+        with self._apply_lock:
+            if self._applying:
+                return
+            self._applying = True
+            self._cancel_event.clear()
         thread = threading.Thread(target=self._do_apply, args=(info,), daemon=True)
         thread.start()
+
+    def cancel_update(self):
+        """Request cancellation at the next bounded copy/download checkpoint."""
+        self._cancel_event.set()
     
     def test_path(self, path: str) -> str:
         """Test if a path contains valid update files. Returns status string."""
@@ -516,13 +660,17 @@ class UpdateManager(QObject):
             with open(vj, "r") as f:
                 data = json.load(f)
             ver = data.get("version", "?")
-            installer = data.get("installer", _INSTALLER_FILENAME)
+            key = ("installer_darwin" if sys.platform == "darwin"
+                   else "installer_windows")
+            installer = data.get(key) or data.get("installer") or installer_filename()
             has_installer = os.path.isfile(os.path.join(path, installer))
             
-            if has_installer:
-                return f"Valid! Version {ver} with installer ready."
-            else:
+            if not has_installer:
                 return f"version.json found (v{ver}) but {installer} is missing."
+            if not _normalise_sha256(data.get("sha256")):
+                return (f"version.json found (v{ver}) but a valid SHA-256 "
+                        f"digest is missing.")
+            return f"Valid! Version {ver} with verified installer ready."
         except (json.JSONDecodeError, OSError) as e:
             return f"Error reading version.json: {e}"
     
@@ -587,114 +735,295 @@ class UpdateManager(QObject):
         finally:
             self._checking = False
     
-    def _download_installer(self, url: str) -> str:
-        """Download an installer URL to a temp file, with progress.
+    def _check_cancelled(self):
+        if self._cancel_event.is_set():
+            raise RuntimeError("Update cancelled.")
 
-        Returns the local path, or "" on failure. The GitHub Releases
-        check reports the asset's download URL as installer_path; the
-        rest of the apply flow works on local files, so the URL has to
-        become one first — without this, that check could find an
-        update it could never apply.
-        """
+    @staticmethod
+    def _ensure_staging_capacity(staging_dir: str, required: int):
+        if required <= 0 or required > MAX_INSTALLER_BYTES:
+            raise RuntimeError("Installer size is invalid or exceeds the 2 GiB limit.")
+        free = shutil.disk_usage(staging_dir).free
+        if free < required + _MIN_FREE_SPACE_BYTES:
+            raise RuntimeError("Not enough free disk space to stage the update.")
+
+    def _download_installer(self, url: str, *, staging_dir: str = None,
+                            expected_size: int = 0,
+                            expected_sha256: str = "",
+                            filename: str = "") -> str:
+        """Stream one bounded installer into an explicitly owned staging tree."""
         import urllib.parse
         import urllib.request
 
-        name = os.path.basename(urllib.parse.urlparse(url).path) \
-            or installer_filename()
-        dest = os.path.join(
-            tempfile.mkdtemp(prefix="frameguard_update_"), name)
+        owns_staging = staging_dir is None
+        if staging_dir is None:
+            staging_dir = tempfile.mkdtemp(prefix="frameguard_update_")
+        os.makedirs(staging_dir, exist_ok=True)
+        name = filename or os.path.basename(
+            urllib.parse.unquote(urllib.parse.urlparse(url).path))
+        name = os.path.basename(name) or installer_filename()
+        dest = os.path.join(staging_dir, name)
+        digest = _normalise_sha256(expected_sha256)
+
         try:
+            self._check_cancelled()
             req = urllib.request.Request(
                 url, headers={"User-Agent": "FrameGuard-Updater"})
-            with urllib.request.urlopen(req, timeout=120) as resp, \
-                    open(dest, "wb") as out:
-                total = int(resp.headers.get("Content-Length") or 0)
+            with urllib.request.urlopen(
+                    req, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
+                if not _http_status_ok(response):
+                    raise RuntimeError("Installer download returned a non-success status.")
+                raw_length = response.headers.get("Content-Length")
+                declared = 0
+                if raw_length not in (None, ""):
+                    try:
+                        declared = int(raw_length)
+                    except (TypeError, ValueError) as error:
+                        raise RuntimeError("Installer Content-Length is invalid.") from error
+                    if declared <= 0 or declared > MAX_INSTALLER_BYTES:
+                        raise RuntimeError(
+                            "Installer size is invalid or exceeds the 2 GiB limit.")
+                if expected_size and declared and declared != expected_size:
+                    raise RuntimeError("Installer size does not match release metadata.")
+                required = expected_size or declared
+                self._ensure_staging_capacity(staging_dir, required)
+
                 copied = 0
-                while True:
-                    chunk = resp.read(256 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-                    copied += len(chunk)
-                    if total > 0:
-                        self._emit(self.download_progress, int(copied * 100 / total))
+                hasher = hashlib.sha256()
+                started = time.monotonic()
+                with open(dest, "xb") as output:
+                    while True:
+                        self._check_cancelled()
+                        if time.monotonic() - started > _MAX_DOWNLOAD_SECONDS:
+                            raise RuntimeError("Installer download exceeded 30 minutes.")
+                        chunk = response.read(_COPY_CHUNK_SIZE)
+                        self._check_cancelled()
+                        if time.monotonic() - started > _MAX_DOWNLOAD_SECONDS:
+                            raise RuntimeError("Installer download exceeded 30 minutes.")
+                        if not chunk:
+                            break
+                        copied += len(chunk)
+                        if copied > MAX_INSTALLER_BYTES:
+                            raise RuntimeError("Installer exceeds the 2 GiB limit.")
+                        if declared and copied > declared:
+                            raise RuntimeError("Installer exceeds its Content-Length.")
+                        if expected_size and copied > expected_size:
+                            raise RuntimeError("Installer exceeds release metadata size.")
+                        output.write(chunk)
+                        hasher.update(chunk)
+                        total = expected_size or declared
+                        if total:
+                            self._emit(
+                                self.download_progress,
+                                min(99, int(copied * 100 / total)),
+                            )
+
+                if declared and copied != declared:
+                    raise RuntimeError("Installer download was truncated.")
+                if expected_size and copied != expected_size:
+                    raise RuntimeError("Installer size does not match release metadata.")
+                if digest and not hmac.compare_digest(hasher.hexdigest(), digest):
+                    raise RuntimeError("Installer integrity verification failed.")
+                self._emit(self.download_progress, 100)
+                return dest
+        except Exception as error:
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            if owns_staging:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                return ""
+            if isinstance(error, RuntimeError):
+                raise
+            raise RuntimeError(f"Installer download failed: {error}") from error
+
+    @staticmethod
+    def _stop_local_copy_process(process) -> bool:
+        """Stop and reap a staging child without an unbounded join."""
+        try:
+            process.join(timeout=0)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=_LOCAL_COPY_STOP_SECONDS)
+            if process.is_alive():
+                kill = getattr(process, "kill", None)
+                if callable(kill):
+                    kill()
+                process.join(timeout=_LOCAL_COPY_STOP_SECONDS)
+            return not process.is_alive()
+        except (OSError, ValueError):
+            return False
+
+    def _stage_local_installer(self, source: str, staging_dir: str,
+                               expected_size: int, expected_sha256: str) -> str:
+        """Stage a local/network installer through a bounded child process."""
+        digest = _normalise_sha256(expected_sha256)
+        if not digest:
+            raise RuntimeError("Installer has no trusted SHA-256 digest.")
+        if not source:
+            raise RuntimeError("Installer path is empty.")
+        if (not isinstance(expected_size, int)
+                or isinstance(expected_size, bool)
+                or expected_size <= 0
+                or expected_size > MAX_INSTALLER_BYTES):
+            raise RuntimeError("Installer has invalid trusted size metadata.")
+        self._ensure_staging_capacity(staging_dir, expected_size)
+
+        dest = os.path.join(staging_dir, os.path.basename(source))
+        context = multiprocessing.get_context("spawn")
+        receiver, sender = context.Pipe(duplex=False)
+        process = context.Process(
+            target=_LOCAL_COPY_WORKER_TARGET,
+            args=(source, dest, expected_size, digest, sender),
+            name="FrameGuardLocalInstallerCopy",
+            daemon=True,
+        )
+        self._local_copy_process = process
+        started = time.monotonic()
+        process_started = False
+        terminal_message = None
+        try:
+            self._check_cancelled()
+            process.start()
+            process_started = True
+            sender.close()
+
+            while terminal_message is None:
+                if self._cancel_event.is_set():
+                    raise RuntimeError("Update cancelled.")
+                remaining = _MAX_LOCAL_COPY_SECONDS - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "Local installer staging exceeded its deadline.")
+                if receiver.poll(min(_LOCAL_COPY_POLL_SECONDS, remaining)):
+                    try:
+                        message = receiver.recv()
+                    except EOFError:
+                        message = None
+                    if (not isinstance(message, tuple) or len(message) != 2
+                            or message[0] not in ("progress", "done", "error")):
+                        raise RuntimeError("Local installer staging worker failed.")
+                    kind, value = message
+                    if kind == "progress":
+                        self._emit(
+                            self.download_progress,
+                            min(99, int(int(value) * 100 / expected_size)),
+                        )
+                    else:
+                        terminal_message = (kind, value)
+                elif not process.is_alive():
+                    # A terminal pipe message may become visible just after the
+                    # process exit state; allow one final bounded drain.
+                    if receiver.poll(_LOCAL_COPY_POLL_SECONDS):
+                        continue
+                    raise RuntimeError("Local installer staging worker exited early.")
+
+            kind, value = terminal_message
+            if kind == "error":
+                raise RuntimeError(str(value) or "Local installer staging failed.")
+            process.join(timeout=_LOCAL_COPY_STOP_SECONDS)
+            if process.is_alive() and not self._stop_local_copy_process(process):
+                raise RuntimeError("Could not stop local installer staging worker.")
+            if process.exitcode not in (0, None):
+                raise RuntimeError("Local installer staging worker failed.")
+            if int(value) != expected_size:
+                raise RuntimeError("Installer copy was truncated.")
             self._emit(self.download_progress, 100)
             return dest
-        except Exception:
-            return ""
+        except Exception as error:
+            stop_failed = (process_started and process.is_alive()
+                           and not self._stop_local_copy_process(process))
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            if stop_failed:
+                raise RuntimeError(
+                    "Could not stop local installer staging worker.") from error
+            raise
+        finally:
+            try:
+                sender.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                receiver.close()
+            except (OSError, ValueError):
+                pass
+            if process_started and process.is_alive():
+                self._stop_local_copy_process(process)
+            try:
+                process.close()
+            except (OSError, ValueError):
+                pass
+            self._local_copy_process = None
 
     def _do_apply(self, info: UpdateInfo):
-        """Download/copy installer and launch it (runs in background thread)."""
+        """Verify, stage once, and launch the installer from a worker thread."""
+        staging_dir = None
+        retained = False
         try:
             self._emit(self.status_changed, "Preparing update...")
+            digest = _normalise_sha256(info.sha256)
+            if not digest:
+                raise RuntimeError("Installer has no trusted SHA-256 digest.")
+            if (not isinstance(info.size_bytes, int)
+                    or isinstance(info.size_bytes, bool)
+                    or info.size_bytes <= 0):
+                raise RuntimeError("Installer has no trusted size metadata.")
 
-            # Determine installer source
+            staging_dir = tempfile.mkdtemp(prefix="frameguard_update_")
+            os.makedirs(staging_dir, exist_ok=True)
             source = info.installer_path
             if source and source.lower().startswith(("http://", "https://")):
                 self._emit(self.status_changed, "Downloading installer...")
-                source = self._download_installer(source)
-                if not source:
-                    self._emit(self.check_failed, "Could not download the installer.")
-                    return
-            if not source or not os.path.isfile(source):
-                self._emit(self.check_failed, f"Installer not found at: {source}")
-                return
+                dest = self._download_installer(
+                    source,
+                    staging_dir=staging_dir,
+                    expected_size=info.size_bytes,
+                    expected_sha256=digest,
+                    filename=info.asset_name,
+                )
+            else:
+                self._emit(self.status_changed, "Copying installer...")
+                dest = self._stage_local_installer(
+                    source, staging_dir, info.size_bytes, digest)
 
-            # Copy to temp directory (avoids file locking issues)
-            temp_dir = tempfile.mkdtemp(prefix="frameguard_update_")
-            dest = os.path.join(temp_dir, os.path.basename(source))
-
-            # Copy with progress
-            self._emit(self.status_changed, "Copying installer...")
-            total_size = os.path.getsize(source)
-            copied = 0
-            chunk_size = 256 * 1024  # 256KB chunks
-
-            with open(source, "rb") as src, open(dest, "wb") as dst:
-                while True:
-                    chunk = src.read(chunk_size)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-                    copied += len(chunk)
-                    pct = int(copied * 100 / total_size) if total_size > 0 else 100
-                    self._emit(self.download_progress, pct)
-
-            self._emit(self.download_progress, 100)
+            self._check_cancelled()
             self._emit(self.download_complete, dest)
-
             if sys.platform == "darwin":
-                # A running .app cannot replace itself, and there is no silent
-                # installer. Reveal the disk image and let the user drag the new
-                # build into /Applications, which is the standard Mac flow.
                 self._emit(self.status_changed, "Opening the update...")
                 subprocess.Popen(["/usr/bin/open", dest])
-                # Deliberately do NOT quit: the user needs FrameGuard closed
-                # only at the moment they replace it, and the Finder copy
-                # prompt makes that obvious.
+                retained = True
+                self._retained_staging_dirs.add(staging_dir)
                 return
 
             self._emit(self.status_changed, "Launching installer...")
-            # Inno Setup silent mode: /SILENT shows progress but no prompts.
             subprocess.Popen(
                 [dest, "/SILENT", "/RESTARTAPPLICATIONS"],
-                creationflags=subprocess.DETACHED_PROCESS if sys.platform == "win32" else 0
+                creationflags=(subprocess.DETACHED_PROCESS
+                               if sys.platform == "win32" else 0),
             )
-
-            # Give installer a moment to start, then close the app
+            retained = True
+            self._retained_staging_dirs.add(staging_dir)
             time.sleep(1)
             self._emit(self.status_changed, "Restarting...")
 
-            # Qt objects must only be touched from the GUI thread; _do_apply
-            # runs on a worker thread, so marshal the quit through the event
-            # loop instead of calling it directly (which hangs or crashes).
             from PySide6.QtWidgets import QApplication
             app = QApplication.instance()
             if app is not None:
                 QTimer.singleShot(0, app.quit)
-
-        except Exception as e:
-            self._emit(self.check_failed, f"Update failed: {str(e)[:200]}")
+        except Exception as error:
+            if self._cancel_event.is_set():
+                self._emit(self.status_changed, "Update cancelled.")
+            else:
+                self._emit(self.check_failed, f"Update failed: {str(error)[:200]}")
+        finally:
+            if staging_dir and not retained:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+            with self._apply_lock:
+                self._applying = False
 
 
 # ---------------------------------------------------------------------------
@@ -703,8 +1032,9 @@ class UpdateManager(QObject):
 
 def create_version_json(version: str, installer_filename: str = _INSTALLER_FILENAME,
                         changelog: str = "", file_size_mb: float = 0,
-                        installer_darwin: str = "FrameGuard.dmg") -> str:
-    """Generate a version.json file content for publishing an update."""
+                        installer_darwin: str = "FrameGuard.dmg",
+                        sha256: str = "") -> str:
+    """Generate version.json content for a local full-installer source."""
     data = {
         "version": version,
         "installer": installer_filename,
@@ -715,4 +1045,7 @@ def create_version_json(version: str, installer_filename: str = _INSTALLER_FILEN
         "min_version": "0.4.0",
         "published": datetime.now().isoformat(),
     }
+    digest = _normalise_sha256(sha256)
+    if digest:
+        data["sha256"] = digest
     return json.dumps(data, indent=2)

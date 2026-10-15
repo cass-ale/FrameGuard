@@ -306,8 +306,13 @@ if [[ $SKIP_TESTS -eq 1 ]]; then
     echo "      SKIPPED (--skip-tests)"
 else
     QT_QPA_PLATFORM=offscreen "$PY" -m pytest \
-        tests/test_macos.py tests/test_packaging.py \
+        tests/test_startup.py tests/test_macos.py tests/test_packaging.py \
         || die "macOS packaging tests failed. Fix them before shipping a build."
+    "$PY" tools_dev/startup_smoke.py \
+        --executable "$PY" --entrypoint main.py \
+        --artifacts-dir "${LOG_DIR}/startup-source" \
+        --label "source-startup" --qpa offscreen --timeout 30 \
+        || die "Source failed the real startup preflight. Evidence: ${LOG_DIR}/startup-source"
 fi
 
 # --- 7. PyInstaller -------------------------------------------------------
@@ -338,6 +343,9 @@ PYINSTALLER_STATUS="${PYINSTALLER_PIPESTATUS[0]}"
 TEE_STATUS="${PYINSTALLER_PIPESTATUS[1]}"
 if [[ -f "$PYINSTALLER_WARN_SOURCE" ]]; then
     cp -f "$PYINSTALLER_WARN_SOURCE" "$PYINSTALLER_WARN_LOG"
+    "$PY" tools_dev/check_pyinstaller_warnings.py \
+        "$PYINSTALLER_WARN_LOG" --platform darwin \
+        || die "PyInstaller omitted a required runtime dependency. Diagnostics: ${PYINSTALLER_WARN_LOG}"
 fi
 [[ "$TEE_STATUS" -eq 0 ]] \
     || die "Could not preserve the PyInstaller log at ${PYINSTALLER_LOG}."
@@ -487,15 +495,25 @@ fi
 
 # --- 9. Smoke test + DMG --------------------------------------------------
 step 9 "Smoke testing and packaging..."
-# --selftest imports every module, builds the main window, resolves FFmpeg and
-# exits with a real status code. Checking "is the process still alive" would
-# pass even when the app is stuck behind a modal error dialog.
+# Keep the component diagnostic, but never accept it as startup evidence: it
+# constructs MainWindow directly and does not exercise the production preamble.
 if "${BUNDLE}/Contents/MacOS/${APP_NAME}" --selftest; then
-    echo "      Smoke test passed"
+    echo "      Component self-test passed"
 else
-    die "The built app failed its self-test. Do not ship this build.
+    die "The built app failed its component self-test. Do not ship this build.
       Reproduce with:  ${BUNDLE}/Contents/MacOS/${APP_NAME} --selftest"
 fi
+
+# The hidden preflight enters frameguard.gui.main(), observes a Qt event-loop
+# turn and deferred show, then exits through an internal watchdog. The harness
+# adds an independent process timeout and validates atomic JSON evidence.
+"$PY" tools_dev/startup_smoke.py \
+    --executable "${BUNDLE}/Contents/MacOS/${APP_NAME}" \
+    --artifacts-dir "${LOG_DIR}/startup-app" \
+    --label "frozen-app-startup" \
+    --expect-frozen --qpa cocoa --timeout 30 \
+    || die "The built app failed the real startup preflight. Evidence: ${LOG_DIR}/startup-app"
+echo "      Real startup preflight passed"
 
 mkdir -p "$DMG_DIR" "$LOCAL_BUILD_ROOT"
 # Build the image on the local filesystem. Google Drive cannot preserve the
@@ -561,6 +579,13 @@ if [[ $NOTARIZE -eq 1 ]]; then
     xcrun stapler validate "$LOCAL_DMG_PATH" \
         || die "Final stapled ticket validation failed after image mutation."
 fi
+# Verify the final artifact itself, not only the build tree: attach read-only,
+# inspect layout/plist/architecture/tools/seal, and execute startup from both
+# the mounted and copied bundle. Detach is unconditional inside the harness.
+"$PY" tools_dev/macos_package_smoke.py \
+    --dmg "$LOCAL_DMG_PATH" --expected-arch "$TARGET_ARCH" \
+    --artifacts-dir "${LOG_DIR}/dmg-smoke" --qpa cocoa \
+    || die "The final DMG failed mounted/copied package smoke. Evidence: ${LOG_DIR}/dmg-smoke"
 DMG_SIZE=$(du -h "$LOCAL_DMG_PATH" | cut -f1)
 
 # Copy only the completed disk image into the shared checkout. Both copies are
