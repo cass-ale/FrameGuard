@@ -4,10 +4,11 @@
 #   1. Bump the version in the four places validate_version.py checks
 #      (frameguard/__init__.py, frameguard.spec, installer.iss,
 #      version.json — changelog lives in version.json), commit, push main.
-#   2. Tag that commit:  git tag -a v0.5.6 -m "FrameGuard 0.5.6"
-#      and push the tag. This workflow does the rest — no local builds,
-#      no Windows machine needed.
-#   3. Enable immutable releases in repo settings (Settings -> General ->
+#   2. Wait for Tests and Release Candidate to pass on that exact commit SHA.
+#      The candidate proves the installed Windows package and both native DMGs.
+#   3. Tag that proven commit: git tag -a v0.8.0 -m "FrameGuard v0.8.0"
+#      and push the tag. This workflow rejects any unproven tag target.
+#   4. Enable immutable releases in repo settings (Settings -> General ->
 #      Releases) and keep the publish job's `release` environment
 #      restricted to v* tags with yourself as reviewer. A published
 #      release can then never be altered: draft -> verify -> publish.
@@ -54,6 +55,7 @@ concurrency:
 # restates exactly the extra permissions it needs.
 permissions:
   contents: read
+  actions: read
 
 jobs:
   verify:
@@ -62,6 +64,9 @@ jobs:
     timeout-minutes: 15
     outputs:
       version: ${{ steps.version.outputs.version }}
+      release_sha: ${{ steps.candidate.outputs.release_sha }}
+      tag_object_sha: ${{ steps.candidate.outputs.tag_object_sha }}
+      candidate_run_id: ${{ steps.candidate.outputs.candidate_run_id }}
     steps:
       - name: Require an existing tag ref for manual releases
         if: github.event_name == 'workflow_dispatch'
@@ -119,6 +124,71 @@ jobs:
             exit 1
           fi
           echo "Tag $RELEASE_TAG == version $VERSION"
+
+      - name: Require successful source and native candidate runs for this commit
+        id: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          RELEASE_SHA="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          TAG_OBJECT_SHA="$(git rev-parse "refs/tags/${RELEASE_TAG}")"
+          CANDIDATE_RUNS="$RUNNER_TEMP/frameguard-candidate-runs.json"
+          TEST_RUNS="$RUNNER_TEMP/frameguard-test-runs.json"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/release-candidate.yml/runs?head_sha=${RELEASE_SHA}&status=success&per_page=20" \
+            > "$CANDIDATE_RUNS"
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/tests.yml/runs?head_sha=${RELEASE_SHA}&status=success&per_page=20" \
+            > "$TEST_RUNS"
+          python - "$CANDIDATE_RUNS" "$TEST_RUNS" "$RELEASE_SHA" \
+            "$TAG_OBJECT_SHA" "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          (candidate_path, tests_path, expected_sha, tag_object_sha,
+           output_path, summary_path) = sys.argv[1:]
+
+          def matching_runs(path, events):
+              payload = json.loads(pathlib.Path(path).read_text(encoding="utf-8"))
+              return [
+                  run for run in payload.get("workflow_runs", [])
+                  if run.get("head_sha") == expected_sha
+                  and run.get("status") == "completed"
+                  and run.get("conclusion") == "success"
+                  and run.get("event") in events
+              ]
+
+          candidates = matching_runs(candidate_path, {"push", "workflow_dispatch"})
+          tests = [
+              run for run in matching_runs(tests_path, {"push"})
+              if run.get("head_branch") == "main"
+          ]
+          if not candidates:
+              raise SystemExit(
+                  "No successful Release Candidate run exists for exact commit "
+                  f"{expected_sha}. The tag cannot build or publish."
+              )
+          if not tests:
+              raise SystemExit(
+                  "No successful main-push Tests run exists for exact commit "
+                  f"{expected_sha}. The tag cannot build or publish."
+              )
+          candidate = max(candidates, key=lambda run: run.get("run_number", 0))
+          test_run = max(tests, key=lambda run: run.get("run_number", 0))
+          with open(output_path, "a", encoding="utf-8") as stream:
+              stream.write(f"release_sha={expected_sha}\n")
+              stream.write(f"tag_object_sha={tag_object_sha}\n")
+              stream.write(f"candidate_run_id={candidate['id']}\n")
+          with open(summary_path, "a", encoding="utf-8") as stream:
+              stream.write("## Exact-SHA release authorization\n\n")
+              stream.write(f"- Commit: `{expected_sha}`\n")
+              stream.write(f"- Tests run: [{test_run['id']}]({test_run['html_url']})\n")
+              stream.write(f"- Candidate run: [{candidate['id']}]({candidate['html_url']})\n")
+          print(f"Exact-SHA Tests authorized by {test_run['html_url']}")
+          print(f"Exact-SHA candidate authorized by {candidate['html_url']}")
+          PY
 
       - name: Build the release notes from version.json
         run: |
@@ -182,7 +252,7 @@ jobs:
     name: Build Windows installer
     needs: verify
     runs-on: windows-2025
-    timeout-minutes: 60
+    timeout-minutes: 120
     defaults:
       run:
         working-directory: src
@@ -190,7 +260,7 @@ jobs:
       - name: Check out the tagged commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ needs.verify.outputs.release_sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -220,7 +290,7 @@ jobs:
           if (-not $found) { throw "Inno Setup (ISCC.exe) is not available." }
 
       - name: Build and installed-smoke the installer (full gated build)
-        timeout-minutes: 45
+        timeout-minutes: 75
         shell: cmd
         # build_installer.bat guards its `pause` calls with
         # `if not defined CI` — under Actions they are skipped entirely.
@@ -233,12 +303,12 @@ jobs:
           dir Output
 
       - name: Smoke test the final Windows installer
-        timeout-minutes: 5
+        timeout-minutes: 12
         shell: pwsh
         run: >-
           ./tools_dev/windows_installer_smoke.ps1
           -Installer Output/FrameGuardInstaller.exe
-          -ArtifactsDir Output/build-logs/installed-smoke
+          -ArtifactsDir Output/build-logs/workflow-installed-smoke
           -Python ./.buildenv/Scripts/python.exe
 
       - name: Generate the SBOM from the frozen build environment
@@ -295,7 +365,7 @@ jobs:
             target_arch: x86_64
             artifact: macos-intel
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 150
     defaults:
       run:
         working-directory: src
@@ -306,7 +376,7 @@ jobs:
       - name: Check out the tagged commit
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ needs.verify.outputs.release_sha }}
           persist-credentials: false
 
       - name: Set up Python
@@ -369,7 +439,7 @@ jobs:
             | grep -F -- "$SIGN_IDENTITY"
 
       - name: Build the DMG (full gated build)
-        timeout-minutes: 45
+        timeout-minutes: 105
         env:
           SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
@@ -448,11 +518,13 @@ jobs:
 
   publish:
     name: Publish GitHub Release
-    needs: [build-windows, build-macos]
+    needs: [verify, build-windows, build-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       GH_REPO: ${{ github.repository }}
+      VERIFIED_RELEASE_SHA: ${{ needs.verify.outputs.release_sha }}
+      VERIFIED_TAG_OBJECT_SHA: ${{ needs.verify.outputs.tag_object_sha }}
     # Serialize latest-release selection and undraft operations across tags.
     concurrency:
       group: release-publish
@@ -553,6 +625,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          REF_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          REF_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          REF_OBJECT="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          if [[ "$REF_TYPE" != "tag" || "$REF_OBJECT" != "$VERIFIED_TAG_OBJECT_SHA" ]]; then
+            echo "::error::$RELEASE_TAG tag object changed before draft reconciliation."
+            exit 1
+          fi
+          TAG_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${REF_OBJECT}")"
+          CURRENT_SHA="$(jq -r 'select(.object.type == "commit") | .object.sha' <<<"$TAG_JSON")"
+          if [[ -z "$CURRENT_SHA" || "$CURRENT_SHA" != "$VERIFIED_RELEASE_SHA" ]]; then
+            echo "::error::$RELEASE_TAG now targets ${CURRENT_SHA:-unknown}, expected $VERIFIED_RELEASE_SHA."
+            exit 1
+          fi
 
           if release_json="$(gh release view "$RELEASE_TAG" --json isDraft 2>/dev/null)"; then
             if [[ "$(jq -r '.isDraft' <<<"$release_json")" != "true" ]]; then
@@ -607,6 +692,19 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          REF_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}")"
+          REF_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          REF_OBJECT="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          if [[ "$REF_TYPE" != "tag" || "$REF_OBJECT" != "$VERIFIED_TAG_OBJECT_SHA" ]]; then
+            echo "::error::$RELEASE_TAG tag object changed before publication."
+            exit 1
+          fi
+          TAG_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${REF_OBJECT}")"
+          CURRENT_SHA="$(jq -r 'select(.object.type == "commit") | .object.sha' <<<"$TAG_JSON")"
+          if [[ -z "$CURRENT_SHA" || "$CURRENT_SHA" != "$VERIFIED_RELEASE_SHA" ]]; then
+            echo "::error::$RELEASE_TAG moved before publication: ${CURRENT_SHA:-unknown} != $VERIFIED_RELEASE_SHA."
+            exit 1
+          fi
           if [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" != "true" ]]; then
             echo "::error::Release $RELEASE_TAG is no longer the verified draft."
             exit 1

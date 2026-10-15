@@ -37,13 +37,14 @@ WHAT'S NEW IN v0.8.0
     - Full-installer updates require exact platform assets and published
       SHA-256 evidence before an installer can run.
 
-  Systematic pre-push proof
-    - One fail-closed command fingerprints the exact source tree, toolchain,
-      logs, manifests, independent review and final package bytes.
-    - Fast checks can never authorize a push; full and package profiles require
-      every mandatory stage and fresh independent approval.
-    - The release candidate passed the complete suite, repeated timing stress,
-      the 120-state rendered UI matrix and final arm64 DMG startup checks.
+  Exact-SHA native release proof
+    - Local pre-push checks fingerprint the source tree, toolchain, logs,
+      manifests, review metadata and local package bytes without claiming
+      cross-platform release authorization.
+    - GitHub blocks release tags until Windows, Apple Silicon and Intel package
+      builders and installed or mounted startup smokes pass for the exact commit.
+    - Release jobs rebuild only that verified commit and recheck the annotated
+      tag immediately before publication.
 
 
 BEFORE YOU INSTALL

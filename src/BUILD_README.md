@@ -16,11 +16,13 @@ from this directory:
 python3 tools_dev/pre_push.py --profile full
 ```
 
-A full run intentionally remains incomplete until fresh independent review JSON
-is supplied on a fingerprint-checked resume. Fast runs can never authorize a
-push; the native arm64 `package` profile adds a clean build and final mounted /
-copied DMG startup smoke. See [`../docs/PRE_PUSH.md`](../docs/PRE_PUSH.md) for
-the evidence format, profiles, resume command, and failure rules.
+A full run intentionally remains incomplete until matching local review metadata
+is supplied on a fingerprint-checked resume. Fast runs can never establish local
+readiness; the native arm64 `package` profile adds a clean build and final mounted /
+copied DMG startup smoke. Local readiness does not authorize a release: GitHub's
+exact-SHA Release Candidate workflow must prove the Windows installer and both
+native macOS DMGs. See [`../docs/PRE_PUSH.md`](../docs/PRE_PUSH.md) for the
+evidence format, profiles, resume command, and failure rules.
 
 Both platform build scripts perform the same gated sequence and fail loudly at each step:
 

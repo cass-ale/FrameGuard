@@ -430,7 +430,7 @@ def test_resume_rejects_adjacent_metadata_tampering(tmp_path, field, message):
             previous, tmp_path, "full", snapshot, tools, (stage,))
 
 
-def test_missing_review_is_incomplete_and_fast_never_authorizes():
+def test_missing_review_is_incomplete_and_fast_never_becomes_local_ready():
     classification = {"unclassified_paths": []}
     passed = [_passed("gate")]
     full_status, full_blockers = pre_push.authorization_status(
@@ -444,7 +444,7 @@ def test_missing_review_is_incomplete_and_fast_never_authorizes():
     assert full_status == "incomplete"
     assert full_blockers == ["review absent"]
     assert fast_status == "incomplete"
-    assert "cannot authorize" in fast_blockers[0]
+    assert "cannot establish local readiness" in fast_blockers[0]
 
 
 def test_stale_review_is_rejected(tmp_path):
@@ -477,7 +477,7 @@ def test_stale_review_is_rejected(tmp_path):
     assert "predates completion" in result["failure"]
 
 
-def test_matching_fresh_review_can_authorize_full_profile(tmp_path):
+def test_matching_fresh_review_can_establish_local_readiness(tmp_path):
     now = datetime.now(timezone.utc)
     completed = now - timedelta(minutes=2)
     request = {
@@ -508,8 +508,46 @@ def test_matching_fresh_review_can_authorize_full_profile(tmp_path):
         {"unclassified_paths": []}, validated,
     )
     assert validated["status"] == "passed"
-    assert status == "authorized"
+    assert status == "local-ready"
     assert blockers == []
+
+
+def test_local_ready_summary_explicitly_refuses_release_authorization():
+    summary = {
+        "run_id": "run-a",
+        "profile": "full",
+        "scope": "local",
+        "release_authorized": False,
+        "final_status": "local-ready",
+        "snapshot": {
+            "head": "a" * 40,
+            "dirty_diff_sha256": "b" * 64,
+            "tree_fingerprint": "tree-a",
+        },
+        "tools": {"fingerprint": "tools-a"},
+        "authorization_evidence_digest": "evidence-a",
+        "evidence_dir": "/evidence/run-a",
+        "classification": {"areas": [], "unclassified_paths": []},
+        "stages": [],
+        "review": {"status": "passed"},
+        "snapshot_checks": [],
+        "evidence_checks": [],
+        "blockers": [],
+    }
+
+    rendered = pre_push.render_summary(summary)
+    assert "LOCAL-READY" in rendered
+    assert "RELEASE NOT AUTHORIZED" in rendered
+    assert "AUTHORIZED: all required gates" not in rendered
+
+
+def test_old_schema_resume_evidence_fails_closed(tmp_path):
+    (tmp_path / "summary.json").write_text(
+        json.dumps({"schema_version": pre_push.SCHEMA_VERSION - 1}),
+        encoding="utf-8",
+    )
+    with pytest.raises(pre_push.PreflightError, match="unsupported schema"):
+        pre_push._load_resume(tmp_path)
 
 
 def test_review_template_with_only_timestamp_changed_is_rejected(tmp_path):

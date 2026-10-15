@@ -1,0 +1,348 @@
+name: Release Candidate
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: "Exact 40-character commit SHA selected as the workflow ref"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-candidate-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  APP_DIR: src
+  PIP_CONSTRAINT: ${{ github.workspace }}/src/constraints-3.12.txt
+
+jobs:
+  verify-candidate:
+    name: Verify exact candidate SHA
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      candidate_sha: ${{ steps.sha.outputs.candidate_sha }}
+    steps:
+      - name: Check out the workflow commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require the requested exact SHA
+        id: sha
+        env:
+          REQUESTED_SHA: ${{ inputs.candidate_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Release candidates require a full lowercase 40-character commit SHA."
+            exit 1
+          fi
+          if [[ "$REQUESTED_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::Requested SHA $REQUESTED_SHA does not match workflow head_sha $GITHUB_SHA. Dispatch against the exact candidate ref."
+            exit 1
+          fi
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          if [[ "$CHECKED_OUT_SHA" != "$GITHUB_SHA" ]]; then
+            echo "::error::Checked out $CHECKED_OUT_SHA, expected $GITHUB_SHA."
+            exit 1
+          fi
+          echo "candidate_sha=$CHECKED_OUT_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: src/.python-version
+
+      - name: Validate release metadata
+        working-directory: src
+        run: python validate_version.py
+
+  build-windows:
+    name: Candidate Windows installer
+    needs: verify-candidate
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: src
+    steps:
+      - name: Initialize guaranteed Windows evidence
+        shell: pwsh
+        working-directory: ${{ runner.temp }}
+        env:
+          CANDIDATE_SHA: ${{ needs.verify-candidate.outputs.candidate_sha }}
+        run: |
+          $evidence = Join-Path $env:RUNNER_TEMP "frameguard-candidate-logs"
+          New-Item -ItemType Directory -Force -Path $evidence | Out-Null
+          [ordered]@{
+            schema_version = 1
+            candidate_sha = $env:CANDIDATE_SHA
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            status = "started"
+          } | ConvertTo-Json | Set-Content (Join-Path $evidence "job-started.json") -Encoding utf8
+
+      - name: Check out the verified candidate SHA
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.verify-candidate.outputs.candidate_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: src/.python-version
+
+      - name: Ensure Inno Setup 6 is available
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+            "C:\Program Files\Inno Setup 6\ISCC.exe"
+          )
+          if ($candidates | Where-Object { Test-Path $_ }) {
+            Write-Host "Inno Setup found preinstalled."
+          } elseif (Get-Command iscc -ErrorAction SilentlyContinue) {
+            Write-Host "Inno Setup found on PATH."
+          } else {
+            choco install innosetup -y --no-progress
+          }
+          $found = ($candidates | Where-Object { Test-Path $_ }) -or
+                   (Get-Command iscc -ErrorAction SilentlyContinue)
+          if (-not $found) { throw "Inno Setup (ISCC.exe) is not available." }
+
+      - name: Build and installed-smoke the installer
+        timeout-minutes: 75
+        shell: pwsh
+        run: |
+          $transcript = Join-Path $env:RUNNER_TEMP "frameguard-candidate-logs\builder.log"
+          & cmd.exe /d /c "build_installer.bat --skip-delta" 2>&1 |
+            Tee-Object -FilePath $transcript
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Smoke test the final Windows installer
+        timeout-minutes: 12
+        shell: pwsh
+        run: >-
+          ./tools_dev/windows_installer_smoke.ps1
+          -Installer Output/FrameGuardInstaller.exe
+          -ArtifactsDir Output/candidate-logs/workflow-installed-smoke
+          -Python ./.buildenv/Scripts/python.exe
+
+      - name: Record Windows candidate evidence
+        shell: pwsh
+        env:
+          CANDIDATE_SHA: ${{ needs.verify-candidate.outputs.candidate_sha }}
+        run: |
+          $installer = Get-Item Output/FrameGuardInstaller.exe
+          $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = [ordered]@{
+            schema_version = 1
+            candidate_sha = $env:CANDIDATE_SHA
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            asset = $installer.Name
+            size_bytes = $installer.Length
+            sha256 = $hash
+            smoke = "passed"
+          }
+          New-Item -ItemType Directory -Force -Path Output/build-logs | Out-Null
+          $manifest | ConvertTo-Json | Set-Content Output/build-logs/candidate-manifest.json -Encoding utf8
+
+      - name: Upload the proven Windows installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: candidate-windows-installer
+          overwrite: true
+          retention-days: 90
+          path: src/Output/FrameGuardInstaller.exe
+          if-no-files-found: error
+
+      - name: Upload Windows candidate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: candidate-windows-evidence
+          overwrite: true
+          retention-days: 90
+          path: |
+            ${{ runner.temp }}/frameguard-candidate-logs/
+            src/Output/candidate-logs/
+            src/Output/build-logs/
+          if-no-files-found: error
+
+  build-macos:
+    name: Candidate macOS DMG (${{ matrix.label }})
+    needs: verify-candidate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: arm64
+            runner: macos-15
+            target_arch: arm64
+            artifact: candidate-macos-arm64-dmg
+          - label: intel
+            runner: macos-15-intel
+            target_arch: x86_64
+            artifact: candidate-macos-intel-dmg
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    defaults:
+      run:
+        working-directory: src
+    env:
+      FRAMEGUARD_MAC_BUILD_ROOT: ${{ github.workspace }}/.frameguard-build/${{ matrix.label }}
+      FRAMEGUARD_TARGET_ARCH: ${{ matrix.target_arch }}
+    steps:
+      - name: Check out the verified candidate SHA
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.verify-candidate.outputs.candidate_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version-file: src/.python-version
+
+      - name: Configure the optional Developer ID certificate
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$SIGN_IDENTITY" ]]; then
+            if [[ -n "$CERTIFICATE_P12_BASE64" || -n "$CERTIFICATE_PASSWORD" \
+                  || -n "$APPLE_ID" || -n "$APPLE_TEAM_ID" \
+                  || -n "$APPLE_APP_PASSWORD" ]]; then
+              echo "::error::macOS signing/notarization secrets require MACOS_SIGN_IDENTITY."
+              exit 1
+            fi
+            echo "No Developer ID configured; the candidate will use an ad-hoc signature."
+            exit 0
+          fi
+          if [[ -z "$CERTIFICATE_P12_BASE64" || -z "$CERTIFICATE_PASSWORD" \
+                || -z "$APPLE_ID" || -z "$APPLE_TEAM_ID" \
+                || -z "$APPLE_APP_PASSWORD" ]]; then
+            echo "::error::Native candidates require the certificate and all notarization secrets when signing is enabled."
+            exit 1
+          fi
+          KEYCHAIN="$RUNNER_TEMP/frameguard-signing.keychain-db"
+          CERTIFICATE="$RUNNER_TEMP/frameguard-signing.p12"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          python - "$CERTIFICATE" <<'PY'
+          import base64
+          import os
+          import pathlib
+          import sys
+          pathlib.Path(sys.argv[1]).write_bytes(
+              base64.b64decode(os.environ["CERTIFICATE_P12_BASE64"], validate=True)
+          )
+          PY
+          chmod 600 "$CERTIFICATE"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$CERTIFICATE" -k "$KEYCHAIN" \
+            -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          EXISTING_KEYCHAINS="$(security list-keychains -d user | tr -d '\"')"
+          # shellcheck disable=SC2086 -- security expects one argument per keychain.
+          security list-keychains -d user -s "$KEYCHAIN" $EXISTING_KEYCHAINS
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -F -- "$SIGN_IDENTITY"
+
+      - name: Build the DMG
+        timeout-minutes: 105
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          set -o pipefail
+          mkdir -p "$FRAMEGUARD_MAC_BUILD_ROOT/logs"
+          bash build_mac.sh --skip-delta 2>&1 | tee "$FRAMEGUARD_MAC_BUILD_ROOT/build.log"
+
+      - name: Remove the temporary signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/frameguard-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/frameguard-signing.p12"
+
+      - name: Verify and smoke the final DMG
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          test -s Output/FrameGuard.dmg
+          BUNDLE="$FRAMEGUARD_MAC_BUILD_ROOT/dist/FrameGuard.app"
+          test -d "$BUNDLE"
+          codesign --verify --deep --strict "$BUNDLE"
+          "$FRAMEGUARD_MAC_BUILD_ROOT/venv/bin/python" \
+            tools_dev/macos_package_smoke.py \
+            --dmg Output/FrameGuard.dmg \
+            --expected-arch "${{ matrix.target_arch }}" \
+            --artifacts-dir "$FRAMEGUARD_MAC_BUILD_ROOT/logs/workflow-dmg-smoke" \
+            --qpa cocoa
+
+      - name: Record macOS candidate evidence
+        env:
+          CANDIDATE_SHA: ${{ needs.verify-candidate.outputs.candidate_sha }}
+          TARGET_ARCH: ${{ matrix.target_arch }}
+        run: |
+          set -euo pipefail
+          SHA256="$(shasum -a 256 Output/FrameGuard.dmg | awk '{print $1}')"
+          SIZE="$(stat -f '%z' Output/FrameGuard.dmg)"
+          export SHA256 SIZE
+          python - "$FRAMEGUARD_MAC_BUILD_ROOT/logs/candidate-manifest.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+          pathlib.Path(sys.argv[1]).write_text(json.dumps({
+              "schema_version": 1,
+              "candidate_sha": os.environ["CANDIDATE_SHA"],
+              "runner_os": os.environ["RUNNER_OS"],
+              "runner_arch": os.environ["RUNNER_ARCH"],
+              "target_arch": os.environ["TARGET_ARCH"],
+              "asset": "FrameGuard.dmg",
+              "size_bytes": int(os.environ["SIZE"]),
+              "sha256": os.environ["SHA256"],
+              "smoke": "passed",
+          }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Upload the proven DMG
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: ${{ matrix.artifact }}
+          overwrite: true
+          retention-days: 90
+          path: src/Output/FrameGuard.dmg
+          if-no-files-found: error
+
+      - name: Upload macOS candidate evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: candidate-macos-${{ matrix.label }}-evidence
+          overwrite: true
+          retention-days: 90
+          path: |
+            ${{ env.FRAMEGUARD_MAC_BUILD_ROOT }}/build.log
+            ${{ env.FRAMEGUARD_MAC_BUILD_ROOT }}/logs/
+          include-hidden-files: true
+          if-no-files-found: warn

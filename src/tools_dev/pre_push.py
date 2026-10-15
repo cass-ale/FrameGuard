@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Fail-closed, evidence-producing pre-push verification for FrameGuard.
 
-This tool never pushes. A zero exit code means that a full/package profile passed
-for one exact source and toolchain fingerprint and that fresh independent review
-evidence approved that fingerprint. Fast runs are diagnostic and always nonzero.
+This tool never pushes. A zero exit code means that a full/package profile is
+locally ready for one exact source, host, and toolchain fingerprint. It never
+authorizes a cross-platform release; GitHub's exact-SHA native candidate gate does.
 """
 
 from __future__ import annotations
@@ -27,14 +27,14 @@ from typing import Iterable
 
 SRC_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = SRC_ROOT.parent
-SCHEMA_VERSION = 1
-FINAL_STATUSES = {"authorized", "failed", "incomplete"}
+SCHEMA_VERSION = 2
+FINAL_STATUSES = {"local-ready", "failed", "incomplete"}
 PASSING_STAGE_STATUS = "passed"
 NON_PASSING_STAGE_STATUSES = {
     "blocked", "failed", "incomplete", "missing", "skipped", "stale",
     "timed_out", "unclassified", "warning",
 }
-AUTHORIZED_PROFILES = {"full", "package"}
+LOCAL_READY_PROFILES = {"full", "package"}
 DEFAULT_STAGE_TIMEOUT = 90 * 60
 DEFAULT_PACKAGE_TIMEOUT = 4 * 60 * 60
 
@@ -363,7 +363,7 @@ def build_stages(profile: str, classification: dict, changed_paths: Iterable[str
             "tests/test_packaging.py", "tests/test_workflow_contracts.py",
         ),), stage_timeout))
 
-    if profile in AUTHORIZED_PROFILES:
+    if profile in LOCAL_READY_PROFILES:
         stages.extend([
             Stage("full-suite", (pytest + ("--durations=25",),), stage_timeout),
             Stage("timing-stress", (
@@ -986,7 +986,7 @@ def validate_review(path: Path | None, request: dict,
                     max_age_hours: float, now: datetime | None = None) -> dict:
     if path is None:
         return {"status": "missing", "path": None,
-                "failure": "independent review evidence was not supplied"}
+                "failure": "review metadata was not supplied"}
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1035,13 +1035,13 @@ def authorization_status(profile: str, expected_names: Iterable[str],
         blockers.append(f"unclassified changed path: {path}")
     if blockers:
         return "failed", blockers
-    if profile not in AUTHORIZED_PROFILES:
-        return "incomplete", ["fast profile is diagnostic and cannot authorize a push"]
+    if profile not in LOCAL_READY_PROFILES:
+        return "incomplete", ["fast profile is diagnostic and cannot establish local readiness"]
     if review.get("status") == "missing":
-        return "incomplete", [review.get("failure") or "independent review is missing"]
+        return "incomplete", [review.get("failure") or "review metadata is missing"]
     if review.get("status") != "passed":
-        return "failed", [review.get("failure") or "independent review failed"]
-    return "authorized", []
+        return "failed", [review.get("failure") or "review metadata failed"]
+    return "local-ready", []
 
 
 def render_summary(summary: dict) -> str:
@@ -1056,7 +1056,7 @@ def render_summary(summary: dict) -> str:
         f"Dirty diff:   {snapshot['dirty_diff_sha256']}",
         f"Tree:         {snapshot['tree_fingerprint']}",
         f"Tools:        {summary['tools']['fingerprint']}",
-        f"Authorization evidence: {summary.get('authorization_evidence_digest') or '<unavailable>'}",
+        f"Local evidence digest: {summary.get('authorization_evidence_digest') or '<unavailable>'}",
         f"Evidence:     {summary['evidence_dir']}",
         "",
         "Impacts: " + (", ".join(summary["classification"]["areas"]) or "none"),
@@ -1078,7 +1078,7 @@ def render_summary(summary: dict) -> str:
     review = summary.get("review", {})
     lines.extend([
         "",
-        f"Independent review: {review.get('status', 'missing').upper()}",
+        f"Review metadata:    {review.get('status', 'missing').upper()}",
     ])
     if review.get("path"):
         lines.append(f"Review evidence:    {review['path']}")
@@ -1090,7 +1090,7 @@ def render_summary(summary: dict) -> str:
                 f"{check.get('phase', '<unnamed>')} at {check.get('checked_at', '<missing>')}"
             )
     if summary.get("evidence_checks"):
-        lines.append("Authorization evidence checks:")
+        lines.append("Local evidence checks:")
         for check in summary["evidence_checks"]:
             lines.append(
                 f"  {check.get('status', 'missing').upper():12} "
@@ -1101,10 +1101,11 @@ def render_summary(summary: dict) -> str:
         lines.append("Blockers:")
         lines.extend(f"  - {item}" for item in summary["blockers"])
     lines.append("")
-    if summary["final_status"] == "authorized":
-        lines.append("AUTHORIZED: all required gates and independent review match this fingerprint.")
+    if summary["final_status"] == "local-ready":
+        lines.append("LOCAL-READY: local gates and review metadata match this host fingerprint.")
+        lines.append("RELEASE NOT AUTHORIZED: require a successful exact-SHA native candidate run.")
     else:
-        lines.append("NOT AUTHORIZED: fail-closed; do not push from this evidence.")
+        lines.append("NOT LOCAL-READY: fail-closed; do not push from this evidence.")
     return "\n".join(lines) + "\n"
 
 
@@ -1158,6 +1159,8 @@ def run(args: argparse.Namespace) -> int:
         "schema_version": SCHEMA_VERSION,
         "run_id": run_id,
         "profile": args.profile,
+        "scope": "local",
+        "release_authorized": False,
         "created_at": (previous_summary or {}).get("created_at", utc_now()),
         "updated_at": utc_now(),
         "evidence_dir": str(evidence_dir),
@@ -1262,7 +1265,7 @@ def run(args: argparse.Namespace) -> int:
         "stages": results,
     })
 
-    if final_status == "authorized":
+    if final_status == "local-ready":
         pre_exit_ok, pre_exit_check = check_snapshot(snapshot, "pre-exit")
         summary["snapshot_checks"].append(pre_exit_check)
         pre_exit_evidence_ok, pre_exit_evidence_check = (
@@ -1287,7 +1290,7 @@ def run(args: argparse.Namespace) -> int:
     rendered = render_summary(summary)
     atomic_write_text(readable_path, rendered)
     print(rendered, end="")
-    return 0 if final_status == "authorized" else 1
+    return 0 if final_status == "local-ready" else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1298,7 +1301,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", type=Path,
                         help="resume one evidence directory after exact fingerprint checks")
     parser.add_argument("--review-evidence", type=Path,
-                        help="independent review JSON matching review-request.json")
+                        help="local review metadata JSON matching review-request.json")
     parser.add_argument("--review-max-age-hours", type=float, default=24.0)
     parser.add_argument("--stage-timeout", type=int, default=DEFAULT_STAGE_TIMEOUT,
                         help="external timeout in seconds for long non-package stages")

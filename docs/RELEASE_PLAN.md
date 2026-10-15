@@ -1,9 +1,9 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.8 · **Date:** 2026-10-15 · **Status:** v0.8.0 shipped-path
-reliability release; the exact source, toolchain, evidence, and arm64 package
-fingerprints must pass the fail-closed package preflight before `main` and
-`v0.8.0` are pushed.
+**Version:** 1.9 · **Date:** 2026-10-15 · **Status:** v0.8.0 exact-SHA native
+candidate recovery. Local preflight establishes local readiness only; Windows,
+Apple Silicon, and Intel packages must pass the GitHub Release Candidate gate
+for the exact commit before `v0.8.0` can move or publish.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -29,37 +29,50 @@ Windows code-signing certificate.
 | D10 | Public updates use **GitHub Release installers**, not a Git branch payload mirror | The proposed channel is physically incompatible with GitHub: `ffmpeg.exe` and `ffprobe.exe` each exceed the hard 100 MB Git-object limit, and the macOS payload is over 600 MB. Omitting them is unsafe because the manifest would tell clients to delete required tools; Git LFS adds quota, authentication and pointer-file failure modes. The existing architecture-aware GitHub Releases updater is therefore the zero-configuration path. Differential updates remain available only as an explicit local/static-host override for teams with suitable infrastructure. |
 | D11 | Publisher ≠ copyright holder, deliberately | Publisher/brand fields say **Capri la Ria**: Inno `AppPublisher`, `VersionInfoCompany`; spec `CompanyName`; About dialog "Publisher"; README and release-notes voice. Legal fields carry his legal name, **Cassian Aléria**: `LegalCopyright`, `VersionInfoCopyright`, `NSHumanReadableCopyright`, and both LICENSE files — copyright sits with him personally, while Capri la Ria (his label, founded 2022) is the publishing imprint credited wherever a publisher is named. This model was applied repo-wide on 2026-10-14 in commits `35dd479`–`df35054` (installer, spec, app metadata, About dialog, both LICENSE files). If SignPath is ever adopted, the *certificate* publisher becomes "SignPath Foundation" while these fields stay the project's — the policy page discloses that. |
 | D12 | The three Inno URLs are distinct | `AppPublisherURL` = caprilaria.com, `AppSupportURL` = GitHub Issues, and `AppUpdatesURL` = GitHub Releases. |
-| D13 | A release tag is created only from a green three-platform push commit | The full constrained suite runs on `windows-2025`, `macos-15`, and `macos-15-intel`. Release-only validation discovered too many defects after tagging; `vX.Y.Z` now points only at a commit already proven on every supported build architecture. |
+| D13 | A release tag is created only from an exact-SHA green source and native-package candidate | Source CI alone does not exercise the installed Windows package or both DMGs. `.github/workflows/release-candidate.yml` must pass the full builders and final package smokes on `windows-2025`, `macos-15`, and `macos-15-intel`; `release.yml` queries GitHub for that exact `head_sha` and fails before building if it is absent. Local preflight cannot substitute for this evidence. |
 | D14 | Drafts resume; published releases never mutate | A rerun may reconcile assets only while the release is a draft. An existing published release is a hard failure requiring a new version. The workflow verifies exact draft asset names and sizes immediately before undrafting; no mutable branch publication sits between those checks. |
 
-## 2. What the workflow does (`.github/workflows/release.yml`)
+## 2. What the workflows do
+
+### Release Candidate (`.github/workflows/release-candidate.yml`)
+
+Every push to `main` first proves the exact workflow `head_sha` on native
+runners. Windows executes the full installer builder plus installed startup and
+uninstall smoke. Apple Silicon and Intel each execute the full DMG builder plus
+mounted and copied Cocoa startup smoke. Package hashes, smoke JSON, and build
+logs are retained. This workflow is read-only and cannot publish.
+
+### Release (`.github/workflows/release.yml`)
 
 Trigger: push of a `v*` tag, or manual dispatch from that existing tag's
 ref. Supplying a tag input while dispatching from `main` is rejected because
 the protected `release` environment admits only `v*` tag refs.
 
-1. **verify** (`ubuntu-24.04`) — checkout the tag, Python from
-   `src/.python-version` (3.12, pinned everywhere), `validate_version.py`,
-   fail unless tag == version.json. Build the release notes from
-   version.json (download table, Gatekeeper/SmartScreen instructions,
-   verify commands, publisher credit, changelog).
-2. **build-windows** (`windows-2025`) — detect Inno Setup's ISCC.exe first
+1. **verify** (`ubuntu-24.04`) — checkout the tag, require an annotated tag,
+   validate all version sources, peel the tag to a commit, and query GitHub for
+   a completed successful Release Candidate run with exactly that `head_sha`.
+   Missing, failed, stale, malformed, or unreadable candidate evidence blocks
+   the release. Build release notes only after this gate passes.
+2. **build-windows** (`windows-2025`) — checkout the verified commit SHA,
+   detect Inno Setup's ISCC.exe first
    (the image ships Inno 6.7.1; a pinned Chocolatey install now *fails* as a
    downgrade), Chocolatey unpinned only if missing, fail loudly if still
    absent. Full gated `build_installer.bat` (its `pause` calls are guarded
    by `if not defined CI` at the source — no stdin tricks). SBOM from the
    build venv's freeze (non-gating). Upload installer + SBOM.
 3. **build-macos-arm64** (`macos-15`) and **build-macos-intel**
-   (`macos-15-intel`) — full gated `build_mac.sh`, ad-hoc signing, SBOM
+   (`macos-15-intel`) — checkout the verified commit SHA, run full gated
+   `build_mac.sh`, ad-hoc signing, SBOM
    (arm job only — the dependency set is identical; the Intel job notes
    this), and one DMG upload per native architecture.
 4. **publish** (`ubuntu-24.04`, `environment: release`, the only job with
    `contents: write` + `id-token: write` + `attestations: write`) —
    stage assets under release names (`FrameGuardInstaller.exe`,
    `FrameGuard-arm64.dmg`, `FrameGuard-intel.dmg`), generate
-   `SHA256SUMS.txt`, attest the three binaries, create or safely resume a
-   **draft** release, verify exact asset names and sizes, then undraft.
-   Published releases are immutable and are never reconciled.
+   `SHA256SUMS.txt`, attest the three binaries, re-peel the tag, create or safely
+   resume a **draft** release, verify exact asset names and sizes, re-peel the
+   tag again immediately before undrafting, then publish. Published releases
+   are immutable and are never reconciled.
 
 Hardening throughout: Node 24-compatible actions pinned to full commit SHAs;
 `.github/dependabot.yml` keeps the pins moving; top-level
@@ -93,7 +106,9 @@ publishing, so this list is the gate. (The workflow automates items 1–2
 partially; the rest are human, on real machines.)
 
 - [ ] Full constrained push CI is green on Windows, macOS arm64, and macOS Intel for the exact `main` commit.
-- [ ] Annotated tag target ↔ version.json ↔ installer ↔ spec versions all equal (CI asserts).
+- [ ] Release Candidate is green for the same exact `head_sha`, including Windows installed smoke and both mounted/copied DMG smokes.
+- [ ] Candidate evidence artifacts contain package hashes and smoke results for all three native jobs.
+- [ ] Annotated tag target ↔ candidate `head_sha` ↔ version.json ↔ installer ↔ spec versions all equal (CI asserts).
 - [ ] Draft assets downloaded *from GitHub*; `SHA256SUMS.txt` verifies;
       `gh attestation verify` passes on each binary.
 - [ ] Clean-machine installs: Windows with no Python (install, launch,

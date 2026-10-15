@@ -7,6 +7,8 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 TESTS_WORKFLOW = (WORKFLOWS / "tests.yml").read_text(encoding="utf-8")
+CANDIDATE_WORKFLOW = (WORKFLOWS / "release-candidate.yml").read_text(
+    encoding="utf-8")
 RELEASE_WORKFLOW = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
 
 ACTION_PINS = {
@@ -28,7 +30,8 @@ def _job(workflow, name):
 
 def test_all_actions_use_the_reviewed_node24_compatible_pins():
     uses = re.findall(r"^\s*uses:\s*([^@\s]+)@([^\s#]+)",
-                      TESTS_WORKFLOW + RELEASE_WORKFLOW, re.MULTILINE)
+                      TESTS_WORKFLOW + CANDIDATE_WORKFLOW + RELEASE_WORKFLOW,
+                      re.MULTILINE)
     assert uses, "no workflow actions found"
     for action, revision in uses:
         assert action in ACTION_PINS, f"unreviewed action added: {action}"
@@ -108,15 +111,117 @@ def test_visual_evidence_uses_fresh_dpi_processes_and_preserves_failures():
     assert "timeout-minutes: 90" in test_job
 
 
+def test_release_candidate_proves_all_native_packages_for_exact_sha():
+    header = CANDIDATE_WORKFLOW.split("jobs:", 1)[0]
+    assert "branches: [main]" in header
+    assert "workflow_dispatch:" in header
+    assert "candidate_sha:" in header
+    assert "permissions:\n  contents: read" in header
+    assert "cancel-in-progress: false" in header
+
+    verify = _job(CANDIDATE_WORKFLOW, "verify-candidate")
+    assert '"$REQUESTED_SHA" != "$GITHUB_SHA"' in verify
+    assert 'CHECKED_OUT_SHA="$(git rev-parse HEAD)"' in verify
+    assert "candidate_sha=$CHECKED_OUT_SHA" in verify
+    assert "python validate_version.py" in verify
+
+    windows = _job(CANDIDATE_WORKFLOW, "build-windows")
+    assert "runs-on: windows-2025" in windows
+    assert "ref: ${{ needs.verify-candidate.outputs.candidate_sha }}" in windows
+    initialize = windows.index("Initialize guaranteed Windows evidence")
+    checkout = windows.index("Check out the verified candidate SHA")
+    assert initialize < checkout
+    assert "${{ runner.temp }}/frameguard-candidate-logs/" in windows
+    assert 'cmd.exe /d /c "build_installer.bat --skip-delta"' in windows
+    assert "frameguard-candidate-logs\\builder.log" in windows
+    smoke = windows.index("tools_dev/windows_installer_smoke.ps1")
+    manifest = windows.index("candidate-manifest.json")
+    upload = windows.index("name: Upload the proven Windows installer")
+    assert smoke < manifest < upload
+    evidence_upload = windows.split(
+        "- name: Upload Windows candidate evidence", 1)[1]
+    assert "if: always()" in evidence_upload
+    assert "src/Output/candidate-logs/" in evidence_upload
+    assert "if-no-files-found: error" in evidence_upload
+    assert "timeout-minutes: 12" in windows
+    assert "retention-days: 90" in windows
+
+    mac = _job(CANDIDATE_WORKFLOW, "build-macos")
+    assert "runner: macos-15" in mac
+    assert "runner: macos-15-intel" in mac
+    assert "target_arch: arm64" in mac
+    assert "target_arch: x86_64" in mac
+    assert "timeout-minutes: 150" in mac
+    assert "bash build_mac.sh --skip-delta" in mac
+    smoke = mac.index("tools_dev/macos_package_smoke.py")
+    manifest = mac.index("candidate-manifest.json")
+    upload = mac.index("name: Upload the proven DMG")
+    assert smoke < manifest < upload
+    evidence_upload = mac.split(
+        "- name: Upload macOS candidate evidence", 1)[1]
+    assert "if: always()" in evidence_upload
+    assert "retention-days: 90" in evidence_upload
+
+
+def test_release_requires_successful_candidate_for_exact_tag_commit():
+    verify = _job(RELEASE_WORKFLOW, "verify")
+    assert "release_sha: ${{ steps.candidate.outputs.release_sha }}" in verify
+    assert "tag_object_sha: ${{ steps.candidate.outputs.tag_object_sha }}" in verify
+    assert 'TAG_OBJECT_SHA="$(git rev-parse "refs/tags/${RELEASE_TAG}")"' in verify
+    assert "release-candidate.yml/runs?head_sha=${RELEASE_SHA}" in verify
+    assert "tests.yml/runs?head_sha=${RELEASE_SHA}" in verify
+    assert 'run.get("head_sha") == expected_sha' in verify
+    assert 'run.get("conclusion") == "success"' in verify
+    assert 'run.get("head_branch") == "main"' in verify
+    assert "No successful Release Candidate run exists" in verify
+    assert "No successful main-push Tests run exists" in verify
+
+    windows = _job(RELEASE_WORKFLOW, "build-windows")
+    mac = _job(RELEASE_WORKFLOW, "build-macos")
+    for job in (windows, mac):
+        assert "ref: ${{ needs.verify.outputs.release_sha }}" in job
+    assert "timeout-minutes: 120" in windows
+    assert "timeout-minutes: 150" in mac
+    assert "timeout-minutes: 12" in windows
+    publish = _job(RELEASE_WORKFLOW, "publish")
+    assert "needs: [verify, build-windows, build-macos]" in publish
+    assert "VERIFIED_RELEASE_SHA: ${{ needs.verify.outputs.release_sha }}" in publish
+    assert "VERIFIED_TAG_OBJECT_SHA: ${{ needs.verify.outputs.tag_object_sha }}" in publish
+    assert publish.count('REF_OBJECT" != "$VERIFIED_TAG_OBJECT_SHA') == 2
+    assert publish.count('CURRENT_SHA" != "$VERIFIED_RELEASE_SHA') == 2
+    draft = publish.index("Create or reconcile the draft release")
+    final = publish.index("Publish the verified release")
+    assert draft < publish.index("tag object changed before draft reconciliation")
+    assert final < publish.index("tag object changed before publication")
+    assert publish.index("tag object changed before publication") < publish.index(
+        'gh release edit "$RELEASE_TAG" --draft=false')
+
+
+def test_release_paths_forbid_all_package_bypass_flags():
+    for workflow in (CANDIDATE_WORKFLOW, RELEASE_WORKFLOW):
+        for forbidden in (
+            "--fast",
+            "--skip-tests",
+            "--allow-unsigned",
+            "--skip-installer-smoke",
+        ):
+            assert forbidden not in workflow
+        assert "--skip-delta" in workflow
+
+
 def test_release_checks_out_only_the_requested_tag_ref():
     verify = _job(RELEASE_WORKFLOW, "verify")
     assert "if: github.event_name == 'workflow_dispatch'" in verify
+    assert "REQUESTED_TAG: ${{ inputs.tag }}" in verify
+    assert '[[ ! "$REQUESTED_TAG" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]; then' in verify
     assert '"$GITHUB_REF" != "refs/tags/${REQUESTED_TAG}"' in verify
     assert "git/ref/tags/${REQUESTED_TAG}" in verify
     assert "ref: refs/tags/${{ env.RELEASE_TAG }}" in verify
     assert 'git cat-file -t "refs/tags/${RELEASE_TAG}"' in verify
     assert "Releases require an annotated tag" in verify
-    assert RELEASE_WORKFLOW.count("ref: refs/tags/${{ env.RELEASE_TAG }}") == 3
+    assert RELEASE_WORKFLOW.count("ref: refs/tags/${{ env.RELEASE_TAG }}") == 1
+    assert RELEASE_WORKFLOW.count(
+        "ref: ${{ needs.verify.outputs.release_sha }}") == 2
 
 
 def test_release_installs_are_constrained_and_jobs_are_bounded():
@@ -128,6 +233,7 @@ def test_release_installs_are_constrained_and_jobs_are_bounded():
     assert RELEASE_WORKFLOW.count("--constraint") >= 2
     assert 'cyclonedx-bom==7.5.0' not in RELEASE_WORKFLOW
     assert RELEASE_WORKFLOW.count("--skip-delta") == 2
+    assert CANDIDATE_WORKFLOW.count("--skip-delta") == 2
     assert "release-windows\\manifest.json" not in RELEASE_WORKFLOW
     assert "release-macos/manifest.json" not in RELEASE_WORKFLOW
 
@@ -155,6 +261,8 @@ def test_macos_uses_one_deterministic_build_root_and_preserves_failure_logs():
 
     upload_pin = "actions/upload-artifact@" + ACTION_PINS["actions/upload-artifact"]
     assert RELEASE_WORKFLOW.count("overwrite: true") == RELEASE_WORKFLOW.count(upload_pin)
+    assert CANDIDATE_WORKFLOW.count("overwrite: true") == CANDIDATE_WORKFLOW.count(
+        upload_pin)
 
 
 def test_publish_reconciles_only_drafts_and_verifies_asset_names_and_sizes():
@@ -215,7 +323,9 @@ def test_publish_keeps_least_privilege_environment_and_release_options():
     assert "contents: write" in publish
     assert "id-token: write" in publish
     assert "attestations: write" in publish
-    assert "contents: read" in RELEASE_WORKFLOW.split("jobs:", 1)[0]
+    workflow_header = RELEASE_WORKFLOW.split("jobs:", 1)[0]
+    assert "contents: read" in workflow_header
+    assert "actions: read" in workflow_header
 
     mac = _job(RELEASE_WORKFLOW, "build-macos")
     job_environment = mac.split("    steps:\n", 1)[0]
