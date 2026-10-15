@@ -208,6 +208,15 @@ def _candidate_tools_dirs() -> list:
             continue
         dirs.append(os.path.join(root, "tools"))
         # Build-time cache is per-platform so a checkout can hold both.
+        # download_tools.py splits the macOS cache per architecture
+        # (tools_cache/darwin-arm64, tools_cache/darwin-x86_64) so the two
+        # builds can never bundle each other's binaries; search the host
+        # arch first, then the other arch, then the pre-split layout name.
+        if plat_key == "darwin":
+            host_arch = "arm64" if platform.machine() == "arm64" else "x86_64"
+            other_arch = "x86_64" if host_arch == "arm64" else "arm64"
+            dirs.append(os.path.join(root, "tools_cache", f"darwin-{host_arch}"))
+            dirs.append(os.path.join(root, "tools_cache", f"darwin-{other_arch}"))
         dirs.append(os.path.join(root, "tools_cache", plat_key))
         dirs.append(os.path.join(root, "tools_cache"))
         dirs.append(root)

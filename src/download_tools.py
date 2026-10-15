@@ -144,6 +144,19 @@ SOURCES = {
 }
 
 
+def sources_for(target: str, arch: str = None) -> dict:
+    """The full tool spec for a platform.
+
+    darwin is per-architecture (different download URLs per arch), so it is
+    built on demand; every other platform reads the static SOURCES table.
+    This is the module's public contract: callers and tests resolve specs
+    here instead of assuming every platform is a static table entry.
+    """
+    if target == "darwin":
+        return _darwin_sources(_norm_arch(arch or _platform.machine()))
+    return SOURCES[target]
+
+
 def detect_platform() -> str:
     system = _platform.system()
     if system == "Darwin":
@@ -291,6 +304,56 @@ def extract_members(archive: Path, wanted: list, dest_dir: Path) -> set:
     return found
 
 
+def _extract_pkg_payload(pkg_path: Path, wanted_lower: set,
+                         dest_dir: Path, found: set) -> None:
+    """Fallback for a flat .pkg: pull the Payload out of the xar container
+    and explode the cpio with stock tools (xar, zcat and cpio all ship with
+    macOS), then collect the wanted basenames into dest_dir / found.
+
+    Exists because pkgutil --expand-full failed silently in the v0.5.6
+    release run (the 26.10 MediaInfo DMG's pkg holds exactly one file,
+    usr/local/bin/mediainfo, verified by opening the pinned DMG). Every
+    stage here logs on failure, so a miss names itself in the build log.
+    """
+    import tempfile as _tf
+    work = Path(_tf.mkdtemp(prefix="fg_xar_"))
+    try:
+        r = subprocess.run(["xar", "-xf", str(pkg_path), "-C", str(work)],
+                           capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print(f"  xar fallback failed for {pkg_path.name}: "
+                  f"{(r.stderr or r.stdout)[:200]}")
+            return
+        payloads = [q for q in work.rglob("Payload") if q.is_file()]
+        if not payloads:
+            print(f"  payload fallback: no Payload inside {pkg_path.name}")
+            return
+        out = work / "payload_out"
+        out.mkdir()
+        for payload in payloads:
+            z = subprocess.Popen(["zcat", str(payload)],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL)
+            c = subprocess.run(["cpio", "-idm"], cwd=out, stdin=z.stdout,
+                               capture_output=True, text=True, timeout=120)
+            if z.stdout:
+                z.stdout.close()
+            z.wait()
+            if c.returncode != 0:
+                print(f"  cpio fallback failed for {pkg_path.name}: "
+                      f"{(c.stderr or '')[:200]}")
+        for broot, _bdirs, bfiles in os.walk(out):
+            for bfn in bfiles:
+                if bfn.lower() in wanted_lower:
+                    shutil.copy2(Path(broot) / bfn, dest_dir / bfn)
+                    make_executable(dest_dir / bfn)
+                    found.add(bfn.lower())
+    except Exception as e:
+        print(f"  payload fallback failed for {pkg_path.name}: {e}")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
     """Pull files out of a macOS .dmg (mediaarea ships MediaInfo this way).
 
@@ -316,7 +379,7 @@ def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
             print(f"  ERROR: hdiutil attach failed: {(r.stderr or r.stdout)[:200]}")
             return found
         try:
-            for root, _dirs, files in os.walk(mount):
+            for root, dirs, files in os.walk(mount):
                 for fn in files:
                     if fn.lower() in wanted_lower:
                         src = Path(root) / fn
@@ -326,9 +389,13 @@ def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
                         shutil.copy2(src, out)
                         make_executable(out)
                         found.add(fn.lower())
-                    # Also look inside a .app bundle for the CLI binary
-                    if fn.endswith(".app"):
-                        for broot, _bdirs, bfiles in os.walk(Path(root) / fn):
+                # Bundles are directories, so they never show up in the
+                # file list above (an earlier version checked files for a
+                # .app suffix, which could never match). Search inside any
+                # .app bundle for the wanted binaries.
+                for dn in dirs:
+                    if dn.endswith(".app"):
+                        for broot, _bdirs, bfiles in os.walk(Path(root) / dn):
                             for bfn in bfiles:
                                 if bfn.lower() in wanted_lower:
                                     shutil.copy2(Path(broot) / bfn, dest_dir / bfn)
@@ -343,23 +410,43 @@ def _extract_dmg_members(archive: Path, wanted: list, dest_dir: Path) -> set:
                     for fn in files:
                         if not fn.lower().endswith(".pkg"):
                             continue
-                        expanded = Path(_tf.mkdtemp(prefix="fg_pkg_"))
+                        # pkgutil --expand-full creates the destination
+                        # itself and refuses a directory that already
+                        # exists, so pass a not-yet-existing child of a
+                        # fresh temp dir. (Handing it the mkdtemp directory
+                        # directly made every expansion fail, and the old
+                        # code swallowed the error silently: the v0.5.6
+                        # release run shipped without mediainfo and the log
+                        # showed no reason.)
+                        pkg_root = Path(_tf.mkdtemp(prefix="fg_pkg_"))
+                        expanded = pkg_root / "expanded"
+                        before = len(found)
                         try:
                             r2 = subprocess.run(
                                 ["pkgutil", "--expand-full",
                                  str(Path(root) / fn), str(expanded)],
                                 capture_output=True, text=True, timeout=120)
                             if r2.returncode != 0:
-                                continue
-                            for broot, _bdirs, bfiles in os.walk(expanded):
-                                for bfn in bfiles:
-                                    if bfn.lower() in wanted_lower:
-                                        shutil.copy2(Path(broot) / bfn,
-                                                     dest_dir / bfn)
-                                        make_executable(dest_dir / bfn)
-                                        found.add(bfn.lower())
+                                print(f"  pkgutil --expand-full failed for "
+                                      f"{fn}: "
+                                      f"{(r2.stderr or r2.stdout)[:200]}")
+                            else:
+                                for broot, _bdirs, bfiles in os.walk(expanded):
+                                    for bfn in bfiles:
+                                        if bfn.lower() in wanted_lower:
+                                            shutil.copy2(Path(broot) / bfn,
+                                                         dest_dir / bfn)
+                                            make_executable(dest_dir / bfn)
+                                            found.add(bfn.lower())
                         finally:
-                            shutil.rmtree(expanded, ignore_errors=True)
+                            shutil.rmtree(pkg_root, ignore_errors=True)
+                        if len(found) == before:
+                            # pkgutil produced nothing usable (its failure modes
+                            # are opaque and version-dependent). Fall back to
+                            # exploding the package payload directly with stock
+                            # tools, so a .pkg can never silently yield nothing.
+                            _extract_pkg_payload(Path(root) / fn, wanted_lower,
+                                                 dest_dir, found)
         finally:
             subprocess.run(["hdiutil", "detach", str(mount), "-quiet"],
                            capture_output=True, timeout=60)
@@ -482,7 +569,7 @@ def main():
         print(f"Target arch     : {arch}")
     print(f"Cache directory : {cache}")
 
-    spec = _darwin_sources(arch) if target == "darwin" else SOURCES[target]
+    spec = sources_for(target, arch)
     entries = {k: v for k, v in spec.items() if isinstance(v, dict)}
 
     required_ok = True
