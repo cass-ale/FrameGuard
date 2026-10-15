@@ -39,6 +39,13 @@ def write_video(folder, name, size_kb=200):
     return path
 
 
+def mark_video_settled(path, age_seconds=10):
+    """Give a fixture an explicit age instead of trusting host clock granularity."""
+    settled_mtime = W.time.time() - age_seconds
+    os.utime(path, (settled_mtime, settled_mtime))
+    return path
+
+
 def poll_until_stable(monitor, times=6):
     """Drive enough polls for the stability window to elapse."""
     for _ in range(times):
@@ -114,6 +121,25 @@ class TestExclusiveOpenProbe:
 
         monkeypatch.setattr(W.os, "open", refuse_open)
         assert not _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
+
+
+class TestManualCompleteness:
+    def test_requires_a_file_older_than_the_stability_window(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 3600.0)
+        path = write_video(tmp_path, "clip.mp4")
+
+        assert not W._looks_complete(path)
+        mark_video_settled(path, age_seconds=7200)
+        assert W._looks_complete(path)
+
+    def test_requires_the_exclusive_open_probe(
+            self, tmp_path, monkeypatch):
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        path = mark_video_settled(write_video(tmp_path, "clip.mp4"))
+        monkeypatch.setattr(W, "_can_open_exclusively", lambda _path: False)
+
+        assert not W._looks_complete(path)
 
 
 class TestStability:
@@ -260,8 +286,8 @@ class TestDuplicates:
         to process it."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         paths = [
-            write_video(tmp_path, "old1.mp4"),
-            write_video(tmp_path, "old2.mp4"),
+            mark_video_settled(write_video(tmp_path, "old1.mp4")),
+            mark_video_settled(write_video(tmp_path, "old2.mp4")),
         ]
         m = WatchFolderMonitor()
         emitted = []
@@ -282,8 +308,8 @@ class TestDuplicates:
             W, "_can_open_exclusively",
             lambda f: not (lock_state["held"]
                            and str(f).endswith("locked.mp4")))
-        free = write_video(tmp_path, "free.mp4")
-        locked = write_video(tmp_path, "locked.mp4")
+        free = mark_video_settled(write_video(tmp_path, "free.mp4"))
+        locked = mark_video_settled(write_video(tmp_path, "locked.mp4"))
         m = WatchFolderMonitor()
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
@@ -312,7 +338,7 @@ class TestDuplicates:
     def test_backlog_is_not_re_emitted_by_a_later_poll(
             self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
-        path = write_video(tmp_path, "old.mp4")
+        path = mark_video_settled(write_video(tmp_path, "old.mp4"))
         m = WatchFolderMonitor()
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
@@ -426,7 +452,7 @@ class TestMidCopyProtection:
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
 
-        path = write_video(tmp_path, "done.mp4")
+        path = mark_video_settled(write_video(tmp_path, "done.mp4"))
         m.sync()
         assert emitted == [path]
 
