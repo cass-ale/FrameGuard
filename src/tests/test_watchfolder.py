@@ -7,16 +7,27 @@ vanish, and duplicate emissions.
 """
 
 import os
+from unittest.mock import mock_open
 
 import pytest
+from PySide6.QtTest import QTest
 
 from frameguard import watchfolder as W
 from frameguard.watchfolder import WatchFolderMonitor
 
 
+_REAL_CAN_OPEN_EXCLUSIVELY = W._can_open_exclusively
+
+
 @pytest.fixture(autouse=True)
-def _qt(qapp):
-    """QTimer needs a QApplication to report isActive() correctly."""
+def _stable_test_environment(qapp, monkeypatch):
+    """Keep unit tests independent of transient host file locks.
+
+    Successful-flow tests exercise watch-folder state transitions, not Defender
+    or indexer timing. Tests for lock handling override this deterministic
+    default, while TestExclusiveOpenProbe calls the saved real implementation.
+    """
+    monkeypatch.setattr(W, "_can_open_exclusively", lambda _path: True)
     return qapp
 
 
@@ -60,6 +71,51 @@ class TestFileFiltering:
         assert W._get_file_size_safe("/nonexistent/nope.mp4") == -1
 
 
+class TestExclusiveOpenProbe:
+    def test_reports_available_when_host_operations_succeed(self, monkeypatch):
+        if os.name == "nt":
+            calls = []
+            monkeypatch.setattr(W.os, "open", lambda _path, _flags: 41)
+            monkeypatch.setattr(
+                W.os, "close", lambda handle: calls.append(("close", handle)))
+            monkeypatch.setattr(
+                W.os, "rename",
+                lambda src, dst: calls.append(("rename", src, dst)))
+
+            assert _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
+            assert calls == [
+                ("close", 41),
+                ("rename", "clip.mp4", "clip.mp4"),
+            ]
+        else:
+            opened = mock_open()
+            monkeypatch.setattr("builtins.open", opened)
+
+            assert _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
+            opened.assert_called_once_with("clip.mp4", "rb")
+
+    def test_reports_locked_when_host_refuses_access(self, monkeypatch):
+        def refuse(*_args, **_kwargs):
+            raise PermissionError("simulated sharing violation")
+
+        if os.name == "nt":
+            monkeypatch.setattr(W.os, "open", lambda _path, _flags: 41)
+            monkeypatch.setattr(W.os, "close", lambda _handle: None)
+            monkeypatch.setattr(W.os, "rename", refuse)
+        else:
+            monkeypatch.setattr("builtins.open", refuse)
+
+        assert not _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
+
+    @pytest.mark.skipif(os.name != "nt", reason="Windows sharing semantics")
+    def test_windows_open_denial_reports_locked(self, monkeypatch):
+        def refuse_open(*_args, **_kwargs):
+            raise PermissionError("simulated open denial")
+
+        monkeypatch.setattr(W.os, "open", refuse_open)
+        assert not _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
+
+
 class TestStability:
     def test_a_growing_file_is_not_scanned(self, tmp_path):
         """The core promise: a file still being written must never be scanned."""
@@ -88,7 +144,8 @@ class TestStability:
         m._poll()   # size unchanged once
         assert emitted == [], "emitted after a single unchanged poll"
 
-    def test_a_finished_file_is_eventually_emitted(self, tmp_path, monkeypatch):
+    def test_a_finished_file_is_eventually_emitted(
+            self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         m = WatchFolderMonitor()
         m.set_watch_path(str(tmp_path))
@@ -98,7 +155,7 @@ class TestStability:
         path = write_video(tmp_path, "done.mp4")
         poll_until_stable(m)
         m._emit_batch()
-        assert path in emitted
+        assert emitted == [path]
 
     def test_tiny_files_do_not_pin_burst_mode_forever(self, tmp_path, monkeypatch):
         """A sub-100KB file was re-detected every poll, permanently holding the
@@ -129,7 +186,8 @@ class TestStability:
 
 
 class TestBatching:
-    def test_a_steady_trickle_cannot_starve_the_batch(self, tmp_path, monkeypatch):
+    def test_a_steady_trickle_cannot_starve_the_batch(
+            self, tmp_path, monkeypatch):
         """BATCH_SETTLE_MS restarts on every arrival; without a ceiling an
         ingest that drops a file every few seconds never scans anything."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
@@ -139,11 +197,12 @@ class TestBatching:
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
 
-        write_video(tmp_path, "a.mp4")
+        path = write_video(tmp_path, "a.mp4")
         poll_until_stable(m)
-        assert emitted, "batch never flushed despite exceeding max age"
+        assert emitted == [path], "batch never flushed despite exceeding max age"
 
-    def test_batch_flushes_once_it_gets_large(self, tmp_path, monkeypatch):
+    def test_batch_flushes_once_it_gets_large(
+            self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         monkeypatch.setattr(W, "MAX_BATCH_SIZE", 3)
         m = WatchFolderMonitor()
@@ -151,23 +210,26 @@ class TestBatching:
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
 
-        for i in range(5):
-            write_video(tmp_path, f"clip{i}.mp4")
+        paths = [write_video(tmp_path, f"clip{i}.mp4") for i in range(5)]
         poll_until_stable(m)
-        assert len(emitted) >= 3, f"only {len(emitted)} emitted; ceiling did not fire"
+        assert len(emitted) == len(paths), \
+            f"only {len(emitted)} emitted; ceiling did not fire"
+        assert set(emitted) == set(paths)
 
-    def test_batch_age_starts_with_the_first_file(self, tmp_path, monkeypatch):
+    def test_batch_age_starts_with_the_first_file(
+            self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         m = WatchFolderMonitor()
         m.set_watch_path(str(tmp_path))
-        write_video(tmp_path, "first.mp4")
+        path = write_video(tmp_path, "first.mp4")
         poll_until_stable(m, 4)
-        if m._batch_queue:
-            assert m._batch_started_at > 0
+        assert m._batch_queue == [path]
+        assert m._batch_started_at > 0
 
 
 class TestDuplicates:
-    def test_sync_does_not_double_emit_a_queued_file(self, tmp_path, monkeypatch):
+    def test_sync_does_not_double_emit_a_queued_file(
+            self, tmp_path, monkeypatch):
         """sync() checked _emitted_files but not _batch_queue, so syncing
         during the settle window scanned the same video twice."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
@@ -176,12 +238,12 @@ class TestDuplicates:
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
 
-        write_video(tmp_path, "clip.mp4")
+        path = write_video(tmp_path, "clip.mp4")
         poll_until_stable(m)          # lands in _batch_queue
         m.sync()                      # user presses Sync mid-settle
         m._emit_batch()               # settle timer fires
 
-        assert len(emitted) == len(set(emitted)), f"duplicate emission: {emitted}"
+        assert emitted == [path], f"duplicate or missing emission: {emitted}"
 
     def test_existing_files_are_not_scanned_on_start(self, tmp_path):
         write_video(tmp_path, "already_here.mp4")
@@ -192,38 +254,35 @@ class TestDuplicates:
         poll_until_stable(m)
         assert emitted == [], "pre-existing files should not auto-scan"
 
-    def test_scan_backlog_opts_into_existing_files(self, tmp_path, monkeypatch):
+    def test_scan_backlog_opts_into_existing_files(
+            self, tmp_path, monkeypatch):
         """Users who point the watcher at a folder with content expect a way
         to process it."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
-        # The exclusivity probe is environmental on Windows: it renames the
-        # file onto itself, which any transient holder (Defender scanning a
-        # just-written file, the indexer) refuses without delete-sharing.
-        # That made this test fail intermittently on Windows CI with one of
-        # two identical files deferred. The probe has its own contract test
-        # below; here it is pinned open so the backlog behaviour itself is
-        # what is under test.
-        monkeypatch.setattr(W, "_can_open_exclusively", lambda f: True)
-        write_video(tmp_path, "old1.mp4")
-        write_video(tmp_path, "old2.mp4")
+        paths = [
+            write_video(tmp_path, "old1.mp4"),
+            write_video(tmp_path, "old2.mp4"),
+        ]
         m = WatchFolderMonitor()
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
         m.set_watch_path(str(tmp_path))
 
         count = m.scan_backlog()
-        assert count == 2
-        assert len(emitted) == 2
+        assert count == len(paths)
+        assert emitted == sorted(paths)
 
-    def test_scan_backlog_defers_a_locked_file(self, tmp_path, monkeypatch):
-        """A file the exclusivity probe refuses is deferred to the poller,
-        not emitted and not lost — the behaviour that fired on Windows CI
-        when a freshly written file was transiently held."""
+    def test_scan_backlog_defers_then_emits_a_locked_file(
+            self, tmp_path, monkeypatch):
+        """A refused file waits in the poller, then emits after its lock clears."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        monkeypatch.setattr(W, "BATCH_SETTLE_MS", 10)
+        lock_state = {"held": True}
         monkeypatch.setattr(
             W, "_can_open_exclusively",
-            lambda f: not str(f).endswith("locked.mp4"))
-        write_video(tmp_path, "free.mp4")
+            lambda f: not (lock_state["held"]
+                           and str(f).endswith("locked.mp4")))
+        free = write_video(tmp_path, "free.mp4")
         locked = write_video(tmp_path, "locked.mp4")
         m = WatchFolderMonitor()
         emitted = []
@@ -231,12 +290,29 @@ class TestDuplicates:
         m.set_watch_path(str(tmp_path))
 
         assert m.scan_backlog() == 1
-        assert len(emitted) == 1
+        assert emitted == [free]
         assert locked in m._pending_files
 
-    def test_backlog_is_not_re_emitted_by_a_later_poll(self, tmp_path, monkeypatch):
+        # Repeated polling must not advance the file while the probe refuses it.
+        poll_until_stable(m)
+        assert emitted == [free]
+        assert locked in m._pending_files
+        assert locked not in m._batch_queue
+
+        lock_state["held"] = False
+        poll_until_stable(m)
+        assert locked not in m._pending_files
+        assert locked in m._batch_queue
+        assert m._settle_timer.isActive()
+
+        QTest.qWait(100)
+        assert emitted == [free, locked]
+        assert not m._settle_timer.isActive()
+
+    def test_backlog_is_not_re_emitted_by_a_later_poll(
+            self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
-        write_video(tmp_path, "old.mp4")
+        path = write_video(tmp_path, "old.mp4")
         m = WatchFolderMonitor()
         emitted = []
         m.files_detected.connect(lambda f: emitted.extend(f))
@@ -244,7 +320,7 @@ class TestDuplicates:
         m.scan_backlog()
         poll_until_stable(m)
         m._emit_batch()
-        assert len(emitted) == 1
+        assert emitted == [path]
 
 
 class TestFolderLifecycle:
@@ -340,7 +416,8 @@ class TestMidCopyProtection:
         assert m.scan_backlog() == 0
         assert emitted == []
 
-    def test_a_settled_file_is_still_synced(self, tmp_path, monkeypatch):
+    def test_a_settled_file_is_still_synced(
+            self, tmp_path, monkeypatch):
         """The guard must not block the normal case."""
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         m = WatchFolderMonitor()
@@ -389,17 +466,20 @@ class TestMonitorState:
         m.resume()
         assert not m.is_paused and m.is_polling
 
-    def test_stop_clears_the_pending_batch(self, tmp_path, monkeypatch):
+    def test_stop_clears_the_pending_batch(
+            self, tmp_path, monkeypatch):
         monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
         m = WatchFolderMonitor()
         m.set_watch_path(str(tmp_path))
         m.start()
-        write_video(tmp_path, "x.mp4")
+        path = write_video(tmp_path, "x.mp4")
         poll_until_stable(m, 3)
+        assert m._batch_queue == [path]
         m.stop()
         assert m._batch_queue == []
 
-    def test_stop_does_not_silently_lose_a_queued_file(self, tmp_path, monkeypatch):
+    def test_stop_does_not_silently_lose_a_queued_file(
+            self, tmp_path, monkeypatch):
         """Queued files were already in _known_files, so clearing the batch on
         stop left them marked as seen while never having been scanned.
 
@@ -428,7 +508,7 @@ class TestMonitorState:
         m.files_detected.connect(lambda f: emitted.extend(f))
         poll_until_stable(m, 3)
         m._emit_batch()
-        assert path in emitted
+        assert emitted == [path]
 
     def test_default_watch_path_is_sensible(self):
         path = W.get_default_watch_path()
