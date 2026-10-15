@@ -1,8 +1,8 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.2 · **Date:** 2026-10-15 · **Status:** v0.6.2 fix-forward
-hardening implemented locally; push CI and tag release validation are required
-before publication.
+**Version:** 1.3 · **Date:** 2026-10-15 · **Status:** v0.6.3 release recovery
+implemented locally; the next remote push includes both main and the release
+tag after local validation.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -25,11 +25,11 @@ Windows code-signing certificate.
 | D7 | Provenance is free, so it is mandatory | `actions/attest-build-provenance` on the final EXE + both DMGs (Sigstore keyless via OIDC; **SLSA Build L2** — L3 is not claimed), plus `SHA256SUMS.txt` covering every asset. Users verify with `gh attestation verify`. |
 | D8 | SBOM ships, generated from the **constrained frozen Python environment** | Windows and both macOS architectures install through `constraints-3.12.txt`; one CycloneDX JSON per platform is generated from `pip freeze` of the build venv. Never scan the PyInstaller bundle/installer — the frozen archive under-reports exactly the Python deps an SBOM exists to list. SBOM step failures remain non-gating. |
 | D9 | version.json is the single source of truth | SemVer, annotated `vX.Y.Z` tags, never moved. CI fails the release unless tag == version.json == Inno AppVersion == spec version. The curated changelog in version.json becomes the release-notes body (plus a compare link). release-please / git-cliff are rejected for this project shape — the curated changelog already exists and beats commit-log prose. |
-| D10 | The delta channel stays, demoted to a **machine-generated mirror** | Research is blunt about the risks: a mutable branch bypasses immutability/attestation, delta bases don't compose across skipped versions, file patching desyncs Inno's registry state, and on macOS patching inside a .app breaks its code seal (TCC re-prompts, possible re-quarantine). Mitigations adopted now: the workflow generates the manifests from the tag, ships them as Release assets (`update-manifest-windows.json`, `update-manifest-macos.json`), and only then mirrors them to the `releases` branch — the branch is never hand-edited again. Known remaining risks, accepted explicitly: macOS in-app delta patching vs. the bundle seal is **not device-verified**; the full installer is always the fallback and the release notes say so. |
+| D10 | Public updates use **GitHub Release installers**, not a Git branch payload mirror | The proposed channel is physically incompatible with GitHub: `ffmpeg.exe` and `ffprobe.exe` each exceed the hard 100 MB Git-object limit, and the macOS payload is over 600 MB. Omitting them is unsafe because the manifest would tell clients to delete required tools; Git LFS adds quota, authentication and pointer-file failure modes. The existing architecture-aware GitHub Releases updater is therefore the zero-configuration path. Differential updates remain available only as an explicit local/static-host override for teams with suitable infrastructure. |
 | D11 | Publisher ≠ copyright holder, deliberately | Publisher/brand fields say **Capri la Ria**: Inno `AppPublisher`, `VersionInfoCompany`; spec `CompanyName`; About dialog "Publisher"; README and release-notes voice. Legal fields carry his legal name, **Cassian Aléria**: `LegalCopyright`, `VersionInfoCopyright`, `NSHumanReadableCopyright`, and both LICENSE files — copyright sits with him personally, while Capri la Ria (his label, founded 2022) is the publishing imprint credited wherever a publisher is named. This model was applied repo-wide on 2026-10-14 in commits `35dd479`–`df35054` (installer, spec, app metadata, About dialog, both LICENSE files). If SignPath is ever adopted, the *certificate* publisher becomes "SignPath Foundation" while these fields stay the project's — the policy page discloses that. |
 | D12 | The three Inno URLs are distinct | `AppPublisherURL` = caprilaria.com, `AppSupportURL` = GitHub Issues, and `AppUpdatesURL` = GitHub Releases. |
 | D13 | A release tag is created only from a green three-platform push commit | The full constrained suite runs on `windows-2025`, `macos-15`, and `macos-15-intel`. Release-only validation discovered too many defects after tagging; `vX.Y.Z` now points only at a commit already proven on every supported build architecture. |
-| D14 | Drafts resume; published releases never mutate | A rerun may reconcile assets only while the release is a draft. An existing published release is a hard failure requiring a new version. The delta channel is committed before the final undraft, so a branch failure leaves a recoverable draft rather than a public release with a stale channel. |
+| D14 | Drafts resume; published releases never mutate | A rerun may reconcile assets only while the release is a draft. An existing published release is a hard failure requiring a new version. The workflow verifies exact draft asset names and sizes immediately before undrafting; no mutable branch publication sits between those checks. |
 
 ## 2. What the workflow does (`.github/workflows/release.yml`)
 
@@ -47,26 +47,23 @@ the protected `release` environment admits only `v*` tag refs.
    downgrade), Chocolatey unpinned only if missing, fail loudly if still
    absent. Full gated `build_installer.bat` (its `pause` calls are guarded
    by `if not defined CI` at the source — no stdin tricks). SBOM from the
-   build venv's freeze (non-gating). Upload installer + delta payload + SBOM.
+   build venv's freeze (non-gating). Upload installer + SBOM.
 3. **build-macos-arm64** (`macos-15`) and **build-macos-intel**
    (`macos-15-intel`) — full gated `build_mac.sh`, ad-hoc signing, SBOM
    (arm job only — the dependency set is identical; the Intel job notes
-   this), DMG upload. The arm job also uploads the delta payload; the
-   Intel build is installer-only (one delta manifest cannot describe two
-   architectures — see D10).
+   this), and one DMG upload per native architecture.
 4. **publish** (`ubuntu-24.04`, `environment: release`, the only job with
    `contents: write` + `id-token: write` + `attestations: write`) —
    stage assets under release names (`FrameGuardInstaller.exe`,
    `FrameGuard-arm64.dmg`, `FrameGuard-intel.dmg`), generate
    `SHA256SUMS.txt`, attest the three binaries, create or safely resume a
-   **draft** release, and verify its assets. Mirror the delta manifests and
-   payloads to the `releases` branch, then undraft only after that push
-   succeeds. Published releases are immutable and are never reconciled.
+   **draft** release, verify exact asset names and sizes, then undraft.
+   Published releases are immutable and are never reconciled.
 
 Hardening throughout: Node 24-compatible actions pinned to full commit SHAs;
 `.github/dependabot.yml` keeps the pins moving; top-level
 `permissions: contents: read`; `persist-credentials: false` on build
-checkouts; per-tag build concurrency plus globally serialized channel
+checkouts; per-tag build concurrency plus globally serialized release
 publishing; bounded job and network retries; pinned runner labels (no floating
 `*-latest` for release jobs).
 
@@ -154,7 +151,9 @@ are metadata lines only, to be merged on top of his text.
 
 ## 8. Revision log
 
-- **1.2 — 2026-10-15.** Adds constrained cross-platform push CI, a macOS-12-compatible Qt pin, bounded DMG verification, complete nested-code signing, temporary CI keychain provisioning, Node 24 action pins, overwrite-safe workflow artifacts, first-release-aware monotonic delta channels, rerun-safe drafts, channel-before-undraft ordering, and the green-commit-before-tag rule. v0.6.2 fixes forward from the immutable unpublished v0.6.1 tag.
+- **1.3 — 2026-10-15.** Retires the impossible Git-backed delta mirror after live release runs proved the Windows payload violates GitHub's hard per-object limit and the macOS tree is over 600 MB. Public updates use architecture-aware GitHub Release installers; optional differential channels require an external filesystem/static host. v0.6.3 fixes forward without rewriting the immutable v0.6.1 or v0.6.2 tags.
+- **1.2 — 2026-10-15.** Added constrained cross-platform push CI, a macOS-12-compatible Qt pin, bounded DMG verification, complete nested-code signing, temporary CI keychain provisioning, Node 24 action pins, overwrite-safe workflow artifacts, rerun-safe drafts, and the green-commit-before-tag rule.
+- **1.3 recovery addendum — 2026-10-15.** The exact release-mode build exposed a transient `hdiutil create` failure before push; image creation now has the same bounded retry, backoff and durable diagnostics as verification.
 - **1.1 — 2026-10-14.** Credit model corrected to the one Cassian applied
   himself in commits `35dd479`–`df35054`: developer and copyright holder is
   **Cassian Aléria** (legal name, accent included) across the installer, the

@@ -18,13 +18,13 @@ Releases are platform-separated (Output/release-windows vs
 Output/release-macos): the payloads overlap by filename, so sharing one
 folder lets one platform's publish silently overwrite the other's.
 
-The full tree is published every time: it is cheap to host in the repo and
-means a client on ANY previous version can update in one step.
-
-Publishing target: the repo's `releases` branch. Publish the Windows build
-into that branch's RELEASES/ folder and the macOS build into RELEASES-macos/,
-then push the branch — the in-app updater reads both straight from
-raw.githubusercontent.com. Use --publish-to with a checkout of that branch.
+The full tree is published every time, so a client on ANY previous version can
+update in one step. This output must live on a filesystem share or static
+artifact host designed for large binaries. It must not be committed to the Git
+repository: the Windows FFmpeg files exceed GitHub's 100 MB object limit and
+the macOS tree is hundreds of megabytes. Use --publish-to with a directory
+served by that external channel. Normal public releases use GitHub Releases
+installers and do not call this script's publishing mode.
 """
 
 import argparse
@@ -96,9 +96,8 @@ def main() -> int:
                         help="Platform this release is for "
                              "(default: auto-detect the host).")
     parser.add_argument("--publish-to", type=Path, default=None,
-                        help="Copy the finished release straight to the update "
-                             "channel: the RELEASES (windows) or RELEASES-macos "
-                             "folder in a checkout of the repo's releases branch")
+                        help="Copy the finished release to an externally hosted "
+                             "filesystem/static-HTTP differential channel")
     parser.add_argument("--compare-to", type=Path, default=None,
                         help="A previous release directory; prints the delta")
     parser.add_argument("--manifest-only", action="store_true",
@@ -178,16 +177,16 @@ def main() -> int:
                 shutil.rmtree(target_payload)
             shutil.copytree(payload, target_payload)
             shutil.copy2(output / M.MANIFEST_FILENAME, target / M.MANIFEST_FILENAME)
-            print("  Done. Commit and push the releases branch; clients will")
-            print("  pick this up within 24 hours.")
+            print("  Done. Publish this directory through the configured static")
+            print("  artifact host; opted-in clients check it every 24 hours.")
         except OSError as e:
             print(f"  ERROR: could not publish: {e}")
             print("  The local release in Output/ is still valid; copy it manually.")
             return 1
 
-    print("\nRelease ready. Publish this folder to the repo's releases branch")
-    print("(RELEASES/ for Windows, RELEASES-macos/ for macOS) and push it;")
-    print("clients will download only the files that differ from their install.")
+    print("\nDifferential payload ready for an external filesystem or static")
+    print("artifact host. Do not commit it to Git. Clients configured for that")
+    print("channel will download only files that differ from their install.")
     return 0
 
 

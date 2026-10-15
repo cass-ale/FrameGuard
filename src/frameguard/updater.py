@@ -8,11 +8,10 @@ Provides seamless "Update & Restart" functionality:
 4. Configurable update source with "Browse" + "Test" in Settings
 5. Remembers last successful path and last check time
 
-Update source: the project's GitHub repository (see
-DEFAULT_UPDATE_CHANNEL). The delta channel reads manifest.json + files/
-from the repo's `releases` branch; a per-machine override in Settings
-can point at a local folder (Downloads, a network share, a test mirror)
-or another URL instead.
+Update source: signed platform installers from GitHub Releases. A per-machine
+channel override in Settings can optionally point at a local folder, network
+share, or static HTTP host that provides manifest.json + files/ for differential
+updates. No differential channel is enabled by default.
 """
 
 import os
@@ -38,57 +37,31 @@ _CHECK_INTERVAL_HOURS = 24  # How often to auto-check (hours)
 _INSTALLER_FILENAME = "FrameGuardInstaller.exe"
 _VERSION_FILENAME = "version.json"
 
-# The repository releases live in — the same repo users download the app
-# from, and the URL installer.iss publishes. One home for this identity:
-# the update channel below and the GitHub Releases check both derive
-# from it.
+# The repository releases live in. GitHub Releases is the zero-configuration,
+# architecture-aware update source and carries the complete installers.
 GITHUB_REPO = "cass-ale/FrameGuard"  # owner/repo
 GITHUB_RELEASES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 
-# The update channel every machine checks: this repository itself.
-# Releases are published to the repo's `releases` branch, which mirrors
-# the layout the channel has always had:
-#
-#     RELEASES/manifest.json + RELEASES/files/...            (Windows)
-#     RELEASES-macos/manifest.json + RELEASES-macos/files/... (macOS)
-#
-# raw.githubusercontent.com serves that tree over HTTPS, path-addressed,
-# which is exactly the shape HttpSource consumes — a fresh install is
-# pointed at the channel with no server to run, nothing to install, and
-# nothing to sign into. Baked in so a fresh install just works, and
-# overridable per machine via QSettings for testing a pre-release
-# (a filesystem path or another URL).
-#
-# The two platforms must never share one folder: their payloads overlap
-# by filename (FrameGuard.exe vs the .app tree, .pyd vs .so, ffmpeg.exe
-# vs ffmpeg) and one publish would silently overwrite the other.
-#
-# Channels are URLs, built with "/" — never os.path.join, which would
-# inject backslashes into the URL on Windows.
-_RELEASE_BRANCH = "releases"
-_RELEASE_BASE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{_RELEASE_BRANCH}"
-DEFAULT_UPDATE_CHANNEL = f"{_RELEASE_BASE_URL}/RELEASES"
+# Differential payload trees do not fit safely in this Git repository: the
+# macOS tree is over 600 MB and the Windows FFmpeg binaries individually exceed
+# GitHub's hard 100 MB Git-object limit. Keep this empty so packaged clients go
+# directly to GitHub Releases. Teams with a real static artifact host can still
+# configure a local/HTTP differential channel in Settings.
+DEFAULT_UPDATE_CHANNEL = ""
 
 
 def get_update_channel_for(platform_name: str = "") -> str:
-    """The channel for a given platform ("windows" or "darwin").
-
-    Mac clients must check RELEASES-macos, not the Windows RELEASES
-    folder — same filenames, different payloads (see above).
-    """
-    name = (platform_name or "").lower()
-    if name.startswith("darwin") or name == "mac":
-        return f"{_RELEASE_BASE_URL}/RELEASES-macos"
+    """Return the shipped differential channel (disabled on every platform)."""
+    del platform_name
     return DEFAULT_UPDATE_CHANNEL
+
+
 _CHANNEL_KEY = "update/channel"
 
-# The retired channel: the team's Google Drive folder, the shipped
-# default until the channel moved to the repository. Machines that
-# explicitly saved it as an override (Settings) would otherwise stay
-# pinned to a location that no longer receives releases, silently —
-# background checks swallow unreachable-channel errors by design.
-# Stored values matching a legacy channel are discarded in favour of
-# the shipped default (see get_update_channel / set_update_channel).
+# Retired Drive and Git-backed channels. Machines that explicitly saved one
+# as an override would otherwise stay pinned to a location that no longer
+# receives releases. Stored legacy values are discarded so the normal GitHub
+# Releases check runs (see get_update_channel / set_update_channel).
 _LEGACY_RELEASE_ROOT = (
     "G:\\Shared drives\\TPG XR\\\u2b50gDrive Reorganization\u2b50\\"
     "Team - Innovation\\Q1\\T260340134 - NY QA Improvement\\"
@@ -97,26 +70,24 @@ _LEGACY_RELEASE_ROOT = (
 
 
 def _is_legacy_channel(value: str) -> bool:
-    """True if `value` is one of the retired Drive update channels."""
+    """True if `value` is a retired Drive or Git-backed update channel."""
     normalised = (value or "").replace("\\", "/").rstrip("/")
     root = _LEGACY_RELEASE_ROOT.replace("\\", "/")
-    return normalised in (root, f"{root}/RELEASES", f"{root}/RELEASES-macos")
+    retired_repo = (
+        f"https://raw.githubusercontent.com/{GITHUB_REPO}/releases/RELEASES",
+        f"https://raw.githubusercontent.com/{GITHUB_REPO}/releases/RELEASES-macos",
+    )
+    return normalised in (root, f"{root}/RELEASES", f"{root}/RELEASES-macos") \
+        or normalised.lower() in {url.lower() for url in retired_repo}
 
 
 def _default_channel_for_this_machine() -> str:
-    """The shipped channel default for the machine actually running this code.
-
-    Mac clients must check RELEASES-macos, not the Windows RELEASES folder —
-    the two releases share filenames (FrameGuard.exe vs the .app tree, .pyd
-    vs .so) and one shared manifest cannot describe both.
-    """
-    if sys.platform == "darwin":
-        return get_update_channel_for("darwin")
-    return DEFAULT_UPDATE_CHANNEL
+    """The optional shipped differential channel; empty means GitHub Releases."""
+    return get_update_channel_for(sys.platform)
 
 
 def get_update_channel() -> str:
-    """The release location this machine checks.
+    """The optional differential release location this machine checks.
 
     Self-healing: a stored override that no longer exists is discarded in
     favour of the shipped default. Without that, a machine which once saved an
@@ -142,14 +113,11 @@ def get_update_channel() -> str:
     if os.path.isdir(stored):
         return stored
 
-    # Stored path is gone. Prefer the shipped default when it is usable.
-    default = _default_channel_for_this_machine()
-    if os.path.isdir(default):
-        settings.remove(_CHANNEL_KEY)
-        return default
-
-    # Neither is reachable (offline laptop). Keep the user's choice.
-    return stored
+    # A dead filesystem override must not pin the machine. Clearing it makes
+    # the normal GitHub Releases check run immediately after the optional delta
+    # lookup returns False.
+    settings.remove(_CHANNEL_KEY)
+    return _default_channel_for_this_machine()
 
 
 def set_update_channel(channel: str):
@@ -161,9 +129,7 @@ def set_update_channel(channel: str):
     """
     settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
     channel = (channel or "").strip()
-    if not channel or channel in (DEFAULT_UPDATE_CHANNEL,
-                                  get_update_channel_for("darwin")) \
-            or _is_legacy_channel(channel):
+    if not channel or _is_legacy_channel(channel):
         settings.remove(_CHANNEL_KEY)
     else:
         settings.setValue(_CHANNEL_KEY, channel)
@@ -214,9 +180,8 @@ def _is_newer(remote: str, local: str) -> bool:
 # Update source discovery
 # ---------------------------------------------------------------------------
 
-# GITHUB_REPO / GITHUB_RELEASES_URL are defined with the channel
-# configuration at the top of this module — one home for the repo
-# identity, which the update channel also derives from.
+# GITHUB_REPO / GITHUB_RELEASES_URL are defined with update configuration at
+# the top of this module.
 
 
 def _pick_release_asset(assets, platform: Optional[str] = None,
@@ -321,10 +286,9 @@ def installer_filename() -> str:
 def get_default_search_paths() -> List[str]:
     """Get the default list of paths to search for updates.
 
-    Filesystem fallback for the installer-based flow only. The primary
-    channel is the repository (see DEFAULT_UPDATE_CHANNEL); these paths
-    cover a user who dropped an installer into Downloads or next to the
-    app by hand.
+    Filesystem fallback for the installer-based flow. GitHub Releases is the
+    primary source; these paths cover a user who dropped an installer into
+    Downloads or next to the app by hand.
     """
     home = os.path.expanduser("~")
     paths = [

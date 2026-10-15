@@ -1,10 +1,9 @@
 """Release channel tests.
 
-The shipped channel is the project's GitHub repository: releases live on
-its `releases` branch and are served from raw.githubusercontent.com.
-These tests pin that, the migration off the retired Google Drive channel
-(a machine that saved the old Drive path as an override must not stay
-pinned to a folder that no longer receives releases), and — because a
+The shipped updater uses full installers from GitHub Releases. Differential
+updates remain available only through an explicit filesystem or static-HTTP
+override; their large payload is not stored in Git. These tests pin that, the
+migration off retired Google Drive and raw-GitHub channels, and — because a
 per-machine override may still point at ANY local folder — that a local
 channel under a non-ASCII path round-trips byte-exact: batch scripts run
 under an OEM codepage that mangles non-ASCII, QSettings has to
@@ -27,20 +26,17 @@ STAR = "\u2b50"
 
 
 class TestConfiguredChannel:
-    def test_channel_points_at_the_repository(self):
-        from frameguard.updater import DEFAULT_UPDATE_CHANNEL, GITHUB_REPO
+    def test_github_releases_is_the_shipped_update_source(self):
+        from frameguard.updater import GITHUB_RELEASES_URL, GITHUB_REPO
 
         assert GITHUB_REPO == "cass-ale/FrameGuard"
-        assert DEFAULT_UPDATE_CHANNEL == (
-            f"https://raw.githubusercontent.com/{GITHUB_REPO}"
-            f"/releases/RELEASES")
+        assert GITHUB_RELEASES_URL == (
+            f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest")
 
-    def test_channel_uses_the_releases_folder(self):
-        """RELEASES/ on the releases branch holds the manifest and the
-        files/ payload — the layout the channel has always had."""
+    def test_no_git_backed_delta_channel_ships_with_the_app(self):
         from frameguard.updater import DEFAULT_UPDATE_CHANNEL
 
-        assert DEFAULT_UPDATE_CHANNEL.endswith("/RELEASES")
+        assert DEFAULT_UPDATE_CHANNEL == ""
 
     def test_crash_logs_stay_local(self):
         """Crash logs go to the per-user local log dir. The retired
@@ -56,13 +52,6 @@ class TestConfiguredChannel:
         assert "Shared drives" not in source
         assert "MetaMate" not in source
         assert "_log_dir" in source
-
-    def test_channel_is_a_url(self):
-        from frameguard.updater import DEFAULT_UPDATE_CHANNEL
-        from frameguard.updatesource import HttpSource
-
-        assert DEFAULT_UPDATE_CHANNEL.startswith("https://")
-        assert isinstance(make_source(DEFAULT_UPDATE_CHANNEL), HttpSource)
 
     def test_a_legacy_drive_channel_migrates_to_the_default(self, qapp):
         """Machines that saved the retired Drive channel as an override
@@ -91,12 +80,10 @@ class TestConfiguredChannel:
 
     def test_channel_survives_qsettings(self, qapp):
         """QSettings is the per-machine override; the value has to round-trip."""
-        from frameguard.updater import (get_update_channel,
-                                        get_update_channel_for,
-                                        set_update_channel)
+        from frameguard.updater import get_update_channel, set_update_channel
 
         original = get_update_channel()
-        expected = get_update_channel_for(sys.platform)
+        expected = "https://artifacts.example.test/frameguard/windows"
         try:
             set_update_channel(expected)
             assert get_update_channel() == expected
@@ -115,10 +102,29 @@ class TestConfiguredChannel:
         try:
             settings.setValue(U._CHANNEL_KEY, str(tmp_path / "deleted_share"))
             resolved = U.get_update_channel()
-            if os.path.isdir(U.DEFAULT_UPDATE_CHANNEL):
-                assert resolved == U.DEFAULT_UPDATE_CHANNEL
-                assert settings.value(U._CHANNEL_KEY, None) is None, \
-                    "the dead override should be cleared, not left to rot"
+            assert resolved == ""
+            assert settings.value(U._CHANNEL_KEY, None) is None, \
+                "the dead override should be cleared, not left to rot"
+        finally:
+            if original is None:
+                settings.remove(U._CHANNEL_KEY)
+            else:
+                settings.setValue(U._CHANNEL_KEY, original)
+
+    def test_a_retired_repository_channel_migrates_to_github_releases(self, qapp):
+        from PySide6.QtCore import QSettings
+        from frameguard import updater as U
+
+        settings = QSettings(U._SETTINGS_ORG, U._SETTINGS_APP)
+        original = settings.value(U._CHANNEL_KEY, None)
+        retired = (
+            "https://raw.githubusercontent.com/cass-ale/FrameGuard/"
+            "releases/RELEASES-macos"
+        )
+        try:
+            settings.setValue(U._CHANNEL_KEY, retired)
+            assert U.get_update_channel() == ""
+            assert settings.value(U._CHANNEL_KEY, None) is None
         finally:
             if original is None:
                 settings.remove(U._CHANNEL_KEY)
@@ -181,6 +187,27 @@ class TestConfiguredChannel:
         assert paths
         assert not any("TPG" in p or "team-share" in p
                        or "Shared drives" in p for p in paths)
+
+    def test_no_delta_channel_falls_through_to_github_releases(
+            self, qapp, monkeypatch):
+        from frameguard import updater as U
+
+        expected = U.UpdateInfo(
+            version="9.9.9",
+            installer_path="https://example.test/FrameGuardInstaller.exe",
+            is_newer=True,
+            source_path="GitHub Releases",
+        )
+        manager = U.UpdateManager()
+        found = []
+        manager.update_available.connect(found.append)
+        monkeypatch.setattr(manager, "check_channel_for_delta", lambda: False)
+        monkeypatch.setattr(U, "check_github_for_update", lambda: expected)
+
+        manager._do_check()
+
+        assert found == [expected]
+        assert manager.get_last_update_info() is expected
 
 
 @pytest.fixture
@@ -245,11 +272,11 @@ class TestSwapScriptEncoding:
 
     def test_release_channel_never_reaches_the_swap_script(self, tmp_path):
         """The helper only touches the install, staging and backup paths."""
-        from frameguard.updater import DEFAULT_UPDATE_CHANNEL
-
         script = D.write_swap_script(str(tmp_path / "install"),
                                      str(tmp_path / "staging"), self._plan(), pid=1)
-        assert DEFAULT_UPDATE_CHANNEL not in open(script, encoding="utf-8").read()
+        body = open(script, encoding="utf-8").read()
+        assert "raw.githubusercontent.com" not in body
+        assert "api.github.com" not in body
 
     @pytest.mark.skipif(os.name != "nt", reason="batch helper is Windows-only")
     def test_swap_succeeds_with_non_ascii_install_path(self, tmp_path):

@@ -21,6 +21,8 @@
 #   ./build_mac.sh              full clean build
 #   ./build_mac.sh --fast       reuse the local macOS build cache (much quicker)
 #   ./build_mac.sh --skip-tests skip the pytest gate (not recommended)
+#   ./build_mac.sh --skip-delta skip optional external-channel payload
+#   SIGN_IDENTITY
 #   SIGN_IDENTITY="Developer ID Application: ..." ./build_mac.sh
 # ============================================================================
 set -euo pipefail
@@ -81,11 +83,14 @@ TOTAL_STEPS=9
 
 FAST=0
 SKIP_TESTS=0
+SKIP_DELTA=0
 ALLOW_UNSIGNED=0
 for arg in "$@"; do
     case "$arg" in
         --fast) FAST=1 ;;
         --skip-tests) SKIP_TESTS=1 ;;
+        --skip-delta) SKIP_DELTA=1 ;;
+        # Retained
         # Retained for compatibility with internal ad-hoc builds. It never
         # downgrades failures when a Developer ID identity is configured.
         --allow-unsigned) ALLOW_UNSIGNED=1 ;;
@@ -95,6 +100,43 @@ done
 
 step() { echo; echo "[$1/${TOTAL_STEPS}] $2"; }
 die()  { echo; echo "ERROR: $*" >&2; exit 1; }
+
+create_dmg() { # create_dmg <staging-directory> <output-image>
+    local source_dir="$1"
+    local image="$2"
+    local diagnostic="${LOG_DIR}/hdiutil-create.log"
+    local attempt attempt_log delay
+
+    mkdir -p "$LOG_DIR"
+    : > "$diagnostic"
+    for attempt in 1 2 3; do
+        attempt_log="${diagnostic}.attempt-${attempt}"
+        rm -f "$image"
+        if hdiutil create -volname "$VOLNAME" -srcfolder "$source_dir" \
+                -ov -format UDZO "$image" >"$attempt_log" 2>&1; then
+            cat "$attempt_log" >> "$diagnostic"
+            rm -f "$attempt_log"
+            echo "      Disk image created (attempt ${attempt})"
+            return 0
+        fi
+        {
+            echo "--- hdiutil create attempt ${attempt} failed ---"
+            cat "$attempt_log"
+        } >> "$diagnostic"
+        rm -f "$attempt_log" "$image"
+        if [[ $attempt -lt 3 ]]; then
+            delay=$((attempt * 3))
+            echo "      hdiutil create failed; retrying in ${delay}s..." >&2
+            sleep "$delay"
+            sync
+        fi
+    done
+
+    echo "      hdiutil create failed after 3 attempts; diagnostics:" >&2
+    cat "$diagnostic" >&2
+    hdiutil info >&2 || true
+    return 1
+}
 
 verify_dmg() { # verify_dmg <path> <diagnostic-label>
     local image="$1"
@@ -465,9 +507,8 @@ trap 'rm -rf "$DMG_STAGE"' EXIT
 cp -R "$BUNDLE" "$DMG_STAGE/"
 ln -s /Applications "$DMG_STAGE/Applications"
 
-hdiutil create -volname "${VOLNAME}" \
-    -srcfolder "$DMG_STAGE" -ov -format UDZO -quiet "$LOCAL_DMG_PATH" \
-    || die "Could not create the disk image."
+create_dmg "$DMG_STAGE" "$LOCAL_DMG_PATH" \
+    || die "Could not create the disk image after bounded retries."
 verify_dmg "$LOCAL_DMG_PATH" "created" \
     || die "The newly created disk image failed verification."
 
@@ -535,10 +576,14 @@ echo "      Arch copy: ${DMG_DIR}/FrameGuard-${TARGET_ARCH}.dmg"
 # build publishes to Output/release-windows, and sharing one folder lets one
 # platform's publish silently overwrite the other's (FrameGuard.exe vs the
 # .app tree, .pyd vs .so, ffmpeg.exe vs ffmpeg).
-echo "      Publishing differential-update release..."
-"$PY" publish_release.py --platform darwin --build-dir "$BUNDLE" \
-    --compare-to "${DMG_DIR}/release-macos" \
-    || echo "      WARNING: could not publish the release manifest."
+if [[ $SKIP_DELTA -eq 0 ]]; then
+    echo "      Preparing optional differential-update payload..."
+    "$PY" publish_release.py --platform darwin --build-dir "$BUNDLE" \
+        --compare-to "${DMG_DIR}/release-macos" \
+        || echo "      WARNING: could not prepare the optional delta payload."
+else
+    echo "      Optional differential payload skipped (--skip-delta)."
+fi
 
 cat <<EOF
 

@@ -382,8 +382,16 @@ class TestBuildScripts:
         assert 'frameguard([.]' in sh
         assert 'PyInstaller reported missing internal FrameGuard modules' in sh
 
-    def test_dmg_verification_is_bounded_diagnostic_and_post_mutation(self):
+    def test_dmg_creation_and_verification_are_bounded_and_diagnostic(self):
         sh = _read("build_mac.sh")
+        create_helper = sh[sh.index("create_dmg()"):
+                           sh.index("verify_dmg()")]
+        assert "for attempt in 1 2 3" in create_helper
+        assert 'rm -f "$image"' in create_helper
+        assert 'sleep "$delay"' in create_helper
+        assert "hdiutil-create.log" in create_helper
+        assert "hdiutil info" in create_helper
+
         helper = sh[sh.index("verify_dmg()"):
                     sh.index("print_notary_log()")]
         assert '[[ -s "$image" ]]' in helper
@@ -394,12 +402,13 @@ class TestBuildScripts:
         assert 'hdiutil-verify-${label}.log' in helper
         assert 'hdiutil imageinfo "$image"' in helper
 
+        create = sh.index('create_dmg "$DMG_STAGE" "$LOCAL_DMG_PATH"')
         created = sh.index('verify_dmg "$LOCAL_DMG_PATH" "created"')
         dmg_sign = sh.index('codesign --force --timestamp --sign')
         staple = sh.index('xcrun stapler staple')
         final = sh.index('verify_dmg "$LOCAL_DMG_PATH" "final"')
         publish = sh.index('cp -f "$LOCAL_DMG_PATH" "$DMG_PATH"')
-        assert created < dmg_sign < staple < final < publish
+        assert create < created < dmg_sign < staple < final < publish
 
     def test_mac_builder_requires_the_release_python_and_apple_tools(self):
         sh = _read("build_mac.sh")
@@ -728,11 +737,11 @@ class TestMacInstallerGaps:
         src = _read(os.path.join("frameguard", "deltaupdate.py"))
         assert "remote_arch" in src or 'remote.get("arch")' in src
 
-    def test_mac_channel_is_not_the_windows_channel(self):
+    def test_mac_uses_github_releases_without_a_delta_default(self):
         from frameguard import updater
-        mac = updater.get_update_channel_for("darwin")
-        assert mac != updater.DEFAULT_UPDATE_CHANNEL
-        assert "macos" in mac.lower()
+        assert updater.get_update_channel_for("darwin") == ""
+        assert updater.DEFAULT_UPDATE_CHANNEL == ""
+        assert updater.GITHUB_RELEASES_URL.endswith("/releases/latest")
 
     def test_diagnostic_sh_exists_and_is_lf(self):
         """Windows has diagnostic.bat; Mac needs the same triage path."""

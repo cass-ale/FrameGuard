@@ -44,10 +44,10 @@ attestation for each binary (verify with
 bundled Python components. See [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md)
 for the signing status and roadmap.
 
-**Updates:** once installed, you don't need to come back here for fixes.
-FrameGuard checks its update channel automatically and downloads only the
-files that changed — a small delta instead of the full installer. A fresh
-installer is only needed for a first install or a reinstall.
+**Updates:** FrameGuard checks GitHub Releases automatically and offers the
+correct Windows, Apple Silicon, or Intel installer when a newer version is
+available. Teams with their own filesystem or static artifact host can opt into
+differential updates from Settings; no extra channel is required for normal use.
 
 Prefer to run from source? See [Quick start](#quick-start) below.
 

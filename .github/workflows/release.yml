@@ -15,10 +15,10 @@
 # WHAT A RELEASE SHIPS:
 #   FrameGuardInstaller.exe (Windows 10/11 x64), FrameGuard-arm64.dmg and
 #   FrameGuard-intel.dmg (macOS 12+, per architecture), SHA256SUMS.txt,
-#   one CycloneDX SBOM per platform, both update manifests, a build
-#   provenance attestation per binary (verify: gh attestation verify),
-#   and a delta-update mirror on the `releases` branch for installed
-#   copies. Publisher: Capri la Ria. Developer: Cassian Aléria.
+#   one CycloneDX SBOM per platform and a build provenance attestation
+#   per binary (verify: gh attestation verify). Installed copies discover
+#   the matching full installer through GitHub Releases. Publisher:
+#   Capri la Ria. Developer: Cassian Aléria.
 #
 # SIGNING STATE (deliberate, zero budget — see CODE_SIGNING_POLICY.md):
 #   Windows unsigned (SmartScreen: More info -> Run anyway); macOS ad-hoc
@@ -146,9 +146,9 @@ jobs:
           **Open Anyway**, authenticate, and launch again. On macOS 14 or
           earlier: right-click FrameGuard → **Open**.
 
-          **Already installed?** You don't need this download — FrameGuard
-          updates itself with a small delta the next time it checks. If an
-          in-app update ever fails, reinstalling from this page is the fix.
+          **Already installed?** FrameGuard checks GitHub Releases automatically
+          and offers the correct installer for this platform and architecture.
+          Reinstalling from this page is always a supported recovery path.
 
           ## Verify your download
 
@@ -224,13 +224,12 @@ jobs:
         shell: cmd
         # build_installer.bat guards its `pause` calls with
         # `if not defined CI` — under Actions they are skipped entirely.
-        run: build_installer.bat
+        run: build_installer.bat --skip-delta
 
       - name: Verify the build outputs exist
         shell: cmd
         run: |
           if not exist "Output\FrameGuardInstaller.exe" exit /b 1
-          if not exist "Output\release-windows\manifest.json" exit /b 1
           dir Output
 
       - name: Generate the SBOM from the frozen build environment
@@ -252,14 +251,6 @@ jobs:
           name: windows-installer
           overwrite: true
           path: src/Output/FrameGuardInstaller.exe
-          if-no-files-found: error
-
-      - name: Upload the delta-update payload
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: windows-delta
-          overwrite: true
-          path: src/Output/release-windows/
           if-no-files-found: error
 
       - name: Upload the SBOM
@@ -290,12 +281,10 @@ jobs:
             runner: macos-15
             target_arch: arm64
             artifact: macos-arm64
-            delta: true
           - label: intel
             runner: macos-15-intel
             target_arch: x86_64
             artifact: macos-intel
-            delta: false # one delta manifest cannot describe two archs
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     defaults:
@@ -380,7 +369,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p "$FRAMEGUARD_MAC_BUILD_ROOT"
-          bash build_mac.sh 2>&1 | tee "$FRAMEGUARD_MAC_BUILD_ROOT/build.log"
+          bash build_mac.sh --skip-delta 2>&1 | tee "$FRAMEGUARD_MAC_BUILD_ROOT/build.log"
 
       - name: Remove the temporary signing keychain
         if: always()
@@ -393,7 +382,7 @@ jobs:
         run: |
           ls -lh Output/
           test -s Output/FrameGuard.dmg
-          test -s Output/release-macos/manifest.json
+          BUNDLE=
           BUNDLE="$FRAMEGUARD_MAC_BUILD_ROOT/dist/FrameGuard.app"
           test -d "$BUNDLE"
           codesign --verify --deep --strict "$BUNDLE"
@@ -415,15 +404,6 @@ jobs:
           name: ${{ matrix.artifact }}-dmg
           overwrite: true
           path: src/Output/FrameGuard.dmg
-          if-no-files-found: error
-
-      - name: Upload the delta-update payload (arm64 only)
-        if: matrix.delta
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
-          name: macos-delta
-          overwrite: true
-          path: src/Output/release-macos/
           if-no-files-found: error
 
       - name: Upload the SBOM
@@ -448,13 +428,13 @@ jobs:
           if-no-files-found: warn
 
   publish:
-    name: Publish GitHub Release + delta channel
+    name: Publish GitHub Release
     needs: [build-windows, build-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       GH_REPO: ${{ github.repository }}
-    # Serialize the mutable channel update and undraft operation across tags.
+    # Serialize latest-release selection and undraft operations across tags.
     concurrency:
       group: release-publish
       cancel-in-progress: false
@@ -463,7 +443,7 @@ jobs:
     # prevent-self-review — solo maintainer). See RELEASE_PLAN §3.
     environment: release
     permissions:
-      contents: write # create the release, push the delta mirror
+      contents: write # create and publish the GitHub Release
       id-token: write # OIDC for the Sigstore attestations below
       attestations: write
     steps:
@@ -480,8 +460,6 @@ jobs:
           cp dist/windows-installer/FrameGuardInstaller.exe stage/
           cp dist/macos-arm64-dmg/FrameGuard.dmg stage/FrameGuard-arm64.dmg
           cp dist/macos-intel-dmg/FrameGuard.dmg stage/FrameGuard-intel.dmg
-          cp dist/windows-delta/manifest.json stage/update-manifest-windows.json
-          cp dist/macos-delta/manifest.json stage/update-manifest-macos.json
           # SBOMs are non-gating: include whichever were produced.
           cp dist/windows-sbom/sbom-windows.cdx.json stage/ 2>/dev/null || echo "no windows SBOM"
           cp dist/macos-sbom/sbom-macos.cdx.json stage/ 2>/dev/null || echo "no macos SBOM"
@@ -498,6 +476,50 @@ jobs:
               exit 1
             fi
           fi
+
+      - name: Refuse to supersede a newer published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          LATEST_RESPONSE="${RUNNER_TEMP}/frameguard-latest-release.json"
+          LATEST_STATUS="$(curl --silent --show-error --location \
+            --retry 3 --retry-all-errors \
+            --output "$LATEST_RESPONSE" --write-out '%{http_code}' \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer ${GH_TOKEN}" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/latest")"
+          case "$LATEST_STATUS" in
+            200) LATEST_TAG="$(jq -er '.tag_name' "$LATEST_RESPONSE")" ;;
+            404)
+              echo "No published release exists yet; ${RELEASE_TAG} may become latest."
+              exit 0
+              ;;
+            *)
+              echo "::error::Could not inspect the latest release (HTTP ${LATEST_STATUS})."
+              cat "$LATEST_RESPONSE" >&2
+              exit 1
+              ;;
+          esac
+          python - "$RELEASE_TAG" "$LATEST_TAG" <<'PY'
+          import re
+          import sys
+
+          def version(value):
+              match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value or "")
+              if not match:
+                  raise SystemExit(f"Invalid release version: {value!r}")
+              return tuple(map(int, match.groups()))
+
+          candidate_text, latest_text = sys.argv[1:]
+          if version(candidate_text) < version(latest_text):
+              raise SystemExit(
+                  f"Refusing to mark {candidate_text} latest because "
+                  f"{latest_text} is already published."
+              )
+          print(f"Version order OK: {candidate_text} >= {latest_text}")
+          PY
 
       - name: Attest build provenance for the binaries
         uses: actions/attest-build-provenance@8beda2b7ed98355c0e97c0a63bec38ae472e66c4 # v4
@@ -560,107 +582,6 @@ jobs:
             | LC_ALL=C sort > uploaded-assets.tsv
           diff -u expected-assets.tsv uploaded-assets.tsv
           echo "Draft asset names and sizes verified: $(wc -l < uploaded-assets.tsv) assets"
-
-      - name: Check out the releases branch (update channel)
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        with:
-          ref: releases
-          path: channel
-          fetch-depth: 0
-          persist-credentials: true
-
-      - name: Refuse to roll back the published update channel
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          LATEST_TAG=""
-          LATEST_RESPONSE="${RUNNER_TEMP}/frameguard-latest-release.json"
-          LATEST_STATUS="$(curl --silent --show-error --location \
-            --retry 3 --retry-all-errors \
-            --output "$LATEST_RESPONSE" --write-out '%{http_code}' \
-            --header 'Accept: application/vnd.github+json' \
-            --header "Authorization: Bearer ${GH_TOKEN}" \
-            --header 'X-GitHub-Api-Version: 2022-11-28' \
-            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/latest")"
-          case "$LATEST_STATUS" in
-            200) LATEST_TAG="$(jq -er '.tag_name' "$LATEST_RESPONSE")" ;;
-            404) echo "No published release exists yet; validating an initial channel." ;;
-            *)
-              echo "::error::Could not inspect the latest release (HTTP ${LATEST_STATUS})."
-              cat "$LATEST_RESPONSE" >&2
-              exit 1
-              ;;
-          esac
-          python - "$RELEASE_TAG" "$LATEST_TAG" <<'PY'
-          import json
-          from pathlib import Path
-          import re
-          import sys
-
-          def version(value):
-              match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value or "")
-              if not match:
-                  raise SystemExit(f"Invalid release version in channel state: {value!r}")
-              return tuple(map(int, match.groups()))
-
-          candidate_text, latest_text = sys.argv[1:]
-          candidate = version(candidate_text)
-          current = []
-          if latest_text:
-              current.append(("latest GitHub release", latest_text))
-          for label, path in (
-              ("Windows channel", Path("channel/RELEASES/manifest.json")),
-              ("macOS channel", Path("channel/RELEASES-macos/manifest.json")),
-          ):
-              if path.is_file():
-                  data = json.loads(path.read_text(encoding="utf-8"))
-                  current.append((label, data.get("app_version", "")))
-          for label, value in current:
-              if candidate < version(value):
-                  raise SystemExit(
-                      f"Refusing channel rollback: {candidate_text} is older than "
-                      f"{label} {value}. Publish a new forward version instead."
-                  )
-              print(f"Version order OK: {candidate_text} >= {label} {value}")
-          PY
-
-      - name: Mirror the delta channel (payload first, manifest last)
-        run: |
-          set -euo pipefail
-          # The branch is a machine-generated mirror of this release only.
-          # Payload first and manifest last keeps partial local copies coherent.
-          rm -rf channel/RELEASES/files channel/RELEASES-macos/files
-          cp -a dist/windows-delta/files channel/RELEASES/files
-          cp -a dist/macos-delta/files channel/RELEASES-macos/files
-          cp dist/windows-delta/manifest.json channel/RELEASES/manifest.json
-          cp dist/macos-delta/manifest.json channel/RELEASES-macos/manifest.json
-
-      - name: Commit and push the update channel
-        working-directory: channel
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add RELEASES RELEASES-macos
-          if git diff --cached --quiet; then
-            echo "Delta channel unchanged; nothing to publish."
-            exit 0
-          fi
-
-          git commit -m "Publish FrameGuard ${RELEASE_TAG} delta update"
-          for attempt in 1 2 3; do
-            git fetch --no-tags origin refs/heads/releases:refs/remotes/origin/releases
-            git rebase refs/remotes/origin/releases
-            if git push origin HEAD:refs/heads/releases; then
-              exit 0
-            fi
-            if [[ "$attempt" -eq 3 ]]; then
-              echo "::error::Could not push the releases branch after 3 attempts."
-              exit 1
-            fi
-            sleep $((attempt * 5))
-          done
 
       - name: Publish the verified release
         env:

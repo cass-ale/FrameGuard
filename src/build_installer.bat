@@ -17,6 +17,7 @@ REM Usage:
 REM   build_installer.bat                full clean build
 REM   build_installer.bat --fast         reuse the existing .buildenv
 REM   build_installer.bat --skip-tests   skip the pytest gate (not recommended)
+REM   build_installer.bat --skip-delta   skip optional external-channel payload
 REM ============================================================================
 
 setlocal enabledelayedexpansion
@@ -27,10 +28,12 @@ cd /d "%~dp0"
 
 set "FAST=0"
 set "SKIP_TESTS=0"
+set "SKIP_DELTA=0"
 set "CONSTRAINTS=constraints-3.12.txt"
 for %%A in (%*) do (
     if /i "%%~A"=="--fast" set "FAST=1"
     if /i "%%~A"=="--skip-tests" set "SKIP_TESTS=1"
+    if /i "%%~A"=="--skip-delta" set "SKIP_DELTA=1"
 )
 
 echo.
@@ -268,12 +271,16 @@ REM instead of re-running the full installer for a small fix.
 REM Windows releases go to Output\release-windows, macOS to
 REM Output\release-macos: the payloads overlap by filename, so sharing one
 REM folder lets one platform's publish silently overwrite the other's.
-echo.
-echo       Publishing differential-update release...
-"%PY%" publish_release.py --platform windows --compare-to "Output\release-windows"
-if errorlevel 1 (
-    echo       WARNING: could not publish the release manifest.
-    echo                The installer is still valid.
+if "!SKIP_DELTA!"=="0" (
+    echo.
+    echo       Preparing optional differential-update payload...
+    "%PY%" publish_release.py --platform windows --compare-to "Output\release-windows"
+    if errorlevel 1 (
+        echo       WARNING: could not prepare the optional delta payload.
+        echo                The installer is still valid.
+    )
+) else (
+    echo       Optional differential payload skipped ^(--skip-delta^).
 )
 
 echo.

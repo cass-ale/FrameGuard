@@ -183,11 +183,10 @@ class TestUpdateSources:
 
 
 class TestUpdateChannel:
-    def test_a_default_channel_ships_with_the_app(self):
-        """A fresh install must already point at the project's release
-        location — the repository."""
+    def test_no_default_delta_channel_ships_with_the_app(self):
+        """Public updates use complete, architecture-specific GitHub assets."""
         from frameguard.updater import DEFAULT_UPDATE_CHANNEL
-        assert DEFAULT_UPDATE_CHANNEL.strip()
+        assert DEFAULT_UPDATE_CHANNEL == ""
 
     def test_channel_round_trips(self, qapp, tmp_path):
         from frameguard.updater import get_update_channel, set_update_channel
@@ -199,16 +198,23 @@ class TestUpdateChannel:
         finally:
             set_update_channel(original)
 
-    def test_blank_channel_falls_back_to_the_default(self, qapp):
+    def test_blank_channel_falls_back_to_github_releases(self, qapp):
         from frameguard.updater import (get_update_channel,
                                         get_update_channel_for,
                                         set_update_channel)
         original = get_update_channel()
         try:
             set_update_channel("")
-            assert get_update_channel() == get_update_channel_for(sys.platform)
+            assert get_update_channel() == get_update_channel_for(sys.platform) == ""
         finally:
             set_update_channel(original)
+
+    def test_blank_channel_bypasses_delta_transport(self, qapp, monkeypatch):
+        from frameguard import updater as U
+
+        monkeypatch.setattr(U, "get_update_channel", lambda: "")
+        manager = U.UpdateManager()
+        assert not manager.check_channel_for_delta()
 
     def test_auto_check_interval_is_24_hours(self):
         from frameguard import updater

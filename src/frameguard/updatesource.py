@@ -5,17 +5,16 @@ A release is always the same shape regardless of transport:
     <channel>/manifest.json     SHA-256 of every file in the build
     <channel>/files/...         the full tree
 
-Two transports are supported, behind one interface. The shipped default
-channel is the project's GitHub repository: releases are published to
-its `releases` branch (RELEASES/ for Windows, RELEASES-macos/ for
-macOS) and raw.githubusercontent.com serves that tree path-addressed
-over HTTPS — exactly the shape HttpSource consumes, with nothing for
-the user to install or sign into.
+Two optional transports are supported behind one interface. FrameGuard's
+zero-configuration updater uses full installers from GitHub Releases instead:
+the bundled Windows FFmpeg files exceed GitHub's per-object Git limit and the
+macOS payload is too large for a repository branch. A team can explicitly
+configure one of these transports when it has a suitable payload host.
 
 LocalSource  - any filesystem path: a local test mirror, a UNC share, a
                mapped drive. Costs nothing to operate and needs no server.
-HttpSource   - any host that serves a directory over HTTP(S): the repo's
-               raw content, an internal static host, an artifact store.
+HttpSource   - an internal static host or artifact store that serves a
+               directory-shaped tree over HTTP(S).
 
 NOTE ON GOOGLE DRIVE (the retired channel)
     Drive hosted this channel until it moved to the repository. As an

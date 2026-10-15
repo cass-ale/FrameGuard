@@ -149,6 +149,7 @@ class TestPackaging:
             assert "constraints-3.12.txt" in body
             assert "-c" in body
             assert "pip check" in body
+            assert "--skip-delta" in body
 
     def test_pyside_pin_preserves_the_advertised_macos_floor(self):
         constraints = _read("constraints-3.12.txt")

@@ -419,24 +419,13 @@ class TestMacHardening:
         manifest = m.build_manifest(str(tmp_path))
         assert manifest["arch"] == "arm64"
 
-    def test_mac_channel_is_a_url_built_with_forward_slashes(self):
-        """Channels are repository URLs now. They must be built with "/"
-        joins on every platform — os.path.join would inject backslashes
-        into the URL on Windows, pointing every client at an address
-        that cannot exist. (The pre-repo bug this replaces: the darwin
-        Drive channel concatenated backslashes, invalid on POSIX.)"""
-        import os as _os
-        repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-        src = open(_os.path.join(repo, "frameguard", "updater.py"),
-                   encoding="utf-8").read()
-        assert "_RELEASE_BASE_URL" in src
-        assert 'f"{_RELEASE_BASE_URL}/RELEASES-macos"' in src
+    def test_public_updates_do_not_use_a_git_payload_channel(self):
+        """GitHub rejects the bundled tools as Git objects over 100 MB;
+        public updates must use complete GitHub Release assets instead."""
         from frameguard import updater
-        mac = updater.get_update_channel_for("darwin")
-        assert mac != updater.DEFAULT_UPDATE_CHANNEL
-        assert "macos" in mac.lower()
-        assert mac.startswith("https://")
-        assert "\\" not in mac
+        assert updater.DEFAULT_UPDATE_CHANNEL == ""
+        assert updater.get_update_channel_for("darwin") == ""
+        assert updater.GITHUB_RELEASES_URL.startswith("https://api.github.com/")
 
     def test_updater_restored_last_check_method(self):
         """check_channel_for_delta used to swallow a get_last_check_time def —

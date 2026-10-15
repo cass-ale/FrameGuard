@@ -74,6 +74,9 @@ def test_release_installs_are_constrained_and_jobs_are_bounded():
     assert "PIP_CONSTRAINT: ${{ github.workspace }}/src/constraints-3.12.txt" in RELEASE_WORKFLOW
     assert RELEASE_WORKFLOW.count("--constraint") >= 2
     assert 'cyclonedx-bom==7.5.0' not in RELEASE_WORKFLOW
+    assert RELEASE_WORKFLOW.count("--skip-delta") == 2
+    assert "release-windows\\manifest.json" not in RELEASE_WORKFLOW
+    assert "release-macos/manifest.json" not in RELEASE_WORKFLOW
 
 
 def test_macos_uses_one_deterministic_build_root_and_preserves_failure_logs():
@@ -104,9 +107,14 @@ def test_macos_uses_one_deterministic_build_root_and_preserves_failure_logs():
 def test_publish_reconciles_only_drafts_and_verifies_asset_names_and_sizes():
     publish = _job(RELEASE_WORKFLOW, "publish")
     assert "already published and immutable" in publish
-    assert publish.index("already published and immutable") < publish.index(
-        "actions/attest-build-provenance"
-    )
+    attest = publish.index("actions/attest-build-provenance")
+    assert publish.index("already published and immutable") < attest
+    latest_guard = publish.index("Refuse to supersede a newer published release")
+    assert latest_guard < attest
+    assert "--retry 3 --retry-all-errors" in publish
+    assert '404)' in publish
+    assert "Refusing to mark" in publish
+    assert "already published" in publish
     assert "--verify-tag" in publish
     assert "gh release delete-asset" in publish
     assert "gh release upload \"$RELEASE_TAG\" stage/* --clobber" in publish
@@ -117,28 +125,32 @@ def test_publish_reconciles_only_drafts_and_verifies_asset_names_and_sizes():
     assert "isDraft" in publish
 
 
-def test_channel_is_pushed_before_undraft_with_a_bounded_non_force_retry():
+def test_publish_uses_verified_release_assets_without_a_git_payload_mirror():
     publish = _job(RELEASE_WORKFLOW, "publish")
-    checkout = publish.index("Check out the releases branch")
-    rollback_guard = publish.index("Refuse to roll back the published update channel")
-    mirror = publish.index("Mirror the delta channel")
-    commit = publish.index("git commit -m")
-    push = publish.index("git push origin HEAD:refs/heads/releases")
+    reconcile = publish.index("Create or reconcile the draft release")
+    verify_assets = publish.index("diff -u expected-assets.tsv uploaded-assets.tsv")
     undraft = publish.index('gh release edit "$RELEASE_TAG" --draft=false')
-    assert checkout < rollback_guard < mirror < commit < push < undraft
-    assert 'LATEST_TAG=""' in publish
-    assert 'LATEST_STATUS="$(curl' in publish
-    assert '200) LATEST_TAG="$(jq -er' in publish
-    assert '404) echo "No published release exists yet' in publish
-    assert "Could not inspect the latest release" in publish
-    assert "--retry 3 --retry-all-errors" in publish
-    assert "Refusing channel rollback" in publish
-    assert "latest GitHub release" in publish
-    assert 'data.get("app_version", "")' in publish
-    assert "for attempt in 1 2 3" in publish
-    assert "git fetch --no-tags origin" in publish
-    assert "git rebase refs/remotes/origin/releases" in publish
-    assert "--force" not in publish
+    assert reconcile < verify_assets < undraft
+
+    for required_asset in (
+        "FrameGuardInstaller.exe",
+        "FrameGuard-arm64.dmg",
+        "FrameGuard-intel.dmg",
+        "SHA256SUMS.txt",
+    ):
+        assert required_asset in publish
+
+    for retired_channel_fragment in (
+        "windows-delta",
+        "macos-delta",
+        "update-manifest-windows.json",
+        "update-manifest-macos.json",
+        "refs/heads/releases",
+        "Mirror the delta channel",
+        "Output/release-windows",
+        "Output/release-macos",
+    ):
+        assert retired_channel_fragment not in RELEASE_WORKFLOW
 
 
 def test_publish_keeps_least_privilege_environment_and_release_options():
@@ -166,9 +178,6 @@ def test_publish_keeps_least_privilege_environment_and_release_options():
     assert "security delete-keychain" in mac
     assert "Official macOS releases require the certificate" in mac
     assert "SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}" in mac
-    assert "delta: true" in mac
-    assert "delta: false" in mac
-    assert "if: matrix.delta" in mac
     assert "continue-on-error: true" in mac
     assert "if: matrix.label == 'arm64'" in mac
     assert '|| echo "no windows SBOM"' in publish

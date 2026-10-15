@@ -3100,21 +3100,21 @@ class SettingsPanel(QWidget):
 
         update_layout.addLayout(update_grid)
 
-        # The channel every machine checks on the 24-hour cadence. Editable so
-        # a pre-release can be tested without a new build.
+        # Optional differential channel. Blank deliberately means the normal,
+        # architecture-aware GitHub Releases installer flow.
         channel_row = QHBoxLayout()
         channel_row.setSpacing(D.SPACE_2)
-        channel_label = QLabel("Update channel:")
+        channel_label = QLabel("Optional delta channel:")
         channel_row.addWidget(channel_label)
 
         from frameguard.updater import get_update_channel
         self.channel_edit = QLineEdit(get_update_channel())
         self.channel_edit.setMinimumHeight(D.CONTROL_MD)
         self.channel_edit.setPlaceholderText(
-            r"\\share\FrameGuard\release  or  https://host/frameguard/release")
+            r"Leave blank for GitHub Releases, or enter \\share\FrameGuard\release")
         self.channel_edit.setToolTip(
-            "Folder or URL that FrameGuard checks for new releases.\n"
-            "Checked automatically once every 24 hours.")
+            "Optional filesystem or static-HTTP differential channel.\n"
+            "Leave blank to use complete installers from GitHub Releases.")
         self.channel_edit.editingFinished.connect(self._save_update_channel)
         channel_row.addWidget(self.channel_edit, 1)
         update_layout.addLayout(channel_row)

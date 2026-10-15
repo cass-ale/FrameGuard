@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.6.2
+FrameGuard Desktop v0.6.3
 Video QA for XR Deliverables
 
 
@@ -22,11 +22,15 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.6.2
+WHAT'S NEW IN v0.6.3
 
   Release reliability
-    - First-release publication now handles a repository with no previous
-      GitHub release while preserving monotonic update-channel protection.
+    - Public updates now use complete, architecture-specific GitHub Release
+      installers instead of an oversized Git branch payload mirror.
+    - First-release publication handles a repository with no previous
+      GitHub release without weakening draft or asset verification.
+    - macOS disk-image creation retries transient failures and preserves
+      complete hdiutil diagnostics.
     - macOS disk-image verification now retries transient system failures
       instead of discarding a valid Apple Silicon build.
     - Windows, Apple Silicon, and Intel run the same pinned full test suite
