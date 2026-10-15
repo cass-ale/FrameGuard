@@ -139,7 +139,7 @@ jobs:
           PY
 
       - name: Save the release notes for the publish job
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes
           path: release-notes.md
@@ -214,21 +214,21 @@ jobs:
           Get-Item sbom-windows.cdx.json
 
       - name: Upload the installer
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-installer
           path: src/Output/FrameGuardInstaller.exe
           if-no-files-found: error
 
       - name: Upload the delta-update payload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-delta
           path: src/Output/release-windows/
           if-no-files-found: error
 
       - name: Upload the SBOM
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-sbom
           path: src/sbom-windows.cdx.json
@@ -300,7 +300,7 @@ jobs:
           ls -lh sbom-macos.cdx.json
 
       - name: Upload the DMG
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}-dmg
           path: src/Output/FrameGuard.dmg
@@ -308,7 +308,7 @@ jobs:
 
       - name: Upload the delta-update payload (arm64 only)
         if: matrix.delta
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-delta
           path: src/Output/release-macos/
@@ -316,7 +316,7 @@ jobs:
 
       - name: Upload the SBOM
         if: matrix.label == 'arm64'
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: macos-sbom
           path: src/sbom-macos.cdx.json
