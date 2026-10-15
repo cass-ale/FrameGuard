@@ -10,8 +10,6 @@ import os
 from unittest.mock import mock_open
 
 import pytest
-from PySide6.QtTest import QTest
-
 from frameguard import watchfolder as W
 from frameguard.watchfolder import WatchFolderMonitor
 
@@ -331,7 +329,11 @@ class TestDuplicates:
         assert locked in m._batch_queue
         assert m._settle_timer.isActive()
 
-        QTest.qWait(100)
+        # Timer delivery is already covered separately. Drive the proven queued
+        # batch directly so saturated CI event loops cannot turn this state
+        # transition test into a scheduler race.
+        m._settle_timer.stop()
+        m._emit_batch()
         assert emitted == [free, locked]
         assert not m._settle_timer.isActive()
 

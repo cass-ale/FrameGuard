@@ -384,6 +384,15 @@ class UpdateManager(QObject):
         self._startup_timer = QTimer(self)
         self._startup_timer.setSingleShot(True)
         self._startup_timer.timeout.connect(self._auto_check)
+
+    @staticmethod
+    def _emit(signal, *args) -> bool:
+        """Emit unless the QObject was deleted during background shutdown."""
+        try:
+            signal.emit(*args)
+            return True
+        except RuntimeError:
+            return False
     
     # --- Public API ---
     
@@ -413,7 +422,7 @@ class UpdateManager(QObject):
             if self._checking:
                 return
             self._checking = True
-        self.status_changed.emit("Checking for updates...")
+        self._emit(self.status_changed, "Checking for updates...")
         thread = threading.Thread(target=self._do_check, daemon=True)
         thread.start()
 
@@ -456,7 +465,7 @@ class UpdateManager(QObject):
 
         self._settings.setValue("update/last_check", datetime.now().isoformat())
         self._settings.setValue("update/last_source", channel)
-        self.delta_update_available.emit(channel, remote_version)
+        self._emit(self.delta_update_available, channel, remote_version)
         return True
 
     def get_last_check_time(self) -> str:
@@ -485,7 +494,7 @@ class UpdateManager(QObject):
         if info is None:
             info = self._last_found_update
         if info is None:
-            self.check_failed.emit("No update information available.")
+            self._emit(self.check_failed, "No update information available.")
             return
         
         # Run in background thread
@@ -538,8 +547,8 @@ class UpdateManager(QObject):
                 self._last_found_update = github_info
                 self._settings.setValue("update/last_check", datetime.now().isoformat())
                 self._settings.setValue("update/last_source", "GitHub Releases")
-                self.status_changed.emit(f"Update found: v{github_info.version}")
-                self.update_available.emit(github_info)
+                self._emit(self.status_changed, f"Update found: v{github_info.version}")
+                self._emit(self.update_available, github_info)
                 self._checking = False
                 return
             
@@ -563,18 +572,18 @@ class UpdateManager(QObject):
                     self._last_found_update = info
                     self._settings.setValue("update/last_check", datetime.now().isoformat())
                     self._settings.setValue("update/last_source", path)
-                    self.status_changed.emit(f"Update found: v{info.version}")
-                    self.update_available.emit(info)
+                    self._emit(self.status_changed, f"Update found: v{info.version}")
+                    self._emit(self.update_available, info)
                     self._checking = False
                     return
             
             # No update found
             self._settings.setValue("update/last_check", datetime.now().isoformat())
-            self.status_changed.emit("Up to date")
-            self.update_not_found.emit()
+            self._emit(self.status_changed, "Up to date")
+            self._emit(self.update_not_found)
             
         except Exception as e:
-            self.check_failed.emit(f"Check failed: {str(e)[:100]}")
+            self._emit(self.check_failed, f"Check failed: {str(e)[:100]}")
         finally:
             self._checking = False
     
@@ -608,8 +617,8 @@ class UpdateManager(QObject):
                     out.write(chunk)
                     copied += len(chunk)
                     if total > 0:
-                        self.download_progress.emit(int(copied * 100 / total))
-            self.download_progress.emit(100)
+                        self._emit(self.download_progress, int(copied * 100 / total))
+            self._emit(self.download_progress, 100)
             return dest
         except Exception:
             return ""
@@ -617,18 +626,18 @@ class UpdateManager(QObject):
     def _do_apply(self, info: UpdateInfo):
         """Download/copy installer and launch it (runs in background thread)."""
         try:
-            self.status_changed.emit("Preparing update...")
+            self._emit(self.status_changed, "Preparing update...")
 
             # Determine installer source
             source = info.installer_path
             if source and source.lower().startswith(("http://", "https://")):
-                self.status_changed.emit("Downloading installer...")
+                self._emit(self.status_changed, "Downloading installer...")
                 source = self._download_installer(source)
                 if not source:
-                    self.check_failed.emit("Could not download the installer.")
+                    self._emit(self.check_failed, "Could not download the installer.")
                     return
             if not source or not os.path.isfile(source):
-                self.check_failed.emit(f"Installer not found at: {source}")
+                self._emit(self.check_failed, f"Installer not found at: {source}")
                 return
 
             # Copy to temp directory (avoids file locking issues)
@@ -636,7 +645,7 @@ class UpdateManager(QObject):
             dest = os.path.join(temp_dir, os.path.basename(source))
 
             # Copy with progress
-            self.status_changed.emit("Copying installer...")
+            self._emit(self.status_changed, "Copying installer...")
             total_size = os.path.getsize(source)
             copied = 0
             chunk_size = 256 * 1024  # 256KB chunks
@@ -649,23 +658,23 @@ class UpdateManager(QObject):
                     dst.write(chunk)
                     copied += len(chunk)
                     pct = int(copied * 100 / total_size) if total_size > 0 else 100
-                    self.download_progress.emit(pct)
+                    self._emit(self.download_progress, pct)
 
-            self.download_progress.emit(100)
-            self.download_complete.emit(dest)
+            self._emit(self.download_progress, 100)
+            self._emit(self.download_complete, dest)
 
             if sys.platform == "darwin":
                 # A running .app cannot replace itself, and there is no silent
                 # installer. Reveal the disk image and let the user drag the new
                 # build into /Applications, which is the standard Mac flow.
-                self.status_changed.emit("Opening the update...")
+                self._emit(self.status_changed, "Opening the update...")
                 subprocess.Popen(["/usr/bin/open", dest])
                 # Deliberately do NOT quit: the user needs FrameGuard closed
                 # only at the moment they replace it, and the Finder copy
                 # prompt makes that obvious.
                 return
 
-            self.status_changed.emit("Launching installer...")
+            self._emit(self.status_changed, "Launching installer...")
             # Inno Setup silent mode: /SILENT shows progress but no prompts.
             subprocess.Popen(
                 [dest, "/SILENT", "/RESTARTAPPLICATIONS"],
@@ -674,7 +683,7 @@ class UpdateManager(QObject):
 
             # Give installer a moment to start, then close the app
             time.sleep(1)
-            self.status_changed.emit("Restarting...")
+            self._emit(self.status_changed, "Restarting...")
 
             # Qt objects must only be touched from the GUI thread; _do_apply
             # runs on a worker thread, so marshal the quit through the event
@@ -685,7 +694,7 @@ class UpdateManager(QObject):
                 QTimer.singleShot(0, app.quit)
 
         except Exception as e:
-            self.check_failed.emit(f"Update failed: {str(e)[:200]}")
+            self._emit(self.check_failed, f"Update failed: {str(e)[:200]}")
 
 
 # ---------------------------------------------------------------------------

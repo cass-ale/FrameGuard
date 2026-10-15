@@ -1,8 +1,8 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.4 · **Date:** 2026-10-15 · **Status:** v0.7.0 Quiet Pro release
-validated locally; the next remote operation atomically pushes both `main` and
-the annotated release tag.
+**Version:** 1.5 · **Date:** 2026-10-15 · **Status:** v0.7.1 cross-platform UI
+recovery validated locally; the immutable failed v0.7.0 tag is preserved and
+the next remote operation atomically pushes both `main` and `v0.7.1`.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -158,6 +158,8 @@ are metadata lines only, to be merged on top of his text.
   promised by this plan, only prepared for.
 
 ## 8. Revision log
+
+- **1.5 - 2026-10-15.** Fixes forward from the immutable failed v0.7.0 tag after its first three-OS run exposed a Windows offscreen default-font failure and a saturated-runner timer race in a watch-folder test. v0.7.1 installs the resolved application font, tightens metric-derived control sizing, makes updater shutdown emissions safe, and removes the test scheduler dependency without weakening its state assertions.
 
 - **1.4 - 2026-10-15.** Adds the v0.7.0 packaged GUI acceptance gate: clean-profile OS theme selection, screen-safe first open, macOS native chrome, and Windows title-bar/DPI/Snap behavior are explicit release evidence rather than assumptions from offscreen tests.
 

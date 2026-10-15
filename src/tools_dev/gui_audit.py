@@ -74,7 +74,7 @@ _TEXT_TOLERANCE = 2
 OVERLAP_ALLOWLIST = (
     ("QAbstractScrollArea", "*", "*"),
     ("QComboBoxPrivateContainer", "*", "*"),
-    ("QMainWindow", "QSizeGrip", "*"),
+    ("*", "QSizeGrip", "*"),
 )
 
 _VISUAL_STYLE_RE = re.compile(

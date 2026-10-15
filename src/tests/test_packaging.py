@@ -251,6 +251,16 @@ class TestUpdaterApi:
                   "get_update_source", "set_update_source"):
             assert callable(getattr(UpdateManager, m, None)), m
 
+    def test_deleted_qobject_signal_is_safe_during_background_shutdown(self):
+        from frameguard.updater import UpdateManager
+
+        class _DeletedSignal:
+            @staticmethod
+            def emit(*_args):
+                raise RuntimeError("Signal source has been deleted")
+
+        assert UpdateManager._emit(_DeletedSignal(), "status") is False
+
 
 class TestWatchFolderApi:
     def test_paused_monitor_is_still_active(self):

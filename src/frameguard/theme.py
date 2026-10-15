@@ -369,7 +369,7 @@ QLabel[fgRole="metric"] { color: %%text_primary%%; font-size: 20pt; font-weight:
 QLabel[fgRole="status"] { color: %%text_secondary%%; font-size: 10pt; font-weight: 600; }
 QLabel[class="hint"], QLabel[class="field-label"], #version_label { color: %%text_tertiary%%; font-size: 9pt; }
 QLabel[class="field-label"] { font-weight: 600; }
-#logo_label { color: %%text_primary%%; font-size: 13pt; font-weight: 700; }
+#logo_label { color: %%text_primary%%; font-size: 12pt; font-weight: 700; }
 #logo_area { background-color: %%bg_tertiary%%; border-bottom: 1px solid %%border%%; }
 
 /* Complete fallback: an unclassified button never leaks native styling. */
@@ -420,6 +420,7 @@ QPushButton[fgRole="destructive"]:hover { background-color: %%destructive_hover%
 QPushButton[fgRole="destructive"]:pressed, QPushButton[fgRole="destructive"]:checked { background-color: %%destructive_pressed%%; border-color: %%destructive_pressed%%; }
 QPushButton[fgRole="destructive"]:focus, QPushButton[fgRole="destructive"]:default { border: 2px solid %%focus%%; }
 QPushButton[fgRole="destructive"]:disabled { background-color: %%disabled_bg%%; color: %%disabled_text%%; border-color: %%border%%; }
+QPushButton#title_btn_close { min-width: 24px; min-height: 24px; padding: 4px; }
 
 QPushButton[fgRole="toolbar"] { background: transparent; border-color: transparent; color: %%text_secondary%%; padding: 4px 10px; }
 QPushButton[fgRole="toolbar"]:hover { background-color: %%surface_hover%%; color: %%text_primary%%; }

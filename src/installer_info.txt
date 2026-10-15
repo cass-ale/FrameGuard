@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.7.0
+FrameGuard Desktop v0.7.1
 Video QA for XR Deliverables
 
 
@@ -22,10 +22,17 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.7.0
+WHAT'S NEW IN v0.7.1
 
-  Quiet Pro interface
-    - Every application-owned control and state is intentionally styled across
+  Cross-platform UI release
+    - The resolved application font is now installed before controls are built,
+      preventing unusable fallback glyphs and mismatched text metrics on clean
+      Windows profiles and headless validation systems.
+    - Windows caption controls, Results summary metrics and Checks headings now
+      reserve space from their realized font metrics.
+    - A shutdown-time update check can no longer emit through a deleted Qt
+      signal source.
+    - Every application-owned control
       all 15 themes, including disabled, focused, selected and error states.
     - First launch follows the operating system appearance and opens with
       screen-safe geometry without creating an output folder prematurely.

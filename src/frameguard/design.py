@@ -73,7 +73,7 @@ _MONO_FONT_FAMILY = None
 
 UI_FONT_CANDIDATES = {
     "win32": (
-        "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI",
+        "Segoe UI", "Segoe UI Variable Text", "Segoe UI Variable",
         "Selawik", "Tahoma",
     ),
     "darwin": ("SF Pro Text", "Helvetica Neue", "Helvetica"),
@@ -107,11 +107,11 @@ def font_css(size: int, weight: int = WEIGHT_NORMAL) -> str:
 
 
 def _resolve_family(candidates, fallback_generic):
-    from PySide6.QtGui import QFont, QFontDatabase, QFontInfo
+    from PySide6.QtGui import QFontDatabase
 
     available = set(QFontDatabase.families())
     for name in candidates:
-        if name in available or QFontInfo(QFont(name)).family() == name:
+        if name in available:
             return name
     return QFontDatabase.systemFont(fallback_generic).family()
 

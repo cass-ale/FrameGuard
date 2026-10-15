@@ -289,6 +289,16 @@ class TestFonts:
         for key in ("win32", "darwin", "default"):
             assert _UI_FONT_CANDIDATES.get(key), f"no UI font chain for {key}"
 
+    def test_application_appearance_installs_the_resolved_ui_font(self, qapp):
+        from PySide6.QtGui import QFontInfo
+        from frameguard import design as D
+        from frameguard.gui import _apply_application_palette
+        from frameguard.theme import get_theme
+
+        _apply_application_palette(get_theme("Clean Light"), qapp)
+        assert QFontInfo(qapp.font()).family() == QFontInfo(D.ui_font()).family()
+        assert qapp.font().pointSize() == D.FONT_BODY
+
 
 class TestSidebar:
     """The sidebar had a 0px left / 8px right inset, so nav rows touched one
@@ -488,6 +498,17 @@ class TestSemanticThemeContract:
             for state in states:
                 selector = f'QPushButton[fgRole="{role}"]:{state}'
                 assert selector in css, f"missing state selector: {selector}"
+
+    def test_stylesheet_has_no_accidental_bare_selector_lines(self):
+        from frameguard.theme import generate_stylesheet
+
+        bare = []
+        for line in generate_stylesheet().splitlines():
+            stripped = line.strip()
+            if (stripped.startswith(("Q", "#", "*")) and "{" not in stripped
+                    and not stripped.endswith(",")):
+                bare.append(stripped)
+        assert not bare, f"selectors without declaration blocks: {bare}"
 
     def test_stylesheet_uses_supported_point_sized_typography(self):
         import re

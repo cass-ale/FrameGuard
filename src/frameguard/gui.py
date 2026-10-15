@@ -157,6 +157,10 @@ def _apply_application_palette(theme: ThemeColors, app=None):
     app = app or QApplication.instance()
     if app is None:
         return
+    # Offscreen Windows and some clean profiles expose an unusable Qt default
+    # family. Install the same resolved font used by metric-driven controls so
+    # inherited labels/buttons render and measure identically.
+    app.setFont(D.ui_font(D.FONT_BODY))
     palette = QPalette(app.palette())
     pairs = {
         QPalette.Window: theme.bg_primary,
@@ -756,7 +760,7 @@ class TitleBar(QWidget):
         layout.addStretch()
 
         # Window control buttons
-        btn_size = QSize(40, 28)
+        btn_size = QSize(44, D.TITLEBAR_H)
 
         self._btn_minimize = QPushButton("\u2013")  # en-dash
         self._btn_minimize.setObjectName("title_btn")
@@ -2125,6 +2129,8 @@ class ResultsPanel(QWidget):
         count_lbl = QLabel(count)
         count_lbl.setObjectName(f"badge_count_{key}")
         count_lbl.setFont(metric_font)
+        count_lbl.setMinimumHeight(
+            D.label_height(metric_font, vertical_padding=D.SPACE_1))
         count_lbl.setProperty("fgInlineStyleAllowed", True)
         _set_role(count_lbl, "metric")
         count_lbl.setStyleSheet(
@@ -3815,6 +3821,9 @@ class ChecksPanel(QWidget):
 
         header_row = QHBoxLayout()
         self._header = QLabel("Checks")
+        heading_font = D.ui_font(D.FONT_TITLE, D.WEIGHT_SEMIBOLD)
+        self._header.setFont(heading_font)
+        self._header.setMinimumHeight(D.label_height(heading_font))
         _set_role(self._header, "heading")
         header_row.addWidget(self._header)
         header_row.addStretch()
