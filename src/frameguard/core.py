@@ -1255,8 +1255,16 @@ def _pair_detect_events(stderr_text: str, prefix: str) -> list:
     start bound to its own end, and reconstructs a missing duration from the
     end timestamp when one is available.
     """
+    # No leading \\b: FFmpeg logs from several filter threads share one
+    # stderr pipe, and lines can interleave mid-line under threaded
+    # filtering — a detect token glued onto the tail of an ebur128 line
+    # ("...LRA:   4.8 LU" + "black_start:10 ...") has no word boundary
+    # before it. Requiring one silently dropped real events (~3 in 8
+    # identical scans of the same clip), reporting a clean PASS for a
+    # file that was never clean. The tokens are distinctive enough to
+    # match unanchored.
     token_re = re.compile(
-        rf"\b{prefix}_(start|end|duration)\s*[:=]\s*(-?\d+(?:\.\d+)?)"
+        rf"{prefix}_(start|end|duration)\s*[:=]\s*(-?\d+(?:\.\d+)?)"
     )
 
     events = []
@@ -1289,7 +1297,7 @@ def _pair_detect_events(stderr_text: str, prefix: str) -> list:
 # ("black_duration", "silence_duration") are intervals, not points on the
 # timeline, so they must NOT be shifted.
 _EVENT_TIME_RE = re.compile(
-    r"\b(black_start|black_end|freeze_start|freeze_end|silence_start|silence_end)"
+    r"(black_start|black_end|freeze_start|freeze_end|silence_start|silence_end)"
     r"(\s*[:=]\s*)(\d+(?:\.\d+)?)"
 )
 
