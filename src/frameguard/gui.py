@@ -4421,7 +4421,11 @@ class MainWindow(QMainWindow):
         # The ffmpeg -version probe spawns two subprocesses; on a slow or
         # hung tool install that blocked first paint entirely. Defer it so
         # the window shows immediately and the warning lands afterwards.
-        QTimer.singleShot(500, lambda: QApplication.platformName() != "offscreen" and self._check_ffmpeg())
+        if os.environ.get("FRAMEGUARD_TEST_MODE") != "1":
+            QTimer.singleShot(
+                500,
+                lambda: QApplication.platformName() != "offscreen" and self._check_ffmpeg(),
+            )
 
         # Restore the persisted scan configuration before the theme cascade so
         # the preset dropdown resolves against the values actually in effect.

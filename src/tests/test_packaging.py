@@ -151,6 +151,13 @@ class TestPackaging:
             assert "pip check" in body
             assert "--skip-delta" in body
 
+    def test_windows_builder_uses_native_qt_with_a_glyph_preflight(self):
+        body = _read("build_installer.bat")
+        assert 'set "QT_QPA_PLATFORM=windows"' in body
+        assert 'set "FRAMEGUARD_TEST_MODE=1"' in body
+        assert "QFontMetrics(font).inFont('A')" in body
+        assert 'set "FRAMEGUARD_TEST_MODE="' in body
+
     def test_pyside_pin_preserves_the_advertised_macos_floor(self):
         constraints = _read("constraints-3.12.txt")
         spec = _read("frameguard.spec")

@@ -152,7 +152,13 @@ echo [5/9] Running the test suite...
 if "!SKIP_TESTS!"=="1" (
     echo       SKIPPED ^(--skip-tests^)
 ) else (
-    set "QT_QPA_PLATFORM=offscreen"
+    set "QT_QPA_PLATFORM=windows"
+    set "FRAMEGUARD_TEST_MODE=1"
+    "%PY%" -c "from PySide6.QtWidgets import QApplication; from PySide6.QtGui import QFontMetrics; from frameguard import design as D; app=QApplication([]); font=D.ui_font(); print('Qt platform=' + app.platformName() + ' font=' + font.family()); assert QFontMetrics(font).inFont('A')"
+    if errorlevel 1 (
+        echo ERROR: Native Windows Qt cannot rasterize the UI font.
+        exit /b 1
+    )
     "%PY%" -m pytest
     if errorlevel 1 (
         echo.
@@ -161,6 +167,7 @@ if "!SKIP_TESTS!"=="1" (
         exit /b 1
     )
     set "QT_QPA_PLATFORM="
+    set "FRAMEGUARD_TEST_MODE="
 )
 
 REM --- Step 6: Build with PyInstaller ---

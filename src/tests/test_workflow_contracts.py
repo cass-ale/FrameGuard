@@ -51,7 +51,9 @@ def test_push_and_pull_requests_run_the_full_supported_runner_matrix():
     assert "python-version-file: src/.python-version" in TESTS_WORKFLOW
     assert "src/constraints-3.12.txt" in TESTS_WORKFLOW
     assert "--constraint constraints-3.12.txt" in TESTS_WORKFLOW
-    assert "QT_QPA_PLATFORM: offscreen" in TESTS_WORKFLOW
+    assert "QT_QPA_PLATFORM: ${{ startsWith(matrix.runner, 'windows') && 'windows' || 'offscreen' }}" in TESTS_WORKFLOW
+    assert 'FRAMEGUARD_TEST_MODE: "1"' in TESTS_WORKFLOW
+    assert "QFontMetrics(font).inFont('A')" in TESTS_WORKFLOW
     assert "python -m pytest --verbose" in TESTS_WORKFLOW
 
 
@@ -78,7 +80,9 @@ def test_visual_evidence_uses_fresh_dpi_processes_and_preserves_failures():
     # multiplying the three supported OS runners in the Actions matrix.
     strategy = test_job.split("    runs-on:", 1)[0]
     assert "scale:" not in strategy
-    assert "timeout-minutes: 30" in test_job
+    # Intel macOS takes roughly an hour for the complete Qt suite; 30 minutes
+    # cancelled a healthy run at 53%.
+    assert "timeout-minutes: 90" in test_job
 
 
 def test_release_checks_out_only_the_requested_tag_ref():

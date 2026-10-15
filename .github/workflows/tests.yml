@@ -20,10 +20,11 @@ jobs:
           - macos-15
           - macos-15-intel
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    timeout-minutes: 90
     env:
       PIP_CONSTRAINT: ${{ github.workspace }}/src/constraints-3.12.txt
-      QT_QPA_PLATFORM: offscreen
+      QT_QPA_PLATFORM: ${{ startsWith(matrix.runner, 'windows') && 'windows' || 'offscreen' }}
+      FRAMEGUARD_TEST_MODE: "1"
       FRAMEGUARD_VISUAL_ARTIFACTS: visual-test-artifacts
     defaults:
       run:
@@ -41,6 +42,16 @@ jobs:
 
       - name: Install constrained dependencies
         run: python -m pip install --constraint constraints-3.12.txt --requirement requirements-dev.txt
+
+      - name: Verify Qt can rasterize text on this runner
+        run: >-
+          python -c "from PySide6.QtWidgets import QApplication;
+          from PySide6.QtGui import QFontMetrics;
+          from frameguard import design as D;
+          app = QApplication([]);
+          font = D.ui_font();
+          print(f'Qt platform={app.platformName()} font={font.family()}');
+          assert QFontMetrics(font).inFont('A')"
 
       - name: Run the full test suite
         run: python -m pytest --verbose
