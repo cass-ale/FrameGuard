@@ -73,40 +73,52 @@ class TestDeviceFailureSignatures:
 
 class TestHwaccelSelection:
     def _with_caps(self, methods, probe_results):
-        """Patch capability detection + probing for one selection call."""
+        """Patch capability detection + probing for one selection call.
+
+        get_ffmpeg_path is patched to a dummy path as well: selection only
+        consults the probe when it can resolve an ffmpeg binary, so on a
+        clean machine with no ffmpeg installed (the Windows CI runner) the
+        mocked probe was silently bypassed and the compile-time list was
+        trusted — the exact failure these tests exist to pin. Patching the
+        path makes the tests hermetic in both environments.
+        """
         caps = mock.patch.object(
             core, "detect_ffmpeg_capabilities",
             return_value={"hwaccel_methods": methods})
         probe = mock.patch.object(
             core, "_probe_hwaccel",
             side_effect=lambda path, method, sample: probe_results[method])
-        return caps, probe
+        path = mock.patch.object(
+            core, "get_ffmpeg_path", return_value="/fake/ffmpeg")
+        return caps, probe, path
 
     def test_compiled_but_deviceless_method_is_skipped(self):
         """cuda is compiled in but the probe decode fails -> next method."""
-        caps, probe = self._with_caps(
+        caps, probe, path = self._with_caps(
             ["cuda", "vaapi"], {"cuda": False, "vaapi": True})
-        with caps, probe:
+        with caps, probe, path:
             args = _get_optimal_hwaccel(_cfg(), probe_file="clip.mp4")
         assert args == ["-hwaccel", "vaapi"]
 
     def test_all_methods_failing_falls_back_to_software(self):
         """Every candidate fails its probe -> no hwaccel args at all."""
-        caps, probe = self._with_caps(
+        caps, probe, path = self._with_caps(
             ["cuda", "vaapi"], {"cuda": False, "vaapi": False, "auto": False})
-        with caps, probe:
+        with caps, probe, path:
             args = _get_optimal_hwaccel(_cfg(), probe_file="clip.mp4")
         assert args == []
 
     def test_known_failed_method_is_never_reoffered(self):
         core._hwaccel_failed_methods.add("cuda")
-        caps, probe = self._with_caps(["cuda", "vaapi"], {"vaapi": True})
-        with caps, probe:
+        caps, probe, path = self._with_caps(["cuda", "vaapi"], {"vaapi": True})
+        with caps, probe, path:
             args = _get_optimal_hwaccel(_cfg(), probe_file="clip.mp4")
         assert args == ["-hwaccel", "vaapi"]
 
     def test_explicit_method_that_cannot_decode_falls_back_to_software(self):
-        with mock.patch.object(core, "_probe_hwaccel", return_value=False):
+        with mock.patch.object(core, "get_ffmpeg_path",
+                               return_value="/fake/ffmpeg"), \
+             mock.patch.object(core, "_probe_hwaccel", return_value=False):
             args = _get_optimal_hwaccel(
                 _cfg(hwaccel_method="cuda"), probe_file="clip.mp4")
         assert args == []

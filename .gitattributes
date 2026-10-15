@@ -1,2 +1,8 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts must keep LF endings on every checkout. text=auto alone
+# lets a Windows checkout (Git for Windows defaults core.autocrlf=true)
+# convert them to CRLF, which breaks the shebang on macOS/Linux — and
+# fails the line-ending tests on Windows CI.
+*.sh text eol=lf
