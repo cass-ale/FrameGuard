@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.5.6
+FrameGuard Desktop v0.6.0
 Video QA for XR Deliverables
 
 
@@ -22,7 +22,7 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.5.6
+WHAT'S NEW IN v0.6.0
 
   Release pipeline repair
     - The macOS build could not finish: the FFmpeg and FFprobe downloads
@@ -30,9 +30,16 @@ WHAT'S NEW IN v0.5.6
       The tools are now downloaded per architecture (Apple Silicon and
       Intel separately), pinned to a specific build, and verified against
       the publisher's SHA-256 checksums before they are bundled.
+    - MediaInfo silently went missing from macOS builds: unpacking its
+      installer package failed without a trace. It is now unpacked
+      reliably, and failures are reported instead of swallowed.
     - Both builders now stop immediately, with the real cause, when a
       required tool or a test fails, instead of warning and failing later
       with an unrelated message.
+    - The Windows test gate could stall forever on a startup dialog that
+      automated runs could never dismiss. The check no longer opens
+      dialogs when the app runs without a display, and every test now
+      has a time limit.
     - App identity moved to the publisher's own: the macOS bundle ID is
       now com.caprilaria.frameguard, and the organization domain is
       caprilaria.com. On macOS, preferences and preset-file ownership
