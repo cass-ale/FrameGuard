@@ -126,6 +126,12 @@ def test_channel_is_pushed_before_undraft_with_a_bounded_non_force_retry():
     push = publish.index("git push origin HEAD:refs/heads/releases")
     undraft = publish.index('gh release edit "$RELEASE_TAG" --draft=false')
     assert checkout < rollback_guard < mirror < commit < push < undraft
+    assert 'LATEST_TAG=""' in publish
+    assert 'LATEST_STATUS="$(curl' in publish
+    assert '200) LATEST_TAG="$(jq -er' in publish
+    assert '404) echo "No published release exists yet' in publish
+    assert "Could not inspect the latest release" in publish
+    assert "--retry 3 --retry-all-errors" in publish
     assert "Refusing channel rollback" in publish
     assert "latest GitHub release" in publish
     assert 'data.get("app_version", "")' in publish

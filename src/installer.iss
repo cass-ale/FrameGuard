@@ -12,7 +12,7 @@
 [Setup]
 AppId={{B7E2F4A1-9C3D-4E5F-8A1B-6D7C8E9F0A2B}
 AppName=FrameGuard Desktop
-AppVersion=0.6.1
+AppVersion=0.6.2
 AppVerName=FrameGuard Desktop v{#SetupSetting("AppVersion")}
 AppPublisher=Capri la Ria
 AppPublisherURL=https://caprilaria.com

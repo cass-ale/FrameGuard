@@ -1,8 +1,8 @@
 # FrameGuard — Release Plan (audited)
 
-**Version:** 1.2 · **Date:** 2026-10-15 · **Status:** v0.6.1 hardening
-implemented locally; push CI and tag release validation are required before
-publication.
+**Version:** 1.2 · **Date:** 2026-10-15 · **Status:** v0.6.2 fix-forward
+hardening implemented locally; push CI and tag release validation are required
+before publication.
 **Publisher:** Capri la Ria · **Developer / copyright holder:** Cassian Aléria
 **Research basis:** `frameguard-github-release-best-practices` deep-research
 report, 2026-10-14 (sources cited there; headline claims re-verified live
@@ -154,7 +154,7 @@ are metadata lines only, to be merged on top of his text.
 
 ## 8. Revision log
 
-- **1.2 — 2026-10-15.** Adds constrained cross-platform push CI, a macOS-12-compatible Qt pin, bounded DMG verification, complete nested-code signing, temporary CI keychain provisioning, Node 24 action pins, overwrite-safe workflow artifacts, monotonic delta channels, rerun-safe drafts, channel-before-undraft ordering, and the green-commit-before-tag rule for v0.6.1.
+- **1.2 — 2026-10-15.** Adds constrained cross-platform push CI, a macOS-12-compatible Qt pin, bounded DMG verification, complete nested-code signing, temporary CI keychain provisioning, Node 24 action pins, overwrite-safe workflow artifacts, first-release-aware monotonic delta channels, rerun-safe drafts, channel-before-undraft ordering, and the green-commit-before-tag rule. v0.6.2 fixes forward from the immutable unpublished v0.6.1 tag.
 - **1.1 — 2026-10-14.** Credit model corrected to the one Cassian applied
   himself in commits `35dd479`–`df35054`: developer and copyright holder is
   **Cassian Aléria** (legal name, accent included) across the installer, the
