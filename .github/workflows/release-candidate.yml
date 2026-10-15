@@ -30,7 +30,7 @@ jobs:
       candidate_sha: ${{ steps.sha.outputs.candidate_sha }}
     steps:
       - name: Check out the workflow commit
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
@@ -91,7 +91,7 @@ jobs:
           } | ConvertTo-Json | Set-Content (Join-Path $evidence "job-started.json") -Encoding utf8
 
       - name: Check out the verified candidate SHA
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-candidate.outputs.candidate_sha }}
           persist-credentials: false
@@ -204,7 +204,7 @@ jobs:
       FRAMEGUARD_TARGET_ARCH: ${{ matrix.target_arch }}
     steps:
       - name: Check out the verified candidate SHA
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.verify-candidate.outputs.candidate_sha }}
           persist-credentials: false
