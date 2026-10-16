@@ -10,6 +10,14 @@ FrameGuard validates video files against configurable delivery specifications, r
 automated checks across metadata, codec compliance, audio integrity, and deep signal
 analysis. All processing happens locally — no data leaves your machine.
 
+## Demo
+
+<video src="assets/frameguard-demo.mp4" controls width="100%"></video>
+
+A 30-second look at a quick scan: 24 captures checked against the 4K UHD @ 30 fps profile, with every mismatch explained per file in the results panel.
+
+[Watch the demo video](assets/frameguard-demo.mp4)
+
 ## Download
 
 Get the latest version from the
