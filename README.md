@@ -12,11 +12,11 @@ analysis. All processing happens locally — no data leaves your machine.
 
 ## Demo
 
-<video src="assets/frameguard-demo.mp4" controls width="100%"></video>
+![FrameGuard demo](assets/frameguard-demo.gif)
 
 A 30-second look at a quick scan: 24 captures checked against the 4K UHD @ 30 fps profile, with every mismatch explained per file in the results panel.
 
-[Watch the demo video](assets/frameguard-demo.mp4)
+[Watch the demo video (MP4)](assets/frameguard-demo.mp4)
 
 ## Download
 
