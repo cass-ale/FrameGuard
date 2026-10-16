@@ -4,6 +4,8 @@
 
 **Published by Capri la Ria · Developed by Cassian Aléria**
 
+[![Tests](https://github.com/cass-ale/FrameGuard/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/cass-ale/FrameGuard/actions/workflows/tests.yml)
+
 FrameGuard validates video files against configurable delivery specifications, running
 automated checks across metadata, codec compliance, audio integrity, and deep signal
 analysis. All processing happens locally — no data leaves your machine.
