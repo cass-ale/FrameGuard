@@ -689,8 +689,19 @@ class TestSidebarChrome:
         assert laid_out_window.nav_buttons
         assert laid_out_window.nav_buttons[0].x() > 0
 
-    def test_bottom_logo_is_centred(self, window):
-        assert window._sidebar_logo_label.alignment() & Qt.AlignHCenter
+    def test_mark_and_version_appear_once(self, window):
+        """v0.8.0 repeated the logo and version at the bottom of the sidebar,
+        directly under the identical header block."""
+        from PySide6.QtWidgets import QLabel
+        from frameguard import __version__
+
+        labels = window._sidebar.findChildren(QLabel)
+        versions = [label for label in labels if label.text() == f"v{__version__}"]
+        logos = [label for label in labels
+                 if label.pixmap() is not None and not label.pixmap().isNull()]
+        assert len(versions) == 1, [label.text() for label in labels]
+        assert len(logos) <= 1
+        assert window._sidebar_logo_label is None
 
 
 class TestScanPageIcons:

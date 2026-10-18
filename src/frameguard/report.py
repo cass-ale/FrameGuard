@@ -273,9 +273,22 @@ def _safe_text(text: str) -> str:
         "\u2122": "(TM)", # trademark
     }
     
+    # macOS hands over filenames in decomposed (NFD) form, so "é" arrived as
+    # "e" + U+0301 and printed as "e?" in reports. Compose first; then
+    # transliterate whatever Latin-1 still cannot hold to its base letters
+    # (e.g. "ő" -> "o") before falling back to "?".
+    import unicodedata
+    text = unicodedata.normalize("NFC", text)
     for char, replacement in replacements.items():
         text = text.replace(char, replacement)
-    
+    if any(ord(ch) > 0xFF for ch in text):
+        text = "".join(
+            ch if ord(ch) <= 0xFF else (
+                "".join(c for c in unicodedata.normalize("NFKD", ch)
+                        if not unicodedata.combining(c) and ord(c) <= 0xFF)
+                or "?")
+            for ch in text)
+
     # Final safety: encode to latin-1, replacing any remaining unknowns
     try:
         text = text.encode("latin-1", errors="replace").decode("latin-1")

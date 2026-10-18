@@ -10,6 +10,30 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.1] — Seamless interface, working updates and crash fixes
+
+### Fixed
+- Deep scans no longer fuse separate silences or freezes into one long false event or drop black-frame events after the second, which could mark clean files as failed. Every detection now reaches the verdict.
+- An entirely black file, or one that opens or ends on a long stretch of black, is now reported instead of passing; short fades are still ignored.
+- A silence that starts at a segment boundary no longer produces a fabricated multi-minute silence.
+- File names and tags containing words such as "corrupt" no longer fail Decode Integrity.
+- Matroska and WebM files no longer carry spurious A/V Duration and Frame Count warnings, an unreadable frame rate is a low-confidence warning instead of a 0 fps failure, and files without audio pass when audio is not required.
+- Preset values are type-checked: values that could alter FFmpeg filter graphs are rejected, and codec and container lists are case-insensitive.
+- Batches larger than 2,000 files now check every file.
+- macOS: clicking the menu-bar icon, using its menu, and quitting no longer crash FrameGuard.
+- The startup splash appears sooner, keeps moving while the window is built, and fades only after the window is on screen.
+- macOS update checks now trust the system keychain, so FrameGuard can reach GitHub Releases; a check that cannot connect says so instead of reporting "Up to date".
+- In-app updates show download progress and errors, close FrameGuard so the installer can replace it, and reopen FrameGuard on Windows.
+
+### Improved
+- The sidebar is one continuous surface with a full-height divider, a single logo and version, aligned rows and a vector collapse control.
+- The macOS title bar now takes the current theme's colour and light or dark appearance, and follows theme changes.
+- Real chevrons, ticks and radio dots in every theme; checked boxes and radios no longer grow; tighter, aligned spacing on Scan, Results, Checks and Settings; the Results header no longer floods with colour when a row is selected, and its checkbox header selects or clears all files.
+- Update checks repeat hourly for long-running sessions, and downloaded installers from earlier updates are cleaned up.
+
+### Changed
+- Updates still come from the exact architecture-specific GitHub Release assets and published SHA-256 evidence. On macOS, v0.8.0 cannot verify GitHub's certificate, so install this release from the Releases page once; in-app updates work from v0.8.1 onward.
+
 ## [0.8.0] — 2026-10-15 — Shipped-path reliability
 
 ### Fixed

@@ -16,6 +16,7 @@ from frameguard.core import (
 )
 
 
+
 class ScanWorker(QObject):
     """Background worker that runs QA checks and emits progress signals."""
 
@@ -248,14 +249,13 @@ class ScanWorker(QObject):
                     cancelled = True
                     break
 
+                # Every result is kept. v0.8.0 stopped the batch at 2000 files
+                # and reported it finished, so later files were never checked;
+                # merely not retaining them would still drop their failures
+                # from the completion counts, the tray summary and the
+                # auto-exported PDF, which all read this list.
                 results.append(result)
                 self.file_finished.emit(idx, result)
-                # Bound per-scan memory: the GUI caps rendering at
-                # MAX_RETAINED_RESULTS, but the worker list itself used to
-                # grow without bound on very large batches.
-                if len(results) >= 2000:
-                    result.set_metadata("batch_truncated", True)
-                    break
 
             if cancelled:
                 # Exactly ONE terminal signal. Emitting both scan_finished and

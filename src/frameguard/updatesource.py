@@ -34,6 +34,12 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
+
+def _https_context():
+    """Trust what the OS trusts (see frameguard.updater.https_context)."""
+    from frameguard.updater import https_context
+    return https_context(include_admin=True)
+
 from frameguard import manifest as M
 
 _TIMEOUT = 30
@@ -112,7 +118,8 @@ class HttpSource(BaseSource):
     def read_manifest(self) -> dict:
         url = f"{self.base_url}/{M.MANIFEST_FILENAME}"
         try:
-            with urllib.request.urlopen(self._request(url), timeout=_TIMEOUT) as r:
+            with urllib.request.urlopen(self._request(url), timeout=_TIMEOUT,
+                                        context=_https_context()) as r:
                 data = json.loads(r.read().decode("utf-8"))
         except (urllib.error.URLError, OSError) as e:
             raise UpdateSourceError(f"Could not reach the update channel:\n{url}\n{e}")
@@ -136,7 +143,8 @@ class HttpSource(BaseSource):
         url = f"{self.base_url}/{M.PAYLOAD_DIRNAME}/{quoted}"
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         try:
-            with urllib.request.urlopen(self._request(url), timeout=_TIMEOUT) as r, \
+            with urllib.request.urlopen(self._request(url), timeout=_TIMEOUT,
+                                        context=_https_context()) as r, \
                     open(dest_path, "wb") as f:
                 shutil.copyfileobj(r, f, length=1024 * 256)
         except (urllib.error.URLError, OSError) as e:

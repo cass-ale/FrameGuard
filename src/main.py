@@ -238,7 +238,12 @@ if __name__ == "__main__":
         except Exception:
             pass  # Don't let crash reporting crash the crash handler
         
-        # 3. Show error dialog to user
+        # 3. Show error dialog to user - only from the main thread. These
+        # hooks also fire on scan threads, thread-pool workers and the GC;
+        # building a QMessageBox there touches AppKit off the main thread,
+        # which macOS answers by aborting the whole process.
+        if threading.current_thread() is not threading.main_thread():
+            return
         _show_error(
             f"[FrameGuard] Unexpected Error\n\n"
             f"{exc_type.__name__}: {exc_value}\n\n"

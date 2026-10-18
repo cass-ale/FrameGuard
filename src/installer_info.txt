@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.8.0
+FrameGuard Desktop v0.8.1
 Video QA for XR Deliverables
 
 
@@ -22,29 +22,24 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.8.0
+WHAT'S NEW IN v0.8.1
 
-  Shipped-path reliability
-    - Source, frozen, installed and mounted applications now exercise the same
-      bounded startup path before a release can be published.
-    - Scan cancellation is isolated per worker, malformed media metadata fails
-      safely, and FFmpeg diagnostics remain memory-bounded without discarding
-      early or late defect evidence.
-    - Watch folders distinguish same-size rewrites and replacements, reject
-      unsafe symlinks, and preserve queued files across low-disk interruptions.
-    - Presets, PDF exports, media launching and updater downloads now use
-      deterministic limits, integrity checks, cancellation and cleanup.
-    - Full-installer updates require exact platform assets and published
-      SHA-256 evidence before an installer can run.
+  More accurate deep scans
+    - Separate silences, freezes and black sequences are each reported on
+      their own instead of being merged into one long false event.
+    - An entirely black file, or one that opens or ends on long black, is now
+      reported; short fades are still ignored.
+    - File names containing words such as "corrupt" no longer fail Decode
+      Integrity, and Matroska/WebM files no longer raise spurious warnings.
+    - Preset values are type-checked before they reach FFmpeg.
 
-  Exact-SHA native release proof
-    - Local pre-push checks fingerprint the source tree, toolchain, logs,
-      manifests, review metadata and local package bytes without claiming
-      cross-platform release authorization.
-    - GitHub blocks release tags until Windows, Apple Silicon and Intel package
-      builders and installed or mounted startup smokes pass for the exact commit.
-    - Release jobs rebuild only that verified commit and recheck the annotated
-      tag immediately before publication.
+  Smoother updates and a calmer interface
+    - In-app updates show progress, close FrameGuard for the installer and
+      reopen it when the update finishes.
+    - Tray actions and quitting no longer crash; the splash screen no longer
+      freezes during startup.
+    - A seamless sidebar, real chevrons, ticks and radio dots, and tighter,
+      aligned spacing throughout.
 
 
 BEFORE YOU INSTALL

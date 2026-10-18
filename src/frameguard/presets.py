@@ -88,16 +88,83 @@ def normalize_preset_config(config: dict) -> dict:
         key = _LEGACY_KEY_ALIASES.get(key, key)
         if key in _EXCLUDED_KEYS or key not in PRESET_CONFIG_KEYS:
             continue
-        out[key] = value
-    # Container extensions are compared against os.path.splitext() output, which
-    # always includes the leading dot. Older presets stored them without one.
-    if isinstance(out.get("accepted_containers"), list):
-        out["accepted_containers"] = [
-            ext if ext.startswith(".") else f".{ext}"
-            for ext in out["accepted_containers"]
-            if isinstance(ext, str) and ext
-        ]
+        coerced = _coerce_preset_value(key, value)
+        if coerced is not _INVALID:
+            out[key] = coerced
     return out
+
+
+_INVALID = object()
+# Values are interpolated into FFmpeg filter graphs (e.g. silence_noise_db
+# becomes "silencedetect=n=<value>dB"), so a string that slipped through could
+# append arbitrary filters - including ones that write files. Every value is
+# therefore coerced to the type of its engine default, or dropped.
+_PRESET_VALUE_RANGES = {
+    "target_width": (16, 16384),
+    "target_height": (16, 16384),
+    "target_fps": (1.0, 1000.0),
+    "fps_tolerance": (0.0, 60.0),
+    "min_bitrate_mbps": (0.0, 100000.0),
+    "min_audio_sample_rate": (1000, 768000),
+    "silence_duration": (0.1, 3600.0),
+    "silence_noise_db": (-120.0, 0.0),
+    "segment_count": (1, 16),
+}
+_LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers")
+# Only these are genuinely whole numbers. Everything else numeric accepts a
+# fraction even when its default happens to be written as an int
+# (min_bitrate_mbps: 20, silence_noise_db: -50): rejecting 12.5 Mbps silently
+# fell back to the stricter default and failed compliant files.
+_INTEGER_PRESET_KEYS = frozenset({
+    "target_width", "target_height", "min_audio_sample_rate", "segment_count",
+})
+
+
+def _coerce_preset_value(key: str, value):
+    """Return ``value`` converted to the engine type for ``key``, or _INVALID."""
+    import math
+    from frameguard.core import DEFAULT_CONFIG
+
+    default = DEFAULT_CONFIG.get(key)
+    if isinstance(default, bool):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+            return value.strip().lower() == "true"
+        return _INVALID
+    if isinstance(default, (int, float)):
+        if isinstance(value, bool):
+            return _INVALID
+        try:
+            number = float(value.strip()) if isinstance(value, str) else float(value)
+        except (TypeError, ValueError, AttributeError):
+            return _INVALID
+        if not math.isfinite(number):
+            return _INVALID
+        low, high = _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
+        number = min(max(number, low), high)
+        if key in _INTEGER_PRESET_KEYS:
+            if number != int(number):
+                return _INVALID
+            return int(number)
+        return int(number) if isinstance(default, int) and number == int(number) else number
+    if isinstance(default, list):
+        if not isinstance(value, list):
+            return _INVALID
+        items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if key in _LOWERCASE_LIST_KEYS:
+            # Probed codec names and os.path.splitext() output are lowercase;
+            # "H264" or ".MP4" in a hand-written preset failed every file.
+            items = [item.lower() for item in items]
+        if key == "accepted_containers":
+            # Compared against splitext() output, which keeps the leading dot.
+            items = [item if item.startswith(".") else f".{item}" for item in items]
+        return items
+    if isinstance(default, str):
+        return value if isinstance(value, str) else _INVALID
+    return _INVALID
 
 
 def get_bundled_presets_dir() -> Path:
