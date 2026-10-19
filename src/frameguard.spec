@@ -27,7 +27,7 @@ import os
 # Configuration
 # ---------------------------------------------------------------------------
 APP_NAME = "FrameGuard"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.2"
 ENTRY_POINT = "main.py"
 # This is an opaque identifier, not branding, but it IS the app's macOS
 # identity (bundle identity, .fg UTI ownership, preferences domain), so
@@ -74,8 +74,8 @@ if sys.platform == "win32":
     )
     version_info = VSVersionInfo(
         ffi=FixedFileInfo(
-            filevers=(0, 8, 0, 0),
-            prodvers=(0, 8, 0, 0),
+            filevers=(0, 8, 2, 0),
+            prodvers=(0, 8, 2, 0),
             mask=0x3F,
             flags=0x0,
             OS=0x40004,
@@ -87,11 +87,11 @@ if sys.platform == "win32":
                 StringTable('040904B0', [
                     StringStruct('CompanyName', 'Capri la Ria'),
                     StringStruct('FileDescription', 'FrameGuard Desktop - Video QA Tool'),
-                    StringStruct('FileVersion', '0.8.0.0'),
+                    StringStruct('FileVersion', '0.8.2.0'),
                     StringStruct('InternalName', 'FrameGuard'),
                     StringStruct('OriginalFilename', 'FrameGuard.exe'),
                     StringStruct('ProductName', 'FrameGuard Desktop'),
-                    StringStruct('ProductVersion', '0.8.0.0'),
+                    StringStruct('ProductVersion', '0.8.2.0'),
                     StringStruct('LegalCopyright', 'Copyright © 2026 Cassian Aléria'),
                 ])
             ]),
@@ -151,12 +151,19 @@ hidden_imports = [
     'frameguard.watchfolder',
     'frameguard.updater',
     'frameguard.presets',
+    'frameguard.players',
     
     # Dependencies
     'fpdf',
     'fpdf.enums',
     'fpdf.fonts',
     'fpdf.image_parsing',
+    'fpdf.output',
+    # Unicode PDF fonts: fpdf2 parses and subsets TrueType fonts with
+    # fontTools, which loads its table modules by name at run time.
+    'fontTools.subset',
+    'fontTools.ttLib',
+    'fontTools.ttLib.ttCollection',
     'psutil',
     
     # Standard library (dynamically imported by our code)
@@ -182,6 +189,9 @@ hidden_imports = [
     'encodings.latin_1',
     'encodings.cp1252',
 ]
+
+from PyInstaller.utils.hooks import collect_submodules
+hidden_imports.extend(collect_submodules('fontTools.ttLib.tables'))
 
 # Platform-specific
 if sys.platform == 'win32':

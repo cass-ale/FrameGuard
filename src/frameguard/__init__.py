@@ -3,7 +3,7 @@
 Copyright (c) 2026 Cassian Aléria. MIT License.
 """
 
-__version__ = "0.8.0"
+__version__ = "0.8.2"
 __author__ = "Cassian Aléria"
 __credits__ = ["Cassian Aléria"]
 __license__ = "MIT"

@@ -689,8 +689,19 @@ class TestSidebarChrome:
         assert laid_out_window.nav_buttons
         assert laid_out_window.nav_buttons[0].x() > 0
 
-    def test_bottom_logo_is_centred(self, window):
-        assert window._sidebar_logo_label.alignment() & Qt.AlignHCenter
+    def test_mark_and_version_appear_once(self, window):
+        """v0.8.0 repeated the logo and version at the bottom of the sidebar,
+        directly under the identical header block."""
+        from PySide6.QtWidgets import QLabel
+        from frameguard import __version__
+
+        labels = window._sidebar.findChildren(QLabel)
+        versions = [label for label in labels if label.text() == f"v{__version__}"]
+        logos = [label for label in labels
+                 if label.pixmap() is not None and not label.pixmap().isNull()]
+        assert len(versions) == 1, [label.text() for label in labels]
+        assert len(logos) <= 1
+        assert window._sidebar_logo_label is None
 
 
 class TestScanPageIcons:
@@ -710,7 +721,7 @@ class TestScanPageIcons:
     def test_icons_are_rerendered_on_theme_change(self, window, qapp):
         """icons.py caches by (name, size, colour); without a cache clear the
         old theme's colour is reused forever."""
-        window._apply_theme("Meta Dark")
+        window._apply_theme("Blue Hour")
         qapp.processEvents()
         dark = window.scan_panel.drop_zone.icon_label.pixmap().toImage()
 
@@ -732,7 +743,7 @@ class TestThemeLegibility:
     """Contrast floors, checked across every shipped theme.
 
     The active sidebar row used to draw the accent colour on bg_tertiary,
-    which is 2.6:1 in Meta Dark. A white label on an accent pill would have
+    which is 2.6:1 in Blue Hour. A white label on an accent pill would have
     been worse still (1.4:1 in Monokai Pro), so the label uses text_primary
     and the accent moved to a left bar.
     """

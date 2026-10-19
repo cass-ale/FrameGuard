@@ -161,7 +161,7 @@ class TestWindowsNativeContracts:
             monkeypatch.setattr(G.sys, "platform", "win32")
             monkeypatch.setattr(
                 ctypes, "windll", SimpleNamespace(dwmapi=_Dwm()), raising=False)
-            window._apply_window_chrome_theme(get_theme("Meta Dark"))
+            window._apply_window_chrome_theme(get_theme("Blue Hour"))
             assert calls == [20, 35, 34, 36]
         finally:
             window._cleanup_worker()

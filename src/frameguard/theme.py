@@ -193,8 +193,8 @@ class ThemeColors:
 
 
 THEMES: Dict[str, ThemeColors] = {
-    "Meta Dark": ThemeColors(
-        name="Meta Dark", accent="#0A6EEA", accent_hover="#0073FF",
+    "Blue Hour": ThemeColors(
+        name="Blue Hour", accent="#0A6EEA", accent_hover="#0073FF",
         accent_dim="#004AAD", bg_primary="#1A1A2E", bg_secondary="#16213E",
         bg_tertiary="#0F3460", bg_input="#1E2A45", surface="#1E2A45",
         surface_hover="#253555", border="#5A6A8C", text_primary="#E8E8EC",
@@ -303,19 +303,29 @@ THEMES: Dict[str, ThemeColors] = {
         status_pass="#059669", status_fail="#DC2626", status_warn="#D5730A"),
 }
 
-_current_theme_name = "Meta Dark"
+_current_theme_name = "Blue Hour"
+
+# Former names that saved preferences may still hold. "Meta Dark" was renamed
+# to "Blue Hour" in v0.8.2; same colours, new name.
+THEME_ALIASES = {"Meta Dark": "Blue Hour"}
+
+
+def canonical_theme_name(name):
+    """Map a retired theme name onto its current one; other values pass through."""
+    return THEME_ALIASES.get(name, name)
 
 
 def get_theme(name: str = None) -> ThemeColors:
     """Return a named theme, or the current theme when no name is supplied."""
     if name is None:
         name = _current_theme_name
-    return THEMES.get(name, THEMES["Meta Dark"])
+    return THEMES.get(canonical_theme_name(name), THEMES["Blue Hour"])
 
 
 def set_current_theme(name: str):
     """Set the current theme when ``name`` is in the stable catalogue."""
     global _current_theme_name
+    name = canonical_theme_name(name)
     if name in THEMES:
         _current_theme_name = name
 
@@ -357,7 +367,11 @@ QMainWindow, QDialog, QWidget {
 QWidget:disabled { color: %%disabled_text%%; }
 QWidget[fgRole="page"], #content_area { background-color: %%bg_primary%%; }
 QWidget[fgRole="toolbar"] { background-color: %%bg_secondary%%; border-bottom: 1px solid %%border%%; }
-QWidget[fgRole="sidebar"], #sidebar { background-color: %%bg_secondary%%; border-right: 1px solid %%border%%; }
+QWidget[fgRole="sidebar"], #sidebar { background-color: %%bg_primary%%; border: none; border-right: 1px solid %%divider%%; }
+/* Layout-only containers inside the sidebar must never repaint the page
+   colour over it: that is what split the sidebar into mismatched blocks and
+   left its right border visible only in fragments. */
+#logo_area, #sidebar_body, #sidebar_toggle_column { background: transparent; border: none; }
 QWidget[fgRole="statistic"] { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 8px; }
 QWidget[fgRole="framed-tool"] { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 8px; }
 QWidget[fgRole="status"] { background-color: %%bg_secondary%%; border: 1px solid %%border%%; border-radius: 4px; }
@@ -370,7 +384,6 @@ QLabel[fgRole="status"] { color: %%text_secondary%%; font-size: 10pt; font-weigh
 QLabel[class="hint"], QLabel[class="field-label"], #version_label { color: %%text_tertiary%%; font-size: 9pt; }
 QLabel[class="field-label"] { font-weight: 600; }
 #logo_label { color: %%text_primary%%; font-size: 12pt; font-weight: 700; }
-#logo_area { background-color: %%bg_tertiary%%; border-bottom: 1px solid %%border%%; }
 
 /* Complete fallback: an unclassified button never leaks native styling. */
 QPushButton, QToolButton {
@@ -441,7 +454,9 @@ QPushButton[fgRole="icon"]:disabled, QPushButton[class="reset-btn"]:disabled { b
 #sidebar QPushButton:pressed { background-color: %%bg_tertiary%%; }
 #sidebar QPushButton:focus { border: 2px solid %%focus%%; padding: 7px 11px; }
 #sidebar QPushButton:disabled { color: %%disabled_text%%; }
-#sidebar QPushButton[active="true"] { background-color: %%bg_tertiary%%; border-left: 3px solid %%accent%%; color: %%text_primary%%; font-weight: 600; padding-left: 9px; }
+#sidebar QPushButton[fgSidebarAction="true"] { text-align: center; }
+#sidebar QPushButton[active="true"] { background-color: %%bg_tertiary%%; border-color: transparent; border-left: 3px solid %%accent%%; border-top-left-radius: 0px; border-bottom-left-radius: 0px; color: %%text_primary%%; font-weight: 600; padding-left: 10px; }
+#sidebar QPushButton[active="true"]:focus { border: 2px solid %%focus%%; border-left: 3px solid %%accent%%; padding: 7px 11px 7px 10px; }
 
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateTimeEdit, QComboBox {
     background-color: %%bg_input%%; border: 1px solid %%border%%; border-radius: 6px;
@@ -452,26 +467,35 @@ QLineEdit:hover, QPlainTextEdit:hover, QTextEdit:hover, QSpinBox:hover, QDoubleS
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QDateTimeEdit:focus, QComboBox:focus { border: 2px solid %%focus%%; padding: 5px 9px; }
 QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled, QDateTimeEdit:disabled, QComboBox:disabled { background-color: %%disabled_bg%%; color: %%disabled_text%%; border-color: %%border%%; }
 QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button, QDateTimeEdit::up-button, QDateTimeEdit::down-button { width: 18px; border: none; background: transparent; }
-QComboBox::drop-down { width: 32px; border: none; border-left: 1px solid %%border%%; }
-QComboBox::down-arrow { width: 0px; height: 0px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 6px solid %%text_secondary%%; }
-QComboBox QAbstractItemView { background-color: %%surface%%; color: %%text_primary%%; border: 1px solid %%border%%; selection-background-color: %%selection%%; selection-color: %%selection_foreground%%; outline: none; padding: 4px; }
-QComboBox QAbstractItemView::item { min-height: 28px; padding: 6px 10px; }
+QComboBox::drop-down { subcontrol-origin: padding; subcontrol-position: center right; width: 28px; border: none; background: transparent; }
+QComboBox::down-arrow { image: %%img_chevron%%; width: 12px; height: 12px; }
+QComboBox::down-arrow:disabled { image: %%img_chevron_disabled%%; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QDateTimeEdit::up-arrow { image: %%img_chevron_up%%; width: 10px; height: 10px; }
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QDateTimeEdit::down-arrow { image: %%img_chevron%%; width: 10px; height: 10px; }
+QComboBox { combobox-popup: 0; }
+QComboBox QAbstractItemView { background-color: %%surface%%; color: %%text_primary%%; border: 1px solid %%border%%; selection-background-color: %%selection%%; selection-color: %%selection_foreground%%; outline: none; padding: 0px; }
+QComboBox QAbstractItemView::item { min-height: 28px; padding: 0px 8px; margin: 2px 4px; border: none; border-radius: 4px; }
+QComboBox QAbstractItemView::item:focus { border: none; }
 QComboBox QAbstractItemView::item:hover { background-color: %%surface_hover%%; }
 QComboBox QAbstractItemView::item:selected { background-color: %%selection%%; color: %%selection_foreground%%; }
 QComboBox QAbstractItemView::item:disabled { color: %%disabled_text%%; }
 
-QCheckBox, QRadioButton { color: %%text_primary%%; spacing: 8px; padding: 4px; }
+QCheckBox, QRadioButton { color: %%text_primary%%; spacing: 8px; padding: 3px 3px 3px 0px; border: 1px solid transparent; border-radius: 4px; }
 QCheckBox:hover, QRadioButton:hover { color: %%text_primary%%; }
-QCheckBox:focus, QRadioButton:focus { border: 1px solid %%focus%%; border-radius: 4px; }
+QCheckBox:focus, QRadioButton:focus { border-color: %%focus%%; }
 QCheckBox:disabled, QRadioButton:disabled { color: %%disabled_text%%; }
 QCheckBox::indicator, QRadioButton::indicator { width: 16px; height: 16px; border: 2px solid %%border%%; background-color: %%bg_input%%; }
 QCheckBox::indicator { border-radius: 4px; }
 QRadioButton::indicator { border-radius: 10px; }
 QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: %%accent%%; }
 QCheckBox::indicator:pressed, QRadioButton::indicator:pressed { border-color: %%accent_pressed%%; background-color: %%bg_tertiary%%; }
-QCheckBox::indicator:checked { border: 5px solid %%accent%%; background-color: %%accent_foreground%%; }
-QRadioButton::indicator:checked { border: 5px solid %%accent%%; background-color: %%accent_foreground%%; }
-QCheckBox::indicator:disabled, QRadioButton::indicator:disabled { border-color: %%disabled_text%%; background-color: %%disabled_bg%%; }
+QCheckBox::indicator:checked { border: 2px solid %%accent%%; background-color: %%accent%%; image: %%img_check%%; }
+QCheckBox::indicator:checked:hover { border-color: %%accent_hover%%; background-color: %%accent_hover%%; }
+QRadioButton::indicator:checked { border: 2px solid %%accent%%; background-color: %%accent%%; image: %%img_dot%%; }
+QRadioButton::indicator:checked:hover { border-color: %%accent_hover%%; background-color: %%accent_hover%%; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled { border-color: %%disabled_text%%; background-color: %%disabled_bg%%; image: none; }
+QCheckBox::indicator:checked:disabled { border-color: %%disabled_text%%; background-color: %%disabled_text%%; image: %%img_check_disabled%%; }
+QRadioButton::indicator:checked:disabled { border-color: %%disabled_text%%; background-color: %%disabled_text%%; image: %%img_dot_disabled%%; }
 
 QProgressBar { background-color: %%bg_tertiary%%; border: 1px solid %%border%%; border-radius: 4px; color: %%text_primary%%; text-align: center; min-height: 8px; }
 QProgressBar::chunk { background-color: %%accent%%; border-radius: 3px; }
@@ -485,26 +509,39 @@ QSlider::handle:horizontal:disabled { background: %%disabled_text%%; }
 QSlider::sub-page:horizontal { background: %%accent%%; border-radius: 2px; }
 
 QAbstractItemView { background-color: %%bg_primary%%; alternate-background-color: %%bg_secondary%%; border: 1px solid %%border%%; color: %%text_primary%%; selection-background-color: %%selection%%; selection-color: %%selection_foreground%%; outline: none; }
-QAbstractItemView::item { padding: 6px 10px; border-bottom: 1px solid %%border%%; }
+QAbstractItemView::item { padding: 6px 10px; border: none; border-bottom: 1px solid %%divider%%; }
+QTableView { gridline-color: %%divider%%; }
+QAbstractItemView::indicator { width: 14px; height: 14px; border: 2px solid %%border%%; border-radius: 4px; background-color: %%bg_input%%; }
+QAbstractItemView::indicator:hover { border-color: %%accent%%; }
+QAbstractItemView::indicator:checked { border-color: %%accent%%; background-color: %%accent%%; image: %%img_check%%; }
 QAbstractItemView::item:hover { background-color: %%surface_hover%%; }
 QAbstractItemView::item:selected { background-color: %%selection%%; color: %%selection_foreground%%; }
 QAbstractItemView::item:focus { border: 1px solid %%focus%%; }
 QAbstractItemView::item:disabled { color: %%disabled_text%%; background-color: %%disabled_bg%%; }
-QHeaderView::section { background-color: %%bg_secondary%%; border: none; border-right: 1px solid %%border%%; border-bottom: 1px solid %%border%%; color: %%text_secondary%%; font-size: 9pt; font-weight: 600; padding: 7px 10px; }
+QHeaderView { background-color: %%bg_secondary%%; border: none; }
+QHeaderView::section { background-color: %%bg_secondary%%; border: none; border-bottom: 1px solid %%border%%; color: %%text_secondary%%; font-size: 9pt; font-weight: 600; padding: 7px 10px; }
+QTableCornerButton::section { background-color: %%bg_secondary%%; border: none; border-bottom: 1px solid %%border%%; }
 QHeaderView::section:hover { background-color: %%surface_hover%%; color: %%text_primary%%; }
 QHeaderView::section:pressed, QHeaderView::section:checked { background-color: %%selection%%; color: %%selection_foreground%%; }
 
 QMenu, QMenuBar { background-color: %%surface%%; color: %%text_primary%%; border: 1px solid %%border%%; }
+QMenu { padding: 4px 0px; }
 QMenuBar { border: none; }
-QMenu::item, QMenuBar::item { padding: 6px 24px 6px 10px; background: transparent; }
+QMenu::item { padding: 7px 24px 7px 12px; margin: 0px 4px; border-radius: 4px; background: transparent; }
+QMenuBar::item { padding: 6px 10px; background: transparent; }
+QMenu::indicator { width: 16px; height: 16px; left: 8px; }
+QMenu::indicator:checked { image: %%img_menu_check%%; }
+QMenu::indicator:checked:selected { image: %%img_menu_check_selected%%; }
 QMenu::item:selected, QMenuBar::item:selected { background-color: %%selection%%; color: %%selection_foreground%%; }
 QMenu::item:pressed, QMenuBar::item:pressed { background-color: %%accent_pressed%%; color: %%accent_foreground%%; }
 QMenu::item:disabled, QMenuBar::item:disabled { color: %%disabled_text%%; }
-QMenu::separator { height: 1px; background-color: %%border%%; margin: 5px 8px; }
+QMenu::separator { height: 1px; background-color: %%divider%%; margin: 4px 0px; }
 QToolTip { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 4px; color: %%text_primary%%; padding: 6px 8px; font-size: 9pt; }
 
 QGroupBox { background: transparent; border: none; margin-top: 18px; padding: 12px 0 0 0; font-weight: 600; }
-QGroupBox::title { color: %%text_secondary%%; subcontrol-origin: margin; subcontrol-position: top left; padding: 0 4px 0 0; }
+QGroupBox::title { color: %%text_secondary%%; subcontrol-origin: margin; subcontrol-position: top left; left: 0px; padding: 0 4px 0 0; }
+QGroupBox[fgRole="page"] { padding-top: 0px; }
+QGroupBox[fgRole="page"]::title { left: -2px; }
 QGroupBox[fgRole="framed-tool"], QGroupBox[fgRole="statistic"] { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 8px; padding: 16px; }
 QGroupBox[fgRole="framed-tool"]::title, QGroupBox[fgRole="statistic"]::title { padding: 0 6px; }
 
@@ -539,6 +576,7 @@ QMessageBox QLabel { color: %%text_primary%%; }
 QFrame[frameShape="4"] { color: %%border%%; max-height: 1px; }
 QFrame[frameShape="5"] { color: %%border%%; max-width: 1px; }
 #drop_zone { background-color: %%bg_secondary%%; border: 2px dashed %%border%%; border-radius: 12px; min-height: 180px; }
+#drop_zone QWidget#drop_zone_empty, #drop_zone QWidget#drop_zone_queue { background: transparent; border: none; }
 #drop_zone:hover { border-color: %%accent%%; background-color: %%surface_hover%%; }
 
 #badge_pass { background-color: %%status_pass_surface%%; border: 1px solid %%status_pass_border%%; color: %%status_pass%%; border-radius: 8px; padding: 3px 8px; font-weight: 600; }
@@ -546,6 +584,102 @@ QFrame[frameShape="5"] { color: %%border%%; max-width: 1px; }
 #badge_warn { background-color: %%status_warn_surface%%; border: 1px solid %%status_warn_border%%; color: %%status_warn%%; border-radius: 8px; padding: 3px 8px; font-weight: 600; }
 #badge_skip { background-color: %%status_skip_surface%%; border: 1px solid %%status_skip_border%%; color: %%status_skip%%; border-radius: 8px; padding: 3px 8px; font-weight: 600; }
 """
+
+
+# ---------------------------------------------------------------------------
+# Indicator artwork
+# ---------------------------------------------------------------------------
+# Qt style sheets cannot draw a chevron, tick or radio dot from borders alone:
+# the old zero-size "CSS triangle" rendered as a flat bar on every combo box,
+# and a 5px checked border made checked boxes and radios visibly larger than
+# unchecked ones. Tiny SVGs, written once per colour, keep every indicator the
+# same size in every state. Qt's bundled svg image-format plugin renders them.
+_SVG_SHAPES = {
+    "chevron": '<path d="M3.5 6l4.5 4.5L12.5 6" fill="none" stroke="{c}" '
+               'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+    "chevron_up": '<path d="M3.5 10l4.5-4.5L12.5 10" fill="none" stroke="{c}" '
+                  'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+    "check": '<path d="M3.5 8.3l3 3 6-6.6" fill="none" stroke="{c}" '
+             'stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
+    "dot": '<circle cx="8" cy="8" r="3.2" fill="{c}"/>',
+}
+
+
+def _asset_dir():
+    """Per-user cache folder for generated indicator artwork.
+
+    Not the temp folder: macOS purges files there that go unused for about
+    three days, and a FrameGuard left running in the tray for that long lost
+    its chevrons, ticks and radio dots on the next restyle.
+    """
+    import os
+    import sys
+    import tempfile
+    try:
+        from frameguard import __version__ as version
+    except ImportError:  # pragma: no cover - package import always works
+        version = "dev"
+    home = os.path.expanduser("~")
+    if sys.platform == "darwin":
+        base = os.path.join(home, "Library", "Caches", "FrameGuard")
+    elif sys.platform == "win32":
+        base = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(),
+                            "FrameGuard", "Cache")
+    else:
+        base = os.path.join(os.environ.get("XDG_CACHE_HOME")
+                            or os.path.join(home, ".cache"), "frameguard")
+    return os.path.join(base, f"ui-{version}")
+
+
+def _fallback_asset_dir():
+    import os
+    import tempfile
+    try:
+        from frameguard import __version__ as version
+    except ImportError:  # pragma: no cover
+        version = "dev"
+    return os.path.join(tempfile.gettempdir(), f"frameguard-ui-{version}")
+
+
+def _svg_url(shape: str, color: str) -> str:
+    """Return a stylesheet ``url(...)`` for one coloured indicator, or ``none``."""
+    return _svg_url_in(shape, color, _asset_dir())
+
+
+def _svg_url_in(shape: str, color: str, directory: str) -> str:
+    import os
+
+    path = os.path.join(directory, f"{shape}-{color.lstrip('#').upper()}.svg")
+    body = ('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
+            'viewBox="0 0 16 16">' + _SVG_SHAPES[shape].format(c=color) + "</svg>")
+    try:
+        if not os.path.isfile(path):
+            os.makedirs(directory, exist_ok=True)
+            temporary = f"{path}.{os.getpid()}.tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                handle.write(body)
+            os.replace(temporary, path)
+    except OSError:
+        if directory != _fallback_asset_dir():
+            return _svg_url_in(shape, color, _fallback_asset_dir())
+        return "none"
+    return 'url("' + path.replace("\\", "/") + '")'
+
+
+def _indicator_images(theme: "ThemeColors") -> Dict[str, str]:
+    return {
+        "img_chevron": _svg_url("chevron", theme.text_secondary),
+        "img_chevron_up": _svg_url("chevron_up", theme.text_secondary),
+        "img_chevron_disabled": _svg_url("chevron", theme.disabled_text),
+        "img_check": _svg_url("check", theme.accent_foreground),
+        "img_dot": _svg_url("dot", theme.accent_foreground),
+        "img_menu_check": _svg_url("check", theme.text_primary),
+        # A disabled choice must still show which option is chosen: while a
+        # scan runs, the selected scan mode used to look unselected.
+        "img_check_disabled": _svg_url("check", theme.disabled_bg),
+        "img_dot_disabled": _svg_url("dot", theme.disabled_bg),
+        "img_menu_check_selected": _svg_url("check", theme.selection_foreground),
+    }
 
 
 def generate_stylesheet(theme: ThemeColors = None) -> str:
@@ -590,10 +724,12 @@ def generate_stylesheet(theme: ThemeColors = None) -> str:
         "scrollbar_bg": theme.scrollbar_bg,
         "scrollbar_handle": theme.scrollbar_handle,
     }
+    replacements["divider"] = _mix(theme.border, theme.bg_primary, 0.45)
+    replacements.update(_indicator_images(theme))
     css = _CSS_TEMPLATE
     for token, value in replacements.items():
         css = css.replace("%%" + token + "%%", value)
     return css
 
 
-DARK_STYLESHEET = generate_stylesheet(THEMES["Meta Dark"])
+DARK_STYLESHEET = generate_stylesheet(THEMES["Blue Hour"])

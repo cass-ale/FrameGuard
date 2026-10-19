@@ -513,17 +513,20 @@ class TestStderrCap:
         assert "black_start:5" in capped and "black_end:15" in capped
         assert "silence_start: 6" in capped and "silence_end: 14" in capped
 
-    def test_evidence_allocation_keeps_first_recent_and_deduplicates(self):
+    def test_every_detection_record_survives_while_noise_is_trimmed(self):
+        """v0.8.0 kept only the first and latest line per category, so the
+        verdict parser saw 2 of 80 black events and paired the wrong starts
+        and ends. Detection records are data: all of them are kept, and only
+        progress noise yields to the line/character budget."""
         lines = [
-            "black_start:0 black_end:1 black_duration:1",
             *(f"black_start:{i} black_end:{i + 1} black_duration:1"
-              for i in range(1, 40)),
+              for i in range(40)),
             "freeze_start:20 freeze_end:25 freeze_duration:5",
             "[h264] Invalid NAL unit size (-1 > 100).",
             "[h264] Invalid NAL unit size (-1 > 100).",
             *(f"black_start:{100 + i} black_end:{101 + i} black_duration:1"
               for i in range(40)),
-            "frame=500",
+            *(f"frame={i}" for i in range(50)),
         ]
         capped, truncated = _cap_stderr_text(
             "\n".join(lines),
@@ -532,12 +535,10 @@ class TestStderrCap:
         )
 
         assert truncated > 0
-        assert capped.count("Invalid NAL unit size") == 1
+        assert capped.count("black_start:") == 80
         assert "freeze_start:20" in capped
-        assert "black_start:0" in capped
-        assert "black_start:139" in capped
-        assert capped.count("black_start:") == 2
-        assert "frame=500" in capped
+        assert capped.count("Invalid NAL unit size") == 2
+        assert "frame=0" not in capped
 
     def test_segment_multimegabyte_unterminated_record_uses_bounded_binary_reads(self):
         stream = _GeneratedBinaryStream(

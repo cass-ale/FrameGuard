@@ -145,7 +145,7 @@ def test_real_source_startup_preflight_is_bounded_and_machine_readable(tmp_path)
     ("options", "expected"),
     [
         (("--startup-preflight-theme", "Clean Light"), "Clean Light"),
-        (("--startup-preflight-legacy-theme", "Meta Dark"), "Meta Dark"),
+        (("--startup-preflight-legacy-theme", "Meta Dark"), "Blue Hour"),
     ],
 )
 def test_saved_and_legacy_themes_use_the_real_startup_resolver(tmp_path, options, expected):

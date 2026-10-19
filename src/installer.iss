@@ -12,7 +12,7 @@
 [Setup]
 AppId={{B7E2F4A1-9C3D-4E5F-8A1B-6D7C8E9F0A2B}
 AppName=FrameGuard Desktop
-AppVersion=0.8.0
+AppVersion=0.8.2
 AppVerName=FrameGuard Desktop v{#SetupSetting("AppVersion")}
 AppPublisher=Capri la Ria
 AppPublisherURL=https://caprilaria.com
@@ -42,7 +42,11 @@ CloseApplications=force
 CloseApplicationsFilter=FrameGuard.exe
 RestartApplications=no
 SetupMutex=FrameGuardDesktopSetup
-AppMutex=FrameGuardDesktopApp
+; No AppMutex: an in-app update launches Setup while FrameGuard is still
+; shutting down, and AppMutex turned that race into a blocking "FrameGuard is
+; running" prompt even under /SILENT. InitializeSetup waits for the app's
+; FrameGuardDesktopApp mutex to clear instead, and CloseApplications=force
+; remains the backstop for an instance that never exits.
 MinVersion=10.0
 VersionInfoVersion={#SetupSetting("AppVersion")}.0
 VersionInfoCompany=Capri la Ria
@@ -101,6 +105,10 @@ Name: "{group}\Uninstall FrameGuard Desktop"; Filename: "{uninstallexe}"
 [Run]
 ; Launch app after install - WorkingDir ensures exe finds _internal/
 Filename: "{app}\FrameGuard.exe"; WorkingDir: "{app}"; Description: "Launch FrameGuard Desktop"; Flags: nowait postinstall skipifsilent
+; In-app updates run Setup /SILENT /RESTARTAPPLICATIONS. The entry above is
+; skipped in silent mode and FrameGuard never registers with Restart Manager,
+; so without this the user was left with no app after "Update & Restart".
+Filename: "{app}\FrameGuard.exe"; WorkingDir: "{app}"; Flags: nowait; Check: ShouldRelaunchAfterUpdate
 
 [Registry]
 Root: HKCU; Subkey: "Software\FrameGuard Desktop"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
@@ -132,12 +140,35 @@ const
 procedure SHChangeNotify(wEventId: Integer; uFlags: Cardinal; dwItem1, dwItem2: Cardinal);
   external 'SHChangeNotify@shell32.dll stdcall';
 
+function ShouldRelaunchAfterUpdate(): Boolean;
+begin
+  Result := WizardSilent and
+    (Pos('/RESTARTAPPLICATIONS', Uppercase(GetCmdTail)) > 0);
+end;
+
+procedure WaitForRunningApp();
+var
+  Attempts: Integer;
+begin
+  // Up to 20 seconds for a FrameGuard that launched this update to finish
+  // saving its settings and exit.
+  Attempts := 0;
+  while CheckForMutexes('FrameGuardDesktopApp') and (Attempts < 80) do
+  begin
+    Sleep(250);
+    Attempts := Attempts + 1;
+  end;
+end;
+
 function InitializeSetup(): Boolean;
 var
   WinVersion: TWindowsVersion;
   InstalledVersion: string;
   UninstallKey: string;
 begin
+  // Interactive installs keep the normal "close applications" page.
+  if WizardSilent then
+    WaitForRunningApp();
   GetWindowsVersionEx(WinVersion);
   if WinVersion.Major < 10 then
   begin
