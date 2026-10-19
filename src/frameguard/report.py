@@ -12,6 +12,7 @@ v0.5.0 changes:
 """
 
 import os
+import sys
 from datetime import datetime
 from typing import List
 from fpdf import FPDF
@@ -61,13 +62,15 @@ def _get_report_colors(theme: ThemeColors = None):
     }
 
 
-# Backward-compatible aliases (fallback if theme import fails)
+# Status pill fills. White 7-8pt bold labels need at least 4.5:1 contrast;
+# the old bright fills (white on #22C55E is 2.3:1, on #F59E0B 2.1:1) were
+# hard to read on screen and washed out when printed.
 STATUS_COLORS = {
-    "PASS": (34, 197, 94),
-    "PASS_WITH_WARNINGS": (245, 158, 11),
-    "FAIL": (239, 68, 68),
-    "WARN": (245, 158, 11),
-    "SKIP": (107, 114, 128),
+    "PASS": (21, 128, 61),            # #15803D  5.0:1 with white
+    "PASS_WITH_WARNINGS": (180, 83, 9),  # #B45309  5.0:1
+    "FAIL": (185, 28, 28),            # #B91C1C  6.5:1
+    "WARN": (180, 83, 9),
+    "SKIP": (75, 85, 99),             # #4B5563  7.6:1
 }
 
 STATUS_LABELS = {
@@ -127,32 +130,103 @@ ROW_MIN_H = 7.0     # minimum row height, so single-line rows aren't cramped
 LINE_H = 4.0        # leading for wrapped body text
 
 
+# Unicode fonts already installed with the operating system. File names are
+# often not plain Latin ("Café_日本語_proxy.mov"); fpdf2's built-in Helvetica
+# is Latin-1 only, so those names printed as "???". Arial is metrically the
+# Helvetica the layout was designed around; the fallbacks cover CJK and other
+# scripts. Nothing is bundled: when none is found, Helvetica plus the Latin-1
+# transliteration in _safe_text is used exactly as before.
+def _font_candidates():
+    if sys.platform == "darwin":
+        sup = "/System/Library/Fonts/Supplemental"
+        main = {"": f"{sup}/Arial.ttf", "B": f"{sup}/Arial Bold.ttf",
+                "I": f"{sup}/Arial Italic.ttf"}
+        fallbacks = [(f"{sup}/Arial Unicode.ttf", 0)]
+    elif sys.platform == "win32":
+        fonts = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
+        main = {"": os.path.join(fonts, "arial.ttf"), "B": os.path.join(fonts, "arialbd.ttf"),
+                "I": os.path.join(fonts, "ariali.ttf")}
+        fallbacks = [(os.path.join(fonts, name), 0) for name in
+                     ("msyh.ttc", "YuGothM.ttc", "malgun.ttf", "Nirmala.ttc", "seguisym.ttf")]
+    else:
+        base = "/usr/share/fonts/truetype/dejavu"
+        main = {"": f"{base}/DejaVuSans.ttf", "B": f"{base}/DejaVuSans-Bold.ttf",
+                "I": f"{base}/DejaVuSans-Oblique.ttf"}
+        fallbacks = []
+    return main, fallbacks
+
+
 class HandoffReport(FPDF):
     """Styled PDF report with modern design language."""
 
-    def __init__(self, preset_label: str = "", editor: str = "", colors: dict = None):
+    def __init__(self, preset_label: str = "", editor: str = "", colors: dict = None,
+                 unicode_fonts: bool = True, fallback_fonts: bool = True):
         super().__init__()
-        self.preset_label = _safe_text(preset_label)
-        self.editor = _safe_text(editor)
+        self.ff = (self._register_fonts(fallback_fonts) if unicode_fonts else "Helvetica")
+        # Raw text: cell()/multi_cell() adapt it to the font at draw time.
+        # Converting here, before any font was set, always took the Latin-1
+        # path and turned "日本語 preset" into "??? preset".
+        self.preset_label = "" if preset_label is None else str(preset_label)
+        self.editor = "" if editor is None else str(editor)
         self.c = colors or _get_report_colors()
         self.set_auto_page_break(auto=False)  # tables manage their own breaks
         self.set_margins(MARGIN_L, MARGIN_T, MARGIN_R)
+        self.continuation_label = ""  # set while a file's checks span pages
+
+    def _register_fonts(self, fallback_fonts: bool = True) -> str:
+        """Register the Unicode report family; return the family to use.
+
+        Fallback fonts (CJK and other scripts) are only registered when the
+        report needs them: each is embedded in the PDF, and opening a large
+        font collection costs about half a second.
+        """
+        main, fallbacks = _font_candidates()
+        if not all(os.path.isfile(path) for path in main.values()):
+            return "Helvetica"
+        try:
+            for style, path in main.items():
+                self.add_font("FGSans", style, path)
+            names = []
+            for index, (path, number) in enumerate(fallbacks if fallback_fonts else ()):
+                if os.path.isfile(path):
+                    name = f"FGFallback{index}"
+                    self.add_font(name, "", path, collection_font_number=number)
+                    names.append(name)
+            if names:
+                self.set_fallback_fonts(names, exact_match=False)
+        except Exception:
+            return "Helvetica"
+        return "FGSans"
+
+    @property
+    def unicode_fonts(self) -> bool:
+        return self.ff != "Helvetica"
+
+    def _text(self, text) -> str:
+        """Text the current font can render."""
+        if text is None:
+            return ""
+        text = str(text)
+        if self.unicode_fonts and getattr(self, "is_ttf_font", False):
+            import unicodedata
+            return unicodedata.normalize("NFC", text)
+        return _safe_text(text)
 
     # fpdf2's built-in fonts are latin-1 only and raise on anything outside it.
     # Sanitizing centrally means a stray Unicode character in a filename, codec
     # name, preset label or editor name can never abort a report mid-render.
     def cell(self, *args, **kwargs):
         if "text" in kwargs:
-            kwargs["text"] = _safe_text(kwargs["text"])
+            kwargs["text"] = self._text(kwargs["text"])
         elif len(args) >= 3:
-            args = args[:2] + (_safe_text(args[2]),) + args[3:]
+            args = args[:2] + (self._text(args[2]),) + args[3:]
         return super().cell(*args, **kwargs)
 
     def multi_cell(self, *args, **kwargs):
         if "text" in kwargs:
-            kwargs["text"] = _safe_text(kwargs["text"])
+            kwargs["text"] = self._text(kwargs["text"])
         elif len(args) >= 3:
-            args = args[:2] + (_safe_text(args[2]),) + args[3:]
+            args = args[:2] + (self._text(args[2]),) + args[3:]
         return super().multi_cell(*args, **kwargs)
 
     def header(self):
@@ -164,10 +238,10 @@ class HandoffReport(FPDF):
         # Minimal header on continuation pages. This runs on every page after
         # the first, so an un-encodable character here breaks exactly the
         # multi-file batch reports and nothing else.
-        self.set_font("Helvetica", "", 8)
+        self.set_font(self.ff, "", 8)
         self.set_text_color(*self.c["text_tertiary"])
         self.set_xy(MARGIN_L, MARGIN_T - 4)
-        self.cell(0, 6, f"FrameGuard Report   |   {self.preset_label}   |   DSS-2", align="L")
+        self.cell(0, 6, f"FrameGuard Report   |   {self.preset_label}", align="L")
         self.set_draw_color(*self.c["border"])
         self.set_line_width(0.2)
         y = MARGIN_T + 3
@@ -176,9 +250,9 @@ class HandoffReport(FPDF):
 
     def footer(self):
         self.set_y(-13)
-        self.set_font("Helvetica", "", 8)
+        self.set_font(self.ff, "", 8)
         self.set_text_color(*self.c["text_tertiary"])
-        self.cell(0, 8, f"Page {self.page_no()}/{{nb}}", align="C")
+        self.cell(0, 8, f"Page {self.page_no()} of {{nb}}", align="C")
 
     # -- measurement --------------------------------------------------------
 
@@ -193,7 +267,7 @@ class HandoffReport(FPDF):
         Uses fpdf2's own line breaker rather than approximating it, so the
         painted row background always matches the text that lands in it.
         """
-        text = _safe_text(text)
+        text = self._text(text)
         if not text:
             return line_h
         lines = self.multi_cell(
@@ -212,7 +286,7 @@ class HandoffReport(FPDF):
         self.set_fill_color(*fill_rgb)
         self.rect(x, y, w, h, style="F", round_corners=True, corner_radius=min(h / 2, 2.6))
         self.set_text_color(*text_rgb)
-        self.set_font("Helvetica", "B", size)
+        self.set_font(self.ff, "B", size)
         self.set_xy(x, y)
         self.cell(w, h, text, align="C")
 
@@ -273,9 +347,22 @@ def _safe_text(text: str) -> str:
         "\u2122": "(TM)", # trademark
     }
     
+    # macOS hands over filenames in decomposed (NFD) form, so "é" arrived as
+    # "e" + U+0301 and printed as "e?" in reports. Compose first; then
+    # transliterate whatever Latin-1 still cannot hold to its base letters
+    # (e.g. "ő" -> "o") before falling back to "?".
+    import unicodedata
+    text = unicodedata.normalize("NFC", text)
     for char, replacement in replacements.items():
         text = text.replace(char, replacement)
-    
+    if any(ord(ch) > 0xFF for ch in text):
+        text = "".join(
+            ch if ord(ch) <= 0xFF else (
+                "".join(c for c in unicodedata.normalize("NFKD", ch)
+                        if not unicodedata.combining(c) and ord(c) <= 0xFF)
+                or "?")
+            for ch in text)
+
     # Final safety: encode to latin-1, replacing any remaining unknowns
     try:
         text = text.encode("latin-1", errors="replace").decode("latin-1")
@@ -285,13 +372,163 @@ def _safe_text(text: str) -> str:
     return text
 
 
+class _OutputError(RuntimeError):
+    """The finished PDF could not be written to disk."""
+
+
+_main_cmap_cache = {}
+
+
+def _main_font_codepoints() -> frozenset:
+    """Code points the main report font covers (empty when unavailable)."""
+    main, _ = _font_candidates()
+    path = main.get("")
+    if path in _main_cmap_cache:
+        return _main_cmap_cache[path]
+    codepoints = frozenset()
+    try:
+        if path and os.path.isfile(path):
+            from fontTools.ttLib import TTFont
+            with TTFont(path, lazy=True) as font:
+                codepoints = frozenset(font.getBestCmap() or {})
+    except Exception:
+        codepoints = frozenset()
+    _main_cmap_cache[path] = codepoints
+    return codepoints
+
+
+def _needs_fallback_fonts(results, *extra) -> bool:
+    """True when some text has characters the main report font lacks.
+
+    Checked against the font's own character map, so FrameGuard's own em
+    dashes and arrows do not pull every CJK fallback font into the PDF.
+    """
+    covered = _main_font_codepoints()
+
+    def _beyond(text) -> bool:
+        for ch in str(text or ""):
+            code = ord(ch)
+            if code > 0x7E and (code not in covered if covered else code > 0x052F):
+                if ch.isspace():
+                    continue
+                return True
+        return False
+    if any(_beyond(t) for t in extra):
+        return True
+    for r in results:
+        if _beyond(getattr(r, "filename", "")):
+            return True
+        for check in getattr(r, "checks", ()) or ():
+            if isinstance(check, (list, tuple)) and len(check) >= 3 and (
+                    _beyond(check[0]) or _beyond(check[2])):
+                return True
+    return False
+
+
+def _is_dark(rgb) -> bool:
+    r, g, b = rgb
+    return (0.2126 * r + 0.7152 * g + 0.0722 * b) < 128
+
+
+def _status_text_palette(colors: dict) -> dict:
+    """Status colours for text on the page background (not on a pill).
+
+    Dark pill fills are unreadable as text on a dark theme's page, and the
+    theme's bright status colours are too light for text on white paper.
+    """
+    if _is_dark(colors["bg_primary"]):
+        fail, warn, ok = colors["status_fail"], colors["status_warn"], colors["status_pass"]
+    else:
+        fail, warn, ok = STATUS_COLORS["FAIL"], STATUS_COLORS["WARN"], STATUS_COLORS["PASS"]
+    return {"MISMATCH": fail, "FAIL": fail, "PASS_WITH_WARNINGS": warn,
+            "WARN": warn, "PASS": ok}
+
+
+# A file's check table never leaves fewer than this many rows at the foot of
+# a page (orphans) or carries fewer than this many onto the next (widows).
+MIN_ORPHAN_ROWS = 4
+MIN_WIDOW_ROWS = 3
+
+
+def _detail_layout(pdf, r, chk_cols):
+    """``(head_height, [row_heights])`` for one file's detailed block."""
+    total = _detail_block_height(pdf, r, chk_cols)
+    rows = []
+    pdf.set_font(pdf.ff, "", 8)
+    for check in r.checks:
+        if isinstance(check, (list, tuple)) and len(check) >= 3:
+            rows.append(max(ROW_MIN_H, pdf.text_height(chk_cols[2], pdf._text(check[2]), 4.0) + 3))
+    return total - sum(rows) - 7, rows
+
+
+def _first_break(available: float, head_h: float, rows) -> object:
+    """Where to break a block that starts with ``available`` mm left.
+
+    Returns ``None`` (fits), ``0`` (start it on a new page) or the index of
+    the first row to carry onto the next page.
+    """
+    if head_h + sum(rows) <= available:
+        return None
+    room = available - head_h
+    fit = 0
+    for height in rows:
+        if room < height:
+            break
+        room -= height
+        fit += 1
+    if fit < MIN_ORPHAN_ROWS:
+        return 0
+    if len(rows) - fit < MIN_WIDOW_ROWS:
+        fit = len(rows) - MIN_WIDOW_ROWS
+        if fit < MIN_ORPHAN_ROWS:
+            return 0
+    return fit
+
+
+def _detail_block_height(pdf, r, chk_cols) -> float:
+    """Height of one file's detailed block, measured with the real fonts."""
+    height = 5 + 2
+    pdf.set_font(pdf.ff, "B", 8)
+    pill_w = pdf.get_string_width(_status_label(_result_status(r))) + 8
+    pdf.set_font(pdf.ff, "B", 11)
+    height += max(6, pdf.text_height(USABLE_W - pill_w - 4 + 2 * CELL_PAD,
+                                     pdf._text(r.filename), 5.2))
+    height += 6  # metadata line
+    summary = r.plain_summary() if hasattr(r, "plain_summary") else ""
+    if summary and summary != "All checks passed.":
+        pdf.set_font(pdf.ff, "I", 9)
+        height += pdf.text_height(USABLE_W, summary, 4.4) + 2
+    height += 1 + 6.5  # table header
+    pdf.set_font(pdf.ff, "", 8)
+    for check in r.checks:
+        if isinstance(check, (list, tuple)) and len(check) >= 3:
+            height += max(ROW_MIN_H, pdf.text_height(chk_cols[2], pdf._text(check[2]), 4.0) + 3)
+    return height + 7
+
+
 def generate_report(results: List[QAResult], output_path: str,
                     preset_label: str = "Custom", editor: str = "",
                     colors: dict = None) -> str:
     """Generate a styled PDF handoff report.
 
-    Returns the output file path.
+    Returns the output file path. Rendered with the system's Unicode fonts
+    when available; if anything in that path fails (a damaged font file, a
+    font feature fpdf2 cannot subset) the report is rebuilt with the built-in
+    Latin-1 font rather than not being produced at all.
     """
+    try:
+        return _generate_report(results, output_path, preset_label, editor, colors, True)
+    except _OutputError:
+        raise  # the file could not be written; another font will not help
+    except ValueError as error:
+        if "no scan results" in str(error):
+            raise
+        return _generate_report(results, output_path, preset_label, editor, colors, False)
+    except Exception:
+        return _generate_report(results, output_path, preset_label, editor, colors, False)
+
+
+def _generate_report(results, output_path, preset_label, editor, colors, unicode_fonts):
     if not results:
         raise ValueError("Cannot generate a report with no scan results.")
     preset_label = preset_label or "Custom"
@@ -309,21 +546,31 @@ def generate_report(results: List[QAResult], output_path: str,
     # Background runners pass an immutable-at-creation palette so a theme
     # switch cannot change colors halfway through a long report.
     colors = dict(colors) if colors is not None else _get_report_colors()
-    pdf = HandoffReport(preset_label=preset_label, editor=editor, colors=colors)
+    pdf = HandoffReport(preset_label=preset_label, editor=editor, colors=colors,
+                        unicode_fonts=unicode_fonts,
+                        fallback_fonts=_needs_fallback_fonts(results, preset_label, editor))
     pdf.alias_nb_pages()
+    # Document properties: what a PDF viewer, search index or DMS shows.
+    pdf.set_title(f"FrameGuard Report - {pdf.preset_label}")
+    pdf.set_author(pdf.editor or "FrameGuard Desktop")
+    pdf.set_subject(f"Video QA results for {len(results)} file(s)")
+    pdf.set_keywords("FrameGuard, video QA, delivery, report")
+    pdf.set_creator(f"FrameGuard Desktop v{__version__}")
+    pdf.set_lang("en")
     pdf.add_page()
+    status_text = _status_text_palette(colors)
 
     c = colors  # shorthand
 
     # ---- Title block ----
     pdf.set_xy(MARGIN_L, MARGIN_T)
-    pdf.set_font("Helvetica", "B", 24)
+    pdf.set_font(pdf.ff, "B", 24)
     pdf.set_text_color(*c["accent"])
     pdf.cell(0, 11, "FrameGuard Report", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    pdf.set_font("Helvetica", "", 10)
+    pdf.set_font(pdf.ff, "", 10)
     pdf.set_text_color(*c["text_secondary"])
-    now = datetime.now().strftime("%B %d, %Y at %H:%M")
+    now = datetime.now().astimezone().strftime("%B %d, %Y at %H:%M %Z").strip()
     pdf.cell(0, 5.5, f"{now}   |   Profile: {preset_label}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     if editor:
         pdf.cell(0, 5.5, f"Editor: {editor}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -342,9 +589,9 @@ def generate_report(results: List[QAResult], output_path: str,
 
     badges = [
         ("Total", total, c["accent"]),
-        ("Passed", passed, c["status_pass"]),
-        ("Failed", mismatched, c["status_fail"]),
-        ("Warnings", warned, c["status_warn"]),
+        ("Passed", passed, STATUS_COLORS["PASS"]),
+        ("Failed", mismatched, STATUS_COLORS["FAIL"]),
+        ("Warnings", warned, STATUS_COLORS["WARN"]),
     ]
     badge_gap = 4.0
     badge_w = (USABLE_W - badge_gap * (len(badges) - 1)) / len(badges)
@@ -364,7 +611,7 @@ def generate_report(results: List[QAResult], output_path: str,
     sum_headers = ["Filename", "Codec", "Resolution", "Result", "Summary"]
 
     def _summary_header():
-        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_font(pdf.ff, "B", 8)
         pdf.set_fill_color(*c["accent"])
         pdf.rect(MARGIN_L, pdf.get_y(), USABLE_W, 7.5, style="F",
                  round_corners=("TOP_LEFT", "TOP_RIGHT"), corner_radius=2)
@@ -376,17 +623,23 @@ def generate_report(results: List[QAResult], output_path: str,
             x += sum_cols[i]
         pdf.set_xy(MARGIN_L, y + 7.5)
 
-    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_font(pdf.ff, "B", 13)
     pdf.set_text_color(*c["text_primary"])
     pdf.cell(0, 7, "Summary", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(2)
     _summary_header()
 
     for idx, r in enumerate(results):
-        summary = _safe_text(r.plain_summary() if hasattr(r, "plain_summary") else "")
+        summary = pdf._text(r.plain_summary() if hasattr(r, "plain_summary") else "")
 
-        pdf.set_font("Helvetica", "", 7.5)
-        row_h = max(ROW_MIN_H, pdf.text_height(sum_cols[4], summary, 3.6) + 3)
+        pdf.set_font(pdf.ff, "", 7.5)
+        summary_h = pdf.text_height(sum_cols[4], summary, 3.6)
+        # File names wrap rather than being cut to "Extremely_Long_...":
+        # the full production name is what an operator searches for.
+        fname = pdf._text(r.filename)
+        pdf.set_font(pdf.ff, "", 8)
+        name_h = pdf.text_height(sum_cols[0], fname, 3.8)
+        row_h = max(ROW_MIN_H, summary_h + 3, name_h + 3)
 
         if not pdf.room_for(row_h):
             pdf.add_page()
@@ -396,24 +649,16 @@ def generate_report(results: List[QAResult], output_path: str,
         pdf.row_band(y, row_h, c["bg_secondary"] if idx % 2 == 0 else c["bg_primary"])
 
         metadata = r.metadata or {}
-        fname = _safe_text(r.filename)
-        # Ellipsize to the actual column width rather than a fixed char count.
-        max_w = sum_cols[0] - 2 * CELL_PAD
-        if pdf.get_string_width(fname) > max_w:
-            while fname and pdf.get_string_width(fname + "...") > max_w:
-                fname = fname[:-1]
-            fname += "..."
-
         x = MARGIN_L
-        pdf.set_font("Helvetica", "", 8)
+        pdf.set_font(pdf.ff, "", 8)
         pdf.set_text_color(*c["text_primary"])
-        pdf.cell_text(x, y, sum_cols[0], row_h, fname)
+        pdf.wrapped_text(x, y + (row_h - name_h) / 2, sum_cols[0], fname, line_h=3.8)
         x += sum_cols[0]
 
         pdf.set_text_color(*c["text_secondary"])
-        pdf.cell_text(x, y, sum_cols[1], row_h, _safe_text(metadata.get("video_codec", "-")))
+        pdf.cell_text(x, y, sum_cols[1], row_h, pdf._text(metadata.get("video_codec", "-")))
         x += sum_cols[1]
-        pdf.cell_text(x, y, sum_cols[2], row_h, _safe_text(metadata.get("resolution", "-")))
+        pdf.cell_text(x, y, sum_cols[2], row_h, pdf._text(metadata.get("resolution", "-")))
         x += sum_cols[2]
 
         status = _result_status(r)
@@ -422,9 +667,9 @@ def generate_report(results: List[QAResult], output_path: str,
                  _status_label(status), STATUS_COLORS.get(status, c["text_secondary"]), size=7)
         x += sum_cols[3]
 
-        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_font(pdf.ff, "", 7.5)
         pdf.set_text_color(*c["text_secondary"])
-        pdf.wrapped_text(x, y + 2, sum_cols[4], summary, line_h=3.6)
+        pdf.wrapped_text(x, y + (row_h - summary_h) / 2, sum_cols[4], summary, line_h=3.6)
         pdf.set_xy(MARGIN_L, y + row_h)
 
     pdf.ln(10)
@@ -433,8 +678,16 @@ def generate_report(results: List[QAResult], output_path: str,
     chk_cols = [w * USABLE_W for w in (0.13, 0.24, 0.63)]
     chk_headers = ["Status", "Check", "Detail"]
 
-    def _check_header():
-        pdf.set_font("Helvetica", "B", 8)
+    def _check_header(continued: str = ""):
+        if continued:
+            # A file's checks resumed on a new page: say whose they are.
+            pdf.set_font(pdf.ff, "B", 9)
+            pdf.set_text_color(*c["text_secondary"])
+            pdf.set_x(MARGIN_L)
+            pdf.multi_cell(USABLE_W, 4.6, f"{continued} (continued)",
+                           new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.ln(1.5)
+        pdf.set_font(pdf.ff, "B", 8)
         pdf.set_fill_color(*c["accent"])
         pdf.rect(MARGIN_L, pdf.get_y(), USABLE_W, 6.5, style="F",
                  round_corners=("TOP_LEFT", "TOP_RIGHT"), corner_radius=2)
@@ -445,21 +698,31 @@ def generate_report(results: List[QAResult], output_path: str,
             x += chk_cols[i]
         pdf.set_xy(MARGIN_L, y + 6.5)
 
-    if not pdf.room_for(24):
+    # The section heading always lands with its first file block.
+    first_head, first_rows = _detail_layout(pdf, results[0], chk_cols)
+    if _first_break(pdf.content_bottom - pdf.get_y() - 10, first_head, first_rows) == 0:
         pdf.add_page()
-    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_font(pdf.ff, "B", 13)
     pdf.set_text_color(*c["text_primary"])
     pdf.cell(0, 7, "Detailed Results", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(3)
 
     for r in results:
-        # Keep the file header, metadata line and at least one check row
-        # together; an orphaned header at the foot of a page looks broken.
-        if not pdf.room_for(38):
-            pdf.add_page()
-
         overall = _result_status(r)
         overall_color = STATUS_COLORS.get(overall, c["text_secondary"])
+        overall_text = status_text.get(overall, c["text_secondary"])
+
+        # Widow/orphan control: a block that has to split leaves at least
+        # MIN_ORPHAN_ROWS check rows on this page and carries at least
+        # MIN_WIDOW_ROWS to the next, under a "(continued)" heading. A page
+        # used to open with one or two stray rows of the previous file.
+        head_h, row_heights = _detail_layout(pdf, r, chk_cols)
+        break_at = _first_break(pdf.content_bottom - pdf.get_y(), head_h, row_heights)
+        if break_at == 0:
+            pdf.add_page()
+            break_at = _first_break(pdf.content_bottom - pdf.get_y(), head_h, row_heights)
+            if break_at == 0:
+                break_at = None  # taller than a page: split wherever rows run out
 
         y = pdf.get_y()
         pdf.set_draw_color(*c["border"])
@@ -468,15 +731,19 @@ def generate_report(results: List[QAResult], output_path: str,
         y += 5
 
         label_text = _status_label(overall)
-        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_font(pdf.ff, "B", 8)
         pill_w = pdf.get_string_width(label_text) + 8
         pdf.pill(MARGIN_L, y, pill_w, 6, label_text, overall_color, size=8)
 
-        pdf.set_font("Helvetica", "B", 11)
+        pdf.set_font(pdf.ff, "B", 11)
         pdf.set_text_color(*c["text_primary"])
-        pdf.set_xy(MARGIN_L + pill_w + 4, y)
-        pdf.cell(USABLE_W - pill_w - 4, 6, _safe_text(r.filename))
-        y += 8
+        name_w = USABLE_W - pill_w - 4
+        name = pdf._text(r.filename)
+        # Wrapped: a long name used to run straight off the right edge.
+        name_h = max(6, pdf.text_height(name_w + 2 * CELL_PAD, name, 5.2))
+        pdf.set_xy(MARGIN_L + pill_w + 4, y + (0.4 if name_h > 6 else 0))
+        pdf.multi_cell(name_w, 5.2 if name_h > 6 else 6, name)
+        y += name_h + 2
 
         metadata = r.metadata or {}
         meta_parts = []
@@ -488,37 +755,42 @@ def generate_report(results: List[QAResult], output_path: str,
             meta_parts.append(f"{metadata['frame_rate']:.2f} fps")
         if metadata.get("duration_display"):
             meta_parts.append(str(metadata["duration_display"]))
-        if metadata.get("file_size_mb"):
-            meta_parts.append(f"{metadata['file_size_mb']} MB")
+        if isinstance(metadata.get("file_size_mb"), (int, float)):
+            from frameguard.core import _format_size
+            meta_parts.append(_format_size(float(metadata["file_size_mb"])))
         if meta_parts:
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font(pdf.ff, "", 8)
             pdf.set_text_color(*c["text_tertiary"])
             pdf.set_xy(MARGIN_L, y)
-            pdf.cell(USABLE_W, 4.5, _safe_text("   |   ".join(meta_parts)))
+            pdf.cell(USABLE_W, 4.5, pdf._text("   |   ".join(meta_parts)))
             y += 6
 
-        summary = _safe_text(r.plain_summary()) if hasattr(r, "plain_summary") else ""
+        summary = pdf._text(r.plain_summary()) if hasattr(r, "plain_summary") else ""
         if summary and summary != "All checks passed.":
-            pdf.set_font("Helvetica", "I", 9)
-            pdf.set_text_color(*overall_color)
+            pdf.set_font(pdf.ff, "I", 9)
+            pdf.set_text_color(*overall_text)
             h = pdf.text_height(USABLE_W, summary, 4.4)
-            pdf.wrapped_text(MARGIN_L, y, USABLE_W, summary, line_h=4.4)
+            # Same left edge as the metadata line above it.
+            pdf.set_xy(MARGIN_L, y)
+            pdf.multi_cell(USABLE_W, 4.4, summary)
             y += h + 2
 
         pdf.set_xy(MARGIN_L, y + 1)
         _check_header()
 
+        row_index = -1
         for check in r.checks:
             if not isinstance(check, (list, tuple)) or len(check) < 3:
                 continue
-            check_name, status, detail = _safe_text(check[0]), check[1], _safe_text(check[2])
+            row_index += 1
+            check_name, status, detail = pdf._text(check[0]), check[1], pdf._text(check[2])
 
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font(pdf.ff, "", 8)
             row_h = max(ROW_MIN_H, pdf.text_height(chk_cols[2], detail, 4.0) + 3)
 
-            if not pdf.room_for(row_h):
+            if row_index == break_at or not pdf.room_for(row_h):
                 pdf.add_page()
-                _check_header()
+                _check_header(continued=pdf._text(r.filename))
 
             y = pdf.get_y()
             pdf.row_band(y, row_h, c["bg_secondary"])
@@ -529,12 +801,12 @@ def generate_report(results: List[QAResult], output_path: str,
                      STATUS_COLORS.get(status, c["text_secondary"]), size=7)
 
             x = MARGIN_L + chk_cols[0]
-            pdf.set_font("Helvetica", "B", 8)
+            pdf.set_font(pdf.ff, "B", 8)
             pdf.set_text_color(*c["text_primary"])
             pdf.cell_text(x, y, chk_cols[1], row_h, check_name)
             x += chk_cols[1]
 
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font(pdf.ff, "", 8)
             pdf.set_text_color(*c["text_secondary"])
             pdf.wrapped_text(x, y + 2, chk_cols[2], detail, line_h=4.0)
             pdf.set_xy(MARGIN_L, y + row_h)
@@ -549,7 +821,7 @@ def generate_report(results: List[QAResult], output_path: str,
     pdf.set_line_width(0.2)
     pdf.line(MARGIN_L, pdf.get_y(), PAGE_W - MARGIN_R, pdf.get_y())
     pdf.ln(3)
-    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_font(pdf.ff, "I", 8)
     pdf.set_text_color(*c["text_tertiary"])
     pdf.set_x(MARGIN_L)
     pdf.cell(
@@ -560,16 +832,30 @@ def generate_report(results: List[QAResult], output_path: str,
     )
 
     # Save
-    if not os.path.dirname(output_path):
-        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "FrameGuard")
-        os.makedirs(docs_dir, exist_ok=True)
-        output_path = os.path.join(docs_dir, os.path.basename(output_path))
-    else:
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
     try:
-        pdf.output(output_path)
-    except Exception as e:
-        raise RuntimeError(f"Failed to write PDF to '{output_path}': {e}") from e
+        if not os.path.dirname(output_path):
+            docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "FrameGuard")
+            os.makedirs(docs_dir, exist_ok=True)
+            output_path = os.path.join(docs_dir, os.path.basename(output_path))
+        else:
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    except OSError as e:
+        raise _OutputError(f"Failed to write PDF to '{output_path}': {e}") from e
+    # Render first (font subsetting happens here), then write atomically: a
+    # report interrupted mid-write never replaces a good one, and a reader
+    # never sees a half-written file.
+    data = bytes(pdf.output())
+    partial = f"{output_path}.part"
+    try:
+        with open(partial, "wb") as handle:
+            handle.write(data)
+        os.replace(partial, output_path)
+    except OSError as e:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+        raise _OutputError(f"Failed to write PDF to '{output_path}': {e}") from e
     return output_path
 
 

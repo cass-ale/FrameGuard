@@ -141,7 +141,7 @@ def test_principal_pages_have_stable_distinct_light_and_dark_renders(
     window = visual_window
     artifacts = _artifact_dir(tmp_path)
     light = "Meta Light" if "Meta Light" in THEMES else "Clean Light"
-    themes = [light, "Meta Dark"]
+    themes = [light, "Blue Hour"]
     panels = (
         (G.PANEL_SCAN, "Scan"),
         (G.PANEL_RESULTS, "Results"),

@@ -550,7 +550,7 @@ class TestThemePersistence:
 
     def test_default_theme_is_still_selectable_after_restore(self):
         """Restoring a non-default theme used to leave the panel believing it
-        was still on Meta Dark, making that button a permanent no-op."""
+        was still on Blue Hour, making that button a permanent no-op."""
         from frameguard.gui import MainWindow
 
         w = MainWindow()
@@ -559,8 +559,8 @@ class TestThemePersistence:
 
         emitted = []
         w.settings_panel.theme_changed.connect(emitted.append)
-        w.settings_panel._select_theme("Meta Dark")
-        assert emitted == ["Meta Dark"]
+        w.settings_panel._select_theme("Blue Hour")
+        assert emitted == ["Blue Hour"]
 
     def test_windows_combo_popup_uses_theme_selection_contrast(self, monkeypatch):
         from PySide6.QtWidgets import QComboBox
@@ -613,7 +613,7 @@ class TestFirstLaunchContract:
         settings.clear()
         assert resolve_startup_theme(settings, prefers_dark=False) == ("Clean Light", False)
         assert not settings.contains(_THEME_KEY)
-        assert resolve_startup_theme(settings, prefers_dark=True) == ("Meta Dark", False)
+        assert resolve_startup_theme(settings, prefers_dark=True) == ("Blue Hour", False)
         assert not settings.contains(_THEME_KEY)
 
     def test_valid_legacy_theme_is_preserved(self):

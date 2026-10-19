@@ -151,6 +151,46 @@ def _drop_files():
     return [arrow, tray], []
 
 
+def _chevron_left():
+    """Collapse the sidebar."""
+    p = QPainterPath()
+    p.moveTo(14.5, 6); p.lineTo(8.5, 12); p.lineTo(14.5, 18)
+    return [p], []
+
+
+def _chevron_right():
+    """Expand the sidebar."""
+    p = QPainterPath()
+    p.moveTo(9.5, 6); p.lineTo(15.5, 12); p.lineTo(9.5, 18)
+    return [p], []
+
+
+def _reset():
+    """Counter-clockwise arrow - restore a setting to its default.
+
+    Replaces U+21BA, which rendered at roughly half the size of the other
+    controls and in whatever weight the substituted font provided.
+    """
+    arc = QPainterPath()
+    arc.arcMoveTo(QRectF(4.5, 4.5, 15, 15), 140)
+    arc.arcTo(QRectF(4.5, 4.5, 15, 15), 140, -290)
+    head = QPainterPath()
+    head.moveTo(4.6, 4.8); head.lineTo(5.6, 9.7); head.lineTo(10.4, 8.4)
+    return [arc, head], []
+
+
+def _info():
+    """Circled 'i' - inline hints (replaces the U+1F6C8 emoji, which macOS
+    fonts lack and drew as a placeholder box)."""
+    ring = QPainterPath()
+    ring.addEllipse(QPointF(12, 12), 8.5, 8.5)
+    stem = QPainterPath()
+    stem.moveTo(12, 11); stem.lineTo(12, 16.5)
+    dot = QPainterPath()
+    dot.addEllipse(QPointF(12, 7.6), 1.25, 1.25)
+    return [ring, stem], [dot]
+
+
 BUILDERS = {
     "scan": _scan,
     "results": _results,
@@ -161,6 +201,10 @@ BUILDERS = {
     "folder": _folder,
     "folder_open": _folder_open,
     "drop_files": _drop_files,
+    "chevron_left": _chevron_left,
+    "chevron_right": _chevron_right,
+    "reset": _reset,
+    "info": _info,
 }
 
 

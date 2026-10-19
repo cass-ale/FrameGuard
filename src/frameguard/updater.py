@@ -20,6 +20,7 @@ import multiprocessing
 import os
 import re
 import shutil
+import ssl
 import sys
 import json
 import subprocess
@@ -92,6 +93,127 @@ def _copy_local_installer_worker(source: str, destination: str,
 
 
 _LOCAL_COPY_WORKER_TARGET = _copy_local_installer_worker
+
+
+# ---------------------------------------------------------------------------
+# HTTPS trust
+# ---------------------------------------------------------------------------
+# The frozen macOS app bundles python.org's OpenSSL, whose CA search path is
+# /Library/Frameworks/Python.framework/Versions/3.12/etc/openssl/cert.pem. That
+# file exists only on Macs with python.org Python *and* its "Install
+# Certificates" step, so on a normal Mac every HTTPS request failed
+# verification. check_github_for_update() swallowed the error and the app
+# reported "Up to date" forever. macOS trust lives in the system keychains, so
+# load their roots (plus any certificate an administrator installed, e.g. a
+# corporate TLS-inspection root) into the context explicitly. Windows already
+# reads the system certificate store through ssl.create_default_context().
+_ROOT_KEYCHAIN = "/System/Library/Keychains/SystemRootCertificates.keychain"
+_ADMIN_KEYCHAIN = "/Library/Keychains/System.keychain"
+_KEYCHAINS = (_ROOT_KEYCHAIN,)
+_macos_pem_cache: Optional[List[str]] = None
+_macos_admin_pem_cache: Optional[List[str]] = None
+_macos_pem_lock = threading.Lock()
+
+
+def _macos_keychain_certificates(include_admin: bool = False) -> List[str]:
+    """PEM certificates from the macOS keychains (cached per process).
+
+    Apple's root store by default. ``include_admin`` adds certificates an
+    administrator installed in the System keychain; that keychain can also
+    hold certificates that were imported but never marked trusted, so it is
+    only consulted after verification against Apple's roots has failed
+    (e.g. behind a corporate TLS-inspection proxy).
+    """
+    global _macos_pem_cache, _macos_admin_pem_cache
+    with _macos_pem_lock:
+        cached = _macos_admin_pem_cache if include_admin else _macos_pem_cache
+        if cached is not None:
+            return cached
+        certificates: List[str] = []
+        failed = False
+        security = "/usr/bin/security"
+        keychains = (_ROOT_KEYCHAIN, _ADMIN_KEYCHAIN) if include_admin else (_ROOT_KEYCHAIN,)
+        if os.path.exists(security):
+            for keychain in keychains:
+                if not os.path.exists(keychain):
+                    continue
+                try:
+                    completed = subprocess.run(
+                        [security, "find-certificate", "-a", "-p", keychain],
+                        capture_output=True, text=True, timeout=15, check=False)
+                except Exception:
+                    # Never let trust-store discovery break an update check;
+                    # the default context still applies. Retry next time.
+                    failed = True
+                    continue
+                for block in completed.stdout.split("-----END CERTIFICATE-----"):
+                    start = block.find("-----BEGIN CERTIFICATE-----")
+                    if start >= 0:
+                        certificates.append(
+                            block[start:] + "-----END CERTIFICATE-----\n")
+        if certificates or not failed:
+            if include_admin:
+                _macos_admin_pem_cache = certificates
+            else:
+                _macos_pem_cache = certificates
+        return certificates
+
+
+def _is_certificate_failure(error: BaseException) -> bool:
+    reason = getattr(error, "reason", error)
+    return isinstance(reason, ssl.SSLCertVerificationError) or isinstance(
+        error, ssl.SSLCertVerificationError)
+
+
+def _urlopen_verified(request, timeout: float):
+    """urlopen with OS trust; on macOS retry once with admin-installed roots."""
+    import urllib.request
+
+    try:
+        return urllib.request.urlopen(
+            request, timeout=timeout, context=https_context())
+    except Exception as error:
+        if sys.platform != "darwin" or not _is_certificate_failure(error):
+            raise
+        return urllib.request.urlopen(
+            request, timeout=timeout,
+            context=https_context(include_admin=True))
+
+
+def https_context(include_admin: bool = False) -> ssl.SSLContext:
+    """A verifying TLS context that trusts what the operating system trusts."""
+    try:
+        context = ssl.create_default_context()
+    except Exception:
+        # Loading the platform store can fail on unusual systems; keep full
+        # verification (CERT_REQUIRED + hostname checks) with OpenSSL defaults.
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            context.set_default_verify_paths()
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        for pem in _macos_keychain_certificates(include_admin):
+            try:
+                context.load_verify_locations(cadata=pem)
+            except (ssl.SSLError, ValueError):
+                # One unparsable keychain item must not discard the rest.
+                continue
+    return context
+
+
+class UpdateCheckError(RuntimeError):
+    """GitHub Releases could not be reached or answered with garbage."""
+
+
+# Reason the most recent check_github_for_update() call could not complete,
+# or "" when it reached GitHub. Read by UpdateManager._do_check, which runs one
+# check at a time, so the failure is reported instead of "Up to date".
+_last_github_error = ""
+
+
+def last_github_error() -> str:
+    return _last_github_error
 
 # The repository releases live in. GitHub Releases is the zero-configuration,
 # architecture-aware update source and carries the complete installers.
@@ -319,7 +441,7 @@ def _checksum_from_release(assets, filename: str) -> str:
 
     request = urllib.request.Request(
         url, headers={"User-Agent": "FrameGuard-Updater"})
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with _urlopen_verified(request, timeout=10) as response:
         if not _http_status_ok(response):
             return ""
         text = _read_bounded(response, _MAX_CHECKSUM_BYTES).decode(
@@ -338,7 +460,14 @@ def _checksum_from_release(assets, filename: str) -> str:
 
 
 def check_github_for_update() -> Optional["UpdateInfo"]:
-    """Check GitHub Releases for one integrity-verifiable stable installer."""
+    """Check GitHub Releases for one integrity-verifiable stable installer.
+
+    Returns None when there is nothing installable. When GitHub could not be
+    reached at all, the reason is also left in ``last_github_error()`` so the
+    caller can say "check failed" rather than "up to date".
+    """
+    global _last_github_error
+    _last_github_error = ""
     try:
         import urllib.request
 
@@ -347,12 +476,21 @@ def check_github_for_update() -> Optional["UpdateInfo"]:
             headers={"Accept": "application/vnd.github.v3+json",
                      "User-Agent": "FrameGuard-Updater"},
         )
-        with urllib.request.urlopen(req, timeout=10) as response:
-            if not _http_status_ok(response):
-                return None
-            data = json.loads(
-                _read_bounded(response, _MAX_RELEASE_METADATA_BYTES).decode(
-                    "utf-8", errors="strict"))
+        try:
+            with _urlopen_verified(req, timeout=10) as response:
+                if not _http_status_ok(response):
+                    status = getattr(response, "status", "")
+                    raise UpdateCheckError(f"GitHub answered HTTP {status}".strip())
+                data = json.loads(
+                    _read_bounded(response, _MAX_RELEASE_METADATA_BYTES).decode(
+                        "utf-8", errors="strict"))
+        except UpdateCheckError as error:
+            _last_github_error = str(error)
+            return None
+        except Exception as error:  # network, TLS, proxy, malformed JSON
+            reason = getattr(error, "reason", None) or error
+            _last_github_error = str(reason)[:160] or type(error).__name__
+            return None
 
         if not isinstance(data, dict) or data.get("draft") or data.get("prerelease"):
             return None
@@ -506,9 +644,19 @@ class UpdateManager(QObject):
     delta_update_available = Signal(str, str)   # channel, version   # UpdateInfo
     update_not_found = Signal()
     check_failed = Signal(str)
+    # Install failures only. check_failed is shared with update checks, so a
+    # failed hourly check used to close the install progress dialog mid-download.
+    apply_failed = Signal(str)
     download_progress = Signal(int)
     download_complete = Signal(str)
     status_changed = Signal(str)
+    # Emitted on the GUI thread's queue once the installer has been handed
+    # off (macOS: the DMG is open; Windows: Setup is running). The window must
+    # then quit so the installed app can be replaced. The old code called
+    # a zero-delay QTimer quit from this worker thread, which has no Qt
+    # event loop, so the quit never ran: Setup sat behind a "FrameGuard is
+    # running" prompt and macOS could not replace the running bundle.
+    install_handoff = Signal(str)
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -527,6 +675,13 @@ class UpdateManager(QObject):
         self._startup_timer = QTimer(self)
         self._startup_timer.setSingleShot(True)
         self._startup_timer.timeout.connect(self._auto_check)
+        # FrameGuard often runs for days in the tray watching a folder; the
+        # startup check alone meant such a session never saw a new release.
+        self._periodic_timer = QTimer(self)
+        self._periodic_timer.setInterval(60 * 60 * 1000)
+        self._periodic_timer.timeout.connect(
+            lambda: self.start_auto_check(delay_seconds=0))
+        self._stale_staging_cleaned = False
 
     @staticmethod
     def _emit(signal, *args) -> bool:
@@ -543,8 +698,13 @@ class UpdateManager(QObject):
         """Schedule an automatic background check after a short delay.
         
         Only checks if enough time has passed since the last check.
-        Called once at app startup.
+        Called at app startup and then hourly.
         """
+        if not self._periodic_timer.isActive():
+            self._periodic_timer.start()
+        if not self._stale_staging_cleaned:
+            self._stale_staging_cleaned = True
+            remove_stale_staging_dirs()
         last_check_str = self._settings.value("update/last_check", "")
         if last_check_str:
             try:
@@ -561,6 +721,11 @@ class UpdateManager(QObject):
         """Manually trigger an update check (from Settings button).
         Returns immediately — results come via signals.
         """
+        if self._applying:
+            # Never race a check against an install in progress, but always
+            # answer so a manual "Check for Updates" button is released.
+            self._emit(self.check_failed, "An update is already being installed.")
+            return
         with self._check_lock:
             if self._checking:
                 return
@@ -606,8 +771,11 @@ class UpdateManager(QObject):
         if not remote_version or not _is_newer(remote_version, get_current_version()):
             return False
 
-        self._settings.setValue("update/last_check", datetime.now().isoformat())
-        self._settings.setValue("update/last_source", channel)
+        # A separate QSettings per thread: one instance shared between this
+        # worker thread and the GUI thread is not thread-safe.
+        settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+        settings.setValue("update/last_check", datetime.now().isoformat())
+        settings.setValue("update/last_source", channel)
         self._emit(self.delta_update_available, channel, remote_version)
         return True
 
@@ -632,6 +800,7 @@ class UpdateManager(QObject):
             info = self._last_found_update
         if info is None:
             self._emit(self.check_failed, "No update information available.")
+            self._emit(self.apply_failed, "No update information available.")
             return
         with self._apply_lock:
             if self._applying:
@@ -688,13 +857,17 @@ class UpdateManager(QObject):
             if self.check_channel_for_delta():
                 return
 
+            settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
+
             # Try GitHub Releases first (primary update source)
-            from frameguard.updater import check_github_for_update
-            github_info = check_github_for_update()
+            from frameguard import updater as _updater
+            _updater._last_github_error = ""
+            github_info = _updater.check_github_for_update()
+            github_error = _updater.last_github_error()
             if github_info and github_info.is_newer:
                 self._last_found_update = github_info
-                self._settings.setValue("update/last_check", datetime.now().isoformat())
-                self._settings.setValue("update/last_source", "GitHub Releases")
+                settings.setValue("update/last_check", datetime.now().isoformat())
+                settings.setValue("update/last_source", "GitHub Releases")
                 self._emit(self.status_changed, f"Update found: v{github_info.version}")
                 self._emit(self.update_available, github_info)
                 self._checking = False
@@ -718,15 +891,23 @@ class UpdateManager(QObject):
                 if info and info.is_newer:
                     # Found an update!
                     self._last_found_update = info
-                    self._settings.setValue("update/last_check", datetime.now().isoformat())
-                    self._settings.setValue("update/last_source", path)
+                    settings.setValue("update/last_check", datetime.now().isoformat())
+                    settings.setValue("update/last_source", path)
                     self._emit(self.status_changed, f"Update found: v{info.version}")
                     self._emit(self.update_available, info)
                     self._checking = False
                     return
             
+            if github_error:
+                # Unreachable is not "up to date". Leave last_check alone so
+                # the next launch (or the hourly timer) tries again.
+                self._emit(self.status_changed, "Update check failed")
+                self._emit(self.check_failed,
+                           f"Could not reach GitHub Releases: {github_error}")
+                return
+
             # No update found
-            self._settings.setValue("update/last_check", datetime.now().isoformat())
+            settings.setValue("update/last_check", datetime.now().isoformat())
             self._emit(self.status_changed, "Up to date")
             self._emit(self.update_not_found)
             
@@ -769,7 +950,7 @@ class UpdateManager(QObject):
             self._check_cancelled()
             req = urllib.request.Request(
                 url, headers={"User-Agent": "FrameGuard-Updater"})
-            with urllib.request.urlopen(
+            with _urlopen_verified(
                     req, timeout=_DOWNLOAD_TIMEOUT_SECONDS) as response:
                 if not _http_status_ok(response):
                     raise RuntimeError("Installer download returned a non-success status.")
@@ -997,6 +1178,7 @@ class UpdateManager(QObject):
                 subprocess.Popen(["/usr/bin/open", dest])
                 retained = True
                 self._retained_staging_dirs.add(staging_dir)
+                self._emit(self.install_handoff, dest)
                 return
 
             self._emit(self.status_changed, "Launching installer...")
@@ -1007,18 +1189,15 @@ class UpdateManager(QObject):
             )
             retained = True
             self._retained_staging_dirs.add(staging_dir)
-            time.sleep(1)
             self._emit(self.status_changed, "Restarting...")
-
-            from PySide6.QtWidgets import QApplication
-            app = QApplication.instance()
-            if app is not None:
-                QTimer.singleShot(0, app.quit)
+            # Setup waits for this process's mutex to clear before installing.
+            self._emit(self.install_handoff, dest)
         except Exception as error:
             if self._cancel_event.is_set():
                 self._emit(self.status_changed, "Update cancelled.")
             else:
                 self._emit(self.check_failed, f"Update failed: {str(error)[:200]}")
+                self._emit(self.apply_failed, f"Update failed: {str(error)[:200]}")
         finally:
             if staging_dir and not retained:
                 shutil.rmtree(staging_dir, ignore_errors=True)
@@ -1029,6 +1208,38 @@ class UpdateManager(QObject):
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
+
+_STALE_STAGING_SECONDS = 24 * 60 * 60
+
+
+def remove_stale_staging_dirs(now: Optional[float] = None) -> int:
+    """Delete update staging folders left by earlier, completed updates.
+
+    A successful launch hands the staged installer to the OS, so the folder
+    cannot be removed by the process that created it; each update used to
+    leave a 100-200 MB copy in the temp directory forever.
+    """
+    root = tempfile.gettempdir()
+    now = time.time() if now is None else now
+    removed = 0
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.startswith("frameguard_update_"):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if not os.path.isdir(path) or os.path.islink(path):
+                continue
+            if now - os.path.getmtime(path) < _STALE_STAGING_SECONDS:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    return removed
 
 def create_version_json(version: str, installer_filename: str = _INSTALLER_FILENAME,
                         changelog: str = "", file_size_mb: float = 0,

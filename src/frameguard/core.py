@@ -735,7 +735,7 @@ def check_container_format(filepath: str, result: QAResult, cfg: dict):
     if ext not in cfg["accepted_containers"]:
         result.add_fail("Container Format", f"Container '{ext}' not in accepted list {cfg['accepted_containers']}.")
         return
-    result.add_pass("Container Format", f"{file_size_mb:.1f} MB, container: {ext}")
+    result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
 
 
 def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
@@ -835,6 +835,29 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
         )
 
 
+def _format_size(size_mb: float) -> str:
+    """'40.3 MB', or KB below 0.1 MB: a 7 KB file read as '0.0 MB'."""
+    if size_mb < 0.1:
+        return f"{max(size_mb * 1024, 0.0):.0f} KB"
+    return f"{size_mb:.1f} MB"
+
+
+def _format_mbps(mbps: float) -> str:
+    """One decimal normally; more for sub-1 Mbps so 0.05 is not '0.0'."""
+    if mbps >= 1:
+        return f"{mbps:.1f}"
+    if mbps >= 0.01:
+        return f"{mbps:.2f}"
+    return "<0.01"
+
+
+def _format_pct(pct: float) -> str:
+    """A deficit that rounds to 100% but is not 100% reads '>99%'."""
+    if pct >= 99.5 and pct < 100:
+        return ">99%"
+    return f"{pct:.0f}%"
+
+
 def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     """Check 4: Validate frame rate."""
     video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
@@ -847,6 +870,10 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     result.set_metadata("avg_frame_rate", avg_fps)
     fps = avg_fps if avg_fps > 0 else r_fps
     result.set_metadata("frame_rate", fps)
+    if fps <= 0:
+        result.add_warn("Frame Rate", "Could not determine the frame rate from the container.",
+                        confidence=50)
+        return
     if abs(fps - cfg["target_fps"]) <= cfg["fps_tolerance"]:
         result.add_pass("Frame Rate", f"{fps:.2f} fps (target: {cfg['target_fps']} fps)")
     elif fps > cfg["target_fps"]:
@@ -922,19 +949,19 @@ def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
                            f"(format total: {orig_mbps:.1f} Mbps). PCM audio may skew calculation.")
             return
     if bitrate_mbps >= min_br:
-        result.add_pass("Bitrate", f"{bitrate_mbps:.1f} Mbps (min: {min_br} Mbps)")
+        result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps (min: {min_br} Mbps)")
     else:
         # Percentage-based tolerance: VBR encoding commonly varies 10-15% below target
         deficit_pct = ((min_br - bitrate_mbps) / min_br * 100) if min_br > 0 else 0
         if deficit_pct <= 10:
             # Within 10% - marginal pass (normal VBR variance)
-            result.add_pass("Bitrate", f"{bitrate_mbps:.1f} Mbps ({deficit_pct:.0f}% below target {min_br} Mbps - within VBR tolerance)", confidence=70)
+            result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps ({deficit_pct:.0f}% below target {min_br} Mbps - within VBR tolerance)", confidence=70)
         elif deficit_pct <= 25:
             # 10-25% below - warn but don't fail
-            result.add_warn("Bitrate", f"{bitrate_mbps:.1f} Mbps — {deficit_pct:.0f}% below {min_br} Mbps target. Likely still usable; verify no visible compression artifacts.", confidence=75)
+            result.add_warn("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps — {deficit_pct:.0f}% below {min_br} Mbps target. Likely still usable; verify no visible compression artifacts.", confidence=75)
         else:
             # >25% below - definite fail
-            result.add_fail("Bitrate", f"{bitrate_mbps:.1f} Mbps is {deficit_pct:.0f}% below minimum {min_br} Mbps. Likely visible compression artifacts.", confidence=95)
+            result.add_fail("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps is {_format_pct(deficit_pct)} below minimum {min_br} Mbps. Likely visible compression artifacts.", confidence=95)
 
 
 def check_audio(probe_data: dict, result: QAResult, cfg: dict):
@@ -944,7 +971,7 @@ def check_audio(probe_data: dict, result: QAResult, cfg: dict):
         if cfg["audio_required"]:
             result.add_fail("Audio Stream", "No audio stream found (audio is required).")
         else:
-            result.add_warn("Audio Stream", "No audio stream found.")
+            result.add_pass("Audio Stream", "No audio stream (audio not required).")
         return
     audio = audio_streams[0]
     codec = audio.get("codec_name", "unknown").lower()
@@ -1018,6 +1045,26 @@ def check_naming(filepath: str, result: QAResult, cfg: dict):
         result.add_warn("Naming Convention", f"Does not match expected pattern: {cfg['naming_example']}")
 
 
+def _stream_duration_text(stream: dict) -> Optional[str]:
+    """Per-stream duration in seconds as text, including Matroska's tag form.
+
+    MKV and WebM streams carry no ``duration`` field; the length lives in a
+    ``DURATION`` tag formatted ``HH:MM:SS.nnnnnnnnn``. Without this fallback
+    every Matroska file with audio raised an A/V Duration warning.
+    """
+    value = stream.get("duration")
+    if value and value != "N/A":
+        return str(value)
+    tags = stream.get("tags") or {}
+    for key, raw in tags.items():
+        if str(key).upper().startswith("DURATION") and isinstance(raw, str):
+            match = re.fullmatch(r"\s*(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*", raw)
+            if match:
+                hours, minutes, seconds = match.groups()
+                return str(int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    return None
+
+
 def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
     """Check 11: Detect video/audio duration mismatch with tiered severity."""
     video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
@@ -1025,8 +1072,8 @@ def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
     if not video_streams or not audio_streams:
         result.add_skip("A/V Duration", "Need both video and audio streams to compare.")
         return
-    v_dur_str = video_streams[0].get("duration")
-    a_dur_str = audio_streams[0].get("duration")
+    v_dur_str = _stream_duration_text(video_streams[0])
+    a_dur_str = _stream_duration_text(audio_streams[0])
     if not v_dur_str or not a_dur_str:
         result.add_warn("A/V Duration", "Per-stream duration not available.")
         return
@@ -1105,7 +1152,15 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     vs = video_streams[0]
     nb_frames_str = vs.get("nb_frames")
     if not nb_frames_str or nb_frames_str == "N/A":
-        result.add_warn("Frame Count", "nb_frames not available in container metadata.")
+        # Matroska and WebM never record a per-stream frame count, so its
+        # absence there says nothing about the file; every .mkv used to carry
+        # a Frame Count warning. Elsewhere a missing count stays a warning.
+        format_name = str((probe_data.get("format") or {}).get("format_name") or "")
+        if nb_frames_str in (None, "", "N/A") and (
+                "matroska" in format_name or "webm" in format_name):
+            result.add_skip("Frame Count", "Frame count is not recorded in Matroska/WebM files.")
+        else:
+            result.add_warn("Frame Count", "nb_frames not available in container metadata.")
         return
     actual_frames = _safe_int(nb_frames_str)
     if actual_frames is None or actual_frames < 0:
@@ -1140,7 +1195,9 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
 
 def _filter_hwaccel_noise(stderr_text: str) -> str:
     """Remove hwaccel fallback messages from stderr to prevent false positives."""
-    lines = stderr_text.strip().split("\n")
+    # Split without stripping the whole text: the first line's indentation
+    # tells _extract_decode_errors whether it belongs to the metadata dump.
+    lines = stderr_text.split("\n")
     filtered = []
     for line in lines:
         line_lower = line.lower()
@@ -1185,19 +1242,41 @@ DECODE_ERROR_PATTERNS = (
 )
 
 
+_NON_DECODER_LINE_RE = re.compile(
+    r"^(?:Input|Output) #\d|^Stream #\d|^Duration:|^Metadata:|^Chapters?:"
+    r"|^[A-Za-z_][\w .-]*?\s{2,}:\s"   # padded "key        : value" dump rows
+)
+
+
+# "[h264 @ 0x7f..]" - present on decoder messages, including one glued onto
+# an indented line by interleaved filter-thread output.
+_DECODER_TAG_RE = re.compile(r"\[[^\]@\n]+ @ 0x[0-9a-fA-F]+\]")
+
+
 def _extract_decode_errors(stderr_clean: str) -> list:
-    """Return the lines in FFmpeg stderr that indicate a real decode problem."""
+    """Return the lines in FFmpeg stderr that indicate a real decode problem.
+
+    FFmpeg's input banner ("Input #0, mov,... from '/path/not_corrupt.mp4':")
+    and metadata dump are not suppressed by -hide_banner, and they contain the
+    file path and tags. Matching patterns such as "corrupt" against those
+    lines failed Decode Integrity for a clean file purely because of its name.
+    """
     errors = []
-    for line in stderr_clean.strip().split("\n"):
-        line = line.strip()
-        if not line:
+    for raw in stderr_clean.split("\n"):
+        # The banner, metadata dump and stream list are indented; decoder
+        # messages start at column 0 or with a "[codec @ 0x...]" prefix. This
+        # also covers long keys whose padding collapses ("com.apple.quicktime
+        # .description: corrupt take") and ": ..." continuation rows.
+        if raw[:1] in (" ", "\t") and not _DECODER_TAG_RE.search(raw):
+            continue
+        line = raw.strip()
+        if not line or _NON_DECODER_LINE_RE.match(line):
             continue
         if any(p in line for p in DECODE_ERROR_PATTERNS):
             errors.append(line)
     return errors
 
 
-_STDERR_EVIDENCE_ORDER = ("decode", "freeze", "silence", "black")
 _STDERR_EVIDENCE_TOKENS = {
     "black": ("black_start", "black_end", "black_duration"),
     "freeze": ("freeze_start", "freeze_end", "freeze_duration"),
@@ -1282,7 +1361,19 @@ class _CapturedStderr(str):
 
 
 class _BoundedStderrCapture:
-    """Keep first/recent semantic evidence per category plus a late tail."""
+    """Keep every detection record, plus a bounded tail of other context.
+
+    Verdicts are parsed from this text, so detect-filter events and decode
+    errors are data, not diagnostics. v0.8.0 kept only the first and most
+    recent line per category: freezedetect writes three lines per event and
+    silencedetect two, so the parser paired the first event's start with the
+    last event's end and fabricated a single multi-minute silence or freeze
+    (a false MISMATCH), black events beyond the second vanished, and repeated
+    decode errors were collapsed into one. Event lines are now all retained up
+    to a hard ceiling (``deep_scan_max_event_lines``) that only pathological
+    streams reach; ordinary progress noise still shares the line and character
+    budget, and is what gets discarded under pressure.
+    """
 
     def __init__(self, cfg: dict):
         self.max_lines = max(
@@ -1290,11 +1381,20 @@ class _BoundedStderrCapture:
         self.max_chars = max(
             1, int(cfg.get("deep_scan_max_stderr_chars", 512 * 1024)
                    or 512 * 1024))
+        self.max_event_lines = max(
+            1, int(cfg.get("deep_scan_max_event_lines", 20000) or 20000))
+        self.max_event_chars = max(
+            1, int(cfg.get("deep_scan_max_event_chars", 4 * 1024 * 1024)
+                   or 4 * 1024 * 1024))
         evidence_slots = max(1, min(self.max_lines, 8))
         separators = max(0, evidence_slots - 1)
-        self._evidence_line_limit = max(
-            1, (self.max_chars - separators) // evidence_slots)
-        self._evidence = {}
+        # A single event record is clipped to a parseable snippet: parsing
+        # needs only the tokens, and unclipped multi-kilobyte decoder lines
+        # let 20000 retained records reach tens of megabytes per segment.
+        self._evidence_line_limit = min(512, max(
+            256, (self.max_chars - separators) // evidence_slots))
+        self._kept = []
+        self._kept_chars = 0
         self._tail = deque()
         self._tail_chars = 0
         self._sequence = 0
@@ -1306,46 +1406,15 @@ class _BoundedStderrCapture:
     def note_fragment_split(self) -> None:
         self.truncated_records += 1
 
-    def _allocated_evidence(self) -> list:
-        allocated = []
-        seen = set()
-        # One recent representative for every distinct category comes first;
-        # remaining slots preserve the earliest representative for each.
-        for position in (-1, 0):
-            for category in _STDERR_EVIDENCE_ORDER:
-                entries = self._evidence.get(category, [])
-                if not entries:
-                    continue
-                entry = entries[position]
-                if entry[0] in seen:
-                    continue
-                seen.add(entry[0])
-                allocated.append(entry)
-                if len(allocated) >= self.max_lines:
-                    return allocated
-        return allocated
-
     def _entries(self) -> list:
-        return sorted([*self._allocated_evidence(), *self._tail])
+        return sorted([*self._kept, *self._tail])
 
     def _retained_count(self) -> int:
-        return len(self._allocated_evidence()) + len(self._tail)
+        return len(self._kept) + len(self._tail)
 
     def _joined_chars(self) -> int:
-        evidence = self._allocated_evidence()
-        count = len(evidence) + len(self._tail)
-        return (sum(len(entry[1]) for entry in evidence)
-                + self._tail_chars + max(0, count - 1))
-
-    def _prune_unallocated_evidence(self) -> None:
-        retained = {entry[0] for entry in self._allocated_evidence()}
-        for category in list(self._evidence):
-            entries = [entry for entry in self._evidence[category]
-                       if entry[0] in retained]
-            if entries:
-                self._evidence[category] = entries
-            else:
-                del self._evidence[category]
+        count = self._retained_count()
+        return self._kept_chars + self._tail_chars + max(0, count - 1)
 
     def add(self, line: str) -> None:
         line = line.rstrip("\r\n")
@@ -1359,27 +1428,21 @@ class _BoundedStderrCapture:
         self._sequence += 1
 
         if categories:
-            added = False
-            for category in categories:
-                entries = self._evidence.setdefault(category, [])
-                if any(existing[1] == clipped for existing in entries):
-                    continue
-                if len(entries) == 2:
-                    entries.pop()
-                    self.truncated_records += 1
-                entries.append(entry)
-                added = True
-            if not added:
+            if (len(self._kept) >= self.max_event_lines
+                    or self._kept_chars + len(clipped) > self.max_event_chars):
+                self.truncated_records += 1
                 return
-            self._prune_unallocated_evidence()
+            self._kept.append(entry)
+            self._kept_chars += len(clipped)
         else:
             self._tail.append(entry)
             self._tail_chars += len(clipped)
 
-        while (self._retained_count() > self.max_lines
-               or self._joined_chars() > self.max_chars):
-            if not self._tail:
-                break
+        # The tail only gets what the retained evidence leaves of the budget.
+        line_budget = max(0, self.max_lines - len(self._kept))
+        char_budget = max(0, self.max_chars - self._kept_chars - len(self._kept))
+        while self._tail and (len(self._tail) > line_budget
+                              or self._tail_chars + len(self._tail) > char_budget):
             discarded = self._tail.popleft()
             self._tail_chars -= len(discarded[1])
             self.truncated_records += 1
@@ -1546,8 +1609,43 @@ def _pair_detect_events(stderr_text: str, prefix: str) -> list:
 # timeline, so they must NOT be shifted.
 _EVENT_TIME_RE = re.compile(
     r"(black_start|black_end|freeze_start|freeze_end|silence_start|silence_end)"
-    r"(\s*[:=]\s*)(\d+(?:\.\d+)?)"
+    # The value may be negative: a region that began just before a segment's
+    # seek point is reported as e.g. "silence_start: -0.0213". Leaving it
+    # unshifted paired it with a shifted end and fabricated a silence
+    # hundreds of seconds long.
+    r"(\s*[:=]\s*)(-?\d+(?:\.\d+)?)"
 )
+
+
+_REGION_CLOSERS = {
+    "freeze": "lavfi.freezedetect.freeze_end: {end:.3f}",
+    "silence": "[silencedetect] silence_end: {end:.3f}",
+    "black": "[blackdetect] black_end:{end:.3f}",
+}
+
+
+def _close_open_regions(stderr_text: str, end_time: float) -> str:
+    """Close any detection region still open at ``end_time``.
+
+    freezedetect never prints freeze_end for a freeze that lasts until the
+    input ends, so a clip that froze for its last six seconds - or a whole
+    static deliverable - was reported as "1 freeze event, total 0.0s" and
+    passed. With segmented scans every segment of a frozen file ended that
+    way, giving several 0.0s events instead of one long freeze. The open
+    region now ends where the scanned range ends.
+    """
+    if not stderr_text or end_time is None:
+        return stderr_text or ""
+    additions = []
+    for prefix, closer in _REGION_CLOSERS.items():
+        last_kind = None
+        for match in re.finditer(rf"{prefix}_(start|end)\s*[:=]", stderr_text):
+            last_kind = match.group(1)
+        if last_kind == "start":
+            additions.append(closer.format(end=float(end_time)))
+    if not additions:
+        return stderr_text
+    return stderr_text + "\n" + "\n".join(additions)
 
 
 def _offset_event_times(stderr_text: str, offset: float) -> str:
@@ -1864,9 +1962,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     max_gb = float(cfg.get("deep_scan_max_file_gb", 8.0) or 8.0)
     max_dur = float(cfg.get("deep_scan_max_duration_s", 7200.0) or 7200.0)
     if file_gb > max_gb or duration > max_dur:
-        result.add_skip(
+        result.add_warn(
             "Deep Scan",
-            f"Skipped frame-level analysis: file is {file_gb:.1f} GB / "
+            f"Frame-level analysis not run: file is {file_gb:.1f} GB / "
             f"{duration:.0f}s (limits {max_gb:.0f} GB / {max_dur:.0f}s). "
             f"Metadata checks still apply.")
         result.set_metadata("deep_scan_skipped_reason", "size_or_duration_gate")
@@ -1890,9 +1988,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     # file: a compile-time hwaccel method with no device on this machine
     # must never be selected — its decode dies before the first frame and
     # the empty result used to be reported as a clean pass.
-    hwaccel_args = _get_optimal_hwaccel(cfg, probe_file=filepath)
-
     # ---- Quick mode: skip deep scan entirely ----
+    # Checked before hardware-decode probing: those probes spawn up to five
+    # FFmpeg test decodes that quick mode never uses.
     if quick:
         result.add_skip("Decode Integrity", "Skipped (quick mode)")
         result.add_skip("Black Frames", "Skipped (quick mode)")
@@ -1900,6 +1998,8 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         result.add_skip("Audio Silence", "Skipped (quick mode)")
         # REMOVED v0.4.4: result.add_skip("Audio Loudness", "Skipped (quick mode)")
         return
+
+    hwaccel_args = _get_optimal_hwaccel(cfg, probe_file=filepath)
 
     # Build filter strings — video and audio SEPARATE
     vf_str = (
@@ -1986,7 +2086,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                             seg_stderr, "truncated_records", 0)
                     # -ss before -i zeroes the segment's PTS, so shift every
                     # reported timestamp back onto the whole-file timeline.
-                    segment_results.append((idx, _offset_event_times(seg_stderr, segments[idx][0])))
+                    segment_results.append((idx, _close_open_regions(
+                        _offset_event_times(seg_stderr, segments[idx][0]),
+                        segments[idx][1])))
                     completed += 1
                     if progress_callback:
                         progress_callback("filter", completed * (duration / len(segments)), duration, "Deep Scan [combined]")
@@ -2169,6 +2271,8 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 
     # ---- Parse decode errors from stderr (merged from Pass 1) ----
     stderr_clean = _filter_hwaccel_noise(stderr_text)
+    # Regions still open when the input ended (see _close_open_regions).
+    events_text = _close_open_regions(stderr_text, duration)
     decode_errors = _extract_decode_errors(stderr_clean)
 
     if not decode_errors:
@@ -2182,13 +2286,19 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     # ---- Parse filter results from combined stderr ----
 
     # Check 15: Black frames
-    black_events = _merge_event_intervals(_pair_detect_events(stderr_text, "black"))
+    black_events = _merge_event_intervals(_pair_detect_events(events_text, "black"))
     # FIX: Exclude black events in first 1s and last 1s (legitimate fade-in/fade-out)
+    # Trim the first and last second instead of discarding whole events:
+    # dropping any event that touched a margin let an entirely black file,
+    # or one opening or ending on 20s of black, pass as "no black frames".
     if duration > 3.0:
-        black_events = [
-            (start, dur) for start, dur in black_events
-            if start >= 1.0 and (start + dur) <= (duration - 1.0)
-        ]
+        trimmed = []
+        for start, dur in black_events:
+            begin = max(start, 1.0)
+            finish = min(start + dur, duration - 1.0)
+            if finish - begin > 0:
+                trimmed.append((begin, finish - begin))
+        black_events = trimmed
 
     if black_events:
         total_black = sum(d for _, d in black_events)
@@ -2212,7 +2322,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         result.add_pass("Black Frames", "No black frame sequences detected.")
 
     # Check 16: Freeze frames
-    freeze_events = _merge_event_intervals(_pair_detect_events(stderr_text, "freeze"))
+    freeze_events = _merge_event_intervals(_pair_detect_events(events_text, "freeze"))
 
     if freeze_events:
         total_freeze = sum(d for _, d in freeze_events)
@@ -2230,7 +2340,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 
     # Check 17: Audio silence
     if has_audio:
-        silence_events = _merge_event_intervals(_pair_detect_events(stderr_text, "silence"))
+        silence_events = _merge_event_intervals(_pair_detect_events(events_text, "silence"))
 
         if silence_events:
             count = len(silence_events)
