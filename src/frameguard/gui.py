@@ -87,7 +87,7 @@ from frameguard.updater import UpdateManager
 from frameguard import design as D
 from frameguard.theme import (
     generate_stylesheet, get_theme, get_theme_names, set_current_theme,
-    THEMES, ThemeColors
+    THEMES, ThemeColors, canonical_theme_name
 )
 
 from frameguard import __version__ as APP_VERSION
@@ -106,7 +106,7 @@ _THEME_KEY = "appearance/theme"
 _LEGACY_THEME_KEY = "theme"
 _WINDOW_GEOMETRY_KEY = "window/normal_geometry"
 _RESULTS_SPLITTER_KEY = "window/results_splitter"
-_DEFAULT_DARK_THEME = "Meta Dark"
+_DEFAULT_DARK_THEME = "Blue Hour"
 _DEFAULT_LIGHT_THEME = "Clean Light"
 
 
@@ -144,8 +144,13 @@ def resolve_startup_theme(settings=None, prefers_dark=None) -> tuple[str, bool]:
     for key in (_THEME_KEY, _LEGACY_THEME_KEY):
         if settings.contains(key):
             saved = settings.value(key, "")
-            if saved in THEMES:
-                return str(saved), True
+            renamed = canonical_theme_name(saved)
+            if renamed in THEMES:
+                if renamed != saved:
+                    # A retired name (e.g. "Meta Dark"): keep the user's
+                    # choice and store it under its current name.
+                    settings.setValue(key, renamed)
+                return str(renamed), True
             invalid_saved_value = True
     if invalid_saved_value:
         settings.remove(_THEME_KEY)
@@ -229,8 +234,40 @@ def _fit_dialog_to_screen(dialog: QDialog, preferred: QSize, minimum: QSize = QS
     dialog.move(frame.topLeft())
 
 
+def _fit_combo_popup(combo) -> None:
+    """Make a combo's popup wide enough for its longest entry.
+
+    The list popup is only as wide as the closed combo, so long preset names
+    ("1080p Full HD @ 24fps (Cinematic)") were elided in the middle.
+    """
+    view = combo.view()
+    view.ensurePolished()
+    # The delegate's own size hint: the styled font, item padding and margins
+    # exactly as the popup will draw them.
+    widest = max(view.sizeHintForColumn(0), 0)
+    extra = 2 + 8  # frame, plus breathing room after the longest entry
+    if combo.count() > combo.maxVisibleItems():
+        from PySide6.QtWidgets import QStyle
+        extra += view.style().pixelMetric(QStyle.PM_ScrollBarExtent)
+    view.setMinimumWidth(widest + extra)
+
+
+def _install_combo_popup_fit(combo) -> None:
+    if combo.property("fgPopupFit"):
+        return
+    combo.setProperty("fgPopupFit", True)
+    model = combo.model()
+    refit = lambda *_args: _fit_combo_popup(combo)  # noqa: E731
+    model.rowsInserted.connect(refit)
+    model.rowsRemoved.connect(refit)
+    model.modelReset.connect(refit)
+    model.dataChanged.connect(refit)
+    _fit_combo_popup(combo)
+
+
 def _style_combobox_popup(combo, theme):
-    """Force QComboBox popups through Qt drawing on Windows."""
+    """Size every combo popup to its content; force Qt drawing on Windows."""
+    _install_combo_popup_fit(combo)
     if sys.platform != "win32":
         return
     from PySide6.QtWidgets import QListView
@@ -908,6 +945,7 @@ class ThemePreviewDelegate(QStyledItemDelegate):
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
         theme_name = index.data(Qt.DisplayRole)
+        theme_name = canonical_theme_name(theme_name)
         if theme_name and theme_name in THEMES:
             theme = THEMES[theme_name]
             colors = [theme.accent, theme.bg_primary, theme.text_primary]
@@ -1614,10 +1652,23 @@ class ScanPanel(QWidget):
 
 
 
+    def _style_file_count(self, tone: str) -> None:
+        """Colour the file-count line from the *current* theme.
+
+        The colour used to be baked in when files were added, so after a
+        theme switch "6 files selected" kept the old theme's colour - white
+        text on Clean Light's white page.
+        """
+        self._file_count_tone = tone
+        t = get_theme()
+        color = {"warn": t.status_warn, "primary": t.text_primary}.get(tone, t.text_secondary)
+        self.file_count_label.setStyleSheet(f"color: {color}; font-size: 14px; font-weight: normal;")
+
     def apply_theme(self, t: ThemeColors):
         """Update all inline styles to match the current theme."""
         _set_role(self._header, "heading")
         _set_role(self._subtitle, "muted")
+        self._style_file_count(getattr(self, "_file_count_tone", "muted"))
         _set_role(self._custom_hint, "muted")
         _set_role(self._mode_hint, "muted")
         _set_role(self.progress_detail, "muted")
@@ -1677,17 +1728,14 @@ class ScanPanel(QWidget):
                 if files:
                     self._set_files(files)
                 else:
-                    t = get_theme()
                     self.file_count_label.setText("No supported video files in selection")
-                    self.file_count_label.setStyleSheet(
-                        f"color: {t.status_warn}; font-size: 14px;")
+                    self._style_file_count("warn")
                 return
         except Exception:
             pass
         # Slow path: folders (possibly network) -> background runner.
-        t = get_theme()
         self.file_count_label.setText("Looking for video files\u2026")
-        self.file_count_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px;")
+        self._style_file_count("muted")
         self.scan_btn.setEnabled(False)
         runner = _FileDiscoveryRunner(list(paths))
         self._discovery_runners.append(runner)
@@ -1711,18 +1759,15 @@ class ScanPanel(QWidget):
         if files:
             self._set_files(files)
         else:
-            t = get_theme()
             self.file_count_label.setText("No supported video files found")
-            self.file_count_label.setStyleSheet(
-                f"color: {t.status_warn}; font-size: 14px;")
+            self._style_file_count("warn")
             self.scan_btn.setEnabled(False)
 
     def _on_files_dropped(self, paths):
         if not paths:
             self._files = []
-            t = get_theme()
             self.file_count_label.setText("No files selected")
-            self.file_count_label.setStyleSheet(f"color: {t.text_secondary}; font-size: 14px;")
+            self._style_file_count("muted")
             self.scan_btn.setEnabled(False)
             self.hide_completion("files-cleared")
             return
@@ -1742,10 +1787,9 @@ class ScanPanel(QWidget):
                     if self.preset_combo.itemData(i) == detected:
                         self.preset_combo.setCurrentIndex(i)
                         break
-        t = get_theme()
         count = len(files)
         self.file_count_label.setText(f"{count} file{'s' if count != 1 else ''} selected")
-        self.file_count_label.setStyleSheet(f"color: {t.text_primary}; font-size: 14px; font-weight: normal;")
+        self._style_file_count("primary")
         self.scan_btn.setEnabled(True)
         self.drop_zone.show_file_queue(files)
 
@@ -1962,6 +2006,9 @@ class ResultsPanel(QWidget):
     export_requested = Signal()
     reveal_requested = Signal(str)  # filepath to show in the file manager
     history_cleared = Signal()
+    # Emitted from a launcher thread when a player fails after it was started;
+    # Qt queues it onto the GUI thread.
+    player_launch_failed = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2002,6 +2049,10 @@ class ResultsPanel(QWidget):
             "Hide files that passed cleanly. Selection and exports are unaffected.")
         self._issues_only_cb.toggled.connect(self._apply_row_filter)
         header_row.addWidget(self._issues_only_cb)
+        # The filter and the action buttons are separate groups: 16px between
+        # them, 8px between the buttons. "Issues only" sat 4px from Clear
+        # Results while the buttons were 8px apart.
+        header_row.addSpacing(D.SPACE_1)
 
         # Operators could not find the reset: it was buried in the overflow
         # menu as "Clear History", which does not read as "empty this page".
@@ -2012,6 +2063,7 @@ class ResultsPanel(QWidget):
         self.clear_btn.setToolTip("Remove all results from this page")
         self.clear_btn.setAccessibleName("Clear results")
         self.clear_btn.clicked.connect(self._on_clear_history)
+        self.player_launch_failed.connect(self._on_player_launch_failed)
         header_row.addWidget(self.clear_btn)
 
         self._more_btn = QPushButton("\u22EF")
@@ -2570,12 +2622,13 @@ class ResultsPanel(QWidget):
             width = max(minimum, min(maximum, widest + 2 * D.SPACE_2 + D.SPACE_4))
             self.table.setColumnWidth(col, width)
 
-    def _show_actions_menu(self):
-        """Secondary actions, kept off the toolbar so it fits a small window."""
+    def _build_actions_menu(self):
+        """Build the overflow menu; returns ``(menu, actions_by_key)``."""
         from PySide6.QtWidgets import QMenu
 
         has_results = bool(self._results)
         menu = QMenu(self)
+        menu.setObjectName("actions_menu")
 
         sort_action = menu.addAction("Failures first")
         sort_action.setCheckable(True)
@@ -2583,10 +2636,10 @@ class ResultsPanel(QWidget):
         sort_action.setToolTip("Sort failed files to the top, or list them in scan order.")
 
         menu.addSeparator()
-        play = menu.addAction("\u25B6  Open selected in VLC")
         # Enabled whenever there is anything to play. Gating on currentRow()
         # left a dead menu entry when no row had been clicked yet, which reads
         # as the feature being broken; _play_selected() explains what to do.
+        play = self._add_open_actions(menu, self._results_to_open(), selected_wording=True)
         play.setEnabled(has_results)
 
         menu.addSeparator()
@@ -2594,22 +2647,21 @@ class ResultsPanel(QWidget):
         clear_sel = menu.addAction("Clear Selection")
         for action in (select_all, clear_sel):
             action.setEnabled(has_results)
+        # "Clear History" used to repeat the toolbar's Clear Results button
+        # under a different name; the toolbar button is the one reset.
+        return menu, {"sort": sort_action, "play": play,
+                      "select_all": select_all, "clear_selection": clear_sel}
 
-        menu.addSeparator()
-        clear_history = menu.addAction("Clear History")
-        clear_history.setEnabled(has_results)
-
+    def _show_actions_menu(self):
+        """Secondary actions, kept off the toolbar so it fits a small window."""
+        menu, actions = self._build_actions_menu()
         chosen = menu.exec(self._more_btn.mapToGlobal(self._more_btn.rect().bottomLeft()))
-        if chosen is sort_action:
-            self._toggle_sort_order(sort_action.isChecked())
-        elif chosen is play:
-            self._play_selected()
-        elif chosen is select_all:
+        if chosen is actions["sort"]:
+            self._toggle_sort_order(actions["sort"].isChecked())
+        elif chosen is actions["select_all"]:
             self.select_all(True)
-        elif chosen is clear_sel:
+        elif chosen is actions["clear_selection"]:
             self.select_all(False)
-        elif chosen is clear_history:
-            self._on_clear_history()
 
     def set_failures_first(self, enabled: bool):
         """Public toggle for the failures-first ordering (also driven by the menu)."""
@@ -2617,15 +2669,22 @@ class ResultsPanel(QWidget):
 
     def _show_row_context_menu(self, pos):
         """Right-click a result to jump straight to the offending file."""
-        from PySide6.QtWidgets import QMenu
-
         row = self.table.rowAt(pos.y())
         if not (0 <= row < len(self._results)):
             return
         result = self._results[row]
+        menu, play, reveal, copy_path, copy_summary, details = self._build_row_menu(
+            self._results_to_open(clicked_row=row))
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        self._handle_row_menu_choice(
+            chosen, result, play, reveal, copy_path, copy_summary, details)
+
+    def _build_row_menu(self, targets=None):
+        from PySide6.QtWidgets import QMenu
 
         menu = QMenu(self)
-        play = menu.addAction("Open in VLC")
+        menu.setObjectName("row_menu")
+        play = self._add_open_actions(menu, targets or [])
         reveal = menu.addAction("Show in Explorer" if sys.platform == "win32"
                                 else "Reveal in Finder" if sys.platform == "darwin"
                                 else "Open Containing Folder")
@@ -2634,8 +2693,10 @@ class ResultsPanel(QWidget):
         copy_summary = menu.addAction("Copy Summary")
         menu.addSeparator()
         details = menu.addAction("View Full Details")
+        return menu, play, reveal, copy_path, copy_summary, details
 
-        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+    def _handle_row_menu_choice(self, chosen, result, play, reveal,
+                                copy_path, copy_summary, details):
         if chosen is reveal:
             if not _reveal_in_file_manager(result.filepath):
                 title = ("File Not Found" if not os.path.exists(result.filepath)
@@ -2644,8 +2705,6 @@ class ResultsPanel(QWidget):
                     self, title,
                     f"The file could not be revealed at:\n{result.filepath}",
                 )
-        elif chosen is play:
-            self._play_result(result)
         elif chosen is copy_path:
             QApplication.clipboard().setText(result.filepath)
         elif chosen is copy_summary:
@@ -2654,38 +2713,187 @@ class ResultsPanel(QWidget):
         elif chosen is details:
             DetailPopup(result, self).exec()
 
-    def _play_result(self, result):
-        """Hand a file off to VLC (or the default player if VLC is absent)."""
-        used = open_in_player(result.filepath)
-        if used == "missing":
+    # --- Open in a video player -------------------------------------------
+    #
+    # "Open in VLC" only knew VLC: without it every click opened the default
+    # player behind a "VLC Not Found" dialog. Every app the OS says can play
+    # the file is offered instead, the last one used is remembered, and
+    # launches never block the window (see frameguard.players).
+
+    _PLAYER_SETTING = "player/preferred"
+
+    def _results_to_open(self, clicked_row: Optional[int] = None) -> list:
+        """Files an open action applies to.
+
+        Checked rows when any are checked (and the clicked row is one of
+        them); otherwise the clicked or highlighted row.
+        """
+        checked = []
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.checkState() == Qt.Checked and row < len(self._results):
+                checked.append(row)
+        if checked and (clicked_row is None or clicked_row in checked):
+            return [self._results[row] for row in checked]
+        row = clicked_row if clicked_row is not None else self.table.currentRow()
+        if row is not None and 0 <= row < len(self._results):
+            return [self._results[row]]
+        return []
+
+    def _preferred_player(self, available):
+        from frameguard import players as P
+
+        key = QSettings(_SETTINGS_ORG, _SETTINGS_APP).value(self._PLAYER_SETTING, "")
+        if key and key != P.DEFAULT_KEY:
+            match = P.find_player(available, key) or P.player_from_app_path(key)
+            if match is not None:
+                return match
+        default_name = P.default_player_name(available)
+        return P.Player(name=default_name or "Default App", key=P.DEFAULT_KEY)
+
+    def _remember_player(self, player):
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).setValue(self._PLAYER_SETTING, player.key)
+
+    def _add_open_actions(self, menu, targets, selected_wording: bool = False):
+        """Add "Open in <app>" plus an "Open With" submenu; return the first."""
+        from frameguard import players as P
+
+        sample = targets[0].filepath if targets else None
+        available = P.discover_players(sample)
+        primary = self._preferred_player(available)
+        noun = "Selected" if selected_wording else ""
+        count = len(targets)
+        suffix = f" ({count} files)" if count > 1 else ""
+        label = f"Open {noun} in {primary.name}".replace("  ", " ") + suffix
+        primary_action = menu.addAction(label)
+        primary_action.triggered.connect(
+            lambda _=False, p=primary: self._open_targets(p, targets))
+
+        submenu = menu.addMenu(f"Open {noun} With".replace("  ", " "))
+        submenu.setObjectName("open_with_menu")
+        default_name = P.default_player_name(available)
+        for player in available:
+            text = f"{player.name} (Default)" if player.is_default else player.name
+            action = submenu.addAction(text)
+            action.setCheckable(True)
+            action.setChecked(player.key == primary.key or (
+                primary.key == P.DEFAULT_KEY and player.is_default))
+            action.triggered.connect(
+                lambda _=False, p=player: self._open_targets(p, targets, remember=True))
+        if not default_name:
+            fallback = submenu.addAction("Default App")
+            fallback.triggered.connect(
+                lambda _=False: self._open_targets(
+                    P.Player(name="Default App", key=P.DEFAULT_KEY), targets, remember=True))
+        submenu.addSeparator()
+        choose = submenu.addAction("Choose Another App\u2026")
+        choose.triggered.connect(lambda _=False: self._choose_player(targets))
+        enabled = bool(targets)
+        submenu.setEnabled(enabled)
+        if not enabled:
+            # Explain instead of doing nothing (see _play_selected).
+            primary_action.triggered.disconnect()
+            primary_action.triggered.connect(lambda _=False: self._play_selected())
+        return primary_action
+
+    def _choose_player(self, targets):
+        from frameguard import players as P
+
+        if not targets:
+            self._play_selected()
+            return
+        if sys.platform == "win32":
+            try:
+                P.open_with_chooser(targets[0].filepath)
+            except P.LaunchError as error:
+                QMessageBox.warning(self, "Could Not Open File", str(error))
+            return
+        from PySide6.QtWidgets import QFileDialog
+        start = "/Applications" if sys.platform == "darwin" else os.path.expanduser("~")
+        title = "Choose a Video Player"
+        if sys.platform == "darwin":
+            path, _ = QFileDialog.getOpenFileName(self, title, start, "Applications (*.app)")
+        else:
+            path, _ = QFileDialog.getOpenFileName(self, title, start)
+        if not path:
+            return
+        player = P.player_from_app_path(path)
+        if player is None:
+            QMessageBox.warning(self, "Not an Application",
+                                f"{os.path.basename(path)} is not an application.")
+            return
+        self._open_targets(player, targets, remember=True)
+
+    def _open_targets(self, player, targets, remember: bool = False) -> bool:
+        """Open ``targets`` in ``player``; True when a launch was started."""
+        from frameguard import players as P
+
+        if not targets:
+            self._play_selected()
+            return False
+        paths = [result.filepath for result in targets]
+        missing = [p for p in paths if not os.path.isfile(p)]
+        if len(missing) == len(paths):
             QMessageBox.warning(
                 self, "File Not Found",
-                f"The file is no longer at:\n{result.filepath}"
-            )
-        elif used == "failed":
-            QMessageBox.warning(
-                self, "Could Not Open File",
-                f"No application could be launched for:\n{result.filepath}"
-            )
-        elif used == "default":
-            # Falling back silently is why this read as "VLC did not open".
-            QMessageBox.information(
-                self, "VLC Not Found",
-                "VLC is not installed, so the file was opened in your default "
-                "video player instead.\n\nInstall VLC from videolan.org to use "
-                "this action as intended."
-            )
+                "The file is no longer at:\n" + "\n".join(missing[:5]))
+            return False
+        try:
+            opened = P.open_files(player, paths, on_error=self.player_launch_failed.emit)
+        except P.LaunchError as error:
+            QMessageBox.warning(self, "Could Not Open File", str(error))
+            return False
+        if remember:
+            self._remember_player(player)
+        notes = []
+        if missing:
+            notes.append(f"{len(missing)} file(s) could not be found and were skipped.")
+        skipped = len(paths) - len(missing) - len(opened)
+        if skipped > 0:
+            notes.append(f"Only the first {len(opened)} files were opened; "
+                         f"{skipped} more were left out to keep {player.name} responsive.")
+        if notes:
+            QMessageBox.information(self, "Some Files Not Opened", "\n\n".join(notes))
+        return True
+
+    def _on_player_launch_failed(self, message: str):
+        QMessageBox.warning(self, "Could Not Open File", message)
+
+    def _play_result(self, result):
+        """Open one file in the preferred player (the system default if unset)."""
+        from frameguard import players as P
+
+        available = P.discover_players(result.filepath)
+        return self._open_targets(self._preferred_player(available), [result])
+
+    def _play_current(self):
+        """Return/Enter: open only the highlighted row.
+
+        Checkboxes are the export selection; pressing Return on one row must
+        not launch a player window for every checked file.
+        """
+        from frameguard import players as P
+
+        row = self.table.currentRow()
+        if not (0 <= row < len(self._results)):
+            return self._play_selected()
+        target = [self._results[row]]
+        available = P.discover_players(target[0].filepath)
+        return self._open_targets(self._preferred_player(available), target)
 
     def _play_selected(self):
-        """Toolbar action: play the currently highlighted row."""
-        row = self.table.currentRow()
-        if 0 <= row < len(self._results):
-            self._play_result(self._results[row])
-        else:
+        """Open the checked files, or the highlighted one, in the preferred player."""
+        from frameguard import players as P
+
+        targets = self._results_to_open()
+        if not targets:
             QMessageBox.information(
                 self, "No File Selected",
-                "Select a result row first, then choose Open in VLC."
-            )
+                "Select a result row (or check several files) first, then "
+                "choose Open.")
+            return False
+        available = P.discover_players(targets[0].filepath)
+        return self._open_targets(self._preferred_player(available), targets)
 
     def _update_badge_count(self, name: str, value: str):
         lbl = self.findChild(QLabel, f"badge_count_{name}")
@@ -3029,7 +3237,7 @@ class SettingsPanel(QWidget):
         theme_grid.setSpacing(8)
         
         self._theme_buttons = {}
-        self._current_theme_name = "Meta Dark"
+        self._current_theme_name = "Blue Hour"
         
         theme_names = list(get_theme_names())
         cols = 3  # 3-column grid; rows are derived from len(THEMES)
@@ -3073,7 +3281,7 @@ class SettingsPanel(QWidget):
         appearance_layout.addLayout(theme_grid)
         
         # Mark the default as selected
-        self._highlight_active_theme("Meta Dark")
+        self._highlight_active_theme("Blue Hour")
         
         self._main_layout.addWidget(appearance_box)
         self._main_layout.addStretch(1)
@@ -3171,12 +3379,16 @@ class SettingsPanel(QWidget):
         self.open_presets_btn.setToolTip("Open the presets directory")
         self.open_presets_btn.clicked.connect(self._open_presets_folder)
 
-        for _b in (self.export_preset_btn, self.import_preset_btn, self.open_presets_btn):
+        # One row of equal-width buttons. The 2x2 grid left an empty cell
+        # beside Open Folder; three buttons fit the minimum window width.
+        for column, _b in enumerate(
+                (self.export_preset_btn, self.import_preset_btn, self.open_presets_btn)):
             _b.setMinimumHeight(D.CONTROL_MD)
-        btn_grid.addWidget(self.export_preset_btn, 0, 0)
-        btn_grid.addWidget(self.import_preset_btn, 0, 1)
-        btn_grid.addWidget(self.open_presets_btn, 1, 0)
+            btn_grid.addWidget(_b, 0, column)
+            btn_grid.setColumnStretch(column, 1)
+        btn_grid.setContentsMargins(0, D.SPACE_2, 0, 0)
         preset_layout.addLayout(btn_grid)
+        preset_layout.addSpacing(D.SPACE_3)
 
         # Info label
         info = QLabel(
@@ -3192,7 +3404,7 @@ class SettingsPanel(QWidget):
         # entire Settings page into horizontal scrolling on a non-maximized window.
         info.setWordWrap(True)
         _set_role(info, "muted")
-        info.setMargin(D.SPACE_1)
+        # No inner margin: the text starts on the same column as the buttons.
         preset_layout.addWidget(info)
 
         parent_layout.addWidget(preset_box)
@@ -3203,10 +3415,12 @@ class SettingsPanel(QWidget):
         update_box = self._make_group("Updates")
         update_layout = update_box.layout()
 
-        # Three buttons side by side overflowed the Settings viewport at the
-        # minimum window size, so they go in a grid like the preset actions.
+        # One row of equal-width buttons (Install Update joins it only once an
+        # update is found). The old 2x2 grid left Check for Updates alone on
+        # its row with an empty cell beside it.
         update_grid = QGridLayout()
         update_grid.setSpacing(D.SPACE_2)
+        update_grid.setContentsMargins(0, D.SPACE_2, 0, 0)
         self.check_update_btn = QPushButton("Check for Updates")
         _set_role(self.check_update_btn, "secondary")
         self.check_update_btn.setToolTip("Check if a newer version of FrameGuard is available")
@@ -3222,7 +3436,7 @@ class SettingsPanel(QWidget):
         self.install_update_btn.setVisible(False)
         self.install_update_btn.setMinimumHeight(D.CONTROL_MD)
         self.install_update_btn.clicked.connect(self.install_update_requested.emit)
-        update_grid.addWidget(self.install_update_btn, 0, 1)
+        update_grid.addWidget(self.install_update_btn, 0, 3)
 
         # Differential update: pull a release folder and transfer only the
         # files that differ, rather than re-running the ~90MB installer.
@@ -3233,7 +3447,7 @@ class SettingsPanel(QWidget):
             "Update from a published release folder, downloading only the "
             "files that changed")
         self.delta_update_btn.clicked.connect(self._pick_release_folder)
-        update_grid.addWidget(self.delta_update_btn, 1, 0)
+        update_grid.addWidget(self.delta_update_btn, 0, 1)
 
         # There was previously no way to report a problem from inside the app.
         self.report_problem_btn = QPushButton("Report a Problem...")
@@ -3242,22 +3456,27 @@ class SettingsPanel(QWidget):
         self.report_problem_btn.setToolTip(
             "Collect version, tool and session details into a report you can send")
         self.report_problem_btn.clicked.connect(self.report_problem_requested.emit)
-        update_grid.addWidget(self.report_problem_btn, 1, 1)
+        update_grid.addWidget(self.report_problem_btn, 0, 2)
+        for column in range(3):
+            update_grid.setColumnStretch(column, 1)
+        self._update_grid = update_grid
 
         update_layout.addLayout(update_grid)
 
-        # Optional differential channel. Blank deliberately means the normal,
-        # architecture-aware GitHub Releases installer flow.
-        channel_row = QHBoxLayout()
+        # Optional differential channel, laid out like every other setting:
+        # its name above a full-width field. The inline label sat on a
+        # different column from the buttons and 2px under them.
+        update_layout.addSpacing(D.SPACE_5)
+        channel_row = QVBoxLayout()
         channel_row.setSpacing(D.SPACE_2)
-        channel_label = QLabel("Optional delta channel:")
+        channel_label = QLabel("Delta channel (optional)")
+        channel_label.setFont(D.ui_font(D.FONT_SUBHEAD, D.WEIGHT_SEMIBOLD))
         channel_row.addWidget(channel_label)
 
         from frameguard.updater import get_update_channel
         self.channel_edit = QLineEdit(get_update_channel())
         self.channel_edit.setAccessibleName("Optional delta channel")
         channel_label.setBuddy(self.channel_edit)
-        _set_role(channel_label, "muted")
         self.channel_edit.setMinimumHeight(D.CONTROL_MD)
         self.channel_edit.setPlaceholderText(
             r"Leave blank for GitHub Releases, or enter \\share\FrameGuard\release")
@@ -3265,7 +3484,7 @@ class SettingsPanel(QWidget):
             "Optional filesystem or static-HTTP differential channel.\n"
             "Leave blank to use complete installers from GitHub Releases.")
         self.channel_edit.editingFinished.connect(self._save_update_channel)
-        channel_row.addWidget(self.channel_edit, 1)
+        channel_row.addWidget(self.channel_edit)
         update_layout.addLayout(channel_row)
 
         parent_layout.addWidget(update_box)
@@ -3277,6 +3496,7 @@ class SettingsPanel(QWidget):
             f"Downloads and runs the v{info.version} installer, then restarts FrameGuard."
         )
         self.install_update_btn.setVisible(True)
+        self._update_grid.setColumnStretch(3, 1)
     
     def _export_current_preset(self):
         """Export current settings as a preset file."""
@@ -4257,7 +4477,7 @@ class WatchFolderPanel(QWidget):
         self._browse_btn.clicked.connect(self._browse)
         path_group.addWidget(self._browse_btn)
         
-        self._sync_btn = QPushButton("⟳ Sync")
+        self._sync_btn = QPushButton("Sync Now")
         _set_role(self._sync_btn, "secondary")
         self._sync_btn.setMinimumWidth(D.SPACE_6 * 3)   # label needs ~92px
         self._sync_btn.setFixedHeight(D.CONTROL_MD)
@@ -4303,7 +4523,7 @@ class WatchFolderPanel(QWidget):
         # Info footer
         info = QLabel("Files are scanned using the profile selected on the Scan page.\n"
                       "New files are detected via polling (works on all drives).\n"
-                      "Use Sync to manually pick up any files missed during batch placement.")
+                      "Use Sync Now to pick up any files missed during batch placement.")
         _set_role(info, "muted")
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -4734,6 +4954,9 @@ class MainWindow(QMainWindow):
         self._sidebar_import_btn.setIconSize(QSize(20, 20))
         self._sidebar_import_btn.setFixedHeight(D.CONTROL_LG)
         self._sidebar_import_btn.setFocusPolicy(Qt.TabFocus)
+        # An action, not a destination: centred across the sidebar so it does
+        # not read as a sixth nav row.
+        self._sidebar_import_btn.setProperty("fgSidebarAction", True)
         self._sidebar_import_btn.setToolTip(
             "Load a .fg preset shared by a teammate (or just drag one onto the window)"
         )
@@ -4741,21 +4964,10 @@ class MainWindow(QMainWindow):
             lambda: self.settings_panel._import_preset_file()
         )
         body_layout.addWidget(self._sidebar_import_btn)
-
-        # Bottom sidebar. The mark and version already head the sidebar; a
-        # second, larger copy of both down here read as duplicated chrome.
-        sidebar_bottom = QVBoxLayout()
-        sidebar_bottom.setContentsMargins(0, D.SPACE_2, 0, 0)
-        sidebar_bottom.setSpacing(D.SPACE_2)
-
-        self._dss_label = QLabel("DSS-2 Compliant")
-        self._dss_label.setFont(D.ui_font(D.FONT_CAPTION))
-        _set_role(self._dss_label, "status")
-        self._dss_label.setAlignment(Qt.AlignCenter)
-        self._dss_label.setMinimumHeight(D.CONTROL_SM)
-        sidebar_bottom.addWidget(self._dss_label)
-
-        body_layout.addLayout(sidebar_bottom)
+        # Import Preset is the last row: the bottom gutter matches the side
+        # gutter so it sits inset like every other row. (The "DSS-2 Compliant"
+        # badge that used to live here was removed in v0.8.2.)
+        body_layout.addSpacing(D.SPACE_2)
 
         # Sidebar collapse control: a vector chevron, vertically centred on
         # the banner mark. It used to be a U+25C0 text glyph pinned 8px from
@@ -4865,6 +5077,18 @@ class MainWindow(QMainWindow):
         
         # Actions
         QShortcut(QKeySequence("Ctrl+O"), self, self._shortcut_browse)
+        # Open the checked (or highlighted) results in the preferred player.
+        # Ctrl+O already browses for files, hence the Shift.
+        QShortcut(QKeySequence("Ctrl+Shift+O"), self, self._shortcut_open_in_player)
+        # Return/Enter on a result row opens it. Space is left alone: it
+        # toggles the row's export checkbox.
+        for key in ("Return", "Enter"):
+            QShortcut(QKeySequence(key), self.results_panel.table,
+                      self.results_panel._play_current,
+                      context=Qt.WidgetWithChildrenShortcut)
+        # Ask the OS which players exist now, so the first menu opens instantly.
+        from frameguard import players as _players
+        _players.warm_cache()
         QShortcut(QKeySequence("F5"), self, self._shortcut_scan)
         QShortcut(QKeySequence("Ctrl+E"), self, self._shortcut_export)
         QShortcut(QKeySequence("Ctrl+Q"), self, self._tray_quit)
@@ -5054,6 +5278,11 @@ class MainWindow(QMainWindow):
         if self.scan_panel._files:
             self.scan_panel.scan_btn.click()
     
+    def _shortcut_open_in_player(self):
+        if self.results_panel._results:
+            self._switch_panel(PANEL_RESULTS)
+            self.results_panel._play_selected()
+
     def _shortcut_export(self):
         """Ctrl+E: Export PDF if results exist."""
         if self.results_panel._results:
@@ -5107,6 +5336,7 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self, theme_name: str, persist: bool = False):
         """Apply a theme; persist only an explicit Settings-page choice."""
+        theme_name = canonical_theme_name(theme_name)
         if theme_name not in THEMES:
             theme_name, _ = resolve_startup_theme()
         set_current_theme(theme_name)
@@ -5126,7 +5356,6 @@ class MainWindow(QMainWindow):
                 pix = tinted.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                 self._sidebar_logo_small.setPixmap(pix)
 
-        _set_role(self._dss_label, "status")
         _set_role(self._sidebar_toggle_btn, "icon")
 
         # === Cascade to title bar and all panels ===
@@ -5692,14 +5921,14 @@ class MainWindow(QMainWindow):
                 extra = f" (+{len(failed)-2} more)" if len(failed) > 2 else ""
                 self._tray_icon.showMessage(
                     "FrameGuard - Issues Found",
-                    f"\u26a0\ufe0f {len(failed)} file(s) FAILED: {names}{extra}",
+                    f"{len(failed)} file(s) FAILED: {names}{extra}",
                     QSystemTrayIcon.MessageIcon.Warning,
                     5000
                 )
             elif self._tray_icon and self._is_in_background():
                 self._tray_icon.showMessage(
                     "FrameGuard - Scan Complete",
-                    f"\u2705 {len(results)} file(s) scanned - all passed",
+                    f"{len(results)} file(s) scanned - all passed",
                     QSystemTrayIcon.MessageIcon.Information,
                     3000
                 )
@@ -5739,11 +5968,11 @@ class MainWindow(QMainWindow):
             status = _result_status(r)
             name = os.path.basename(r.filepath)
             if status == "PASS":
-                entries.append(f"\u2705 {name} - PASS")
+                entries.append(f"PASS  {name}")
             elif status == "PASS_WITH_WARNINGS":
-                entries.append(f"\u26a0\ufe0f {name} - PASS (warnings)")
+                entries.append(f"WARN  {name}")
             else:
-                entries.append(f"\u274c {name} - FAIL")
+                entries.append(f"FAIL  {name}")
         
         log_text = f"[{timestamp}] Scanned {len(results)} file(s):\n" + "\n".join(entries)
         
@@ -5837,7 +6066,7 @@ class MainWindow(QMainWindow):
         if self._worker:
             self._worker.cancel()
 
-    def _cleanup_worker(self):
+    def _cleanup_worker(self, wait_ms: int = 8000):
         """Safely stop and dispose the worker thread.
 
         Never calls QThread.terminate() on a running scan: killing a thread
@@ -5852,13 +6081,13 @@ class MainWindow(QMainWindow):
                 except Exception:
                     pass
             self._worker_thread.quit()
-            if not self._worker_thread.wait(8000):
+            if not self._worker_thread.wait(wait_ms):
                 # Keep both Python wrappers alive. Dropping the final QThread
                 # owner while Qt is still running it can abort the process, and
                 # clearing the field would also defeat the scan re-entry guard.
                 # closeEvent retries until the worker's bounded subprocess call
                 # returns; a future scan disposes this pair once it is stopped.
-                print("[FrameGuard] WARNING: worker thread did not exit in 8s; "
+                print(f"[FrameGuard] WARNING: worker thread did not exit in {wait_ms} ms; "
                       "retaining it until it finishes.")
                 return
             try:
@@ -6170,6 +6399,8 @@ class MainWindow(QMainWindow):
         # The native window only fully exists once shown; re-tint it so the
         # macOS title bar matches the theme from the first frame.
         self._apply_window_chrome_theme(get_theme())
+        for combo in self.findChildren(QComboBox):
+            _install_combo_popup_fit(combo)
         if not getattr(self, "_initial_focus_set", False):
             self._initial_focus_set = True
             # Park focus on the page itself rather than the first sidebar row,
@@ -6215,6 +6446,7 @@ class MainWindow(QMainWindow):
         status-item backend, which is what crashed the app when the menu-bar
         icon was clicked.
         """
+        self._hidden_to_tray = False
         self.showNormal()
         self.activateWindow()
         self.raise_()
@@ -6230,6 +6462,7 @@ class MainWindow(QMainWindow):
         # path in closeEvent is what persists settings and watch config, so
         # quitting straight from the tray used to discard the whole session.
         self._force_quit = True
+        _arm_exit_watchdog()
         self.close()
     
     def _on_tray_activated(self, reason):
@@ -6669,6 +6902,37 @@ class MainWindow(QMainWindow):
             f"<b>Lead Developer:</b> Cassian Aléria{build_info}</p>"
         )
 
+    def _shutdown_services(self):
+        """Persist state and stop every background service (idempotent)."""
+        if getattr(self, "_services_stopped", False):
+            return
+        self._services_stopped = True
+        for step in (self.settings_panel.save_settings,
+                     self.watch_panel.save_watch_settings,
+                     self._save_window_state):
+            try:
+                step()
+            except Exception:
+                pass  # a failed save must never block quitting
+        try:
+            if hasattr(self, '_watch_monitor') and self._watch_monitor.is_active:
+                self._watch_monitor.stop()
+        except Exception:
+            pass
+        self._cleanup_worker(_exit_budget_ms(8000))
+        # Let a PDF export that is already being written finish (bounded,
+        # inside the exit watchdog's window): the hard exit that follows
+        # would otherwise drop a report mid-generation.
+        try:
+            if getattr(self, "_export_runners", None):
+                QThreadPool.globalInstance().waitForDone(_exit_budget_ms(8000))
+        except Exception:
+            pass
+        if hasattr(self, '_tray_heartbeat'):
+            self._tray_heartbeat.stop()
+        if self._tray_icon:
+            self._defer(self._tray_icon.hide)
+
     def closeEvent(self, event):
         """Override close: minimize to tray if watch folder is active."""
         if not getattr(self, '_force_quit', False):
@@ -6677,11 +6941,15 @@ class MainWindow(QMainWindow):
                     and self._tray_icon is not None):
                 event.ignore()
                 self.hide()
+                self._hidden_to_tray = True
                 self._tray_icon.show()
                 self._tray_icon.showMessage(
                     "FrameGuard",
-                    "Minimized to tray. Watch folder still active.\n"
-                    "Right-click tray icon for controls.",
+                    "Still watching the folder in the background.\n"
+                    + ("Click the FrameGuard icon in the menu bar for controls, "
+                       "or press \u2318Q to quit."
+                       if sys.platform == "darwin" else
+                       "Right-click the tray icon for controls or to quit."),
                     QSystemTrayIcon.MessageIcon.Information,
                     3000
                 )
@@ -6698,25 +6966,22 @@ class MainWindow(QMainWindow):
                 return
 
         # Full shutdown: stop all services
-        self.settings_panel.save_settings()
-        self.watch_panel.save_watch_settings()
-        self._save_window_state()
-        if hasattr(self, '_watch_monitor') and self._watch_monitor.is_active:
-            self._watch_monitor.stop()
-        self._cleanup_worker()
-        if hasattr(self, '_tray_heartbeat'):
-            self._tray_heartbeat.stop()
-        if self._tray_icon:
-            self._defer(self._tray_icon.hide)
+        self._shutdown_services()
         
-        # Ensure worker thread is properly stopped
-        if self._worker_thread and self._worker_thread.isRunning():
+        # Ensure worker thread is properly stopped. cancel() (inside
+        # _cleanup_worker) already killed its FFmpeg processes; an explicit
+        # quit does not wait on a straggler again and again, which froze the
+        # window for 8s at a time. The exit watchdog and the hard exit after
+        # the event loop finish the job.
+        if (self._worker_thread and self._worker_thread.isRunning()
+                and not getattr(self, "_force_quit", False)):
             self._cleanup_worker()
             if self._worker_thread and self._worker_thread.isRunning():
                 event.ignore()
                 QTimer.singleShot(500, self.close)
                 return
-        self._cleanup_worker()
+        if getattr(self, "_force_quit", False):
+            _arm_exit_watchdog()
         event.accept()
         # quitOnLastWindowClosed is off (see main()), so the event loop has to
         # be told to stop explicitly or the process lingers with no window.
@@ -7285,6 +7550,67 @@ class _StartupProbe:
         self._write()
 
 
+# Set by main(): only a real application run may hard-exit. Tests construct
+# and close windows in-process and must never be killed by the watchdog.
+_EXIT_WATCHDOG_ENABLED = False
+_exit_watchdog_armed = False
+_EXIT_WATCHDOG_SECONDS = 12.0
+
+
+def _sync_settings() -> None:
+    """Flush preferences to disk before the process exits."""
+    try:
+        QSettings(_SETTINGS_ORG, _SETTINGS_APP).sync()
+    except Exception:
+        pass
+
+
+def _hard_exit(code: int = 0) -> None:
+    """Flush what matters and end the process without interpreter teardown.
+
+    Interpreter and Qt teardown can block indefinitely on work that no longer
+    matters once the user has quit: QThreadPool waits for every runnable,
+    concurrent.futures joins its workers, and a wedged FFmpeg read holds a
+    thread forever. Settings are synced and subprocesses killed first.
+    """
+    _sync_settings()
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    os._exit(int(code))
+
+
+_exit_watchdog_deadline = None
+
+
+def _exit_budget_ms(wanted_ms: int) -> int:
+    """Milliseconds a shutdown step may wait without outliving the watchdog."""
+    if _exit_watchdog_deadline is None:
+        return wanted_ms
+    import time as _time
+    remaining = int((_exit_watchdog_deadline - _time.monotonic()) * 1000) - 1000
+    return max(0, min(wanted_ms, remaining))
+
+
+def _arm_exit_watchdog(seconds: float = None) -> None:
+    """Guarantee the process ends after an explicit quit, even if wedged."""
+    global _exit_watchdog_armed, _exit_watchdog_deadline
+    if not _EXIT_WATCHDOG_ENABLED or _exit_watchdog_armed:
+        return
+    _exit_watchdog_armed = True
+    import time as _time
+    _exit_watchdog_deadline = _time.monotonic() + (
+        _EXIT_WATCHDOG_SECONDS if seconds is None else seconds)
+    import threading
+    timer = threading.Timer(
+        _EXIT_WATCHDOG_SECONDS if seconds is None else seconds, _hard_exit, (0,))
+    timer.daemon = True
+    timer.name = "frameguard-exit-watchdog"
+    timer.start()
+
+
 class _FileOpenFilter(QObject):
     """Queue macOS Apple-Event file opens until MainWindow is ready.
 
@@ -7317,6 +7643,19 @@ class _FileOpenFilter(QObject):
         self._window.activateWindow()
 
     def eventFilter(self, obj, event):
+        if event.type() == QEvent.Quit and self._window is not None:
+            # An explicit quit (Cmd+Q, the app or Dock menu's Quit, logout,
+            # or our own tray Quit) must quit, not "hide to the menu bar".
+            # Without this, Qt delivered the quit as a close request,
+            # closeEvent hid the window because a watch folder was active,
+            # and macOS cancelled the quit: the app could only be stopped
+            # from Activity Monitor.
+            try:
+                self._window._force_quit = True
+            except RuntimeError:
+                pass
+            _arm_exit_watchdog()
+            return False
         if event.type() == QEvent.FileOpen:
             path = event.file()
             if path and os.path.exists(path):
@@ -7464,6 +7803,18 @@ def main(dev_mode: bool = False,
         if probe:
             probe.checkpoint("window_constructed")
         file_open_filter.set_window(window)
+        if not probe:
+            global _EXIT_WATCHDOG_ENABLED
+            _EXIT_WATCHDOG_ENABLED = True
+        if sys.platform == "darwin":
+            # Clicking the Dock icon brings back a window hidden to the menu
+            # bar; macOS otherwise just activates an app with no windows.
+            def _reopen_hidden_window(state, _window=window):
+                if (state == Qt.ApplicationState.ApplicationActive
+                        and getattr(_window, "_hidden_to_tray", False)
+                        and not _window.isVisible()):
+                    _window._tray_show()
+            app.applicationStateChanged.connect(_reopen_hidden_window)
         if probe:
             probe.checkpoint("file_open_attached")
             for path in startup_preflight.warm_file_open_paths:
@@ -7586,6 +7937,16 @@ def main(dev_mode: bool = False,
             probe.checkpoint("event_loop_entered")
 
         exit_code = app.exec()
+        # Make sure an explicit quit really stops every service, even when the
+        # loop ended through a platform path that never reached closeEvent's
+        # shutdown branch (for example macOS terminating a hidden app).
+        try:
+            if not probe:
+                window._force_quit = True
+                window._shutdown_services()
+        except Exception:
+            pass
+        _sync_settings()
         if probe and probe.data["status"] == "running":
             error = RuntimeError(
                 f"Qt event loop exited before startup preflight completed ({exit_code})")

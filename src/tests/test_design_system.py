@@ -164,10 +164,10 @@ class TestSplashTheme:
         from frameguard.theme import set_current_theme
 
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
-        original = settings.value("theme", "Meta Dark")
+        original = settings.value("theme", "Blue Hour")
         try:
             settings.setValue("theme", "Carbon")
-            set_current_theme("Meta Dark")      # live theme deliberately differs
+            set_current_theme("Blue Hour")      # live theme deliberately differs
             assert get_saved_theme_name() == "Carbon"
 
             splash = SplashScreen()
@@ -225,7 +225,7 @@ class TestSplashTheme:
         from frameguard.gui import SplashScreen
 
         splash = SplashScreen()
-        splash.set_theme("Meta Dark")
+        splash.set_theme("Blue Hour")
         blue = splash._logo.toImage()
         splash.set_theme("Monokai Pro")
         amber = splash._logo.toImage()
@@ -404,7 +404,7 @@ class TestSidebar:
             "the nav icon does not change colour when its row becomes active"
 
     def test_icons_recolour_with_the_theme(self, window, qapp):
-        window._apply_theme("Meta Dark")
+        window._apply_theme("Blue Hour")
         qapp.processEvents()
         dark = window.nav_buttons[1].icon().pixmap(20, 20).toImage()
 
@@ -524,7 +524,7 @@ class TestSemanticThemeContract:
         from frameguard.theme import THEMES, generate_stylesheet
 
         assert tuple(THEMES) == (
-            "Meta Dark", "Midnight Charcoal", "Slate Professional", "Nord Frost",
+            "Blue Hour", "Midnight Charcoal", "Slate Professional", "Nord Frost",
             "Monokai Pro", "Solarized Dark", "Darkula", "Carbon", "Abyss Teal",
             "Clean Light", "Warm Cream", "Arctic Blue", "Sage", "Pearl", "Glacier",
         )

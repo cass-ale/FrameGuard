@@ -19,9 +19,9 @@ from conftest import make_result
 
 @pytest.fixture(autouse=True)
 def _default_theme():
-    set_current_theme("Meta Dark")
+    set_current_theme("Blue Hour")
     yield
-    set_current_theme("Meta Dark")
+    set_current_theme("Blue Hour")
 
 
 def _pdf_is_valid(path):
@@ -252,7 +252,7 @@ class TestBackgroundOutputBoundaries:
         from frameguard import report as R
         from frameguard.gui import _PdfExportRunner
 
-        set_current_theme("Meta Dark")
+        set_current_theme("Blue Hour")
         expected = R._get_report_colors()
         runner = _PdfExportRunner([make_result()], "ignored.pdf", "4K30")
         set_current_theme("Clean Light")

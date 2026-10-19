@@ -735,7 +735,7 @@ def check_container_format(filepath: str, result: QAResult, cfg: dict):
     if ext not in cfg["accepted_containers"]:
         result.add_fail("Container Format", f"Container '{ext}' not in accepted list {cfg['accepted_containers']}.")
         return
-    result.add_pass("Container Format", f"{file_size_mb:.1f} MB, container: {ext}")
+    result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
 
 
 def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
@@ -835,6 +835,29 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
         )
 
 
+def _format_size(size_mb: float) -> str:
+    """'40.3 MB', or KB below 0.1 MB: a 7 KB file read as '0.0 MB'."""
+    if size_mb < 0.1:
+        return f"{max(size_mb * 1024, 0.0):.0f} KB"
+    return f"{size_mb:.1f} MB"
+
+
+def _format_mbps(mbps: float) -> str:
+    """One decimal normally; more for sub-1 Mbps so 0.05 is not '0.0'."""
+    if mbps >= 1:
+        return f"{mbps:.1f}"
+    if mbps >= 0.01:
+        return f"{mbps:.2f}"
+    return "<0.01"
+
+
+def _format_pct(pct: float) -> str:
+    """A deficit that rounds to 100% but is not 100% reads '>99%'."""
+    if pct >= 99.5 and pct < 100:
+        return ">99%"
+    return f"{pct:.0f}%"
+
+
 def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     """Check 4: Validate frame rate."""
     video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
@@ -926,19 +949,19 @@ def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
                            f"(format total: {orig_mbps:.1f} Mbps). PCM audio may skew calculation.")
             return
     if bitrate_mbps >= min_br:
-        result.add_pass("Bitrate", f"{bitrate_mbps:.1f} Mbps (min: {min_br} Mbps)")
+        result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps (min: {min_br} Mbps)")
     else:
         # Percentage-based tolerance: VBR encoding commonly varies 10-15% below target
         deficit_pct = ((min_br - bitrate_mbps) / min_br * 100) if min_br > 0 else 0
         if deficit_pct <= 10:
             # Within 10% - marginal pass (normal VBR variance)
-            result.add_pass("Bitrate", f"{bitrate_mbps:.1f} Mbps ({deficit_pct:.0f}% below target {min_br} Mbps - within VBR tolerance)", confidence=70)
+            result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps ({deficit_pct:.0f}% below target {min_br} Mbps - within VBR tolerance)", confidence=70)
         elif deficit_pct <= 25:
             # 10-25% below - warn but don't fail
-            result.add_warn("Bitrate", f"{bitrate_mbps:.1f} Mbps — {deficit_pct:.0f}% below {min_br} Mbps target. Likely still usable; verify no visible compression artifacts.", confidence=75)
+            result.add_warn("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps — {deficit_pct:.0f}% below {min_br} Mbps target. Likely still usable; verify no visible compression artifacts.", confidence=75)
         else:
             # >25% below - definite fail
-            result.add_fail("Bitrate", f"{bitrate_mbps:.1f} Mbps is {deficit_pct:.0f}% below minimum {min_br} Mbps. Likely visible compression artifacts.", confidence=95)
+            result.add_fail("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps is {_format_pct(deficit_pct)} below minimum {min_br} Mbps. Likely visible compression artifacts.", confidence=95)
 
 
 def check_audio(probe_data: dict, result: QAResult, cfg: dict):
@@ -1594,6 +1617,37 @@ _EVENT_TIME_RE = re.compile(
 )
 
 
+_REGION_CLOSERS = {
+    "freeze": "lavfi.freezedetect.freeze_end: {end:.3f}",
+    "silence": "[silencedetect] silence_end: {end:.3f}",
+    "black": "[blackdetect] black_end:{end:.3f}",
+}
+
+
+def _close_open_regions(stderr_text: str, end_time: float) -> str:
+    """Close any detection region still open at ``end_time``.
+
+    freezedetect never prints freeze_end for a freeze that lasts until the
+    input ends, so a clip that froze for its last six seconds - or a whole
+    static deliverable - was reported as "1 freeze event, total 0.0s" and
+    passed. With segmented scans every segment of a frozen file ended that
+    way, giving several 0.0s events instead of one long freeze. The open
+    region now ends where the scanned range ends.
+    """
+    if not stderr_text or end_time is None:
+        return stderr_text or ""
+    additions = []
+    for prefix, closer in _REGION_CLOSERS.items():
+        last_kind = None
+        for match in re.finditer(rf"{prefix}_(start|end)\s*[:=]", stderr_text):
+            last_kind = match.group(1)
+        if last_kind == "start":
+            additions.append(closer.format(end=float(end_time)))
+    if not additions:
+        return stderr_text
+    return stderr_text + "\n" + "\n".join(additions)
+
+
 def _offset_event_times(stderr_text: str, offset: float) -> str:
     """Shift segment-relative event timestamps onto the whole-file timeline.
 
@@ -2032,7 +2086,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                             seg_stderr, "truncated_records", 0)
                     # -ss before -i zeroes the segment's PTS, so shift every
                     # reported timestamp back onto the whole-file timeline.
-                    segment_results.append((idx, _offset_event_times(seg_stderr, segments[idx][0])))
+                    segment_results.append((idx, _close_open_regions(
+                        _offset_event_times(seg_stderr, segments[idx][0]),
+                        segments[idx][1])))
                     completed += 1
                     if progress_callback:
                         progress_callback("filter", completed * (duration / len(segments)), duration, "Deep Scan [combined]")
@@ -2215,6 +2271,8 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 
     # ---- Parse decode errors from stderr (merged from Pass 1) ----
     stderr_clean = _filter_hwaccel_noise(stderr_text)
+    # Regions still open when the input ended (see _close_open_regions).
+    events_text = _close_open_regions(stderr_text, duration)
     decode_errors = _extract_decode_errors(stderr_clean)
 
     if not decode_errors:
@@ -2228,7 +2286,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     # ---- Parse filter results from combined stderr ----
 
     # Check 15: Black frames
-    black_events = _merge_event_intervals(_pair_detect_events(stderr_text, "black"))
+    black_events = _merge_event_intervals(_pair_detect_events(events_text, "black"))
     # FIX: Exclude black events in first 1s and last 1s (legitimate fade-in/fade-out)
     # Trim the first and last second instead of discarding whole events:
     # dropping any event that touched a margin let an entirely black file,
@@ -2264,7 +2322,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         result.add_pass("Black Frames", "No black frame sequences detected.")
 
     # Check 16: Freeze frames
-    freeze_events = _merge_event_intervals(_pair_detect_events(stderr_text, "freeze"))
+    freeze_events = _merge_event_intervals(_pair_detect_events(events_text, "freeze"))
 
     if freeze_events:
         total_freeze = sum(d for _, d in freeze_events)
@@ -2282,7 +2340,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
 
     # Check 17: Audio silence
     if has_audio:
-        silence_events = _merge_event_intervals(_pair_detect_events(stderr_text, "silence"))
+        silence_events = _merge_event_intervals(_pair_detect_events(events_text, "silence"))
 
         if silence_events:
             count = len(silence_events)

@@ -321,6 +321,29 @@ if __name__ == "__main__":
 
             MainWindow()
             print("  main window    : constructed")
+
+            # The PDF path pulls in fpdf2 + fontTools modules that PyInstaller
+            # only finds through hidden imports; prove the bundle can render
+            # a non-Latin file name.
+            import tempfile as _tempfile
+            from frameguard.core import QAResult as _QAResult
+            from frameguard.report import HandoffReport, _font_candidates, _generate_report
+            _probe = _QAResult("Caf\u00e9_\u65e5\u672c\u8a9e_selftest.mov")
+            _probe.add_pass("Container Format", "selftest")
+            _probe.finalize()
+            _pdf_path = _os.path.join(_tempfile.mkdtemp(prefix="fg-selftest-"), "selftest.pdf")
+            # The Unicode path directly: generate_report's Latin-1 retry
+            # would hide a bundle that cannot render with the system fonts.
+            _generate_report([_probe], _pdf_path, "Selftest", "", None, True)
+            _family = HandoffReport().ff
+            _main_fonts, _ = _font_candidates()
+            if all(_os.path.isfile(p) for p in _main_fonts.values()) and _family != "FGSans":
+                failures.append("system Unicode font present but not used for PDF reports")
+            with open(_pdf_path, "rb") as _handle:
+                if _handle.read(5) != b"%PDF-":
+                    failures.append("PDF report was not written")
+            _pdf_ok = not any("PDF" in f or "Unicode font" in f for f in failures)
+            print(f"  pdf report     : {'ok' if _pdf_ok else 'FAILED'} ({_family})")
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -342,5 +365,10 @@ if __name__ == "__main__":
     startup_preflight = None
     if _STARTUP_OPTIONS.get("report_path"):
         startup_preflight = StartupPreflightConfig(**_STARTUP_OPTIONS)
-    sys.exit(main(dev_mode=dev_mode, startup_preflight=startup_preflight))
+    exit_code = main(dev_mode=dev_mode, startup_preflight=startup_preflight)
+    # Settings are saved and child processes stopped by now. End the process
+    # directly: interpreter and Qt teardown could otherwise block on leftover
+    # background work, leaving a FrameGuard that could only be force-quit.
+    from frameguard.gui import _hard_exit
+    _hard_exit(exit_code)
 

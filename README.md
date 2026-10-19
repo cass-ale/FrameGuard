@@ -12,11 +12,37 @@ analysis. All processing happens locally — no data leaves your machine.
 
 ## Demo
 
-![FrameGuard demo](assets/frameguard-demo.gif)
+![A real FrameGuard v0.8.2 deep scan of six files in the Blue Hour theme, ending on the Results page](assets/screenshots/scan.gif)
 
-A 30-second look at a quick scan: 24 captures checked against the 4K UHD @ 30 fps profile, with every mismatch explained per file in the results panel.
+A real deep scan in FrameGuard v0.8.2: six test files checked against the 4K UHD @ 30 fps profile, from the queue to the Results page with each failure explained.
 
-[Watch the demo video (MP4)](assets/frameguard-demo.mp4)
+[Watch the longer v0.8.0 walkthrough (MP4)](assets/frameguard-demo.mp4). It shows an earlier version of the interface.
+
+## Screenshots
+
+Every image below was captured from the running application (v0.8.2) after a real scan of the same six test files. Nothing was mocked up or edited.
+
+| | |
+|:---:|:---:|
+| ![Results page in Blue Hour: four failures and two warnings, with per-check detail for the selected file](assets/screenshots/results-blue-hour.png) | ![Results page in Clean Light](assets/screenshots/results-clean-light.png) |
+| **Results** · Blue Hour | **Results** · Clean Light |
+| ![Scan page during a deep scan, showing the queue and progress](assets/screenshots/scan-running-blue-hour.png) | ![Scan page after the scan, with the completion banner](assets/screenshots/scan-clean-light.png) |
+| **Scanning** · Blue Hour | **Scan complete** · Clean Light |
+| ![Checks matrix: every file against every check](assets/screenshots/checks-nord-frost.png) | ![Open With menu listing the video players installed on the Mac](assets/screenshots/open-with-blue-hour.png) |
+| **Checks matrix** · Nord Frost | **Open With** · Blue Hour |
+| ![Settings page](assets/screenshots/settings-warm-cream.png) | ![Watch Folder page with the activity log](assets/screenshots/watch-abyss-teal.png) |
+| **Settings** · Warm Cream | **Watch Folder** · Abyss Teal |
+
+The menus in the Open With image were captured from the live menus and composited onto the window, because they open as separate pop-up windows. The players listed are the ones installed on the capture machine.
+
+### PDF report
+
+The same scan exported as a PDF. The report follows the active theme. Download the [sample report (PDF)](assets/screenshots/sample-report.pdf).
+
+| | |
+|:---:|:---:|
+| ![PDF report page 1 in Clean Light: summary badges, batch summary table and the first file's checks](assets/screenshots/report-clean-light-p1.png) | ![PDF report page 2 in Blue Hour: a file's checks continued from page 1, with the next file kept together](assets/screenshots/report-blue-hour-p2.png) |
+| Page 1 · Clean Light | Page 2 · Blue Hour |
 
 ## Download
 
@@ -101,14 +127,22 @@ PDF report. Hours of manual QC become a background task.
 - **Checks matrix** — every file against every check in one grid, so a systemic
   problem ("all 40 files failing Bitrate") is obvious at a glance
 - **Issues only** filter to hide files that passed cleanly
-- Right-click any result to open it in VLC, reveal it in Explorer, or copy its path
-- **PDF handoff reports** with a batch summary and per-file detail
+- **Open With** — open one or many results in any video player installed on the
+  machine (QuickTime Player, VLC, IINA, TV and others on macOS; VLC, MPC-HC/BE,
+  PotPlayer, mpv and the system chooser on Windows). The last player you used is
+  remembered. Right-click a result to reveal it in Explorer or Finder, or to copy its path.
+- **PDF handoff reports** with a batch summary and per-file detail. File names in any
+  language render correctly, each file's checks stay together across page breaks, and
+  pages are numbered "Page X of Y"
 - **15 color themes** with live switching and persistence — the
   theme also recolors the app icon, title bar, and system tray icon
 - Scan settings persist between sessions
 - Watch folder with automatic scanning and tray notifications
 - Standard window behaviour: Aero Snap, drag-to-maximize, Win+Arrow tiling
-- Keyboard shortcuts: `Ctrl+1..5` panels, `Ctrl+O` browse, `F5` scan, `Ctrl+E` export
+- Keyboard shortcuts: `Ctrl+1..5` panels, `Ctrl+O` browse, `F5` scan, `Ctrl+E` export,
+  `Return` opens the highlighted result and `Ctrl+Shift+O` opens the checked results in
+  your player (`Cmd` on macOS)
+- Quitting always quits, even while a watch folder is running in the menu bar or tray
 
 ### Packaging
 

@@ -611,10 +611,10 @@ def _theme_names(theme_mode: str, available: Iterable[str]) -> list[str]:
     names = list(available)
     if theme_mode == "all":
         return names
-    preferred = [name for name in ("Meta Light", "Clean Light", "Meta Dark") if name in names]
-    # One representative light and Meta Dark are the key full-matrix themes.
+    preferred = [name for name in ("Meta Light", "Clean Light", "Blue Hour") if name in names]
+    # One representative light and Blue Hour are the key full-matrix themes.
     light = next((name for name in preferred if "Light" in name), None)
-    selected = [name for name in (light, "Meta Dark") if name and name in names]
+    selected = [name for name in (light, "Blue Hour") if name and name in names]
     return list(dict.fromkeys(selected or names[:2]))
 
 

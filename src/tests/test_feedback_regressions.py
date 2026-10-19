@@ -721,7 +721,7 @@ class TestScanPageIcons:
     def test_icons_are_rerendered_on_theme_change(self, window, qapp):
         """icons.py caches by (name, size, colour); without a cache clear the
         old theme's colour is reused forever."""
-        window._apply_theme("Meta Dark")
+        window._apply_theme("Blue Hour")
         qapp.processEvents()
         dark = window.scan_panel.drop_zone.icon_label.pixmap().toImage()
 
@@ -743,7 +743,7 @@ class TestThemeLegibility:
     """Contrast floors, checked across every shipped theme.
 
     The active sidebar row used to draw the accent colour on bg_tertiary,
-    which is 2.6:1 in Meta Dark. A white label on an accent pill would have
+    which is 2.6:1 in Blue Hour. A white label on an accent pill would have
     been worse still (1.4:1 in Monokai Pro), so the label uses text_primary
     and the accent moved to a left bar.
     """

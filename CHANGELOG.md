@@ -10,7 +10,30 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.8.1] — Seamless interface, working updates and crash fixes
+## [0.8.2] — Open With, reliable quitting and a polished interface and report
+
+### Fixed
+- Quitting always quits. Cmd+Q, the app and Dock menus' Quit and the menu-bar icon's Quit no longer hide FrameGuard to the menu bar while a watch folder is active; settings are saved, scans and FFmpeg processes are stopped, and the process exits promptly instead of needing Force Quit.
+- Deep scans now measure a freeze, silence or black region that lasts until the end of the file or scan segment. A clip that froze for its final seconds, or an entirely static deliverable, was reported as a 0.0s freeze and could pass.
+- Very small sizes and bitrates no longer read as "0.0 MB" or "0.0 Mbps is 100% below minimum".
+- Dropdown lists on macOS use the themed list with comfortable rows, are wide enough for long preset names, and no longer show a native checkmark gutter.
+- Results "More" menu items line up; the duplicate "Clear History" entry is gone (Clear Results is on the toolbar).
+- After a theme switch, the Scan page's file count no longer keeps the previous theme's colour, which could make it invisible.
+- The selected scan mode stays visible while a scan is running.
+
+### Improved
+- Open With: open one or many results in any video player the system knows about (QuickTime Player, VLC, IINA, TV, Premiere Pro and others on macOS; VLC, MPC-HC/BE, PotPlayer, mpv and Windows Media Player Legacy on Windows, plus any app through Choose Another App). The last player used is remembered and offered as "Open in ..."; launches never block the window and failures are reported clearly. Return opens the highlighted result; Ctrl+Shift+O (Cmd+Shift+O) opens the checked results.
+- PDF reports: file names in any language render correctly, long names wrap instead of being cut off, a file's checks are kept together with widow and orphan control and a "(continued)" heading when they must split, status badges meet text-contrast guidelines on screen and in print, pages read "Page X of Y", and the PDF carries title, author and subject properties.
+- Sidebar: Import Preset is centred as an action, the active row's label lines up with the others, and the bottom badge was removed.
+- Settings: Scan Presets and Updates buttons sit in single even rows, and the delta channel field is labelled like every other setting.
+- Results toolbar: consistent spacing between the Issues only filter and the action buttons.
+- Watch Folder: the activity log and notifications use plain PASS / WARN / FAIL words instead of colour emoji, and the Sync button reads Sync Now.
+
+### Changed
+- The "Meta Dark" theme is now called "Blue Hour" (same colours). A saved Meta Dark preference switches to Blue Hour automatically.
+- The "DSS-2 Compliant" badge and the matching PDF footer text were removed.
+
+## [0.8.1] — 2026-10-19 — Seamless interface, working updates and crash fixes
 
 ### Fixed
 - Deep scans no longer fuse separate silences or freezes into one long false event or drop black-frame events after the second, which could mark clean files as failed. Every detection now reaches the verdict.

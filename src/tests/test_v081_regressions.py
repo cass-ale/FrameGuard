@@ -398,7 +398,7 @@ class TestTrayAndShutdownCrashes:
 class TestSeamlessChrome:
     def test_sidebar_layout_containers_do_not_repaint_the_page_colour(self):
         from frameguard.theme import generate_stylesheet, get_theme
-        css = generate_stylesheet(get_theme("Meta Dark"))
+        css = generate_stylesheet(get_theme("Blue Hour"))
         assert "#logo_area, #sidebar_body, #sidebar_toggle_column { background: transparent;" in css
 
     def test_sidebar_body_and_toggle_are_named_for_the_rule(self, window):
@@ -424,7 +424,7 @@ class TestSeamlessChrome:
 
     def test_checked_indicator_keeps_its_unchecked_size(self):
         from frameguard.theme import generate_stylesheet, get_theme
-        css = generate_stylesheet(get_theme("Meta Dark"))
+        css = generate_stylesheet(get_theme("Blue Hour"))
         assert "QRadioButton::indicator:checked { border: 2px solid" in css
         assert "QCheckBox::indicator:checked { border: 2px solid" in css
 

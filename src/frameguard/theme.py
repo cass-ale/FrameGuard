@@ -193,8 +193,8 @@ class ThemeColors:
 
 
 THEMES: Dict[str, ThemeColors] = {
-    "Meta Dark": ThemeColors(
-        name="Meta Dark", accent="#0A6EEA", accent_hover="#0073FF",
+    "Blue Hour": ThemeColors(
+        name="Blue Hour", accent="#0A6EEA", accent_hover="#0073FF",
         accent_dim="#004AAD", bg_primary="#1A1A2E", bg_secondary="#16213E",
         bg_tertiary="#0F3460", bg_input="#1E2A45", surface="#1E2A45",
         surface_hover="#253555", border="#5A6A8C", text_primary="#E8E8EC",
@@ -303,19 +303,29 @@ THEMES: Dict[str, ThemeColors] = {
         status_pass="#059669", status_fail="#DC2626", status_warn="#D5730A"),
 }
 
-_current_theme_name = "Meta Dark"
+_current_theme_name = "Blue Hour"
+
+# Former names that saved preferences may still hold. "Meta Dark" was renamed
+# to "Blue Hour" in v0.8.2; same colours, new name.
+THEME_ALIASES = {"Meta Dark": "Blue Hour"}
+
+
+def canonical_theme_name(name):
+    """Map a retired theme name onto its current one; other values pass through."""
+    return THEME_ALIASES.get(name, name)
 
 
 def get_theme(name: str = None) -> ThemeColors:
     """Return a named theme, or the current theme when no name is supplied."""
     if name is None:
         name = _current_theme_name
-    return THEMES.get(name, THEMES["Meta Dark"])
+    return THEMES.get(canonical_theme_name(name), THEMES["Blue Hour"])
 
 
 def set_current_theme(name: str):
     """Set the current theme when ``name`` is in the stable catalogue."""
     global _current_theme_name
+    name = canonical_theme_name(name)
     if name in THEMES:
         _current_theme_name = name
 
@@ -444,8 +454,9 @@ QPushButton[fgRole="icon"]:disabled, QPushButton[class="reset-btn"]:disabled { b
 #sidebar QPushButton:pressed { background-color: %%bg_tertiary%%; }
 #sidebar QPushButton:focus { border: 2px solid %%focus%%; padding: 7px 11px; }
 #sidebar QPushButton:disabled { color: %%disabled_text%%; }
-#sidebar QPushButton[active="true"] { background-color: %%bg_tertiary%%; border-color: transparent; border-left: 3px solid %%accent%%; border-top-left-radius: 0px; border-bottom-left-radius: 0px; color: %%text_primary%%; font-weight: 600; padding-left: 9px; }
-#sidebar QPushButton[active="true"]:focus { border: 2px solid %%focus%%; border-left: 3px solid %%accent%%; padding: 7px 11px 7px 9px; }
+#sidebar QPushButton[fgSidebarAction="true"] { text-align: center; }
+#sidebar QPushButton[active="true"] { background-color: %%bg_tertiary%%; border-color: transparent; border-left: 3px solid %%accent%%; border-top-left-radius: 0px; border-bottom-left-radius: 0px; color: %%text_primary%%; font-weight: 600; padding-left: 10px; }
+#sidebar QPushButton[active="true"]:focus { border: 2px solid %%focus%%; border-left: 3px solid %%accent%%; padding: 7px 11px 7px 10px; }
 
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateTimeEdit, QComboBox {
     background-color: %%bg_input%%; border: 1px solid %%border%%; border-radius: 6px;
@@ -461,15 +472,17 @@ QComboBox::down-arrow { image: %%img_chevron%%; width: 12px; height: 12px; }
 QComboBox::down-arrow:disabled { image: %%img_chevron_disabled%%; }
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow, QDateTimeEdit::up-arrow { image: %%img_chevron_up%%; width: 10px; height: 10px; }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow, QDateTimeEdit::down-arrow { image: %%img_chevron%%; width: 10px; height: 10px; }
-QComboBox QAbstractItemView { background-color: %%surface%%; color: %%text_primary%%; border: 1px solid %%border%%; selection-background-color: %%selection%%; selection-color: %%selection_foreground%%; outline: none; padding: 4px; }
-QComboBox QAbstractItemView::item { min-height: 28px; padding: 6px 10px; }
+QComboBox { combobox-popup: 0; }
+QComboBox QAbstractItemView { background-color: %%surface%%; color: %%text_primary%%; border: 1px solid %%border%%; selection-background-color: %%selection%%; selection-color: %%selection_foreground%%; outline: none; padding: 0px; }
+QComboBox QAbstractItemView::item { min-height: 28px; padding: 0px 8px; margin: 2px 4px; border: none; border-radius: 4px; }
+QComboBox QAbstractItemView::item:focus { border: none; }
 QComboBox QAbstractItemView::item:hover { background-color: %%surface_hover%%; }
 QComboBox QAbstractItemView::item:selected { background-color: %%selection%%; color: %%selection_foreground%%; }
 QComboBox QAbstractItemView::item:disabled { color: %%disabled_text%%; }
 
-QCheckBox, QRadioButton { color: %%text_primary%%; spacing: 8px; padding: 4px; }
+QCheckBox, QRadioButton { color: %%text_primary%%; spacing: 8px; padding: 3px 3px 3px 0px; border: 1px solid transparent; border-radius: 4px; }
 QCheckBox:hover, QRadioButton:hover { color: %%text_primary%%; }
-QCheckBox:focus, QRadioButton:focus { border: 1px solid %%focus%%; border-radius: 4px; padding: 3px; }
+QCheckBox:focus, QRadioButton:focus { border-color: %%focus%%; }
 QCheckBox:disabled, QRadioButton:disabled { color: %%disabled_text%%; }
 QCheckBox::indicator, QRadioButton::indicator { width: 16px; height: 16px; border: 2px solid %%border%%; background-color: %%bg_input%%; }
 QCheckBox::indicator { border-radius: 4px; }
@@ -481,6 +494,8 @@ QCheckBox::indicator:checked:hover { border-color: %%accent_hover%%; background-
 QRadioButton::indicator:checked { border: 2px solid %%accent%%; background-color: %%accent%%; image: %%img_dot%%; }
 QRadioButton::indicator:checked:hover { border-color: %%accent_hover%%; background-color: %%accent_hover%%; }
 QCheckBox::indicator:disabled, QRadioButton::indicator:disabled { border-color: %%disabled_text%%; background-color: %%disabled_bg%%; image: none; }
+QCheckBox::indicator:checked:disabled { border-color: %%disabled_text%%; background-color: %%disabled_text%%; image: %%img_check_disabled%%; }
+QRadioButton::indicator:checked:disabled { border-color: %%disabled_text%%; background-color: %%disabled_text%%; image: %%img_dot_disabled%%; }
 
 QProgressBar { background-color: %%bg_tertiary%%; border: 1px solid %%border%%; border-radius: 4px; color: %%text_primary%%; text-align: center; min-height: 8px; }
 QProgressBar::chunk { background-color: %%accent%%; border-radius: 3px; }
@@ -510,12 +525,17 @@ QHeaderView::section:hover { background-color: %%surface_hover%%; color: %%text_
 QHeaderView::section:pressed, QHeaderView::section:checked { background-color: %%selection%%; color: %%selection_foreground%%; }
 
 QMenu, QMenuBar { background-color: %%surface%%; color: %%text_primary%%; border: 1px solid %%border%%; }
+QMenu { padding: 4px 0px; }
 QMenuBar { border: none; }
-QMenu::item, QMenuBar::item { padding: 6px 24px 6px 10px; background: transparent; }
+QMenu::item { padding: 7px 24px 7px 12px; margin: 0px 4px; border-radius: 4px; background: transparent; }
+QMenuBar::item { padding: 6px 10px; background: transparent; }
+QMenu::indicator { width: 16px; height: 16px; left: 8px; }
+QMenu::indicator:checked { image: %%img_menu_check%%; }
+QMenu::indicator:checked:selected { image: %%img_menu_check_selected%%; }
 QMenu::item:selected, QMenuBar::item:selected { background-color: %%selection%%; color: %%selection_foreground%%; }
 QMenu::item:pressed, QMenuBar::item:pressed { background-color: %%accent_pressed%%; color: %%accent_foreground%%; }
 QMenu::item:disabled, QMenuBar::item:disabled { color: %%disabled_text%%; }
-QMenu::separator { height: 1px; background-color: %%border%%; margin: 5px 8px; }
+QMenu::separator { height: 1px; background-color: %%divider%%; margin: 4px 0px; }
 QToolTip { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 4px; color: %%text_primary%%; padding: 6px 8px; font-size: 9pt; }
 
 QGroupBox { background: transparent; border: none; margin-top: 18px; padding: 12px 0 0 0; font-weight: 600; }
@@ -653,6 +673,12 @@ def _indicator_images(theme: "ThemeColors") -> Dict[str, str]:
         "img_chevron_disabled": _svg_url("chevron", theme.disabled_text),
         "img_check": _svg_url("check", theme.accent_foreground),
         "img_dot": _svg_url("dot", theme.accent_foreground),
+        "img_menu_check": _svg_url("check", theme.text_primary),
+        # A disabled choice must still show which option is chosen: while a
+        # scan runs, the selected scan mode used to look unselected.
+        "img_check_disabled": _svg_url("check", theme.disabled_bg),
+        "img_dot_disabled": _svg_url("dot", theme.disabled_bg),
+        "img_menu_check_selected": _svg_url("check", theme.selection_foreground),
     }
 
 
@@ -706,4 +732,4 @@ def generate_stylesheet(theme: ThemeColors = None) -> str:
     return css
 
 
-DARK_STYLESHEET = generate_stylesheet(THEMES["Meta Dark"])
+DARK_STYLESHEET = generate_stylesheet(THEMES["Blue Hour"])
