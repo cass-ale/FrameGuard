@@ -10,7 +10,18 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.8.2] — Open With, reliable quitting and a polished interface and report
+## [0.8.3] — Menu-bar crash fix and sidebar polish
+
+### Fixed
+- macOS: clicking the FrameGuard icon in the menu bar no longer crashes the app. macOS 27 opens menu-bar menus without a mouse event, and Qt's menu-bar code asked that missing event for its click count, which aborted FrameGuard before any of its own code ran. The menu now opens normally.
+- The sidebar's show/hide button is a full square on hover. The button was wider than the column it sits in, so the page cut off the right edge of its hover outline.
+- Long file names in the Results and Checks tables are shortened in the middle instead of at the end, so the clip number that tells similar names apart stays visible.
+
+### Changed
+- Build and release workflows use the reviewed actions/checkout v7.0.1, actions/setup-python v7.0.0 and actions/attest-build-provenance v4.2.2. Dependabot now proposes action updates as one grouped pull request.
+- The README demo and screenshots show a scan with passes, warnings and failures.
+
+## [0.8.2] — 2026-10-19 — Open With, reliable quitting and a polished interface and report
 
 ### Fixed
 - Quitting always quits. Cmd+Q, the app and Dock menus' Quit and the menu-bar icon's Quit no longer hide FrameGuard to the menu bar while a watch folder is active; settings are saved, scans and FFmpeg processes are stopped, and the process exits promptly instead of needing Force Quit.

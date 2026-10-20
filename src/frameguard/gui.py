@@ -939,6 +939,19 @@ class TitleBar(QWidget):
 # THEME COLOR PREVIEW DELEGATE (for combo box)
 # ============================================================================
 
+class _MiddleElideDelegate(QStyledItemDelegate):
+    """Elide long file names in the middle, keeping the distinguishing end.
+
+    Production names share long prefixes ("PROJ_CAM01_TAKE_20261018_C001");
+    eliding at the right turned every row into the same
+    "PROJ_CAM0..._TAKE_20261018_C00...", hiding the clip number.
+    """
+
+    def initStyleOption(self, option, index):
+        super().initStyleOption(option, index)
+        option.textElideMode = Qt.ElideMiddle
+
+
 class ThemePreviewDelegate(QStyledItemDelegate):
     """Custom delegate that draws 3 color squares next to theme name in dropdown."""
 
@@ -2146,6 +2159,8 @@ class ResultsPanel(QWidget):
 
         # Results table
         self.table = QTableWidget()
+        self._name_delegate = _MiddleElideDelegate(self.table)
+        self.table.setItemDelegateForColumn(2, self._name_delegate)
         self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(
             ["\u2610", "Status", "Filename", "Codec", "Resolution", "Duration", "Summary"])
@@ -4210,6 +4225,8 @@ class ChecksPanel(QWidget):
         layout.addWidget(self._empty, 1)
 
         self.table = QTableWidget()
+        self._name_delegate = _MiddleElideDelegate(self.table)
+        self.table.setItemDelegateForColumn(0, self._name_delegate)
         self.table.viewport().installEventFilter(self)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionMode(QAbstractItemView.NoSelection)
@@ -4975,14 +4992,17 @@ class MainWindow(QMainWindow):
         # shape with whatever font the OS substituted.
         self._toggle_container = QWidget()
         self._toggle_container.setObjectName("sidebar_toggle_column")
-        self._toggle_container.setFixedWidth(D.ICON_BTN)
+        # The column is exactly the square button plus a 4px gutter each side.
+        # It used to be 32px wide while the icon-button style grew the button
+        # to 34px, so the hover square was cut off on its right by the page.
+        self._toggle_container.setFixedWidth(D.CONTROL_SM + 2 * D.SPACE_1)
         toggle_layout = QVBoxLayout(self._toggle_container)
-        toggle_layout.setContentsMargins(
-            D.SPACE_1, D.SPACE_4 + (28 - D.CONTROL_SM) // 2, D.SPACE_1, 0)
+        toggle_layout.setContentsMargins(D.SPACE_1, D.SPACE_4, D.SPACE_1, 0)
         toggle_layout.setSpacing(0)
 
         self._sidebar_toggle_btn = QPushButton("")
-        self._sidebar_toggle_btn.setFixedSize(D.CONTROL_SM - 4, D.CONTROL_SM)
+        self._sidebar_toggle_btn.setObjectName("sidebar_toggle")
+        self._sidebar_toggle_btn.setFixedSize(D.CONTROL_SM, D.CONTROL_SM)
         self._sidebar_toggle_btn.setIconSize(QSize(16, 16))
         self._sidebar_toggle_btn.setToolTip("Hide sidebar")
         self._sidebar_toggle_btn.setAccessibleName("Hide sidebar")
@@ -5124,6 +5144,8 @@ class MainWindow(QMainWindow):
             tray_menu.addAction("About", lambda: self._defer(self._show_about))
             tray_menu.addAction("Quit", lambda: self._defer(self._tray_quit))
             self._tray_menu = tray_menu
+            # Before the menu is attached: see _install_macos_status_item_guard.
+            _install_macos_status_item_guard()
             self._tray_icon.setContextMenu(tray_menu)
             self._tray_icon.activated.connect(self._on_tray_activated)
             
@@ -6992,6 +7014,97 @@ class MainWindow(QMainWindow):
         if app is not None:
             QTimer.singleShot(0, app.quit)
 
+
+
+# Mouse event types for which -[NSEvent clickCount] is valid.
+_NS_CLICK_EVENT_TYPES = frozenset({1, 2, 3, 4, 25, 26})
+_status_item_guard_state = {"installed": False, "callbacks": []}
+
+
+def _install_macos_status_item_guard() -> bool:
+    """Stop Qt's menu-bar icon handler from crashing on macOS 27.
+
+    When the menu-bar (status item) menu opens, Qt's QStatusItemDelegate
+    reads ``NSApp.currentEvent.clickCount`` to decide between a click and a
+    double-click. macOS 27 opens status-item menus from a scene action, so
+    the current event is not a mouse event, and -[NSEvent clickCount] throws
+    NSInternalInconsistencyException - an uncaught Objective-C exception that
+    aborted FrameGuard every time its menu-bar icon was clicked. No Python
+    code runs before the abort, so this cannot be caught in a handler.
+
+    The delegate's two entry points are wrapped: they run Qt's original code
+    only when the current event really is a mouse click, and do nothing
+    otherwise (FrameGuard does not use the activation signal while the menu
+    is attached; the menu itself still opens normally). Returns True when
+    the guard is active. Idempotent; a no-op off Cocoa.
+    """
+    state = _status_item_guard_state
+    if state["installed"]:
+        return True
+    if sys.platform != "darwin" or QApplication.platformName() != "cocoa":
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+
+        objc = ctypes.cdll.LoadLibrary(
+            ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.class_getInstanceMethod.restype = ctypes.c_void_p
+        objc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        objc.method_setImplementation.restype = ctypes.c_void_p
+        objc.method_setImplementation.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        delegate_class = objc.objc_getClass(b"QStatusItemDelegate")
+        if not delegate_class:
+            return False
+
+        def sel(name: str):
+            return objc.sel_registerName(name.encode("ascii"))
+
+        msg_id = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)(
+            ("objc_msgSend", objc))
+        msg_type = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p)(
+            ("objc_msgSend", objc))
+        ns_app_class = objc.objc_getClass(b"NSApplication")
+
+        def current_event_is_click() -> bool:
+            app = msg_id(ns_app_class, sel("sharedApplication"))
+            event = msg_id(app, sel("currentEvent")) if app else None
+            return bool(event) and msg_type(event, sel("type")) in _NS_CLICK_EVENT_TYPES
+
+        installed = 0
+        for name, argtypes in (("statusItemMenuBeganTracking:", (ctypes.c_void_p,)),
+                               ("statusItemClicked", ())):
+            method = objc.class_getInstanceMethod(delegate_class, sel(name))
+            if not method:
+                continue
+            prototype = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_void_p, *argtypes)
+            holder = {}
+
+            def replacement(self_, cmd, *args, _holder=holder):
+                try:
+                    if current_event_is_click():
+                        _holder["original"](self_, cmd, *args)
+                except Exception:
+                    pass  # never let an exception cross back into AppKit
+
+            callback = prototype(replacement)
+            # Keep the callback alive before AppKit can call it, and for the
+            # life of the process.
+            state["callbacks"].append((callback, holder))
+            original = objc.method_setImplementation(method, ctypes.cast(callback, ctypes.c_void_p))
+            if not original:
+                continue  # replacement stays inert: no original to forward to
+            holder["original"] = prototype(original)
+            installed += 1
+        state["installed"] = installed > 0
+        return state["installed"]
+    except Exception:
+        return False
 
 
 def _apply_macos_titlebar(widget, theme) -> bool:

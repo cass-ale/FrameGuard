@@ -11,12 +11,18 @@ CANDIDATE_WORKFLOW = (WORKFLOWS / "release-candidate.yml").read_text(
     encoding="utf-8")
 RELEASE_WORKFLOW = (WORKFLOWS / "release.yml").read_text(encoding="utf-8")
 
+# Reviewed action revisions. A Dependabot bump fails CI until a person has
+# checked the new release (tag points at this exact commit, runtime is node24,
+# no breaking input or trigger changes for these workflows) and updated the
+# pin here in the same commit as the workflows.
+#   actions/checkout v7.0.1, actions/setup-python v7.0.0 and
+#   actions/attest-build-provenance v4.2.2 were reviewed for v0.8.3.
 ACTION_PINS = {
-    "actions/checkout": "fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
-    "actions/setup-python": "ece7cb06caefa5fff74198d8649806c4678c61a1",
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/setup-python": "5fda3b95a4ea91299a34e894583c3862153e4b97",
     "actions/upload-artifact": "cf430e030ddbb5b0abf93d22962f4752f3646cd9",
     "actions/download-artifact": "9000827ccba6bdab643e8b6fd33ac0654aef8333",
-    "actions/attest-build-provenance": "8beda2b7ed98355c0e97c0a63bec38ae472e66c4",
+    "actions/attest-build-provenance": "4d101475d8b20a2381f78447822ac1eab6504dd8",
 }
 
 
@@ -36,7 +42,9 @@ def test_all_actions_use_the_reviewed_node24_compatible_pins():
     for action, revision in uses:
         assert action in ACTION_PINS, f"unreviewed action added: {action}"
         assert revision == ACTION_PINS[action], (
-            f"{action} must use reviewed revision {ACTION_PINS[action]}, got {revision}"
+            f"{action} must use reviewed revision {ACTION_PINS[action]}, got {revision}. "
+            "If this is a Dependabot bump, review the new release and update "
+            "ACTION_PINS in this file in the same commit."
         )
         assert re.fullmatch(r"[0-9a-f]{40}", revision), revision
 

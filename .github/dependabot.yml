@@ -6,3 +6,10 @@ updates:
     directory: "/"
     schedule:
       interval: "monthly"
+    # One pull request for all action bumps: each needs the same manual pin
+    # review in src/tests/test_workflow_contracts.py, so reviewing them
+    # together avoids three PRs failing CI separately.
+    groups:
+      github-actions:
+        patterns:
+          - "*"

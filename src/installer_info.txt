@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.8.2
+FrameGuard Desktop v0.8.3
 Video QA for XR Deliverables
 
 
@@ -22,23 +22,20 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.8.2
+WHAT'S NEW IN v0.8.3
 
-  Open With
-    - Open one or many results in any installed video player, such as VLC,
+  Fixes
+    - The sidebar's show/hide button is now a full square when you hover
+      over it.
+    - (macOS) Clicking the FrameGuard menu-bar icon no longer closes the app.
+
+  Also in v0.8.2
+    - Open With: open results in any installed video player, such as VLC,
       MPC-HC or Windows Media Player Legacy, or any app through Choose
-      Another App. Your last choice is remembered.
-
-  Reliable quitting
-    - Quit always closes FrameGuard, even while a watch folder is active;
-      scans and FFmpeg processes are stopped first.
-
-  Sharper reports and interface
-    - File names in any language render in PDF reports, long names wrap,
-      each file's checks stay together, and status badges are easier to read.
-    - Freezes and silences that run to the end of a file are measured.
-    - Cleaner sidebar, settings, toolbar and dropdown spacing; the Meta Dark
-      theme is now called Blue Hour.
+      Another App.
+    - Quit always closes FrameGuard, even while a watch folder is active.
+    - PDF reports render file names in any language, keep each file's
+      checks together, and use easier-to-read status badges.
 
 
 BEFORE YOU INSTALL

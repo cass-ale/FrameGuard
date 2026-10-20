@@ -372,6 +372,7 @@ QWidget[fgRole="sidebar"], #sidebar { background-color: %%bg_primary%%; border: 
    colour over it: that is what split the sidebar into mismatched blocks and
    left its right border visible only in fragments. */
 #logo_area, #sidebar_body, #sidebar_toggle_column { background: transparent; border: none; }
+QPushButton#sidebar_toggle { min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; padding: 0px; border-radius: 6px; }
 QWidget[fgRole="statistic"] { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 8px; }
 QWidget[fgRole="framed-tool"] { background-color: %%surface%%; border: 1px solid %%border%%; border-radius: 8px; }
 QWidget[fgRole="status"] { background-color: %%bg_secondary%%; border: 1px solid %%border%%; border-radius: 4px; }

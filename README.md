@@ -12,19 +12,19 @@ analysis. All processing happens locally — no data leaves your machine.
 
 ## Demo
 
-![A real FrameGuard v0.8.2 deep scan of six files in the Blue Hour theme, ending on the Results page](assets/screenshots/scan.gif)
+![A real FrameGuard v0.8.3 deep scan of six files in the Blue Hour theme: two pass, two pass with warnings and two fail, shown on the Results page and in the Checks matrix](assets/screenshots/scan.gif)
 
-A real deep scan in FrameGuard v0.8.2: six test files checked against the 4K UHD @ 30 fps profile, from the queue to the Results page with each failure explained.
+A real deep scan in FrameGuard v0.8.3: six test files checked against the 4K UHD @ 30 fps profile. Two pass, two pass with warnings (a burst of black frames, a stretch of silence) and two fail (a 1080p 24 fps proxy, and a 4K file encoded at less than half the minimum bitrate). The demo then steps through a failure, a warning and a pass on the Results page and ends on the Checks matrix.
 
 [Watch the longer v0.8.0 walkthrough (MP4)](assets/frameguard-demo.mp4). It shows an earlier version of the interface.
 
 ## Screenshots
 
-Every image below was captured from the running application (v0.8.2) after a real scan of the same six test files. Nothing was mocked up or edited.
+Every image below was captured from the running application (v0.8.3) after a real scan of the same six test files. Nothing was mocked up or edited.
 
 | | |
 |:---:|:---:|
-| ![Results page in Blue Hour: four failures and two warnings, with per-check detail for the selected file](assets/screenshots/results-blue-hour.png) | ![Results page in Clean Light](assets/screenshots/results-clean-light.png) |
+| ![Results page in Blue Hour: two failures, two warnings and two passes, with per-check detail for the selected file](assets/screenshots/results-blue-hour.png) | ![Results page in Clean Light](assets/screenshots/results-clean-light.png) |
 | **Results** · Blue Hour | **Results** · Clean Light |
 | ![Scan page during a deep scan, showing the queue and progress](assets/screenshots/scan-running-blue-hour.png) | ![Scan page after the scan, with the completion banner](assets/screenshots/scan-clean-light.png) |
 | **Scanning** · Blue Hour | **Scan complete** · Clean Light |
