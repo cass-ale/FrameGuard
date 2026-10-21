@@ -78,3 +78,34 @@ class TestStableWindow:
         with open(path, "ab"):
             assert W._can_open_exclusively(path) is False
         assert W._can_open_exclusively(path) is True
+
+
+class TestLockedFiles:
+    """Review L6: a file held open elsewhere was polled every second, silently."""
+
+    def test_lock_is_reported_once_and_polling_relaxes(self, qapp, tmp_path, monkeypatch):
+        locked = {"value": True}
+        monkeypatch.setattr(W, "MIN_STABLE_SECONDS", 0.0)
+        monkeypatch.setattr(W, "_can_open_exclusively", lambda _p: not locked["value"])
+        monitor = W.WatchFolderMonitor()
+        monitor.set_watch_path(str(tmp_path))
+        monitor.start()
+        statuses, waiting = [], []
+        monitor.status_changed.connect(statuses.append)
+        monitor.file_waiting.connect(waiting.append)
+        path = _video(tmp_path, "open_in_player.mp4")
+
+        for _ in range(W.STABLE_POLLS_REQUIRED + 6):
+            monitor._poll()
+
+        assert waiting == [path]
+        assert statuses.count("Waiting: open_in_player.mp4 is open in another app") == 1
+        assert path not in monitor._batch_queue
+        assert not monitor._in_burst_mode
+        assert monitor._timer.interval() == W.DEFAULT_POLL_INTERVAL_MS
+
+        locked["value"] = False
+        monitor._poll()
+        assert path in monitor._batch_queue
+        assert any("released" in s for s in statuses)
+        monitor.stop()

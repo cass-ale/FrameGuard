@@ -912,6 +912,21 @@ def _json_safe(value):
     return str(value)
 
 
+def _tool_versions_only(tools: dict) -> dict:
+    """``{"ffmpeg": "ffmpeg version 9.0.2 ..."}`` without install paths.
+
+    An install path names the machine and, on Windows, the user
+    (C:\\Users\\<name>\\AppData\\...). It adds nothing to reproducing a verdict
+    that the version string does not already say. Media paths are kept:
+    operators need them to find the file.
+    """
+    versions = {}
+    for name, info in tools.items():
+        version = info.get("version") if isinstance(info, dict) else info
+        versions[str(name)] = version if isinstance(version, str) else None
+    return versions
+
+
 def _result_record(r: QAResult) -> dict:
     checks = []
     for check in getattr(r, "checks", ()) or ():
@@ -935,7 +950,7 @@ def _result_record(r: QAResult) -> dict:
         "scan_started": getattr(r, "started_at", None),
         "scan_finished": getattr(r, "finished_at", None),
         "frameguard_version": getattr(r, "engine_version", __version__),
-        "tool_versions": getattr(r, "tool_versions", {}) or {},
+        "tool_versions": _tool_versions_only(getattr(r, "tool_versions", {}) or {}),
         "config": getattr(r, "config", {}) or {},
         "checks": checks,
         "metadata": getattr(r, "metadata", {}) or {},
@@ -986,8 +1001,8 @@ def _csv_rows(document: dict):
             "overall_status": record["status_label"],
             "scan_started": record.get("scan_started") or "",
             "scan_finished": record.get("scan_finished") or "",
-            "ffmpeg_version": (tools.get("ffmpeg") or {}).get("version") or "",
-            "ffprobe_version": (tools.get("ffprobe") or {}).get("version") or "",
+            "ffmpeg_version": tools.get("ffmpeg") or "",
+            "ffprobe_version": tools.get("ffprobe") or "",
         }
         for check in record["checks"]:
             yield {**base, "record_type": "check", "name": check["name"],
@@ -1044,6 +1059,16 @@ def _fmt_choice(value) -> str:
     return "not enforced" if value in (None, "any") else str(value)
 
 
+def _loudness_spec(c: dict) -> str:
+    mode = c.get("loudness_mode", "report")
+    if mode == "off":
+        return "not measured"
+    if mode == "report":
+        return "measured and reported, not enforced"
+    return (f"{mode}: {c.get('target_loudness_lufs')} ± {c.get('loudness_tolerance_lu')} LUFS, "
+            f"TP ≤ {c.get('true_peak_max_dbtp')} dBTP")
+
+
 def spec_rows(config: dict) -> List[tuple]:
     """(label, value) pairs summarising the effective spec for the PDF."""
     if not config:
@@ -1070,9 +1095,7 @@ def spec_rows(config: dict) -> List[tuple]:
                            f"≥{c.get('freeze_detect_duration')} s (noise {c.get('freeze_detect_noise')})"),
         ("Silence", f"≤{c.get('silence_noise_db')} dB for ≥{c.get('silence_duration')} s; "
                     f"dead at {float(c.get('dead_channel_ratio') or 0) * 100:g}%"),
-        ("Loudness", "not measured" if c.get("loudness_mode") == "off" else
-                     f"{c.get('loudness_mode')}: {c.get('target_loudness_lufs')} ± "
-                     f"{c.get('loudness_tolerance_lu')} LUFS, TP ≤ {c.get('true_peak_max_dbtp')} dBTP"),
+        ("Loudness", _loudness_spec(c)),
     ]
     return [(label, value) for label, value in rows if value not in (None, "")]
 

@@ -226,11 +226,21 @@ class TestSoftwareDecoding:
 class TestEveryAudioTrack:
     """H4: only the first audio track was analysed."""
 
-    def test_silent_second_track_fails(self, media):
+    def test_silent_second_track_is_reported(self, media):
+        """Track 2 used to go unchecked. A blank secondary track is reported
+        but only warns (review M2: intentional blank tracks exist)."""
         clip = media.get("silent51.mp4", lambda p: make_clip(p, audio=("stereo", "silent-5.1")))
         result = _scan(clip)
         silence = _row(result, "Audio Silence")
-        assert silence[1] == "FAIL" and "Track 2" in silence[2], silence
+        assert silence[1] == "WARN", silence
+        assert "Track 2 is silent - intentional blank track?" in silence[2]
+        assert result.status == "PASS_WITH_WARNINGS"
+
+    def test_silent_main_track_fails(self, media):
+        clip = media.get("silentmain.mp4", lambda p: make_clip(p, audio=("silent-stereo", "5.1")))
+        result = _scan(clip)
+        silence = _row(result, "Audio Silence")
+        assert silence[1] == "FAIL" and "Track 1" in silence[2], silence
         assert result.status == "MISMATCH"
 
     def test_low_sample_rate_second_track_fails(self, media):
@@ -380,7 +390,8 @@ class TestXRMetadata:
 # ---------------------------------------------------------------------------
 
 class TestLoudness:
-    """D3: ebur128 ran and its result was discarded."""
+    """D3: ebur128 ran and its result was discarded. Enforcement is opt-in
+    (review H2); the defaults are covered in test_v090_review.py."""
 
     def test_measured_loudness_is_checked(self, media):
         clip = media.get("clean_h264.mp4", lambda p: make_clip(p))

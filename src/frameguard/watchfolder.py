@@ -242,6 +242,9 @@ class WatchFolderMonitor(QObject):
     status_changed = Signal(str)
     error = Signal(str)
     folder_lost = Signal(str)   # watched folder became unreachable; watching stopped
+    # A finished-looking file is held open by another app (Windows exclusive
+    # open refused). Emitted once per file until it is released.
+    file_waiting = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -630,7 +633,10 @@ class WatchFolderMonitor(QObject):
             self._flush_if_batch_is_overdue()
             return
 
-        if new_files:
+        # Pending files are not "known" yet, so they appear in new_files on
+        # every poll; only genuinely new arrivals justify fast polling.
+        arrivals = new_files - set(self._pending_files)
+        if arrivals:
             self._enter_burst_mode()
 
         # Every unseen file joins the pending set; stability is decided in one
@@ -651,6 +657,7 @@ class WatchFolderMonitor(QObject):
                 state["size"] = size
                 state["stable_polls"] = 0
                 state["last_change"] = now
+                state["locked"] = False
                 continue
 
             state["stable_polls"] += 1
@@ -674,8 +681,13 @@ class WatchFolderMonitor(QObject):
                 self._emitted_files.add(filepath)
                 continue
 
-            if (_can_open_exclusively(filepath)
-                    and _get_file_identity_safe(filepath) == identity):
+            if not _can_open_exclusively(filepath):
+                self._note_locked(filepath, state)
+                continue
+            if _get_file_identity_safe(filepath) == identity:
+                if state.get("lock_reported"):
+                    self.status_changed.emit(
+                        f"{os.path.basename(filepath)} was released by the other app \u2014 queued")
                 newly_stable.append(filepath)
                 stable_identities[filepath] = identity
                 del self._pending_files[filepath]
@@ -689,6 +701,12 @@ class WatchFolderMonitor(QObject):
             self._settle_timer.stop()
             self._settle_timer.start(BATCH_SETTLE_MS)
 
+        # Files that only wait for another app to let go do not need 1 s
+        # polling: drop back to the normal interval until something changes.
+        if not arrivals and self._pending_files and all(
+                st.get("locked") for st in self._pending_files.values()):
+            self._exit_burst_mode()
+
         # Everything has settled: emit promptly rather than waiting out the
         # full window.
         if not self._pending_files and self._batch_queue:
@@ -697,6 +715,21 @@ class WatchFolderMonitor(QObject):
                 self._settle_timer.start(1000)
 
         self._flush_if_batch_is_overdue()
+
+    def _note_locked(self, filepath: str, state: dict) -> None:
+        """Record that a settled file is held open elsewhere; say so once.
+
+        It used to stay pending with no message while the folder polled every
+        second, so a clip left open in a player or NLE was silently never
+        scanned.
+        """
+        state["locked"] = True
+        if state.get("lock_reported"):
+            return
+        state["lock_reported"] = True
+        self.status_changed.emit(
+            f"Waiting: {os.path.basename(filepath)} is open in another app")
+        self.file_waiting.emit(filepath)
 
     def _flush_if_batch_is_overdue(self):
         """Emit the batch if it has grown too large or waited too long.

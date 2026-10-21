@@ -254,7 +254,10 @@ PROJECTION_CHOICES = (
     "half_equirectangular", "tiled_equirectangular", "rectilinear",
 )
 STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
-LOUDNESS_MODES = ("off", "advisory", "essential")
+# "report" measures and shows loudness without judging it: camera originals
+# and phone recordings routinely sit far from broadcast targets (-23 LUFS,
+# -1 dBTP) and must not be flagged unless the spec asks for it.
+LOUDNESS_MODES = ("off", "report", "advisory", "essential")
 
 DEFAULT_CONFIG = {
     # Picture geometry and timing. Resolution must match exactly unless
@@ -315,8 +318,9 @@ DEFAULT_CONFIG = {
     # length is dead.
     "dead_channel_ratio": 0.95,
 
-    # Loudness (EBU R128). "off" skips ebur128 entirely.
-    "loudness_mode": "advisory",
+    # Loudness (EBU R128): "off" skips ebur128 entirely, "report" measures
+    # without enforcing, "advisory" warns and "essential" fails off-target.
+    "loudness_mode": "report",
     "target_loudness_lufs": -23.0,
     "loudness_tolerance_lu": 2.0,
     "true_peak_max_dbtp": -1.0,
@@ -452,20 +456,25 @@ class QAResult:
         with self._lock:
             self.checks.append((check_name, "SKIP", detail, confidence))
 
-    def add_not_verified(self, check_name: str, reason: str):
-        """Record an analysis that should have run but could not.
+    def add_not_verified(self, check_name: str, reason: str, by_choice: bool = False):
+        """Record an analysis that did not run.
 
         SKIP is ignored by the verdict, so an unrun integrity scan used to read
         exactly like a clean one. "Not verified" is a WARN with an explicit
         label: the file can never come out a clean PASS on unverified ground.
+
+        ``by_choice`` marks analysis the operator chose not to run (a quick
+        scan). Strict Mode escalates genuine failures to analyse, but not a
+        choice: otherwise every quick + strict scan was a FAIL.
         """
         with self._lock:
             detail = f"{NOT_VERIFIED_PREFIX}{reason}"
             self.checks.append((check_name, "WARN", detail, 100))
             self.warnings.append(f"{check_name}: {detail}")
-            self.metadata.setdefault("not_verified", [])
-            if check_name not in self.metadata["not_verified"]:
-                self.metadata["not_verified"].append(check_name)
+            key = "not_run_by_choice" if by_choice else "not_verified"
+            self.metadata.setdefault(key, [])
+            if check_name not in self.metadata[key]:
+                self.metadata[key].append(check_name)
 
     def set_metadata(self, key, value):
         with self._lock:
@@ -507,24 +516,28 @@ class QAResult:
         for check_name, status, *_ in self.checks:
             if status == "FAIL":
                 issues.append(_PLAIN.get(check_name, check_name.lower() + " issue"))
+        if issues:
+            if len(issues) == 1:
+                return issues[0][0].upper() + issues[0][1:] + "."
+            return ", ".join(i.capitalize() for i in issues) + "."
 
-        if not issues:
-            warn_names = []
-            for check_name, status, detail, *_ in self.checks:
-                if status != "WARN":
-                    continue
-                if str(detail).startswith(NOT_VERIFIED_PREFIX):
-                    warn_names.append(f"{check_name.lower()} not verified")
-                else:
-                    warn_names.append(_PLAIN.get(check_name, check_name.lower() + " concern"))
-            if warn_names:
-                unique = list(dict.fromkeys(warn_names))
-                return "Heads up: " + ", ".join(unique) + "."
+        notes = []
+        for check_name, status, detail, *_ in self.checks:
+            if status != "WARN":
+                continue
+            if str(detail).startswith(NOT_VERIFIED_PREFIX):
+                notes.append(f"{check_name.lower()} not verified")
+            else:
+                notes.append(_PLAIN.get(check_name, check_name.lower() + " concern"))
+        notes = list(dict.fromkeys(notes))
+        if not notes:
             return "Passed with minor notes."
-
-        if len(issues) == 1:
-            return issues[0][0].upper() + issues[0][1:] + "."
-        return ", ".join(i.capitalize() for i in issues) + "."
+        # The wording follows the final verdict: under Strict Mode warnings
+        # are failures, and "Heads up" on a FAIL row contradicted it.
+        verdict = self.status or self.overall_status()
+        if verdict == "MISMATCH":
+            return "Failed in Strict Mode: " + ", ".join(notes) + "."
+        return "Heads up: " + ", ".join(notes) + "."
 
     def overall_status(self, strict: bool = False) -> str:
         """Return the file's overall verdict.
@@ -545,6 +558,7 @@ class QAResult:
         """
         strict = strict or bool(getattr(self, "strict", False))
         flagged = False
+        by_choice = set(self.metadata.get("not_run_by_choice") or ())
 
         for check_tuple in self.checks:
             name, status = check_tuple[0], check_tuple[1]
@@ -559,7 +573,9 @@ class QAResult:
             if name in ESSENTIAL_CHECKS and status == "FAIL" and confidence >= 70:
                 return "MISMATCH"
 
-            if strict:
+            chosen = (status == "WARN" and name in by_choice
+                      and str(check_tuple[2]).startswith(NOT_VERIFIED_PREFIX))
+            if strict and not chosen:
                 return "MISMATCH"
 
             flagged = True
@@ -647,12 +663,21 @@ def probe_first_video_frame(filepath: str, stream_index: int, process_owner=None
 
 
 class FrameTiming:
-    """Presentation timestamps of a video stream, read from packets only."""
+    """Presentation timestamps of a video stream, read from packets only.
 
-    def __init__(self, windows: List[List[float]], sampled: bool, description: str):
-        self.windows = windows          # sorted pts lists, one per read window
+    ``windows`` hold only presented frames (sorted pts inside the stream's
+    presentation range). ``hidden_leadin`` counts packets before the stream
+    start: frames an edit list hides, as left by a lossless (stream-copy)
+    trim that had to keep the preceding GOP so the first shown frame can be
+    decoded. They are stored and counted in nb_frames but never displayed.
+    """
+
+    def __init__(self, windows: List[List[float]], sampled: bool, description: str,
+                 hidden_leadin: Optional[int] = None):
+        self.windows = windows
         self.sampled = sampled
         self.description = description
+        self.hidden_leadin = hidden_leadin
 
     @property
     def packet_count(self) -> int:
@@ -681,9 +706,14 @@ def _timing_windows(duration: Optional[float], file_size: int, cfg: dict) -> Lis
 
 def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[float],
                        cfg: dict, process_owner=None,
-                       cancel_event: Optional[threading.Event] = None) -> Optional[FrameTiming]:
+                       cancel_event: Optional[threading.Event] = None,
+                       start_time: float = 0.0,
+                       stream_duration: Optional[float] = None) -> Optional[FrameTiming]:
     """Read packet timestamps for one video stream (no decoding).
 
+    Packets outside [start_time, start_time + stream_duration] are not
+    presented (edit-list lead-in before, reorder spill-over after a cut), so
+    they are counted as hidden lead-in or dropped rather than read as gaps.
     Returns None when ffprobe fails, so the CFR check can say "not verified"
     instead of passing on no evidence.
     """
@@ -696,6 +726,9 @@ def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[floa
         return None
     specs = _timing_windows(duration, file_size, cfg)
     windows = []
+    hidden_leadin = None
+    epsilon = 1e-4
+    end_time = (start_time + stream_duration) if stream_duration else None
     for spec in specs:
         cmd = [ffprobe, "-v", "error", "-select_streams", str(stream_index)]
         if spec:
@@ -712,14 +745,19 @@ def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[floa
             value = _safe_float(line.strip().strip(","))
             if value is not None:
                 pts.append(value)
-        windows.append(sorted(pts))
+        if spec is None or spec.startswith("0.000%") or spec.startswith("%"):
+            # Only a window read from the very start sees the lead-in.
+            hidden_leadin = sum(1 for p in pts if p < start_time - epsilon)
+        presented = [p for p in pts if p >= start_time - epsilon
+                     and (end_time is None or p < end_time - epsilon)]
+        windows.append(sorted(presented))
     sampled = specs != [None]
     if sampled:
         description = (f"sampled {len(specs)} windows "
-                       f"(file is {file_size / 1024 ** 3:.1f} GB)")
+                       f"(file is {_format_size(file_size / 1024 ** 2)})")
     else:
         description = "all packets"
-    return FrameTiming(windows, sampled, description)
+    return FrameTiming(windows, sampled, description, hidden_leadin)
 
 
 def _safe_float(value, default=None):
@@ -917,7 +955,9 @@ def _side_data(entries, kind: str) -> Optional[dict]:
 
 
 def _format_size(size_mb: float) -> str:
-    """'40.3 MB', or KB below 0.1 MB: a 7 KB file read as '0.0 MB'."""
+    """'40.3 MB' ('4.8 GB' from 1 GB), or KB below 0.1 MB: a 7 KB file read as '0.0 MB'."""
+    if size_mb >= 1024:
+        return f"{size_mb / 1024:.1f} GB"
     if size_mb < 0.1:
         return f"{max(size_mb * 1024, 0.0):.0f} KB"
     return f"{size_mb:.1f} MB"
@@ -986,6 +1026,25 @@ def _displayed_size(video: dict) -> Tuple[int, int, int]:
     return width, height, rotation
 
 
+def _orientation_name(width: int, height: int) -> str:
+    return "portrait" if height > width else "landscape" if width > height else "square"
+
+
+def _orientation_mismatch(width: int, height: int, tw: int, th: int, rotation: int) -> Optional[str]:
+    """A clear message when the picture is turned the other way from the target.
+
+    A portrait phone clip against a UHD spec used to read "smaller than the
+    target... would upscale", which sent operators looking for a scaling
+    problem instead of a rotation one.
+    """
+    actual, wanted = _orientation_name(width, height), _orientation_name(tw, th)
+    if "square" in (actual, wanted) or actual == wanted:
+        return None
+    turned = f" (rotated {abs(rotation)}°)" if abs(rotation) % 180 == 90 else ""
+    return (f"{actual.capitalize()} orientation{turned}: {width}x{height} displayed vs "
+            f"{tw}x{th} {wanted} target.")
+
+
 def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     """The displayed frame must equal the target exactly.
 
@@ -1011,8 +1070,11 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     tw, th = int(cfg["target_width"]), int(cfg["target_height"])
     rot_note = f" (displayed after {abs(rotation)}° rotation)" if rotation else ""
 
+    orientation = _orientation_mismatch(width, height, tw, th, rotation)
     if (width, height) == (tw, th):
         result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}")
+    elif orientation:
+        result.add_fail("Resolution", orientation, confidence=95)
     elif width >= tw and height >= th and cfg.get("allow_larger_resolution", False):
         result.add_pass("Resolution", f"{width}x{height} exceeds the {tw}x{th} target "
                                       f"(larger frames allowed by this spec){rot_note}")
@@ -1105,6 +1167,23 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     result.add_fail("Frame Rate", f"{fps:.3f} fps does not match the {target:g} ± {tolerance:g} fps target.")
 
 
+# Intervals ignored at each edge of every packet window. Within a window
+# read from a seek point (or cut by a lossless trim) the first and last few
+# presentation timestamps are incomplete: B-frames whose packets fall
+# outside the window leave holes up to the reorder depth, and the stream's
+# own first/last intervals absorb edit-list and priming offsets (a
+# fragmented MP4's first frame lasts 55 ms instead of 33 ms). None of that
+# says anything about the cadence; real VFR runs through the middle.
+WINDOW_EDGE_INTERVALS = 8
+
+
+def _trim_window_edges(window_gaps: list) -> list:
+    edge = WINDOW_EDGE_INTERVALS
+    if len(window_gaps) > 4 * edge:
+        return window_gaps[edge:-edge]
+    return window_gaps[1:-1]
+
+
 def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
     """(dominant interval, total intervals, irregular count, irregular samples).
 
@@ -1114,17 +1193,8 @@ def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, Lis
     from it is irregular: a dropped/held frame or a genuine rate change.
     """
     gaps = []
-    last = len(timing.windows) - 1
-    for number, window in enumerate(timing.windows):
-        window_gaps = [(b, b - a) for a, b in zip(window, window[1:])]
-        # The stream's first and last intervals absorb edit-list and priming
-        # offsets (a fragmented MP4's first frame lasts 55 ms instead of
-        # 33 ms); they say nothing about the cadence.
-        if number == 0:
-            window_gaps = window_gaps[1:]
-        if number == last:
-            window_gaps = window_gaps[:-1]
-        gaps.extend(window_gaps)
+    for window in timing.windows:
+        gaps.extend(_trim_window_edges([(b, b - a) for a, b in zip(window, window[1:])]))
     if not gaps:
         return None, 0, 0, []
     counts = Counter(round(delta, 4) for _, delta in gaps if delta > 0)
@@ -1548,6 +1618,10 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     if actual_frames is None or actual_frames < 0:
         result.add_warn("Frame Count", f"Could not parse frame count: {nb_frames_str}")
         return
+    hidden = int(result.metadata.get("edit_list_hidden_frames", 0) or 0)
+    hidden_note = (f" ({hidden} lead-in frame(s) stored but hidden by an edit list, "
+                   f"as left by a lossless trim)") if hidden else ""
+    actual_frames = max(0, actual_frames - hidden)
     duration = _safe_float(vs.get("duration") or probe_data.get("format", {}).get("duration"))
     fps = parse_frame_rate(vs.get("r_frame_rate", "0/1"))
     if duration is None or duration <= 0 or fps <= 0:
@@ -1556,11 +1630,15 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     expected_frames = int(round(duration * fps))
     diff = abs(expected_frames - actual_frames)
     tolerance = max(2, int(fps * 0.1))
+    if hidden:
+        # A stream-copy cut also drops the B-frames at its tail whose
+        # reference fell outside the cut: up to the reorder depth.
+        tolerance = max(tolerance, 8)
     result.set_metadata("expected_frames", expected_frames)
     result.set_metadata("actual_frames", actual_frames)
     result.set_metadata("frame_count_diff", diff)
     if diff <= tolerance:
-        result.add_pass("Frame Count", f"{actual_frames} frames (expected ~{expected_frames}, diff: {diff})")
+        result.add_pass("Frame Count", f"{actual_frames} frames (expected ~{expected_frames}, diff: {diff}){hidden_note}")
     elif diff <= expected_frames * 0.10:
         result.add_warn("Frame Count", f"{actual_frames} frames vs ~{expected_frames} (diff: {diff}, {diff/expected_frames*100:.1f}%). May be normal for static/slow-motion content.")
     else:
@@ -2084,11 +2162,13 @@ def _channel_names(track: dict, count: int) -> List[str]:
 class _ScanPlan:
     """What the integrity pass decodes and what it should find."""
 
-    def __init__(self, probe_data: dict, cfg: dict, variable_rate: bool = False):
+    def __init__(self, probe_data: dict, cfg: dict, variable_rate: bool = False,
+                 hidden_frames: int = 0):
+        self.hidden_frames = max(0, int(hidden_frames or 0))
         self.video = _primary_video_stream(probe_data)
         self.audio = _audio_streams(probe_data)
         self.duration = _probed_duration(probe_data)
-        self.loudness = (cfg.get("loudness_mode", "advisory") != "off") and bool(self.audio)
+        self.loudness = (cfg.get("loudness_mode", "report") != "off") and bool(self.audio)
         self.variable_rate = variable_rate
 
     def video_frames_unreliable(self) -> bool:
@@ -2103,17 +2183,27 @@ class _ScanPlan:
                 or parse_frame_rate(self.video.get("r_frame_rate", "0/0")))
 
     def video_expected_frames(self) -> Optional[int]:
-        """Frames the container says exist: nb_frames, else duration x rate."""
+        """Frames that should be presented.
+
+        ``nb_frames`` counts stored packets, including the lead-in an edit
+        list hides after a lossless trim (up to a GOP: a 15 s open-GOP H.264
+        cut stores 498 frames and shows 452), so the hidden lead-in is
+        subtracted and the result capped by duration x rate. A truncated
+        copy keeps its original header, so both values still describe the
+        full file and the shortfall is caught.
+        """
         if not self.video:
             return None
         declared = _safe_int(self.video.get("nb_frames"))
-        if declared and declared > 0:
-            return declared
+        if declared is not None and declared > 0:
+            declared = max(0, declared - self.hidden_frames)
+        else:
+            declared = None
         fps = self.video_fps()
         duration = _stream_duration(self.video) or self.duration
-        if fps > 0 and duration:
-            return int(round(duration * fps))
-        return None
+        by_time = int(round(duration * fps)) if fps > 0 and duration else None
+        candidates = [v for v in (declared, by_time) if v]
+        return min(candidates) if candidates else None
 
     @staticmethod
     def channels(track: dict) -> int:
@@ -2464,12 +2554,23 @@ def _silence_events(log_text: str, instance: str, end_time: float) -> List[Tuple
     return [(start, dur if dur > 0 else max(0.0, end_time - start)) for start, dur in events]
 
 
-def _track_silence_entry(label: str, events, duration: float, cfg: dict) -> Tuple[str, str]:
+def _primary_track_position(tracks: List[dict]) -> int:
+    """The track a player picks: the first flagged default, else the first."""
+    for position, track in enumerate(tracks):
+        if (track.get("disposition") or {}).get("default"):
+            return position
+    return 0
+
+
+def _track_silence_entry(label: str, events, duration: float, cfg: dict,
+                         primary: bool = True, number: int = 1) -> Tuple[str, str]:
     """Status/detail for one track's silence, using the long-standing tiers.
 
-    New: a track silent for at least ``dead_channel_ratio`` of its length is
-    dead and fails whatever its length (the old >30 s condition let a
-    completely silent 20 s clip through as a warning).
+    A primary track silent for at least ``dead_channel_ratio`` of its length
+    carries no programme and fails whatever its length (the old >30 s
+    condition let a completely silent 20 s clip through as a warning). A
+    blank secondary track only warns: broadcast and archive layouts reserve
+    empty tracks on purpose.
     """
     if not events:
         return "PASS", _with_track(label, "No extended silence detected.")
@@ -2477,8 +2578,10 @@ def _track_silence_entry(label: str, events, duration: float, cfg: dict) -> Tupl
     positions = _format_event_list(events)
     count = len(events)
     if duration > 0 and total >= duration * float(cfg.get("dead_channel_ratio", 0.95)):
-        return "FAIL", _with_track(label, f"Silent for {total:.1f}s of {duration:.1f}s "
-                                          f"({total / duration * 100:.0f}%): track carries no audio.")
+        share = f"silent for {total:.1f}s of {duration:.1f}s ({total / duration * 100:.0f}%)"
+        if not primary:
+            return "WARN", f"Track {number} is silent - intentional blank track? ({share})"
+        return "FAIL", _with_track(label, f"{share[0].upper()}{share[1:]}: the main track carries no audio.")
     if total > duration * 0.5 and duration > 30:
         return "FAIL", _with_track(label, f"{count} silence region(s), total {total:.1f}s. Extended silence in deliverable. At: {positions}")
     if total < 1.0:
@@ -2544,14 +2647,22 @@ def _parse_loudness(log_text: str) -> Dict[int, dict]:
 
 
 def _loudness_entry(label: str, measured: Optional[dict], cfg: dict) -> Tuple[str, str]:
+    """One track's loudness row for the configured ``loudness_mode``."""
+    mode = cfg.get("loudness_mode", "report")
     if not measured or "integrated" not in measured:
+        if mode == "report":
+            return "SKIP", _with_track(label, "Loudness summary not reported by FFmpeg.")
         return "WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}loudness summary not reported by FFmpeg.")
-    essential = cfg.get("loudness_mode") == "essential"
+    integrated = measured["integrated"]
+    peak = measured.get("true_peak")
+    peak_text = f"{peak:.1f} dBTP" if peak is not None and math.isfinite(peak) else "-inf dBTP"
+    loudness_text = ("no measurable loudness (silent)" if integrated <= -69.9
+                     else f"{integrated:.1f} LUFS")
+    if mode == "report":
+        return "PASS", _with_track(label, f"{loudness_text}, true peak {peak_text}; not enforced")
     target = float(cfg["target_loudness_lufs"])
     tolerance = float(cfg["loudness_tolerance_lu"])
     peak_max = float(cfg["true_peak_max_dbtp"])
-    integrated = measured["integrated"]
-    peak = measured.get("true_peak")
     issues = []
     if integrated <= -69.9:
         issues.append("no measurable programme loudness (silent)")
@@ -2559,11 +2670,11 @@ def _loudness_entry(label: str, measured: Optional[dict], cfg: dict) -> Tuple[st
         issues.append(f"integrated {integrated:.1f} LUFS is outside {target:g} ± {tolerance:g} LUFS")
     if peak is not None and peak > peak_max:
         issues.append(f"true peak {peak:.1f} dBTP exceeds {peak_max:g} dBTP")
-    peak_text = f"{peak:.1f} dBTP" if peak is not None and math.isfinite(peak) else "-inf dBTP"
-    text = f"I {integrated:.1f} LUFS (target {target:g} ± {tolerance:g}), true peak {peak_text} (max {peak_max:g})"
+    text = (f"{loudness_text}, true peak {peak_text} "
+            f"(target {target:g} ± {tolerance:g} LUFS, max {peak_max:g} dBTP)")
     if not issues:
         return "PASS", _with_track(label, text)
-    status = "FAIL" if essential else "WARN"
+    status = "FAIL" if mode == "essential" else "WARN"
     return status, _with_track(label, f"{text}: " + "; ".join(issues))
 
 
@@ -2571,12 +2682,14 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
     silence, dead, loudness = [], [], []
     measured = _parse_loudness(outcome.log_text) if plan.loudness else {}
     total = len(plan.audio)
+    primary = _primary_track_position(plan.audio)
     for position, track in enumerate(plan.audio):
         label = _track_label(position, track, total)
         duration = (_decoded_audio_seconds(track, outcome.accounting)
                     or plan.audio_expected_seconds(track) or 0.0)
         events = _silence_events(outcome.log_text, f"silencedetect@a{position}", duration)
-        status, detail = _track_silence_entry(label, events, duration, cfg)
+        status, detail = _track_silence_entry(label, events, duration, cfg,
+                                              primary=position == primary, number=position + 1)
         silence.append((status, detail))
         if position == 0 and events:
             result.set_metadata("silence_regions", len(events))
@@ -2648,10 +2761,11 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     if probe_data is None:
         probe_data = run_ffprobe(filepath, process_owner, cancel_event)
     plan = _ScanPlan(probe_data or {}, cfg,
-                     variable_rate=bool(result.metadata.get("vfr_detected")))
+                     variable_rate=bool(result.metadata.get("vfr_detected")),
+                     hidden_frames=result.metadata.get("edit_list_hidden_frames", 0))
     if quick:
-        _mark_not_verified(result, plan.frame_check_names(),
-                           "quick scan — the file was not decoded.")
+        for name in plan.frame_check_names():
+            result.add_not_verified(name, "quick scan — the file was not decoded.", by_choice=True)
         return
     if probe_data is None:
         _mark_not_verified(result, plan.frame_check_names(), "the file could not be probed.")
@@ -2786,7 +2900,11 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
                                               process_owner, cancel_event)
         timing = probe_frame_timing(filepath, int(video["index"]),
                                     _probed_duration(probe_data), cfg,
-                                    process_owner, cancel_event)
+                                    process_owner, cancel_event,
+                                    start_time=_safe_float(video.get("start_time"), 0.0) or 0.0,
+                                    stream_duration=_stream_duration(video))
+        if timing is not None and timing.hidden_leadin:
+            result.set_metadata("edit_list_hidden_frames", timing.hidden_leadin)
     check_video_codec(probe_data, result, cfg)
     check_resolution(probe_data, result, cfg)
     check_aspect_ratio(probe_data, result, cfg)

@@ -52,6 +52,14 @@ class TestPresetValidation:
         with pytest.raises(PresetValidationError):
             validate_preset_config({"required_transfer": "dolby"})
 
+    @pytest.mark.parametrize("mode", ["off", "report", "advisory", "essential"])
+    def test_every_loudness_mode_validates(self, mode):
+        assert validate_preset_config({"loudness_mode": mode.upper()}) == {"loudness_mode": mode}
+
+    def test_unknown_loudness_mode_is_rejected(self):
+        with pytest.raises(PresetValidationError, match="loudness_mode"):
+            validate_preset_config({"loudness_mode": "warn"})
+
     def test_import_rejects_and_can_explain(self, tmp_path):
         path = tmp_path / "bad.fg"
         export_preset("ok", {"target_width": 1920}, str(path))
