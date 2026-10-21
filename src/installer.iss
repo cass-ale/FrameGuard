@@ -147,6 +147,8 @@ Root: HKCU; Subkey: "Software\Classes\.webm\OpenWithProgids"; ValueType: string;
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
+; Per-theme shortcut icons written by the app (frameguard/winshell.py).
+Type: filesandordirs; Name: "{localappdata}\FrameGuard\icons"
 
 [Code]
 // Tells the shell that file associations changed, so .fg files pick up the

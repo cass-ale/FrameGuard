@@ -65,15 +65,13 @@ class TestTokens:
         assert scale == sorted(scale)
         assert len(set(scale)) == len(scale)
 
-    def test_page_margins_shrink_on_narrow_windows(self):
-        """A fixed 32px gutter is what made the UI feel cramped until maximized."""
-        narrow = D.page_margins(1000)
-        wide = D.page_margins(1920)
-        assert narrow < wide
-        assert narrow % 8 == 0 and wide % 8 == 0
-
-    def test_sidebar_shrinks_on_narrow_windows(self):
-        assert D.sidebar_width(1000) < D.sidebar_width(1920)
+    def test_gutter_and_sidebar_do_not_jump_while_resizing(self):
+        """0.9.1: stepped gutters (16/24/32 px) and a sidebar that narrowed at
+        1100 px made the page jump sideways mid-drag. Both are now constant."""
+        widths = range(760, 2561, 20)
+        assert len({D.page_margins(w) for w in widths}) == 1
+        assert len({D.sidebar_width(w) for w in widths}) == 1
+        assert D.page_margins(1000) % 8 == 0
 
 
 class TestThemeContrast:
@@ -360,20 +358,13 @@ class TestSidebar:
             assert btn.height() in (D.CONTROL_MD, D.CONTROL_LG, D.CONTROL_XL), \
                 f"nav row height {btn.height()}px is off the scale"
 
-    def test_sidebar_width_is_not_frozen_by_the_stylesheet(self, window, qapp):
-        """A hard-coded min-width/max-width in theme.py silently overrode the
-        responsive sizing, so the sidebar never actually narrowed."""
-        # Exercise the policy directly: a native window manager may cap an
-        # oversized test window to the runner's desktop before resizeEvent.
+    def test_sidebar_width_is_stable_across_window_widths(self, window, qapp):
+        """The sidebar keeps one width while the window is resized (0.9.1)."""
         window._apply_responsive_layout(1000)
         narrow = window._sidebar.maximumWidth()
-
         window._apply_responsive_layout(1920)
         wide = window._sidebar.maximumWidth()
-
-        assert narrow < wide, f"sidebar did not adapt: {narrow}px vs {wide}px"
-        assert narrow == D.sidebar_width(1000)
-        assert wide == D.sidebar_width(1920)
+        assert narrow == wide == D.sidebar_width(1280)
 
     def test_every_nav_row_has_a_real_icon(self, window):
         for btn in window.nav_buttons:
@@ -761,7 +752,9 @@ class TestLayoutIntegrity:
                     offenders.append(f"{name}/{label[:20]!r}={child.height()}px")
         assert not offenders, "controls below 28px: " + ", ".join(offenders)
 
-    def test_panel_gutters_respond_to_width(self, window, qapp):
+    def test_panel_gutters_hold_still_while_resizing(self, window, qapp):
+        """0.9.1: the gutter is one value at every width, so the page no longer
+        jumps sideways when a window edge is dragged across a breakpoint."""
         from frameguard import gui as G
 
         window._switch_panel(G.PANEL_RESULTS)
@@ -771,4 +764,4 @@ class TestLayoutIntegrity:
         window._apply_responsive_layout(1920)
         wide = window.results_panel.layout().contentsMargins().left()
 
-        assert narrow < wide, f"gutter did not adapt: {narrow} vs {wide}"
+        assert narrow == wide == D.page_margins(1280), f"gutter moved: {narrow} vs {wide}"

@@ -13,6 +13,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.9.1] — 2026-10-21 — Signal QC: audio, picture and conformance checks from the benchmark
 
 ### Fixed
+- Windows: the window now uses the native Windows frame, tinted to the theme (title bar in the sidebar colour, themed caption text and border, Windows 11 rounded corners and Snap Layouts). The hand-drawn title bar clipped its own close button and the right and bottom edge of every page.
+- Windows: resizing no longer drags the page sideways. The content sat under the invisible resize border, and the page gutter and sidebar width stepped at 1100 and 1400 px mid-drag; both are now constant.
+- Windows: the pinned taskbar button, Start menu and desktop shortcuts follow the theme's icon colour, not just the running window. (A button already pinned may keep the old image until Windows next redraws the taskbar.)
+- Windows 11: the interface uses Segoe UI Variable, the system typeface.
 - 29.97 fps no longer passes a 30 fps spec silently (and 23.976/59.94 likewise): an NTSC rate against its integer target now warns (fails in Strict Mode) unless "Treat NTSC Rates as Integer" is on. The FPS tolerance now only absorbs measurement jitter.
 - Audio shorter than the video by more than 2 frames warns, and by more than 0.5 s fails (Telestream FC-108 practice); audio up to 2 s long passes.
 - A rotated (portrait) file no longer fails both Resolution and Aspect Ratio for the same reason; a flat 180° or mirrored picture now warns.

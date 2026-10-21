@@ -1,14 +1,12 @@
 """Windows chrome contracts that are safe to exercise on every CI host."""
 
 import ctypes
-import inspect
+
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt
-from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QMainWindow
+from PySide6.QtCore import QRect
 
 pytestmark = pytest.mark.usefixtures("qapp")
 REPO = Path(__file__).resolve().parents[1]
@@ -68,83 +66,26 @@ class TestWindowsPackageGate:
         assert "startup_smoke.py" in smoke
 
 
-class TestWindowsTitleBar:
-    def test_caption_controls_are_accessible_and_semantic(self, qapp):
-        from frameguard.gui import TitleBar
+class TestWindowsNativeChrome:
+    """0.9.1 replaced the frameless window and hand-drawn title bar with the
+    native frame, themed through DWM."""
 
-        window = QMainWindow()
-        window.resize(900, 600)
-        bar = TitleBar(window)
-        bar.resize(900, bar.height())
-        bar.show()
-        qapp.processEvents()
+    def test_caption_attributes_follow_the_theme(self):
+        from frameguard import gui as G
+        from frameguard.theme import get_theme
 
-        expected = (
-            (bar._btn_minimize, "Minimize window", "icon"),
-            (bar._btn_maximize, "Maximize window", "icon"),
-            (bar._btn_close, "Close window", "destructive"),
-        )
-        for button, accessible_name, role in expected:
-            assert button.accessibleName() == accessible_name
-            assert button.property("fgRole") == role
-            assert button.height() >= 28
+        for name in ("Blue Hour", "Clean Light", "Warm Cream"):
+            theme = get_theme(name)
+            attrs = dict(G._windows_caption_attributes(theme))
+            assert attrs[G._DWMWA_CAPTION_COLOR] == G._colorref(theme.bg_secondary)
+            assert attrs[G._DWMWA_TEXT_COLOR] == G._colorref(theme.text_primary)
+            assert attrs[G._DWMWA_BORDER_COLOR] == G._colorref(theme.border)
+            assert attrs[G._DWMWA_WINDOW_CORNER_PREFERENCE] == G._DWMWCP_ROUND
+            dark = G.QColor(theme.bg_primary).lightness() < 128
+            assert attrs[G._DWMWA_USE_IMMERSIVE_DARK_MODE] == int(dark)
+        assert G._colorref("#112233") == 0x332211
 
-        window.close()
-
-    def test_hit_test_excludes_buttons_and_exposes_snap_layouts(self, qapp):
-        from frameguard.gui import TitleBar
-
-        window = QMainWindow()
-        window.resize(900, 600)
-        bar = TitleBar(window)
-        bar.resize(900, bar.height())
-        bar.show()
-        qapp.processEvents()
-
-        drag_point = bar.mapTo(window, QPoint(300, bar.height() // 2))
-        minimize = bar._btn_minimize.mapTo(window, bar._btn_minimize.rect().center())
-        maximize = bar._btn_maximize.mapTo(window, bar._btn_maximize.rect().center())
-        close = bar._btn_close.mapTo(window, bar._btn_close.rect().center())
-
-        assert bar.hit_test_code(drag_point) == 2  # HTCAPTION
-        assert bar.hit_test_code(minimize) == 1   # HTCLIENT
-        assert bar.hit_test_code(maximize) == 9   # HTMAXBUTTON / Snap Layouts
-        assert bar.hit_test_code(close) == 1      # HTCLIENT
-        window.close()
-
-    def test_maximize_glyph_tracks_window_state(self, qapp):
-        from frameguard.gui import TitleBar
-
-        window = QMainWindow()
-        bar = TitleBar(window)
-        window.showMaximized()
-        qapp.processEvents()
-        bar.sync_maximize_button()
-        assert bar._btn_maximize.toolTip() == "Restore Down"
-        assert bar._btn_maximize.accessibleName() == "Restore window"
-        window.showNormal()
-        qapp.processEvents()
-        bar.sync_maximize_button()
-        assert bar._btn_maximize.toolTip() == "Maximize"
-        assert bar._btn_maximize.accessibleName() == "Maximize window"
-        window.close()
-
-
-class TestWindowsNativeContracts:
-    def test_custom_chrome_remains_windows_only(self):
-        from frameguard import gui
-
-        assert gui.USE_CUSTOM_CHROME == (gui.sys.platform == "win32")
-
-    def test_native_event_keeps_resize_snap_and_taskbar_contracts(self):
-        from frameguard.gui import MainWindow, TitleBar
-
-        native_source = inspect.getsource(MainWindow.nativeEvent)
-        for contract in ("WM_GETMINMAXINFO", "WM_NCHITTEST"):
-            assert contract in native_source
-        assert "HTMAXBUTTON" in inspect.getsource(TitleBar.hit_test_code)
-
-    def test_dwm_contract_applies_dark_caption_border_and_text(self, monkeypatch):
+    def test_dwm_calls_dark_mode_first_and_falls_back_on_old_windows_10(self, monkeypatch):
         from frameguard import gui as G
         from frameguard.theme import get_theme
 
@@ -154,46 +95,99 @@ class TestWindowsNativeContracts:
             @staticmethod
             def DwmSetWindowAttribute(hwnd, attribute, value, size):
                 calls.append(attribute.value)
-                return 0
+                # Pre-20H1 Windows 10 rejects 20 and every Windows 11 attribute.
+                return 0 if attribute.value == 19 else -2147024809
 
-        window = G.MainWindow()
-        try:
-            monkeypatch.setattr(G.sys, "platform", "win32")
-            monkeypatch.setattr(
-                ctypes, "windll", SimpleNamespace(dwmapi=_Dwm()), raising=False)
-            window._apply_window_chrome_theme(get_theme("Blue Hour"))
-            assert calls == [20, 35, 34, 36]
-        finally:
-            window._cleanup_worker()
-            window._watch_monitor.stop()
-            window.hide()
+        monkeypatch.setattr(G.sys, "platform", "win32")
+        monkeypatch.setattr(ctypes, "windll", SimpleNamespace(dwmapi=_Dwm()), raising=False)
+        assert G._apply_windows_caption(1234, get_theme("Blue Hour")) is False
+        assert calls[:2] == [20, 19]
+        assert set(calls[2:]) == {33, 35, 34, 36}
 
-    def test_alt_space_forwards_to_native_system_menu(self, monkeypatch):
+    def test_no_caption_calls_off_windows_or_without_a_window(self, monkeypatch):
         from frameguard import gui as G
+        from frameguard.theme import get_theme
 
-        calls = []
+        monkeypatch.setattr(G.sys, "platform", "darwin")
+        assert G._apply_windows_caption(1234, get_theme("Blue Hour")) is False
+        monkeypatch.setattr(G.sys, "platform", "win32")
+        assert G._apply_windows_caption(0, get_theme("Blue Hour")) is False
 
-        class _User32:
-            @staticmethod
-            def PostMessageW(*args):
-                calls.append(args)
-                return 1
 
-        window = G.MainWindow()
-        try:
-            monkeypatch.setattr(G, "USE_CUSTOM_CHROME", True)
-            monkeypatch.setattr(
-                ctypes, "windll", SimpleNamespace(user32=_User32()), raising=False)
-            event = QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.AltModifier)
-            window.keyPressEvent(event)
-            assert event.isAccepted()
-            assert len(calls) == 1
-            assert calls[0][1:] == (0x0112, 0xF100, ord(" "))
-        finally:
-            window._cleanup_worker()
-            window._watch_monitor.stop()
-            window.hide()
+class TestWindowsShortcutIcons:
+    def test_icon_file_is_a_valid_multi_size_ico(self, qapp, tmp_path):
+        import struct
+        from frameguard import gui as G, winshell
+        from frameguard.theme import get_theme
 
+        path = winshell.write_theme_icon(G._themed_app_icon(get_theme("Abyss Teal")),
+                                         "Abyss Teal", directory=str(tmp_path))
+        assert Path(path).name == "frameguard-abyss-teal.ico"
+        data = Path(path).read_bytes()
+        reserved, kind, count = struct.unpack("<HHH", data[:6])
+        assert (reserved, kind) == (0, 1) and count >= 6
+        sides = {data[6 + 16 * i] or 256 for i in range(count)}
+        assert {16, 32, 48, 256} <= sides
+        for i in range(count):
+            size, offset = struct.unpack("<II", data[6 + 16 * i + 8: 6 + 16 * i + 16])
+            assert data[offset:offset + 8] == b"\x89PNG\r\n\x1a\n" and offset + size <= len(data)
+
+    def test_icon_names_are_per_theme_and_filesystem_safe(self):
+        from frameguard import winshell
+
+        assert winshell.icon_file_name("Blue Hour") == "frameguard-blue-hour.ico"
+        assert winshell.icon_file_name("Solarized Dark") != winshell.icon_file_name("Blue Hour")
+        assert "/" not in winshell.icon_file_name("A/B:C")
+
+    def test_retheme_is_a_no_op_off_windows_or_from_source(self, monkeypatch, tmp_path):
+        from frameguard import winshell
+
+        icon = tmp_path / "x.ico"
+        icon.write_bytes(b"\0")
+        monkeypatch.setattr(winshell.sys, "platform", "darwin")
+        assert winshell.retheme_shortcuts(str(icon), target_exe="C:/x.exe", dirs=[str(tmp_path)]) == []
+        monkeypatch.setattr(winshell.sys, "platform", "win32")
+        monkeypatch.delattr(winshell.sys, "frozen", raising=False)
+        assert winshell.retheme_shortcuts(str(icon), dirs=[str(tmp_path)]) == []
+
+    @pytest.mark.skipif(not __import__("sys").platform.startswith("win"), reason="needs the Windows shell")
+    def test_only_shortcuts_to_this_exe_are_re_iconed(self, qapp, tmp_path):
+        import shutil
+        import subprocess
+        import sys
+        from frameguard import gui as G, winshell
+        from frameguard.theme import get_theme
+
+        exe, other = tmp_path / "FrameGuard.exe", tmp_path / "Other.exe"
+        shutil.copy2(sys.executable, exe)
+        shutil.copy2(sys.executable, other)
+        nested = tmp_path / "Start Menu" / "FrameGuard Desktop"
+        nested.mkdir(parents=True)
+
+        def make(link, target):
+            script = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{link}');"
+                      f"$s.TargetPath='{target}';$s.Save()")
+            subprocess.run(["powershell", "-NoProfile", "-Command", script], check=True)
+
+        def icon_of(link):
+            script = f"(New-Object -ComObject WScript.Shell).CreateShortcut('{link}').IconLocation"
+            return subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+
+        ours, ours_nested, theirs = tmp_path / "FG.lnk", nested / "FG.lnk", tmp_path / "Other.lnk"
+        make(ours, exe)
+        make(ours_nested, exe)
+        make(theirs, other)
+        ico = winshell.write_theme_icon(G._themed_app_icon(get_theme("Sage")), "Sage",
+                                        directory=str(tmp_path / "icons"))
+        changed = winshell.retheme_shortcuts(ico, target_exe=str(exe), dirs=[str(tmp_path)])
+        assert sorted(map(Path, changed)) == sorted([ours, ours_nested])
+        assert icon_of(ours).lower() == f"{ico},0".lower()
+        assert "frameguard-sage" not in icon_of(theirs)
+        assert winshell.retheme_shortcuts(ico, target_exe=str(exe), dirs=[str(tmp_path)]) == []
+
+
+class TestWindowsNativeContracts:
     def test_window_rect_clamps_in_logical_pixels(self):
         from frameguard.gui import _clamp_window_rect
 
@@ -202,12 +196,11 @@ class TestWindowsNativeContracts:
         assert _clamp_window_rect(QRect(1250, 760, 600, 400), available) == QRect(
             700, 450, 600, 400)
 
-    def test_resize_border_meets_practical_hit_target(self):
+    def test_minimum_size_fits_small_laptops(self):
         from frameguard.gui import MainWindow
 
         window = MainWindow()
         try:
-            assert window._resize_border_width() >= 8
             # Small enough for 1366x768 laptops, large enough for the pages'
             # layouts (0.9.0 raised it from 480x320, which cut the table off).
             assert window.minimumWidth() <= 760

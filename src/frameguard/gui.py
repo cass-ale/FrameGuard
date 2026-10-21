@@ -49,6 +49,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
@@ -60,7 +61,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar,
     QCheckBox, QGroupBox, QMessageBox, QTextEdit, QFrame, QSplitter,
     QAbstractItemView, QScrollArea, QSpinBox, QSlider, QGridLayout,
-    QListWidget, QListWidgetItem, QDialog, QSizeGrip, QStyledItemDelegate,
+    QListWidget, QListWidgetItem, QDialog, QStyledItemDelegate,
     QSizePolicy, QProgressDialog, QLineEdit, QPlainTextEdit
 )
 from PySide6.QtCore import (
@@ -96,11 +97,14 @@ from frameguard import __version__ as APP_VERSION
 _SETTINGS_ORG = "FrameGuard"
 _SETTINGS_APP = "FrameGuardDesktop"
 
-# Windows gets a frameless window with our own title bar (and a hand-rolled
-# Aero Snap implementation in MainWindow.nativeEvent). macOS keeps its native
-# chrome: dropping it there costs the traffic lights, the window shadow,
-# full-edge resize and green-button fullscreen, none of which we reimplement.
-USE_CUSTOM_CHROME = sys.platform == "win32"
+# Every platform uses the native window frame. 0.8-0.9.0 drew its own title
+# bar on Windows (frameless + WS_THICKFRAME + hand-rolled hit testing); without
+# a WM_NCCALCSIZE handler the client area extended under the invisible 8 px
+# resize borders, which clipped the close button and the right/bottom edge of
+# every page, made left-edge resizes slide the content, and lost Windows 11's
+# rounded corners and Snap Layouts flyout. The native caption is themed through
+# DWM instead (see MainWindow._apply_window_chrome_theme), as macOS's is
+# through AppKit.
 
 _THEME_KEY = "appearance/theme"
 _LEGACY_THEME_KEY = "theme"
@@ -407,6 +411,24 @@ def _apply_application_icon(theme) -> None:
     app.setWindowIcon(icon)
     if dock is not None:
         _set_macos_dock_icon(dock)
+
+
+def _retheme_windows_shortcuts(icon: QIcon, theme_name: str) -> None:
+    """Re-icon FrameGuard's own shortcuts for `theme_name` (winshell.py).
+
+    A pinned taskbar button shows its shortcut's icon, not the window's, so
+    without this the pinned FrameGuard stayed Blue Hour whatever the theme.
+    The .ico is rendered here (QPixmap needs the GUI thread); the shortcut
+    rewrite runs off-thread because it walks folders and talks COM.
+    """
+    from frameguard import winshell
+    try:
+        path = winshell.write_theme_icon(icon, theme_name)
+    except OSError:
+        return
+    if path:
+        threading.Thread(target=winshell.retheme_shortcuts, args=(path,),
+                         name="fg-shortcut-icons", daemon=True).start()
 
 
 def _tray_icon_for(theme) -> QIcon:
@@ -810,155 +832,6 @@ def _status_display(result, theme) -> tuple:
         "MISMATCH": theme.status_fail,
     }.get(status, theme.text_secondary)
     return status_label(status), colour
-
-
-# ============================================================================
-# CUSTOM TITLE BAR (frameless window chrome)
-# ============================================================================
-
-class TitleBar(QWidget):
-    """Custom title bar that replaces the default OS window chrome.
-
-    Provides minimize, maximize/restore, and close buttons that are fully
-    theme-aware.  Supports drag-to-move and double-click-to-maximize.
-    Follows the proven pattern from PythonGUIs / Qt community best practices
-    (FramelessWindowHint + startSystemMove).
-    """
-
-    def __init__(self, parent: QMainWindow):
-        super().__init__(parent)
-        self._window = parent
-        self._is_maximized = False
-        self.setFixedHeight(D.control_height(self.font(), self.style(), D.TITLEBAR_H))
-        self.setObjectName("custom_title_bar")
-        _set_role(self, "toolbar")
-        self.setProperty("active", True)
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 0, 4, 0)
-        layout.setSpacing(0)
-
-        # App icon (small)
-        self._icon_label = QLabel()
-        self._icon_label.setPixmap(_brand_glyph(get_theme(), 18))
-        self._icon_label.setAlignment(Qt.AlignCenter)
-        self._icon_label.setFixedSize(20, 20)
-        layout.addWidget(self._icon_label)
-
-        layout.addSpacing(6)
-
-        # Title text
-        self._title_label = QLabel(f"FrameGuard Desktop v{APP_VERSION}")
-        self._title_label.setObjectName("title_bar_label")
-        _set_role(self._title_label, "muted")
-        layout.addWidget(self._title_label)
-
-        layout.addStretch()
-
-        # Window control buttons
-        btn_size = QSize(44, D.TITLEBAR_H)
-
-        self._btn_minimize = QPushButton("\u2013")  # en-dash
-        self._btn_minimize.setObjectName("title_btn")
-        self._btn_minimize.setFixedSize(btn_size)
-        self._btn_minimize.setToolTip("Minimize")
-        self._btn_minimize.setAccessibleName("Minimize window")
-        _set_role(self._btn_minimize, "icon")
-        self._btn_minimize.clicked.connect(self._on_minimize)
-        layout.addWidget(self._btn_minimize)
-
-        self._btn_maximize = QPushButton("\u25A1")  # white square
-        self._btn_maximize.setObjectName("title_btn")
-        self._btn_maximize.setFixedSize(btn_size)
-        self._btn_maximize.setToolTip("Maximize")
-        self._btn_maximize.setAccessibleName("Maximize window")
-        _set_role(self._btn_maximize, "icon")
-        self._btn_maximize.clicked.connect(self._on_maximize_restore)
-        layout.addWidget(self._btn_maximize)
-
-        self._btn_close = QPushButton("\u2715")  # multiplication X
-        self._btn_close.setObjectName("title_btn_close")
-        self._btn_close.setFixedSize(btn_size)
-        self._btn_close.setToolTip("Close")
-        self._btn_close.setAccessibleName("Close window")
-        _set_role(self._btn_close, "destructive")
-        self._btn_close.clicked.connect(self._window.close)
-        layout.addWidget(self._btn_close)
-
-        # Apply initial theme
-        t = get_theme()
-        self.apply_theme(t)
-
-    # ---- Theme ----
-    def apply_theme(self, t: ThemeColors):
-        """Refresh selector-driven titlebar styling."""
-        for widget in (self, self._title_label, self._btn_minimize,
-                       self._btn_maximize, self._btn_close):
-            widget.style().unpolish(widget)
-            widget.style().polish(widget)
-
-    def set_icon_pixmap(self, pixmap: QPixmap):
-        """Swap the title bar mark, e.g. when the theme accent changes."""
-        if pixmap and not pixmap.isNull():
-            self._icon_label.setPixmap(
-                pixmap.scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    # ---- Window controls ----
-    def _on_minimize(self):
-        self._window.showMinimized()
-
-    def _on_maximize_restore(self):
-        if self._window.isMaximized():
-            self._window.showNormal()
-        else:
-            self._window.showMaximized()
-        self.sync_maximize_button()
-
-    def sync_maximize_button(self):
-        """Match the glyph to the real window state.
-
-        Aero Snap, Win+Arrow and double-click all change state without going
-        through the button, so this is driven from the window's changeEvent.
-        """
-        if self._window.isMaximized():
-            self._btn_maximize.setText("\u2752")  # overlapping squares
-            self._btn_maximize.setToolTip("Restore Down")
-            self._btn_maximize.setAccessibleName("Restore window")
-        else:
-            self._btn_maximize.setText("\u25A1")
-            self._btn_maximize.setToolTip("Maximize")
-            self._btn_maximize.setAccessibleName("Maximize window")
-
-    def hit_test_code(self, window_pos) -> int:
-        """Return a Windows non-client code for a window-relative point."""
-        local = self.mapFrom(self._window, window_pos)
-        if not self.rect().contains(local):
-            return 1  # HTCLIENT
-        if self._btn_maximize.geometry().contains(local):
-            return 9  # HTMAXBUTTON enables Windows 11 Snap Layouts
-        for btn in (self._btn_minimize, self._btn_close):
-            if btn.geometry().contains(local):
-                return 1  # HTCLIENT: Qt owns these button clicks
-        return 2  # HTCAPTION
-
-    def is_draggable_point(self, window_pos) -> bool:
-        return self.hit_test_code(window_pos) == 2
-
-    # ---- Drag-to-move ----
-    def mousePressEvent(self, event: QMouseEvent):
-        # On Windows the drag is handled natively via HTCAPTION (see
-        # MainWindow.nativeEvent), which is what gives us Aero Snap.
-        # startSystemMove is the cross-platform fallback.
-        if event.button() == Qt.LeftButton and sys.platform != "win32":
-            handle = self._window.windowHandle()
-            if handle:
-                handle.startSystemMove()
-        super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton:
-            self._on_maximize_restore()
-        super().mouseDoubleClickEvent(event)
 
 
 # ============================================================================
@@ -5061,34 +4934,6 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(min(MIN_WINDOW_W, available.width()),
                             min(MIN_WINDOW_H, available.height()))
 
-        # Frameless window with a custom title bar on Windows, where we also
-        # reimplement Aero Snap via WM_NCHITTEST. On macOS the same flag would
-        # strip the traffic lights, the window shadow, native resize on all
-        # edges and green-button fullscreen — so use native chrome there.
-        #
-        # This must happen BEFORE the WS_THICKFRAME call below: setWindowFlags
-        # destroys and recreates the native window, so a style applied to the
-        # old HWND is silently discarded and the resize borders never work.
-        if USE_CUSTOM_CHROME:
-            self.setWindowFlags(
-                Qt.FramelessWindowHint | Qt.Window
-                | Qt.WindowMinMaxButtonsHint  # keeps taskbar right-click menu
-            )
-
-        # Enable Windows Aero Snap (drag-to-edge resize gestures).
-        # Frameless windows lose this by default; WS_THICKFRAME restores it.
-        if sys.platform == "win32":
-            try:
-                import ctypes
-                hwnd = int(self.winId())
-                GWL_STYLE = -16
-                WS_THICKFRAME = 0x00040000
-                style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-                style |= WS_THICKFRAME
-                ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-            except (OSError, AttributeError):
-                pass  # Non-critical: snap gestures just won't work
-
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setAcceptDrops(True)
 
@@ -5159,12 +5004,6 @@ class MainWindow(QMainWindow):
         outer_layout = QVBoxLayout(central)
         outer_layout.setContentsMargins(0, 0, 0, 0)
         outer_layout.setSpacing(0)
-
-        # Custom title bar exists only on Windows. Native macOS chrome meets
-        # the first application surface directly, with no hidden placeholder.
-        self._title_bar = TitleBar(self) if USE_CUSTOM_CHROME else None
-        if self._title_bar is not None:
-            outer_layout.addWidget(self._title_bar)
 
         # Content row: sidebar + toggle + stack
         content_row = QWidget()
@@ -5462,14 +5301,6 @@ class MainWindow(QMainWindow):
 
         outer_layout.addWidget(content_row)
 
-        # Resize grip, bottom-right. Only needed with custom chrome; macOS
-        # resizes from any edge natively and the grip looks foreign there.
-        self._size_grip = QSizeGrip(central)
-        self._size_grip.setProperty("fgInlineStyleAllowed", True)
-        self._size_grip.setFixedSize(16, 16)
-        self._size_grip.setStyleSheet("background: transparent; border: none;")
-        self._size_grip.setVisible(USE_CUSTOM_CHROME)
-
         # Window (taskbar) icon in the current theme; _apply_theme keeps it,
         # the Dock and the tray in step from here on.
         self.setWindowIcon(_themed_app_icon(get_theme()))
@@ -5723,8 +5554,6 @@ class MainWindow(QMainWindow):
         _set_role(self._sidebar_toggle_btn, "icon")
 
         # === Cascade to title bar and all panels ===
-        if self._title_bar is not None:
-            self._title_bar.apply_theme(t)
         self.scan_panel.apply_theme(t)
         self.results_panel.apply_theme(t)
         self.checks_panel.apply_theme(t)
@@ -5754,8 +5583,6 @@ class MainWindow(QMainWindow):
         # and taskbar icon, the Dock icon (application-wide on macOS) and the
         # tray.
         self._apply_window_chrome_theme(t)
-        if self._title_bar is not None:
-            self._title_bar.set_icon_pixmap(_brand_glyph(t, 18))
         self._apply_app_icon(t)
         self._update_tray_icon_theme(t)
 
@@ -6610,12 +6437,6 @@ class MainWindow(QMainWindow):
         """Keep the resize grip anchored, and re-flow panels for the new size."""
         super().resizeEvent(event)
         self._schedule_autosave()
-        if hasattr(self, '_size_grip'):
-            grip_geo = self._size_grip.geometry()
-            self._size_grip.move(
-                self.width() - grip_geo.width(),
-                self.height() - grip_geo.height()
-            )
         self._apply_responsive_layout()
 
     def _apply_responsive_layout(self, width=None):
@@ -6658,19 +6479,6 @@ class MainWindow(QMainWindow):
         return [os.path.normpath(u.toLocalFile())
                 for u in mime.urls() if u.isLocalFile()]
 
-    def keyPressEvent(self, event):
-        if (USE_CUSTOM_CHROME and event.key() == Qt.Key_Space
-                and event.modifiers() & Qt.AltModifier):
-            try:
-                import ctypes
-                ctypes.windll.user32.PostMessageW(
-                    int(self.winId()), 0x0112, 0xF100, ord(" "))
-                event.accept()
-                return
-            except (AttributeError, OSError):
-                pass
-        super().keyPressEvent(event)
-
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -6710,115 +6518,6 @@ class MainWindow(QMainWindow):
             self._switch_panel(PANEL_SETTINGS)  # show the preset that just landed
 
 
-    # --- Edge resize + Aero Snap for the frameless window (Windows) ---
-    _BORDER_WIDTH = 8  # pixels from edge that triggers resize
-
-    def nativeEvent(self, event_type, message):
-        """Native Windows hit-testing for edge resize and Aero Snap.
-
-        Reporting HTCAPTION for the title bar hands the drag to Windows, which
-        is what enables snap-to-top (maximize), snap-to-side (half tile) and
-        Win+Arrow. A frameless window that only ever reports HTCLIENT gets none
-        of that, no matter what Qt-side move helper is used.
-        """
-        if event_type not in (b"windows_generic_MSG", b"windows_dispatcher_MSG"):
-            return super().nativeEvent(event_type, message)
-
-        try:
-            import ctypes
-            import ctypes.wintypes
-            msg = ctypes.wintypes.MSG.from_address(int(message))
-
-            if msg.message == 0x0024:  # WM_GETMINMAXINFO
-                # Without this a WS_THICKFRAME frameless window maximizes to
-                # the full monitor and hides the taskbar.
-                if self._apply_maximize_bounds(msg):
-                    return True, 0
-
-            if msg.message == 0x0084:  # WM_NCHITTEST
-                pos = self.mapFromGlobal(QCursor.pos())
-                x, y = pos.x(), pos.y()
-                w, h = self.width(), self.height()
-                bw = self._resize_border_width()
-
-                # Resize borders are meaningless while maximized.
-                if not self.isMaximized():
-                    if x < bw and y < bw:
-                        return True, 13  # HTTOPLEFT
-                    if x > w - bw and y < bw:
-                        return True, 14  # HTTOPRIGHT
-                    if x < bw and y > h - bw:
-                        return True, 16  # HTBOTTOMLEFT
-                    if x > w - bw and y > h - bw:
-                        return True, 17  # HTBOTTOMRIGHT
-                    if x < bw:
-                        return True, 10  # HTLEFT
-                    if x > w - bw:
-                        return True, 11  # HTRIGHT
-                    if y < bw:
-                        return True, 12  # HTTOP
-                    if y > h - bw:
-                        return True, 15  # HTBOTTOM
-
-                if self._title_bar is not None:
-                    hit = self._title_bar.hit_test_code(pos)
-                    if hit != 1:
-                        return True, hit
-        except Exception:
-            pass
-
-        return super().nativeEvent(event_type, message)
-
-    def _resize_border_width(self) -> int:
-        """Logical resize hit target derived from the active platform style."""
-        from PySide6.QtWidgets import QStyle
-        metric = self.style().pixelMetric(QStyle.PM_DefaultFrameWidth)
-        return max(self._BORDER_WIDTH, metric + D.SPACE_1)
-
-    def _apply_maximize_bounds(self, msg) -> bool:
-        """Clamp the maximized size to the monitor work area (taskbar-safe)."""
-        import ctypes
-        import ctypes.wintypes
-
-        class POINT(ctypes.Structure):
-            _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-        class MINMAXINFO(ctypes.Structure):
-            _fields_ = [
-                ("ptReserved", POINT), ("ptMaxSize", POINT),
-                ("ptMaxPosition", POINT), ("ptMinTrackSize", POINT),
-                ("ptMaxTrackSize", POINT),
-            ]
-
-        class MONITORINFO(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", ctypes.wintypes.DWORD),
-                ("rcMonitor", ctypes.wintypes.RECT),
-                ("rcWork", ctypes.wintypes.RECT),
-                ("dwFlags", ctypes.wintypes.DWORD),
-            ]
-
-        MONITOR_DEFAULTTONEAREST = 2
-        monitor = ctypes.windll.user32.MonitorFromWindow(
-            int(msg.hWnd), MONITOR_DEFAULTTONEAREST)
-        if not monitor:
-            return False
-
-        info = MONITORINFO()
-        info.cbSize = ctypes.sizeof(MONITORINFO)
-        if not ctypes.windll.user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
-            return False
-
-        mmi = MINMAXINFO.from_address(msg.lParam)
-        work, screen = info.rcWork, info.rcMonitor
-        mmi.ptMaxPosition.x = work.left - screen.left
-        mmi.ptMaxPosition.y = work.top - screen.top
-        mmi.ptMaxSize.x = work.right - work.left
-        mmi.ptMaxSize.y = work.bottom - work.top
-        mmi.ptMaxTrackSize.x = work.right - work.left
-        mmi.ptMaxTrackSize.y = work.bottom - work.top
-        return True
-
     def showEvent(self, event):
         super().showEvent(event)
         # The native window only fully exists once shown; re-tint it so the
@@ -6836,19 +6535,8 @@ class MainWindow(QMainWindow):
                 central.setFocus(Qt.OtherFocusReason)
 
     def changeEvent(self, event):
-        """Keep the custom maximize button in sync with OS-driven state changes.
-
-        Snap, Win+Arrow and double-click all change the window state without
-        going through our button, so the glyph would otherwise go stale.
-        """
-        if event.type() == QEvent.WindowStateChange and self._title_bar is not None:
-            self._title_bar.sync_maximize_button()
-        elif event.type() in (QEvent.WindowActivate, QEvent.WindowDeactivate):
-            if self._title_bar is not None:
-                self._title_bar.setProperty("active", event.type() == QEvent.WindowActivate)
-                self._title_bar.style().unpolish(self._title_bar)
-                self._title_bar.style().polish(self._title_bar)
-        elif event.type() in (QEvent.FontChange, QEvent.StyleChange):
+        """Re-fit the Results columns when the font or style changes."""
+        if event.type() in (QEvent.FontChange, QEvent.StyleChange):
             if hasattr(self, "results_panel"):
                 QTimer.singleShot(0, self.results_panel._autosize_metadata_columns)
         super().changeEvent(event)
@@ -7093,9 +6781,13 @@ class MainWindow(QMainWindow):
     
     def _apply_app_icon(self, theme):
         """Point the window (Windows taskbar) and application (macOS Dock)
-        icons at `theme`'s colourway."""
-        self.setWindowIcon(_themed_app_icon(theme))
+        icons at `theme`'s colourway, and on Windows FrameGuard's own pinned,
+        Start menu and desktop shortcuts too."""
+        icon = _themed_app_icon(theme)
+        self.setWindowIcon(icon)
         _apply_application_icon(theme)
+        if sys.platform == "win32" and getattr(sys, "frozen", False):
+            _retheme_windows_shortcuts(icon, theme.name)
 
     def _update_tray_icon_theme(self, theme=None):
         """Recolor the system tray icon to match the active theme."""
@@ -7106,42 +6798,15 @@ class MainWindow(QMainWindow):
     def _apply_window_chrome_theme(self, theme):
         """Tint the OS-drawn window chrome to match the theme.
 
-        Windows 11+: the border and caption strip Windows still paints around
-        a frameless window, plus the taskbar thumbnail. macOS: the native
-        title bar (see _apply_macos_titlebar). Silently does nothing where the
-        platform offers no such control.
+        macOS: the native title bar (see _apply_macos_titlebar). Windows: the
+        native caption through DWM (see _apply_windows_caption), plus the
+        taskbar shortcut icon (see winshell.retheme_shortcuts). Silently does
+        nothing where the platform offers no such control.
         """
         if sys.platform == "darwin":
             _apply_macos_titlebar(self, theme)
-            return
-        if sys.platform != "win32":
-            return
-        try:
-            import ctypes
-            hwnd = int(self.winId())
-
-            def _colorref(hex_color: str) -> int:
-                h = hex_color.lstrip("#")
-                r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-                return (b << 16) | (g << 8) | r  # DWM wants 0x00BBGGRR
-
-            dwm = ctypes.windll.dwmapi
-            dark_mode = ctypes.c_int(
-                1 if QColor(theme.bg_primary).lightness() < 128 else 0)
-            dwm.DwmSetWindowAttribute(
-                ctypes.c_void_p(hwnd), ctypes.c_int(20),
-                ctypes.byref(dark_mode), ctypes.sizeof(dark_mode))
-            for attribute, color in (
-                (35, theme.bg_secondary),   # DWMWA_CAPTION_COLOR
-                (34, theme.border),         # DWMWA_BORDER_COLOR
-                (36, theme.text_primary),   # DWMWA_TEXT_COLOR
-            ):
-                value = ctypes.c_int(_colorref(color))
-                dwm.DwmSetWindowAttribute(
-                    ctypes.c_void_p(hwnd), ctypes.c_int(attribute),
-                    ctypes.byref(value), ctypes.sizeof(value))
-        except (OSError, AttributeError, ValueError):
-            pass  # Pre-Windows-11 or DWM unavailable — the custom bar still themes
+        elif sys.platform == "win32":
+            _apply_windows_caption(int(self.winId()), theme)
 
     def _collect_diagnostics(self, user_note: str = "") -> str:
         """Assemble everything needed to triage a report, as plain text.
@@ -7655,6 +7320,68 @@ def _install_macos_status_item_guard() -> bool:
         return state["installed"]
     except Exception:
         return False
+
+
+# DWM window attributes (dwmapi.h). Values, not names, are the ABI.
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20         # Windows 10 20H1+ / 11
+_DWMWA_USE_IMMERSIVE_DARK_MODE_OLD = 19     # Windows 10 1809-1909
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33        # Windows 11
+_DWMWA_BORDER_COLOR = 34                    # Windows 11
+_DWMWA_CAPTION_COLOR = 35                   # Windows 11
+_DWMWA_TEXT_COLOR = 36                      # Windows 11
+_DWMWCP_ROUND = 2
+
+
+def _colorref(hex_color: str) -> int:
+    """'#RRGGBB' -> COLORREF (0x00BBGGRR), the byte order DWM expects."""
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (b << 16) | (g << 8) | r
+
+
+def _windows_caption_attributes(theme) -> list:
+    """(attribute, value) pairs that make the native caption match the theme.
+
+    The caption takes the sidebar colour, so title bar and sidebar read as one
+    surface (as the transparent macOS title bar does); the 1 px frame takes
+    the theme border; the caption text and the min/max/close glyphs follow
+    the theme's text colour. Dark mode is set first: on Windows 10, which has
+    no caption-colour attribute, it is what keeps a dark theme's title bar
+    from staying white.
+    """
+    dark = 1 if QColor(theme.bg_primary).lightness() < 128 else 0
+    return [
+        (_DWMWA_USE_IMMERSIVE_DARK_MODE, dark),
+        (_DWMWA_WINDOW_CORNER_PREFERENCE, _DWMWCP_ROUND),
+        (_DWMWA_CAPTION_COLOR, _colorref(theme.bg_secondary)),
+        (_DWMWA_BORDER_COLOR, _colorref(theme.border)),
+        (_DWMWA_TEXT_COLOR, _colorref(theme.text_primary)),
+    ]
+
+
+def _apply_windows_caption(hwnd: int, theme) -> bool:
+    """Apply _windows_caption_attributes to `hwnd`. Returns False off Windows
+    or when DWM is unavailable; attributes an older Windows does not know are
+    rejected by DWM individually (E_INVALIDARG) and simply skipped."""
+    if sys.platform != "win32" or not hwnd:
+        return False
+    try:
+        import ctypes
+        dwm = ctypes.windll.dwmapi
+    except (ImportError, AttributeError, OSError):
+        return False
+    applied = False
+    for attribute, value in _windows_caption_attributes(theme):
+        data = ctypes.c_int(value)
+        result = dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), ctypes.c_int(attribute),
+                                           ctypes.byref(data), ctypes.sizeof(data))
+        if attribute == _DWMWA_USE_IMMERSIVE_DARK_MODE and result != 0:
+            # Windows 10 before 20H1 used attribute 19 for the same switch.
+            dwm.DwmSetWindowAttribute(ctypes.c_void_p(hwnd),
+                                      ctypes.c_int(_DWMWA_USE_IMMERSIVE_DARK_MODE_OLD),
+                                      ctypes.byref(data), ctypes.sizeof(data))
+        applied = applied or result == 0
+    return applied
 
 
 def _apply_macos_titlebar(widget, theme) -> bool:

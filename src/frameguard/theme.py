@@ -440,7 +440,6 @@ QPushButton[fgRole="destructive"]:hover { background-color: %%destructive_hover%
 QPushButton[fgRole="destructive"]:pressed, QPushButton[fgRole="destructive"]:checked { background-color: %%destructive_pressed%%; border-color: %%destructive_pressed%%; }
 QPushButton[fgRole="destructive"]:focus, QPushButton[fgRole="destructive"]:default { border: 2px solid %%focus%%; }
 QPushButton[fgRole="destructive"]:disabled { background-color: %%disabled_bg%%; color: %%disabled_text%%; border-color: %%border%%; }
-QPushButton#title_btn_close { min-width: 24px; min-height: 24px; padding: 4px; }
 
 QPushButton[fgRole="toolbar"] { background: transparent; border-color: transparent; color: %%text_secondary%%; padding: 4px 10px; }
 QPushButton[fgRole="toolbar"]:hover { background-color: %%surface_hover%%; color: %%text_primary%%; }

@@ -33,6 +33,10 @@ WHAT'S NEW IN v0.9.1
     - Container, codec profile, edit list, A/V offset, timecode, HDR and 360
       (spatial video and audio) conformance.
 
+  A native Windows window
+    - Themed native title bar with full-size, unclipped window buttons,
+      smooth resizing, and taskbar and Start menu icons in the theme colour.
+
   Stricter where it matters
     - 29.97 fps no longer passes a 30 fps spec silently: it warns unless
       you allow NTSC rate matching.

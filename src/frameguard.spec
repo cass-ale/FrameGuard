@@ -142,6 +142,7 @@ hidden_imports = [
     'frameguard.audio_checks',
     'frameguard.container_checks',
     'frameguard.video_checks',
+    'frameguard.winshell',
     'frameguard.tools',
     'frameguard.deltaupdate',
     'frameguard.design',

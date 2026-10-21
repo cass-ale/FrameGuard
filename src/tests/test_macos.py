@@ -206,13 +206,17 @@ class TestMacRuntimePaths:
 
 
 class TestNativeChrome:
-    def test_custom_chrome_is_windows_only(self):
-        """FramelessWindowHint on macOS removes the traffic lights, the window
-        shadow, full-edge resize and green-button fullscreen."""
+    def test_every_platform_uses_the_native_frame(self):
+        """No frameless window anywhere: on macOS it removes the traffic
+        lights, shadow, edge resize and fullscreen; on Windows the hand-drawn
+        title bar clipped its own close button and the page edges (0.9.1)."""
+        import inspect
+        from frameguard.gui import MainWindow
+
         gui_src = _read(os.path.join("frameguard", "gui.py"))
-        assert 'USE_CUSTOM_CHROME = sys.platform == "win32"' in gui_src
-        # The flag must gate the setWindowFlags call, not just exist.
-        assert "if USE_CUSTOM_CHROME:" in gui_src
+        assert "FramelessWindowHint" not in inspect.getsource(MainWindow.__init__)
+        assert "USE_CUSTOM_CHROME" not in gui_src
+        assert "SetWindowLongW" not in gui_src  # the old WS_THICKFRAME patch
 
     def test_no_hardcoded_segoe_ui_fonts(self):
         """Segoe UI does not exist on macOS; QFont silently substitutes and the
@@ -230,16 +234,13 @@ class TestNativeChrome:
 
         assert ui_font(10).family()
 
-    def test_native_platform_has_no_placeholder_titlebar(self, qapp):
+    def test_main_window_is_not_frameless(self, qapp):
         from frameguard import gui
 
-        if gui.USE_CUSTOM_CHROME:
-            import pytest
-            pytest.skip("Windows intentionally uses custom chrome")
         window = gui.MainWindow()
         try:
-            assert window._title_bar is None
             assert not (window.windowFlags() & gui.Qt.FramelessWindowHint)
+            assert not hasattr(window, "_title_bar")
         finally:
             window._cleanup_worker()
             window._watch_monitor.stop()

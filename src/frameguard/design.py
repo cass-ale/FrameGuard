@@ -59,21 +59,20 @@ RADIUS_PILL = 999
 
 # Layout tokens.
 SIDEBAR_W = 200
-SIDEBAR_W_NARROW = 168
 SIDEBAR_W_COLLAPSED = 56
-TITLEBAR_H = 36
 ROW_H = 40
 SCROLLBAR_HIT_AREA = 14
 SPLITTER_HIT_AREA = 8
 BP_NARROW = 1100
-BP_WIDE = 1400
 
 _UI_FONT_FAMILY = None
 _MONO_FONT_FAMILY = None
 
 UI_FONT_CANDIDATES = {
+    # Windows 11's system face first (what Settings, Explorer and the new
+    # Office use), then the Windows 10 one.
     "win32": (
-        "Segoe UI", "Segoe UI Variable Text", "Segoe UI Variable",
+        "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI",
         "Selawik", "Tahoma",
     ),
     "darwin": ("SF Pro Text", "Helvetica Neue", "Helvetica"),
@@ -88,17 +87,20 @@ MONO_FONT_CANDIDATES = {
 
 
 def page_margins(width: int) -> int:
-    """Return the responsive outer gutter for a panel width."""
-    if width < BP_NARROW:
-        return SPACE_4
-    if width < BP_WIDE:
-        return SPACE_5
-    return SPACE_6
+    """The outer page gutter: one value at every window width.
+
+    0.8-0.9.0 stepped it 16 -> 24 -> 32 px at 1100 / 1400 px and narrowed the
+    sidebar 200 -> 168 px at 1100 px, so dragging a window edge across those
+    widths made the whole page jump sideways by up to 48 px mid-drag. A fixed
+    gutter and sidebar keep everything anchored while resizing; the sidebar's
+    collapse button is the way to reclaim width on a small screen.
+    """
+    return SPACE_5
 
 
 def sidebar_width(width: int) -> int:
-    """Return the expanded sidebar width for a window width."""
-    return SIDEBAR_W_NARROW if width < BP_NARROW else SIDEBAR_W
+    """The expanded sidebar width: constant, for the reason page_margins gives."""
+    return SIDEBAR_W
 
 
 def font_css(size: int, weight: int = WEIGHT_NORMAL) -> str:
