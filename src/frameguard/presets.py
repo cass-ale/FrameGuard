@@ -60,6 +60,17 @@ PRESET_CONFIG_KEYS = (
     "target_loudness_lufs",
     "loudness_tolerance_lu",
     "true_peak_max_dbtp",
+    # Picture checks (video_checks.py, 0.9.1).
+    "black_frames_enabled",
+    "black_detect_duration",
+    "black_detect_pix_threshold",
+    "black_detect_picture_threshold",
+    "black_short_min_frames",
+    "freeze_frames_enabled",
+    "freeze_detect_duration",
+    "signal_levels_mode",
+    "flash_check_enabled",
+    "interlace_check_enabled",
     # Compatibility-only (see core.COMPAT_ONLY_CONFIG_KEYS): still accepted so
     # presets and saved settings written by 0.8.x round-trip unchanged.
     "use_hwaccel",
@@ -180,6 +191,13 @@ _PRESET_VALUE_RANGES = {
     "target_loudness_lufs": (-70.0, 0.0),
     "loudness_tolerance_lu": (0.0, 20.0),
     "true_peak_max_dbtp": (-20.0, 3.0),
+    # Picture checks. Black level is a fraction of the nominal range (0.02 =
+    # Y <= 20 at 8-bit limited); the picture share is a fraction of pixels.
+    "black_detect_duration": (0.04, 60.0),
+    "black_detect_pix_threshold": (0.0, 0.25),
+    "black_detect_picture_threshold": (0.5, 1.0),
+    "black_short_min_frames": (0, 100),
+    "freeze_detect_duration": (0.2, 600.0),
     "segment_count": (1, 16),
 }
 _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers")
@@ -187,7 +205,7 @@ _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_co
 # fraction even when its default happens to be written as an int.
 _INTEGER_PRESET_KEYS = frozenset({
     "target_width", "target_height", "min_audio_sample_rate", "segment_count",
-    "max_decode_errors",
+    "max_decode_errors", "black_short_min_frames",
 })
 
 
@@ -199,6 +217,7 @@ def _enum_choices(key: str):
         "required_projection": core.PROJECTION_CHOICES,
         "required_stereo_mode": core.STEREO_CHOICES,
         "loudness_mode": core.LOUDNESS_MODES,
+        "signal_levels_mode": core.SIGNAL_LEVELS_MODES,
     }.get(key)
 
 
