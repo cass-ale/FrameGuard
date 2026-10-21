@@ -166,6 +166,14 @@ hidden_imports = [
     'fontTools.ttLib',
     'fontTools.ttLib.ttCollection',
     'psutil',
+    # Imported inside functions: the single-instance handoff (Windows/Linux)
+    # and OS-native TLS verification for update checks.
+    'PySide6.QtNetwork',
+    'truststore',
+    'truststore._api',
+    'truststore._ssl_constants',
+    # Only this platform's backend: the other one cannot import here.
+    'truststore._macos' if IS_MAC else 'truststore._windows',
     
     # Standard library (dynamically imported by our code)
     'multiprocessing',

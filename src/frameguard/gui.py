@@ -8174,13 +8174,108 @@ class _FileOpenFilter(QObject):
         if event.type() == QEvent.FileOpen:
             path = event.file()
             if path and os.path.exists(path):
-                if self._window is None:
-                    if path not in self._pending_paths:
-                        self._pending_paths.append(path)
-                else:
-                    self._deliver([path])
+                self.accept_paths([path])
                 return True
         return super().eventFilter(obj, event)
+
+    def accept_paths(self, paths):
+        """Queue paths for the window (or hold them until it exists)."""
+        paths = [p for p in paths if p and os.path.exists(p)]
+        if not paths:
+            if self._window is not None:  # a bare relaunch: just come forward
+                self._window._tray_show() if self._window.isHidden() else None
+                self._window.raise_()
+                self._window.activateWindow()
+            return
+        if self._window is None:
+            for path in paths:
+                if path not in self._pending_paths:
+                    self._pending_paths.append(path)
+        else:
+            self._deliver(paths)
+
+
+# --- Single instance (Windows and Linux) -----------------------------------
+# macOS routes "Open With" and Dock drops to the running app itself. Windows
+# starts a new process for every file association launch, so a second
+# FrameGuard (with its own watch folder and settings writes) appeared each
+# time a video or preset was opened while the app was already running.
+
+def _instance_server_name() -> str:
+    import getpass
+    import hashlib
+    try:
+        user = getpass.getuser()
+    except Exception:
+        user = "user"
+    digest = hashlib.sha256(f"{user}|{os.path.expanduser('~')}".encode("utf-8")).hexdigest()[:16]
+    return f"FrameGuardDesktop-{digest}"
+
+
+def _forward_to_running_instance(paths, timeout_ms: int = 1500) -> bool:
+    """Hand `paths` to an already running FrameGuard; True if one took them."""
+    from PySide6.QtNetwork import QLocalSocket
+    socket = QLocalSocket()
+    socket.connectToServer(_instance_server_name())
+    if not socket.waitForConnected(timeout_ms):
+        return False
+    payload = (json.dumps({"paths": [os.path.abspath(p) for p in paths]}) + "\n").encode("utf-8")
+    socket.write(payload)
+    ok = socket.waitForBytesWritten(timeout_ms)
+    socket.disconnectFromServer()
+    return ok
+
+
+class _SingleInstanceServer(QObject):
+    """Receives paths from later launches and passes them to the window."""
+
+    MAX_MESSAGE = 1 << 20
+
+    def __init__(self, receiver, parent=None):
+        super().__init__(parent)
+        from PySide6.QtNetwork import QLocalServer
+        self._receiver = receiver
+        self._buffers = {}
+        self._server = QLocalServer(self)
+        self._server.setSocketOptions(QLocalServer.UserAccessOption)
+        name = _instance_server_name()
+        if not self._server.listen(name):
+            # A crashed instance can leave a stale endpoint behind (Unix).
+            QLocalServer.removeServer(name)
+            self._server.listen(name)
+        self._server.newConnection.connect(self._on_connection)
+
+    def is_listening(self) -> bool:
+        return self._server.isListening()
+
+    def _on_connection(self):
+        while self._server.hasPendingConnections():
+            socket = self._server.nextPendingConnection()
+            self._buffers[socket] = b""
+            socket.readyRead.connect(lambda s=socket: self._on_ready(s))
+            socket.disconnected.connect(lambda s=socket: self._on_done(s))
+
+    def _on_ready(self, socket):
+        data = self._buffers.get(socket, b"") + bytes(socket.readAll())
+        if len(data) > self.MAX_MESSAGE:
+            socket.abort()
+            self._buffers.pop(socket, None)
+            return
+        self._buffers[socket] = data
+        if data.endswith(b"\n"):
+            self._on_done(socket)
+
+    def _on_done(self, socket):
+        data = self._buffers.pop(socket, None)
+        if data is None:
+            return
+        try:
+            paths = json.loads(data.decode("utf-8") or "{}").get("paths", [])
+        except (ValueError, AttributeError):
+            paths = []
+        if isinstance(paths, list):
+            self._receiver.accept_paths([p for p in paths if isinstance(p, str)])
+        socket.deleteLater()
 
 
 def main(dev_mode: bool = False,
@@ -8237,6 +8332,16 @@ def main(dev_mode: bool = False,
             on_delivery=probe.deliver_file_open if probe else None,
         )
         app.installEventFilter(file_open_filter)
+
+        # Windows/Linux: a second launch hands its files to this instance.
+        if (sys.platform != "darwin" and not startup_preflight
+                and os.environ.get("FRAMEGUARD_TEST_MODE") != "1"):
+            forwarded = [a for a in sys.argv[1:]
+                         if not a.startswith("-") and os.path.exists(a)]
+            if _forward_to_running_instance(forwarded):
+                return 0
+            # Held on the app so it lives (and listens) as long as the app.
+            app._fg_instance_server = _SingleInstanceServer(file_open_filter, parent=app)
         if probe:
             probe.checkpoint("file_open_filter_installed")
             for path in startup_preflight.cold_file_open_paths:

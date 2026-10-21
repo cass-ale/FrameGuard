@@ -128,6 +128,23 @@ Root: HKCU; Subkey: "Software\Classes\FrameGuard.Preset\DefaultIcon"; ValueType:
 Root: HKCU; Subkey: "Software\Classes\FrameGuard.Preset\shell\open"; ValueType: string; ValueName: ""; ValueData: "Import into FrameGuard"; Flags: uninsdeletekey
 Root: HKCU; Subkey: "Software\Classes\FrameGuard.Preset\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\FrameGuard.exe"" ""%1"""; Flags: uninsdeletekey
 
+; --- Videos: "Open with > FrameGuard" in Explorer (never the default app) ---
+; OpenWithProgids only adds FrameGuard to the list; each extension keeps the
+; user's chosen player. A second launch hands its files to the running app.
+Root: HKCU; Subkey: "Software\Classes\FrameGuard.Video"; ValueType: string; ValueName: ""; ValueData: "Video for QA"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\FrameGuard.Video"; ValueType: string; ValueName: "FriendlyTypeName"; ValueData: "Video for QA"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\FrameGuard.Video\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\frameguard.ico,0"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\FrameGuard.Video\shell\open"; ValueType: string; ValueName: ""; ValueData: "Check with FrameGuard"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\FrameGuard.Video\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\FrameGuard.exe"" ""%1"""; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\.mp4\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.m4v\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.mov\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.mkv\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.mxf\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.avi\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.ts\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.webm\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"; ValueData: ""; Flags: uninsdeletevalue
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}"
 

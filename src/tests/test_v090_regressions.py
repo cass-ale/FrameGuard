@@ -428,3 +428,48 @@ def test_finder_open_with_lists_frameguard_for_videos():
     spec = (SRC / "frameguard.spec").read_text(encoding="utf-8")
     assert '"CFBundleTypeRole": "Viewer"' in spec and '"public.movie"' in spec
     assert '"LSHandlerRank": "Alternate"' in spec
+
+
+class TestSingleInstance:
+    def test_second_launch_hands_its_files_to_the_running_app(self, qapp, tmp_path, monkeypatch):
+        import uuid
+        from frameguard import gui
+        name = f"fg-test-{uuid.uuid4().hex[:12]}"
+        monkeypatch.setattr(gui, "_instance_server_name", lambda: name)
+        received = []
+
+        class Receiver:
+            def accept_paths(self, paths):
+                received.extend(paths)
+
+        server = gui._SingleInstanceServer(Receiver())
+        try:
+            assert server.is_listening()
+            clip = tmp_path / "take one.mov"
+            clip.write_bytes(b"\0")
+            assert gui._forward_to_running_instance([str(clip)]) is True
+            _pump(qapp, 500)
+            assert received == [str(clip)]
+        finally:
+            server.deleteLater()
+
+    def test_no_running_instance_means_start_normally(self, qapp, monkeypatch):
+        import uuid
+        from frameguard import gui
+        monkeypatch.setattr(gui, "_instance_server_name", lambda: f"fg-none-{uuid.uuid4().hex[:12]}")
+        assert gui._forward_to_running_instance([], timeout_ms=200) is False
+
+
+def test_windows_open_with_registers_videos_without_taking_defaults():
+    iss = (SRC / "installer.iss").read_text(encoding="utf-8")
+    assert 'Classes\\FrameGuard.Video\\shell\\open\\command' in iss
+    for ext in ("mp4", "mov", "mkv", "mxf"):
+        assert f'Classes\\.{ext}\\OpenWithProgids"; ValueType: string; ValueName: "FrameGuard.Video"' in iss
+    # Never the default handler for a video extension.
+    assert 'Classes\\.mp4"; ValueType: string; ValueName: ""' not in iss
+
+
+def test_lazily_imported_modules_are_frozen_into_the_app():
+    spec = (SRC / "frameguard.spec").read_text(encoding="utf-8")
+    for module in ("'PySide6.QtNetwork'", "'truststore'", "'truststore._api'"):
+        assert module in spec, module
