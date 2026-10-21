@@ -150,12 +150,30 @@ class TestLevels:
         near = vc.assess_levels(self._series(gam=[0.012] * 60), FPS, False)
         assert vc.levels_entry(near, "essential", False)[2] < 70
 
-    def test_untagged_matrix_keeps_gamut_confidence_low(self):
-        findings = vc.assess_levels(self._series(gam=[0.05] * 60), FPS, False)
-        status, detail, confidence = vc.levels_entry(findings, "essential", False, "bt601")
-        assert status == "FAIL" and confidence < 70 and "BT.601 was assumed" in detail
-        info = vc.PictureInfo.from_stream({"width": 960, "height": 540, "color_space": "unknown"})
-        assert info.matrix == "bt601" and info.matrix_assumed
+    def test_unsignalled_matrix_needs_every_candidate_to_agree(self):
+        """Untagged HD: judged under BT.709 and BT.601; a share counts only
+        when it is out of gamut under both (FFmpeg encodes untagged RGB with
+        BT.601, so BT.709 alone flagged ordinary pictures)."""
+        n = 60
+        series = self._series(n=n)
+        series.gam_by_matrix = {"bt709": [0.6] * n, "bt601": [0.0] * n}
+        series.gam = [min(v) for v in zip(*series.gam_by_matrix.values())]
+        findings = vc.assess_levels(series, FPS, False, ("bt709", "bt601"))
+        status, detail, _ = vc.levels_entry(findings, "advisory", False)
+        assert status == "PASS" and "within R 103 under at least one" in detail
+        series.gam_by_matrix = {"bt709": [0.6] * n, "bt601": [0.5] * n}
+        series.gam = [min(v) for v in zip(*series.gam_by_matrix.values())]
+        findings = vc.assess_levels(series, FPS, False, ("bt709", "bt601"))
+        status, detail, confidence = vc.levels_entry(findings, "advisory", False)
+        assert status == "WARN" and confidence >= 70 and "holds under BT.709 and BT.601" in detail
+
+    def test_candidate_matrices(self):
+        untagged_hd = vc.PictureInfo.from_stream({"width": 1920, "height": 1080, "color_space": "unknown"})
+        untagged_sd = vc.PictureInfo.from_stream({"width": 720, "height": 576})
+        tagged = vc.PictureInfo.from_stream({"width": 1920, "height": 1080, "color_space": "bt709"})
+        assert untagged_hd.gamut_matrices == ("bt709", "bt601")
+        assert untagged_sd.gamut_matrices == ("bt601", "bt709")
+        assert tagged.gamut_matrices == ("bt709",)
 
     def test_full_range_content_tagged_limited(self):
         series = self._series()
@@ -368,6 +386,44 @@ class TestRealScan:
         assert row[1] == "WARN" and "Luma" in row[2], row
         assert _row(_scan(path, signal_levels_mode="essential"), "Signal Levels")[1] == "FAIL"
         assert _row(_scan(path, signal_levels_mode="report"), "Signal Levels")[1] == "PASS"
+
+    @staticmethod
+    def _untagged(path, source, vf="null"):
+        """FFmpeg's default path: RGB source -> yuv420p (swscale BT.601), no
+        colour tags at all."""
+        ffmpeg("-f", "lavfi", "-i", source, "-vf", vf, "-c:v", "libx264", "-preset",
+               "ultrafast", "-crf", "18", "-pix_fmt", "yuv420p", "-an", str(path))
+        return str(path)
+
+    def test_untagged_saturated_hd_is_not_a_gamut_warning(self, tmp_path):
+        path = self._untagged(tmp_path / "untagged.mp4", "testsrc2=s=1280x720:r=30:d=2")
+        row = _row(_scan(path, target_width=1280, target_height=720), "Signal Levels")
+        assert row[1] == "PASS" and "not signalled" in row[2], row
+
+    def test_untagged_genuine_excursion_still_warns(self, tmp_path):
+        # Cb 16 / Cr 240 at mid grey is outside -5..105 % under BT.709 and BT.601.
+        bad = ("geq=lum='lum(X,Y)':cb='if(between(X,320,960)*between(Y,180,540),16,cb(X,Y))'"
+               ":cr='if(between(X,320,960)*between(Y,180,540),240,cr(X,Y))'")
+        path = self._untagged(tmp_path / "bad.mp4", "testsrc2=s=1280x720:r=30:d=2,format=yuv420p", bad)
+        row = _row(_scan(path, target_width=1280, target_height=720), "Signal Levels")
+        assert row[1] == "WARN" and "holds under BT.709 and BT.601" in row[2], row
+
+    def test_tagged_file_uses_only_its_matrix(self, tmp_path):
+        """BT.601-coded picture tagged BT.709: the tag is trusted, as before,
+        so the wrong tag shows up as a gamut excursion."""
+        # Tags set on the encoder make swscale convert with them, so the
+        # BT.601 picture is retagged in the bitstream instead.
+        source = self._untagged(tmp_path / "plain.mp4", "testsrc2=s=1280x720:r=30:d=2")
+        path = str(tmp_path / "mistagged.mp4")
+        ffmpeg("-i", source, "-c", "copy", "-bsf:v",
+               "h264_metadata=matrix_coefficients=1:colour_primaries=1:"
+               "transfer_characteristics=1:video_full_range_flag=0", path)
+        row = _row(_scan(path, target_width=1280, target_height=720), "Signal Levels")
+        assert row[1] == "WARN" and "not signalled" not in row[2], row
+        video = core._primary_video_stream(core.run_ffprobe(path))
+        with vc.VideoAnalysis(video, dict(DEFAULT_CONFIG)) as analysis:
+            graph = ";".join(analysis._area_chains())
+        assert "[ar_gamut1]" not in graph and "[ar_gamut0]" in graph
 
     def test_luma_patch_inside_the_area_tolerance(self, tmp_path):
         path = _clip(tmp_path / "small.mp4",
