@@ -24,7 +24,7 @@ shiboken6==6.9.3
 fpdf2==2.8.9
 defusedxml==0.7.1
 fonttools==4.67.0
-Pillow==12.3.0
+Pillow==13.0.0
 psutil==7.2.2
 truststore==0.10.5
 
@@ -34,7 +34,7 @@ pytest-timeout==2.4.0
 pyflakes==4.0.3
 iniconfig==2.3.1
 packaging==26.3
-pluggy==1.6.0
+pluggy==1.7.0
 Pygments==2.21.0
 colorama==0.4.6
 
