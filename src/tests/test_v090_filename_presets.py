@@ -14,6 +14,8 @@ class TestFilenameSuggestions:
     @pytest.mark.parametrize("name", [
         "PROJ_CAM01_C360.mp4", "overview_vr_cut.mp4", "take_1080_v2.mov",
         "a4kb.mp4", "SHOW_4K_25p.mov", "interview_2160.mov",
+        # 0.9.1: Frame Rate matches rationally, so 59.94 no longer suggests a 60p preset.
+        "x_1920x1080_59.94.mov",
     ])
     def test_ambiguous_or_partial_tokens_suggest_nothing(self, name):
         assert detect_preset_from_filename(name, core.PRESETS) is None
@@ -21,7 +23,7 @@ class TestFilenameSuggestions:
     @pytest.mark.parametrize("name,expected", [
         ("SHOW_4K_60p.mov", "4k60"), ("show_UHD_24fps.mov", "4k24"),
         ("clip_1080p.mp4", "1080p30"), ("x_5.7k_master.mp4", "5.7k30"),
-        ("x_1920x1080_59.94.mov", "1080p60"),
+        ("x_1920x1080_60fps.mov", "1080p60"),
     ])
     def test_whole_tokens_suggest(self, name, expected):
         assert detect_preset_from_filename(name, core.PRESETS) == expected

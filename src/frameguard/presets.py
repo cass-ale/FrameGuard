@@ -60,6 +60,26 @@ PRESET_CONFIG_KEYS = (
     "target_loudness_lufs",
     "loudness_tolerance_lu",
     "true_peak_max_dbtp",
+    # Container / XR / conformance (core.DEFAULT_CONFIG documents each).
+    "allow_ntsc_rate_match",
+    "duration_mismatch_threshold",
+    "av_short_tolerance_frames",
+    "av_long_tolerance_s",
+    "av_offset_warn_ms",
+    "av_offset_max_early_ms",
+    "av_offset_max_late_ms",
+    "allow_display_rotation",
+    "spatial_audio",
+    "require_square_pixels",
+    "warn_untagged_color",
+    "allowed_video_profiles",
+    "allowed_pix_fmts",
+    "max_frame_pixels",
+    "max_pixel_rate",
+    "require_faststart",
+    "allow_trim_edit_lists",
+    "max_audio_tracks",
+    "disabled_checks",
     # Compatibility-only (see core.COMPAT_ONLY_CONFIG_KEYS): still accepted so
     # presets and saved settings written by 0.8.x round-trip unchanged.
     "use_hwaccel",
@@ -181,13 +201,28 @@ _PRESET_VALUE_RANGES = {
     "loudness_tolerance_lu": (0.0, 20.0),
     "true_peak_max_dbtp": (-20.0, 3.0),
     "segment_count": (1, 16),
+    "duration_mismatch_threshold": (0.0, 60.0),
+    "av_short_tolerance_frames": (0, 1000),
+    "av_long_tolerance_s": (0.0, 60.0),
+    "av_offset_warn_ms": (0.0, 1000.0),
+    "av_offset_max_early_ms": (0.0, 10000.0),
+    "av_offset_max_late_ms": (0.0, 10000.0),
+    # 0 = no ceiling; 16384 x 16384 x 1000 fps bounds the rest.
+    "max_frame_pixels": (0, 16384 * 16384),
+    "max_pixel_rate": (0, 16384 * 16384 * 1000),
+    "max_audio_tracks": (0, 64),
 }
-_LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers")
+_LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers",
+                        "allowed_video_profiles", "allowed_pix_fmts")
+# Lists that may legitimately be empty (an empty acceptance list would fail
+# every file, but an empty disabled-check list just runs every check).
+_EMPTY_OK_LIST_KEYS = frozenset({"disabled_checks"})
 # Only these are genuinely whole numbers. Everything else numeric accepts a
 # fraction even when its default happens to be written as an int.
 _INTEGER_PRESET_KEYS = frozenset({
     "target_width", "target_height", "min_audio_sample_rate", "segment_count",
-    "max_decode_errors",
+    "max_decode_errors", "av_short_tolerance_frames", "max_frame_pixels",
+    "max_pixel_rate", "max_audio_tracks",
 })
 
 
@@ -199,6 +234,7 @@ def _enum_choices(key: str):
         "required_projection": core.PROJECTION_CHOICES,
         "required_stereo_mode": core.STEREO_CHOICES,
         "loudness_mode": core.LOUDNESS_MODES,
+        "spatial_audio": core.SPATIAL_AUDIO_CHOICES,
     }.get(key)
 
 
@@ -267,7 +303,9 @@ def _coerce_list(key: str, value):
     items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
     if len(items) != len(value):
         return None, "every entry must be non-empty text"
-    if not items:
+    if key == "disabled_checks":
+        return _coerce_check_names(items)
+    if not items and key not in _EMPTY_OK_LIST_KEYS:
         # An empty acceptance list fails every file.
         return None, "must not be empty"
     if key in _LOWERCASE_LIST_KEYS:
@@ -277,6 +315,16 @@ def _coerce_list(key: str, value):
         # Compared against splitext() output, which keeps the leading dot.
         items = [item if item.startswith(".") else f".{item}" for item in items]
     return items, None
+
+
+def _coerce_check_names(items: List[str]):
+    """Only the optional container/XR checks may be switched off, by exact name."""
+    from frameguard.container_checks import SWITCHABLE_CHECKS
+    by_lower = {name.lower(): name for name in SWITCHABLE_CHECKS}
+    unknown = [item for item in items if item.lower() not in by_lower]
+    if unknown:
+        return None, f"unknown check(s) {', '.join(unknown)}; allowed: {', '.join(SWITCHABLE_CHECKS)}"
+    return list(dict.fromkeys(by_lower[item.lower()] for item in items)), None
 
 
 def get_bundled_presets_dir() -> Path:
@@ -580,23 +628,39 @@ def is_preset_file(filepath: str) -> bool:
 
 
 _FPS_TOKENS = {
-    24: ("24p", "24fps", "2398", "23.976", "23976"),
-    30: ("30p", "30fps", "2997", "29.97"),
-    60: ("60p", "60fps", "5994", "59.94"),
+    24: ("24p", "24fps"),
+    30: ("30p", "30fps"),
+    60: ("60p", "60fps"),
 }
+# NTSC rates are not the integer rate (Frame Rate matches rationally), and no
+# built-in preset targets them, so these tokens suppress any suggestion.
+_NTSC_RATE_TOKENS = frozenset({"2398", "23.976", "23976", "2997", "29.97", "5994", "59.94"})
+# 180-degree deliverables have no built-in preset.
+_HALF_SPHERE_TOKENS = frozenset({"180", "vr180", "180vr"})
 _RESOLUTION_TOKENS = {
     "4k": ("4k", "uhd", "2160p", "3840x2160"),
     "1080p": ("1080p", "fhd", "fullhd", "1920x1080"),
     "720p": ("720p", "1280x720"),
     "5.7k": ("5.7k", "5760x2880"),
     "8k": ("8k", "4320p", "7680x4320"),
+    # Frame sizes that are only ever 360 deliverables.
+    "8k360": ("7680x3840",),
+    "tb5760": ("5760x5760",),
+    "tb3840": ("3840x3840",),
 }
+# Whole tokens that mark a file as 360/VR. They never select a preset on
+# their own (a clip named "C0360" or "overview_vr" is not a 360 deliverable);
+# they only turn a bare "8k" into the 8K 360 preset.
+_SPHERICAL_TOKENS = frozenset({"360", "vr", "vr360", "360vr", "equirect", "equirectangular", "spherical"})
+# Stereo words make a 5.7K/8K name ambiguous (mono 2:1 or top-bottom 1:1).
+_STEREO_TOKENS = frozenset({"tb", "ou", "overunder", "3d", "stereo", "sbs", "lr"})
 # Resolution family + frame rate -> built-in preset. Combinations with no
 # matching preset (e.g. 4K 25p) deliberately produce no suggestion.
 _PRESET_BY_TOKENS = {
     ("4k", 30): "4k30", ("4k", 60): "4k60", ("4k", 24): "4k24",
     ("1080p", 30): "1080p30", ("1080p", 60): "1080p60", ("1080p", 24): "1080p24",
     ("720p", 30): "720p30", ("5.7k", 30): "5.7k30", ("8k", 30): "8k30",
+    ("8k360", 30): "8k360", ("tb5760", 30): "360tb5760", ("tb3840", 30): "360tb3840",
 }
 
 
@@ -616,13 +680,21 @@ def detect_preset_from_filename(filename: str, presets: dict = None) -> Optional
     and any "1080" (a take number) as 1080p. Only unambiguous whole tokens
     count now: a resolution token ("4k", "uhd", "2160p", "1920x1080" ...),
     optionally with a frame-rate token ("24p", "59.94" ...; 30 when absent).
-    Bare numbers, "vr" and "360" never match. This only suggests: callers
-    must never replace a spec the user chose.
+    Bare numbers, "vr" and "360" never match on their own; next to "8k" they
+    select the 8K 360 preset (7680x3840) instead of 8K UHD, and a stereo word
+    next to "5.7k"/"8k" makes the name ambiguous. This only suggests:
+    callers must never replace a spec the user chose.
     """
     tokens = set(_filename_tokens(filename))
+    if tokens & (_NTSC_RATE_TOKENS | _HALF_SPHERE_TOKENS):
+        return None
     families = [fam for fam, words in _RESOLUTION_TOKENS.items() if tokens & set(words)]
+    if families == ["8k"] and tokens & _SPHERICAL_TOKENS:
+        families = ["8k360"]
+    if len(families) == 1 and families[0] in ("5.7k", "8k", "8k360") and tokens & _STEREO_TOKENS:
+        return None
     rates = {fps for fps, words in _FPS_TOKENS.items() if tokens & set(words)}
-    known_rate_words = {w for words in _FPS_TOKENS.values() for w in words}
+    known_rate_words = {w for words in _FPS_TOKENS.values() for w in words} | _NTSC_RATE_TOKENS
     for token in tokens - known_rate_words:
         rate = re.fullmatch(r"(\d{2,3}(?:\.\d+)?)(?:p|fps)", token)
         if rate and float(rate.group(1)) <= 240:

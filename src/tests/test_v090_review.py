@@ -82,7 +82,13 @@ class TestLosslessTrims:
         assert result.metadata.get("edit_list_hidden_frames", 0) > 0, result.metadata
         assert _row(result, "Frame Count")[1] == "PASS", _row(result, "Frame Count")
         assert _row(result, "CFR Check")[1] == "PASS", _row(result, "CFR Check")
-        assert result.status == "PASS", _problems(result)
+        assert _row(result, "Edit List")[1] == "PASS", _row(result, "Edit List")
+        # 0.9.1: A/V ends follow Telestream FC-108 (audio may stop at most 2
+        # frames early). A stream-copy cut can leave the audio a few frames
+        # short at its tail, which is now an advisory A/V Duration warning.
+        others = [c for c in _problems(result) if c[0] != "A/V Duration"]
+        assert not others and result.status in ("PASS", "PASS_WITH_WARNINGS"), _problems(result)
+        assert _row(result, "A/V Duration")[1] in ("PASS", "WARN"), _row(result, "A/V Duration")
 
     def test_truncating_a_trimmed_file_still_fails(self, media, tmp_path):
         source = media.get("opengop_h264.mp4",
@@ -126,7 +132,7 @@ def _hot_clip(path):
     ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=4",
            "-f", "lavfi", "-i", "sine=f=1000:sample_rate=48000:d=4,volume=8",
            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-           "-c:a", "aac", path)
+           "-colorspace", "bt709", "-c:a", "aac", path)
     return path
 
 
