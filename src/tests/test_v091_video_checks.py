@@ -150,6 +150,13 @@ class TestLevels:
         near = vc.assess_levels(self._series(gam=[0.012] * 60), FPS, False)
         assert vc.levels_entry(near, "essential", False)[2] < 70
 
+    def test_untagged_matrix_keeps_gamut_confidence_low(self):
+        findings = vc.assess_levels(self._series(gam=[0.05] * 60), FPS, False)
+        status, detail, confidence = vc.levels_entry(findings, "essential", False, "bt601")
+        assert status == "FAIL" and confidence < 70 and "BT.601 was assumed" in detail
+        info = vc.PictureInfo.from_stream({"width": 960, "height": 540, "color_space": "unknown"})
+        assert info.matrix == "bt601" and info.matrix_assumed
+
     def test_full_range_content_tagged_limited(self):
         series = self._series()
         series.band1 = [0.2] * 60                    # deep sub-black everywhere

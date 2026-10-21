@@ -2272,12 +2272,17 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     noise = float(cfg["silence_noise_db"])
     silence = float(cfg["silence_duration"])
     chains, maps = [], []
+    extra_graphs: List[str] = []
     extra_outputs: List[str] = []
     if plan.video is not None:
         # --- video branch (video_checks.py) ---
         video_analysis = plan.video_analysis
         if video_analysis is not None:
             chains.extend(video_analysis.filter_chains("v"))
+            for graph, label in video_analysis.extra_graphs():
+                extra_graphs += ["-filter_complex", graph]
+                if label:
+                    maps += ["-map", label]
             extra_outputs = video_analysis.extra_outputs()
         else:
             chains.append(f"[0:{int(plan.video['index'])}]"
@@ -2306,7 +2311,7 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
              # analysis, and interlace detection needs the coded lines.
              "-noautorotate",
              "-i", filepath, "-filter_complex_threads", str(threads),
-             "-filter_complex", ";".join(chains)]
+             "-filter_complex", ";".join(chains)] + extra_graphs
             + maps + ["-f", "null", "-"] + extra_outputs)
 
 

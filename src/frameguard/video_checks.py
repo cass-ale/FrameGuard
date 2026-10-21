@@ -116,8 +116,13 @@ FLASH_AREA = 0.25
 FLASH_RED_RATIO = 0.8
 FLASH_RED_DELTA = 20.0
 
-# Freeze: see detect_freezes() for the derivation of these values.
-FREEZE_STILL_MAFD = 0.20        # scdet MAFD (% of full scale, all planes)
+# Freeze (see detect_freezes()). scdet MAFD is the mean absolute difference
+# to the previous frame in % of full scale over all planes. Frozen frames
+# measured <= 0.03 (median) on ProRes, CRF and CBR long-GOP H.264/HEVC;
+# 48,000 frames of real 4K camera footage never went below 0.026 and only
+# 0.05 % of them below 0.42, never for a run; moving synthetic content sits
+# at 1-25.
+FREEZE_STILL_MAFD = 0.20
 FREEZE_BLIP_MAFD = 1.5
 FREEZE_MAX_BLIP_FRAMES = 8
 FREEZE_RELATIVE_DROP = 0.15
@@ -200,6 +205,7 @@ class PictureInfo:
     matrix: str
     field_order: str
     hdr: bool
+    matrix_assumed: bool = False    # no colour-matrix tag: guessed from the size
 
     @classmethod
     def from_stream(cls, video: dict) -> "PictureInfo":
@@ -208,7 +214,9 @@ class PictureInfo:
                    fps=fps if 0 < fps < 1000 else 0.0,
                    full_range=is_full_range(video), matrix=_matrix_for(video),
                    field_order=str(video.get("field_order") or "unknown").lower(),
-                   hdr=str(video.get("color_transfer") or "").lower() in _HDR_TRANSFERS)
+                   hdr=str(video.get("color_transfer") or "").lower() in _HDR_TRANSFERS,
+                   matrix_assumed=str(video.get("color_space") or "").lower()
+                   in ("", "unknown", "unspecified", "reserved"))
 
     @property
     def range_name(self) -> str:
@@ -402,30 +410,37 @@ class VideoAnalysis:
         return self.config.flash and self.needs_area_branch and not self.info.hdr
 
     def filter_chains(self, out_label: str = "v") -> List[str]:
-        """Graph chains for the video stream; the main chain ends in ``[out_label]``.
+        """Chains for the main graph; its black-detect chain ends in ``[out_label]``.
 
-        The frame difference always runs: it carries every frame's
+        The frame difference always runs here: it carries every frame's
         presentation time, which the other per-frame series are aligned to.
         """
-        c = self.config
-        branches = ["fz"]
+        return [f"[0:{self.index}]split=2[vs_main][vs_fz]",
+                f"[vs_main]{black_filter(self.config)}[{out_label}]",
+                f"[vs_fz]scdet@fz=threshold=100,"
+                f"{_print('lavfi.scd.mafd', self.paths['mafd'])},nullsink"]
+
+    def extra_graphs(self) -> List[Tuple[str, Optional[str]]]:
+        """Separate filter graphs: (description, label to map to the null output).
+
+        FFmpeg runs each -filter_complex graph in its own thread, while the
+        filters inside one graph run one after another for every frame.
+        Interlace and the area analysis therefore get graphs of their own:
+        on an idle 16-core machine this took the 4K overhead from +24 % to
+        +7-9 % for a little more CPU. A graph without an output label (the
+        area graph when it feeds the raw flash output) returns None.
+        """
+        graphs: List[Tuple[str, Optional[str]]] = []
         if self.needs_interlace_branch:
-            branches.append("il")
-        if self.needs_area_branch:
-            branches.append("ar")
-        labels = "".join(f"[vs_{name}]" for name in branches)
-        chains = [f"[0:{self.index}]split={len(branches) + 1}[vs_main]{labels}"]
-        chains.append(f"[vs_main]{black_filter(c)}[{out_label}]")
-        chains.append(f"[vs_fz]scdet@fz=threshold=100,"
-                      f"{_print('lavfi.scd.mafd', self.paths['mafd'])},nullsink")
-        if "il" in branches:
-            chains.append(
-                f"[vs_il]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
+            graphs.append((
+                f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
                 f"idet@il={IDET_OPTIONS},"
-                f"{_print('lavfi.idet.multiple.current_frame', self.paths['idet'])},nullsink")
-        if "ar" in branches:
-            chains.extend(self._area_chains())
-        return chains
+                f"{_print('lavfi.idet.multiple.current_frame', self.paths['idet'])}[vs_il]",
+                "[vs_il]"))
+        if self.needs_area_branch:
+            label = None if self.flash_enabled else "[vs_area]"
+            graphs.append((";".join(self._area_chains()), label))
+        return graphs
 
     def _area_chains(self) -> List[str]:
         """Levels, gamut, mean luma and flash from one area-averaged copy.
@@ -450,7 +465,7 @@ class VideoAnalysis:
         labels = "".join(f"[ar_{u}]" for u in uses)
         reduce4 = "scale=w='max(1,trunc(iw/4))':h='max(1,trunc(ih/4))':flags=area"
         chains = [
-            f"[vs_ar]scale=w='max(2,min({ANALYSIS_MAX_WIDTH},trunc(iw/{2 * ANALYSIS_MIN_FACTOR})*2))'"
+            f"[0:{self.index}]scale=w='max(2,min({ANALYSIS_MAX_WIDTH},trunc(iw/{2 * ANALYSIS_MIN_FACTOR})*2))'"
             f":h=-2:flags=area:in_range={rng}:out_range={rng},format=yuv444p,"
             f"split={len(uses)}{labels}"]
         if c.levels:
@@ -473,9 +488,11 @@ class VideoAnalysis:
                 f"{_print('lavfi.signalstats.VAVG', self.paths['gam_b'])},nullsink",
             ]
         if c.black or c.levels:
+            # Without the flash output this branch is the graph's output.
+            tail = "nullsink" if self.flash_enabled else "null[vs_area]"
             chains.append(
                 f"[ar_mean]scale=w='max(1,trunc(iw/8))':h='max(1,trunc(ih/8))':flags=area,"
-                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'])},nullsink")
+                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'])},{tail}")
         if self.flash_enabled:
             linear = _flash_linear_expression(info)
             cols, rows = FLASH_GRID
@@ -955,7 +972,7 @@ def range_plausibility(series: VideoSeries, full_range: bool) -> Optional[str]:
     if not full_range:
         deep = [value > R103_AREA for value in series.band1]
         if _share(deep) >= 0.25 and sum(deep) >= R103_MIN_FRAMES:
-            return (f"black sits below code {RANGE_DEEP_BLACK_MAX} on >1% of the picture in "
+            return (f"black sits at or below code {RANGE_DEEP_BLACK_MAX} on >1% of the picture in "
                     f"{_share(deep) * 100:.0f}% of frames: the content looks full range (0-255) "
                     f"but is tagged limited (tv)")
         return None
@@ -1000,9 +1017,13 @@ def _level_event_text(kind: str, events: Sequence[LevelEvent]) -> str:
     return f"{kind} outside the R 103 range on >1% of the picture: {shown}{more}"
 
 
-def levels_entry(findings: LevelsFindings, mode: str,
-                 full_range: bool) -> Tuple[str, str, int]:
-    """(status, detail, confidence) for the Signal Levels row."""
+def levels_entry(findings: LevelsFindings, mode: str, full_range: bool,
+                 assumed_matrix: Optional[str] = None) -> Tuple[str, str, int]:
+    """(status, detail, confidence) for the Signal Levels row.
+
+    ``assumed_matrix`` names the Y'CbCr matrix guessed for an untagged file:
+    the gamut result depends on it, so confidence stays below 70.
+    """
     luma_part = ("luma n/a (full range)" if full_range
                  else f"luma max {findings.max_luma * 100:.2f}%")
     measured = (f"Largest share outside EBU R 103 (limit 1% of the picture): {luma_part}, "
@@ -1017,12 +1038,16 @@ def levels_entry(findings: LevelsFindings, mode: str,
     if not problems:
         return "PASS", measured + ".", 100
     detail = ". ".join(problems) + f". ({measured}.)"
+    if assumed_matrix and findings.gamut:
+        detail += (f" The colour matrix is not signalled; {assumed_matrix.upper().replace('BT', 'BT.')}"
+                   f" was assumed from the picture size.")
     if mode == "report":
         return "PASS", "Not enforced: " + detail, 100
     peak = max([e.peak for e in findings.luma + findings.gamut] or [0.0])
     # Near the 1 % limit the result depends on the averaging approximation
     # of the R 103 filter: keep confidence below 70 there.
-    confident = peak >= 2 * R103_AREA or bool(findings.range_hint and peak >= R103_AREA)
+    confident = (peak >= 2 * R103_AREA or bool(findings.range_hint and peak >= R103_AREA)) \
+        and not (assumed_matrix and findings.gamut and not findings.luma)
     if mode == "essential":
         return "FAIL", detail, 85 if confident else 60
     return "WARN", detail, 80 if confident else 60
@@ -1108,34 +1133,31 @@ def _hazard_spans(marks: Sequence[Tuple[int, int]], times: Sequence[float],
     return spans
 
 
-@dataclass
-class _FlashSignal:
-    """One flash rule (general or red) applied to block or area series."""
-    kind: str
+def _flash_transitions(kind: str, grid, frames: Sequence[int],
+                       blocks: Sequence[int]) -> List[Tuple[int, int]]:
+    """Transitions of one flash rule for the mean of ``blocks`` over ``frames``.
 
-    def series(self, grid, frames: int, blocks: Sequence[int]) -> List[float]:
-        """The rule's quantity for the mean of ``blocks`` (linear light)."""
-        n = float(len(blocks))
-        out, self.saturated = [], []
-        for i in range(frames):
-            g = sum(grid[i][0][b] for b in blocks) / n
-            bl = sum(grid[i][1][b] for b in blocks) / n
-            r = sum(grid[i][2][b] for b in blocks) / n
-            if self.kind == "general":
-                out.append(FLASH_PEAK_CD / 255.0 * (0.2126 * r + 0.7152 * g + 0.0722 * bl))
-            else:
-                out.append(max(0.0, (r - g - bl) / 255.0) * 320.0)
-                self.saturated.append(r > 0 and r >= FLASH_RED_RATIO * (r + g + bl))
-        return out
-
-    def transitions(self, values: Sequence[float]) -> List[Tuple[int, int]]:
-        if self.kind == "general":
-            return _transitions(values, FLASH_DELTA_CD, FLASH_DARK_CD)
-        saturated = self.saturated
-
-        def red_end(i: int, j: int) -> bool:
-            return saturated[i] or saturated[j]
-        return _transitions(values, FLASH_RED_DELTA, None, red_end)
+    ``kind`` "general": luminance Y = 0.2126 R + 0.7152 G + 0.0722 B of the
+    linear grid scaled to the 200 cd/m2 peak, swings of 20 cd/m2 with the
+    darker state below 160 cd/m2. "red": (R - G - B) x 320 on linear values
+    0..1, swings of 20 where one end is saturated red (R/(R+G+B) >= 0.8).
+    Returned indices are positions within ``frames``.
+    """
+    n = float(len(blocks))
+    values, saturated = [], []
+    for i in frames:
+        g = sum(grid[i][0][b] for b in blocks) / n
+        bl = sum(grid[i][1][b] for b in blocks) / n
+        r = sum(grid[i][2][b] for b in blocks) / n
+        if kind == "general":
+            values.append(FLASH_PEAK_CD / 255.0 * (0.2126 * r + 0.7152 * g + 0.0722 * bl))
+        else:
+            values.append(max(0.0, (r - g - bl) / 255.0) * 320.0)
+            saturated.append(r > 0 and r >= FLASH_RED_RATIO * (r + g + bl))
+    if kind == "general":
+        return _transitions(values, FLASH_DELTA_CD, FLASH_DARK_CD)
+    return _transitions(values, FLASH_RED_DELTA, None,
+                        lambda i, j: saturated[i] or saturated[j])
 
 
 def assess_flash(series: VideoSeries, fps: float) -> List[FlashEvent]:
@@ -1166,10 +1188,9 @@ def assess_flash(series: VideoSeries, fps: float) -> List[FlashEvent]:
     blocks = len(grid[0][0])
     events: List[FlashEvent] = []
     for kind in ("general", "red"):
-        rule = _FlashSignal(kind)
         hazard_frames: List[List[int]] = [[] for _ in range(frames)]
         for b in range(blocks):
-            marks = rule.transitions(rule.series(grid, frames, [b]))
+            marks = _flash_transitions(kind, grid, range(frames), [b])
             for first, last in _hazard_spans(marks, times, window):
                 for f in range(first, last + 1):
                     if not hazard_frames[f] or hazard_frames[f][-1] != b:
@@ -1179,9 +1200,9 @@ def assess_flash(series: VideoSeries, fps: float) -> List[FlashEvent]:
         for first, last in frame_runs(flagged):
             members = sorted({b for f in range(first, last + 1) for b in hazard_frames[f]})
             lo = max(0, first - lead)
-            values = rule.series([grid[i] for i in range(lo, last + 1)], last + 1 - lo, members)
             local_times = times[lo:last + 1]
-            spans = _hazard_spans(rule.transitions(values), local_times, window)
+            marks = _flash_transitions(kind, grid, range(lo, last + 1), members)
+            spans = _hazard_spans(marks, local_times, window)
             if not spans:
                 continue
             start = local_times[spans[0][0]]
@@ -1377,7 +1398,8 @@ def _report_levels(result, config, series, analysis, fps, decoded, reason) -> No
     result.set_metadata("levels_max_gamut_pct", round(findings.max_gamut * 100, 3))
     if findings.range_hint:
         result.set_metadata("range_mismatch_suspected", True)
-    _add(result, LEVELS, *levels_entry(findings, config.levels_mode, full))
+    assumed = analysis.info.matrix if analysis is not None and analysis.info.matrix_assumed else None
+    _add(result, LEVELS, *levels_entry(findings, config.levels_mode, full, assumed))
 
 
 def _report_flash(result, config, series, analysis, fps, decoded, reason) -> None:
