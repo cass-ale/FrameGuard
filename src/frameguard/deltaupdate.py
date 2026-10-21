@@ -321,7 +321,7 @@ class DeltaUpdater(QObject):
         """Compare a release channel against this installation.
 
         `channel` is either a filesystem path (a Drive-synced folder, a UNC
-        share) or an http(s) URL. No files are changed.
+        share) or an https:// URL. No files are changed.
         """
         install = find_install_root()
         if install is None:

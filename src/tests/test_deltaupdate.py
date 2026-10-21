@@ -135,10 +135,17 @@ class TestUpdateSources:
         from frameguard.updatesource import LocalSource, make_source
         assert isinstance(make_source(r"\\share\FrameGuard\release"), LocalSource)
 
-    def test_url_yields_an_http_source(self):
+    def test_https_url_yields_an_http_source(self):
         from frameguard.updatesource import HttpSource, make_source
-        for url in ("http://host/rel", "https://host/rel", "HTTPS://Host/Rel"):
+        for url in ("https://host/rel", "HTTPS://Host/Rel"):
             assert isinstance(make_source(url), HttpSource), url
+
+    def test_plain_http_url_is_refused(self):
+        """The manifest carries every file's hash, so it may not travel in
+        clear text (see TestDeltaHardening in test_release_hardening.py)."""
+        from frameguard.updatesource import UpdateSourceError, make_source
+        with pytest.raises(UpdateSourceError):
+            make_source("http://host/rel")
 
     def test_empty_channel_is_rejected(self):
         from frameguard.updatesource import UpdateSourceError, make_source
@@ -170,7 +177,7 @@ class TestUpdateSources:
         """A laptop off the VPN must not produce an error dialog on a
         background check."""
         from frameguard.updatesource import make_source
-        assert make_source("http://127.0.0.1:1/nope").is_reachable() is False
+        assert make_source("https://127.0.0.1:1/nope").is_reachable() is False
 
     def test_missing_payload_file_raises(self, tmp_path):
         from frameguard.updatesource import UpdateSourceError, make_source

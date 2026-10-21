@@ -572,3 +572,165 @@ class TestOsNativeTls:
         constraints = (SRC / "constraints-3.12.txt").read_text(encoding="utf-8")
         assert re.search(r"^truststore>=0\.10\.5,<1\.0$", requirements, re.M)
         assert re.search(r"^truststore==0\.10\.5$", constraints, re.M)
+
+
+class TestDeltaHardening:
+    """C-O1: the optional delta channel only speaks HTTPS (bearer token or
+    not) and refuses manifests that list a file without a SHA-256."""
+
+    @pytest.mark.parametrize("channel", [
+        "http://artifacts.example.test/frameguard",
+        "HTTP://artifacts.example.test/frameguard",
+        "ftp://artifacts.example.test/frameguard",
+        "file:///srv/frameguard",
+        "https://",
+    ])
+    @pytest.mark.parametrize("token", [None, "secret-token"])
+    def test_non_https_url_channels_are_refused(self, channel, token):
+        from frameguard.updatesource import UpdateSourceError, make_source
+        with pytest.raises(UpdateSourceError):
+            make_source(channel, token=token)
+
+    def test_http_source_itself_refuses_plain_http(self):
+        from frameguard.updatesource import HttpSource, UpdateSourceError
+        with pytest.raises(UpdateSourceError):
+            HttpSource("http://artifacts.example.test/rel", token="secret")
+        assert HttpSource("https://artifacts.example.test/rel").base_url == (
+            "https://artifacts.example.test/rel")
+
+    def test_folder_channels_still_work(self, tmp_path):
+        from frameguard.updatesource import LocalSource, make_source
+        assert isinstance(make_source(str(tmp_path)), LocalSource)
+        assert isinstance(make_source(r"\\share\FrameGuard\release"), LocalSource)
+
+    @staticmethod
+    def _redirect(old_url, new_url, token="secret"):
+        import urllib.request
+        from frameguard.updatesource import _HttpsOnlyRedirectHandler
+
+        request = urllib.request.Request(
+            old_url, headers={"Authorization": f"Bearer {token}",
+                              "User-Agent": "test"})
+        return _HttpsOnlyRedirectHandler().redirect_request(
+            request, None, 302, "Found", {}, new_url)
+
+    def test_redirect_to_plain_http_is_refused(self):
+        import urllib.error
+        with pytest.raises(urllib.error.HTTPError):
+            self._redirect("https://a.example.test/manifest.json",
+                           "http://a.example.test/manifest.json")
+
+    def test_token_is_dropped_when_a_redirect_leaves_the_host(self):
+        moved = self._redirect("https://a.example.test/manifest.json",
+                               "https://cdn.example.test/manifest.json")
+        assert not moved.has_header("Authorization")
+        same = self._redirect("https://a.example.test/manifest.json",
+                              "https://a.example.test/v2/manifest.json")
+        assert same.get_header("Authorization") == "Bearer secret"
+
+    def test_requests_go_through_the_https_only_opener(self, monkeypatch):
+        import io
+        import json
+        from frameguard import updatesource as S
+
+        opened = []
+
+        class _Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        good = {"manifest_version": 1, "files": {
+            "FrameGuard.exe": {"sha256": "a" * 64, "size": 1}}}
+        monkeypatch.setattr(
+            S, "_open_https",
+            lambda request, timeout: opened.append(request.full_url)
+            or _Response(json.dumps(good).encode()))
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *_a, **_k: pytest.fail("bypassed the HTTPS-only opener"))
+        source = S.make_source("https://artifacts.example.test/rel",
+                               token="secret")
+        assert source.read_manifest()["files"]
+        assert opened == ["https://artifacts.example.test/rel/manifest.json"]
+
+    def test_https_opener_uses_os_trust_and_the_redirect_guard(self, monkeypatch):
+        import urllib.request
+        from frameguard import updatesource as S
+
+        built = []
+        monkeypatch.setattr(
+            urllib.request, "build_opener",
+            lambda *handlers: built.extend(handlers) or mock.Mock())
+        sentinel = object()
+        monkeypatch.setattr(S, "_https_context", lambda: sentinel)
+        S._open_https(urllib.request.Request("https://a.example.test/x"), 5)
+        https = [h for h in built if isinstance(h, urllib.request.HTTPSHandler)]
+        assert https and https[0]._context is sentinel
+        assert any(isinstance(h, S._HttpsOnlyRedirectHandler) for h in built)
+
+    @pytest.mark.parametrize("entry", [
+        {"size": 1},
+        {"sha256": "", "size": 1},
+        {"sha256": "abc", "size": 1},
+        {"sha256": "Z" * 64, "size": 1},
+        "not-a-dict",
+    ])
+    def test_manifest_entry_without_a_valid_sha256_is_refused(
+            self, tmp_path, monkeypatch, entry):
+        import io
+        import json
+        from frameguard import manifest as M
+        from frameguard import updatesource as S
+
+        data = {"manifest_version": 1, "files": {
+            "FrameGuard.exe": {"sha256": "a" * 64, "size": 1},
+            "_internal/unverified.dll": entry}}
+        path = tmp_path / M.MANIFEST_FILENAME
+        path.write_text(json.dumps(data), encoding="utf-8")
+        assert M.load_manifest(str(path)) is None
+        with pytest.raises(S.UpdateSourceError):
+            S.make_source(str(tmp_path)).read_manifest()
+
+        class _Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        monkeypatch.setattr(
+            S, "_open_https",
+            lambda *_a, **_k: _Response(json.dumps(data).encode()))
+        with pytest.raises(S.UpdateSourceError, match="SHA-256"):
+            S.make_source("https://artifacts.example.test/rel").read_manifest()
+
+    def test_verify_tree_treats_a_missing_hash_as_a_mismatch(self, tmp_path):
+        from frameguard import manifest as M
+
+        (tmp_path / "a.dll").write_bytes(b"payload")
+        manifest = {"files": {"a.dll": {"size": 7}}}
+        assert M.verify_tree(str(tmp_path), manifest) == ["a.dll"]
+        assert M.verify_tree(str(tmp_path), manifest, ["ghost.dll"]) == ["ghost.dll"]
+        manifest["files"]["a.dll"]["sha256"] = M.file_sha256(str(tmp_path / "a.dll"))
+        assert M.verify_tree(str(tmp_path), manifest) == []
+
+    def test_a_stored_plain_http_channel_heals_to_the_default(self, qapp):
+        from PySide6.QtCore import QSettings
+        from frameguard import updater as U
+
+        settings = QSettings(U._SETTINGS_ORG, U._SETTINGS_APP)
+        original = settings.value(U._CHANNEL_KEY, None)
+        try:
+            settings.setValue(U._CHANNEL_KEY, "http://artifacts.example.test/fg")
+            assert U.get_update_channel() == U.get_update_channel_for(U.sys.platform)
+            assert settings.value(U._CHANNEL_KEY, None) is None
+            settings.setValue(U._CHANNEL_KEY, "https://artifacts.example.test/fg")
+            assert U.get_update_channel() == "https://artifacts.example.test/fg"
+        finally:
+            if original is None:
+                settings.remove(U._CHANNEL_KEY)
+            else:
+                settings.setValue(U._CHANNEL_KEY, original)

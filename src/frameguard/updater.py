@@ -211,9 +211,14 @@ def get_update_channel() -> str:
         settings.remove(_CHANNEL_KEY)
         return _default_channel_for_this_machine()
 
-    # A URL cannot be probed cheaply here; trust it.
-    if stored.lower().startswith(("http://", "https://")):
+    # An HTTPS URL cannot be probed cheaply here; trust it. Any other URL
+    # (plain http:// included) is refused by updatesource.make_source, so
+    # keeping it would only pin this machine to a channel that never works.
+    if stored.lower().startswith("https://"):
         return stored
+    if "://" in stored:
+        settings.remove(_CHANNEL_KEY)
+        return _default_channel_for_this_machine()
 
     if os.path.isdir(stored):
         return stored
