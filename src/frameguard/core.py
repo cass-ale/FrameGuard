@@ -21,6 +21,8 @@ from collections import Counter, deque
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Callable
 
+from frameguard import container_checks
+
 # Live handles remain observable for diagnostics, but cancellation never reads
 # this global set. Every cancellable scan subprocess is registered explicitly
 # with the ScanWorker that owns it.
@@ -110,8 +112,24 @@ except ImportError:
 # ============================================================================
 # Keys other than label/width/height/fps/fps_tolerance/min_bitrate_mbps are
 # engine config keys applied verbatim by ScanWorker.configure(). Only presets
-# that are unambiguously 360 carry a projection requirement: "8K High-End VR"
-# is 16:9 and may be flat or stereo, so it states nothing about projection.
+# that are unambiguously 360 carry a projection requirement. "8k30" is 8K UHD
+# (16:9, flat); an 8K 360 equirect is 7680x3840 (2:1) and has its own preset.
+
+# Meta Quest 360 delivery (Meta Media Studio 360/180 video requirements; Meta
+# Horizon OS media requirements): MP4, H.264/HEVC, "Yuv 420p", SAR 1:1,
+# 30 or 60 fps, hardware decode limit 8192x4096 at 60 fps. Fast-start is
+# YouTube's and every streaming player's requirement.
+_QUEST_360_DELIVERY = {
+    "required_projection": "equirectangular",
+    "accepted_containers": [".mp4"],
+    "accepted_codecs": ["h264", "hevc"],
+    "allowed_pix_fmts": ["yuv420p"],
+    "require_square_pixels": True,
+    "require_faststart": True,
+    "allow_fps_multiples": True,
+    "max_frame_pixels": 8192 * 4096,
+    "max_pixel_rate": 8192 * 4096 * 60,
+}
 
 PRESETS = {
     "4k30": {"label": "4K UHD @ 30fps", "width": 3840, "height": 2160, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 20},
@@ -122,8 +140,14 @@ PRESETS = {
     "1080p24": {"label": "1080p Full HD @ 24fps (Cinematic)", "width": 1920, "height": 1080, "fps": 24.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 6},
     "720p30": {"label": "720p HD @ 30fps (Proxy/Review)", "width": 1280, "height": 720, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 4},
     "5.7k30": {"label": "5.7K @ 30fps (360 VR Capture)", "width": 5760, "height": 2880, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 40,
-               "required_projection": "equirectangular"},
-    "8k30": {"label": "8K UHD @ 30fps (High-End VR)", "width": 7680, "height": 4320, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 60},
+               "required_projection": "equirectangular", "require_square_pixels": True},
+    "8k30": {"label": "8K UHD @ 30fps (7680x4320, flat)", "width": 7680, "height": 4320, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 60},
+    "8k360": {"label": "8K 360° mono @ 30fps (7680x3840, Quest)", "width": 7680, "height": 3840, "fps": 30.0, "fps_tolerance": 0.5,
+              "min_bitrate_mbps": 60, "required_stereo_mode": "mono", **_QUEST_360_DELIVERY},
+    "360tb5760": {"label": "5.7K 360° 3D top-bottom @ 30fps (5760x5760, Quest)", "width": 5760, "height": 5760, "fps": 30.0,
+                  "fps_tolerance": 0.5, "min_bitrate_mbps": 40, "required_stereo_mode": "top_bottom", **_QUEST_360_DELIVERY},
+    "360tb3840": {"label": "4K 360° 3D top-bottom @ 30fps (3840x3840, Quest)", "width": 3840, "height": 3840, "fps": 30.0,
+                  "fps_tolerance": 0.5, "min_bitrate_mbps": 25, "required_stereo_mode": "top_bottom", **_QUEST_360_DELIVERY},
 }
 
 # Preset fields that are not engine config keys under their own name.
@@ -161,10 +185,14 @@ ESSENTIAL_CHECKS = {
     "Bitrate", "Audio Stream", "Audio Codec", "Audio Channels",
     "Audio Sample Rate", "A/V Duration", "File Integrity", "Audio Silence",
     "Dead Channel", "Audio Loudness",
+    # container_checks.py: Codec Profile and Spatial Audio fail only on what
+    # the spec sets; A/V Sync Offset fails beyond the EBU R37 chain budget.
+    "Codec Profile", "Spatial Audio", "A/V Sync Offset",
 }
 
 ADVISORY_CHECKS = {
     "Frame Count", "Black Frames", "Freeze Frames",
+    "Container Structure", "Edit List", "Timecode", "Track Layout",
     # Raised when part of the analysis could not run.
     "Deep Scan",
 }
@@ -210,6 +238,13 @@ CHECK_SEVERITY_WEIGHTS = {
     "Audio Codec": 25,
     "Audio Loudness": 25,
     "Frame Rate": 20,
+    "Codec Profile": 65,
+    "A/V Sync Offset": 60,
+    "Spatial Audio": 55,
+    "Container Structure": 55,
+    "Edit List": 35,
+    "Timecode": 30,
+    "Track Layout": 25,
 }
 
 
@@ -258,6 +293,8 @@ STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
 # and phone recordings routinely sit far from broadcast targets (-23 LUFS,
 # -1 dBTP) and must not be flagged unless the spec asks for it.
 LOUDNESS_MODES = ("off", "report", "advisory", "essential")
+# "required" fails a file without a consistent SA3D ambisonic track.
+SPATIAL_AUDIO_CHOICES = ("any", "required")
 
 DEFAULT_CONFIG = {
     # Picture geometry and timing. Resolution must match exactly unless
@@ -267,8 +304,12 @@ DEFAULT_CONFIG = {
     "target_height": 2160,
     "allow_larger_resolution": False,
     "target_fps": 30.0,
+    # fps_tolerance absorbs measurement jitter only. NTSC rates (x1000/1001:
+    # 23.976, 29.97, 59.94) never match their integer rate through it; that
+    # takes allow_ntsc_rate_match.
     "fps_tolerance": 0.5,
     "allow_fps_multiples": False,
+    "allow_ntsc_rate_match": False,
     "min_bitrate_mbps": 20,
 
     # Codec acceptance lists
@@ -293,9 +334,31 @@ DEFAULT_CONFIG = {
     "min_bit_depth": "any",
     "required_transfer": "any",
 
-    # XR metadata
+    # XR metadata. Display rotation on a spherical file is a failure unless
+    # allowed; on a flat file only 180 degrees / mirroring warn (90/270 are
+    # judged through the displayed resolution).
     "required_projection": "any",
     "required_stereo_mode": "any",
+    "allow_display_rotation": False,
+    # "required" fails a file without consistent SA3D ambisonics.
+    "spatial_audio": "any",
+
+    # Picture and codec conformance ("any" = report only). Pixel limits of 0
+    # mean no decoder ceiling.
+    "require_square_pixels": False,
+    "warn_untagged_color": True,
+    "allowed_video_profiles": ["any"],
+    "allowed_pix_fmts": ["any"],
+    "max_frame_pixels": 0,
+    "max_pixel_rate": 0,
+
+    # Container structure and tracks. A lossless trim's single edit (hidden
+    # lead-in) is normal unless allow_trim_edit_lists is off.
+    "require_faststart": False,
+    "allow_trim_edit_lists": True,
+    "max_audio_tracks": 0,
+    # Optional container/XR checks a spec may switch off by name.
+    "disabled_checks": [],
 
     # File integrity (full software decode)
     "max_decode_errors": 0,
@@ -325,8 +388,17 @@ DEFAULT_CONFIG = {
     "loudness_tolerance_lu": 2.0,
     "true_peak_max_dbtp": -1.0,
 
-    # A/V sync
+    # A/V sync. Ends (Telestream FC-108): audio may end up to
+    # av_short_tolerance_frames before the last frame and up to
+    # av_long_tolerance_s after it; audio short by more than
+    # duration_mismatch_threshold fails. Starts: DPP v5 2.8 file tolerance
+    # (warn) and the EBU R37 chain budget, 40 ms early / 60 ms late (fail).
     "duration_mismatch_threshold": 0.5,
+    "av_short_tolerance_frames": 2,
+    "av_long_tolerance_s": 2.0,
+    "av_offset_warn_ms": 5.0,
+    "av_offset_max_early_ms": 40.0,
+    "av_offset_max_late_ms": 60.0,
 
     # Timeouts
     "timeout_base_seconds": 120,
@@ -508,6 +580,13 @@ class QAResult:
             "Audio Silence": "long stretches of silence found",
             "Dead Channel": "an audio channel is silent",
             "Audio Loudness": "audio levels are outside the target range",
+            "Codec Profile": "codec profile, level or pixel format doesn't match the spec",
+            "A/V Sync Offset": "audio and video don't start together",
+            "Spatial Audio": "spatial (ambisonic) audio metadata is missing or wrong",
+            "Container Structure": "file structure is damaged or not streaming-ready",
+            "Edit List": "an edit list changes what plays",
+            "Timecode": "timecode is discontinuous",
+            "Track Layout": "unexpected track layout",
             "FFprobe": "file could not be read (may be corrupt)",
             "Internal Error": "an unexpected error occurred during the scan",
         }
@@ -984,7 +1063,11 @@ def _format_pct(pct: float) -> str:
 # ============================================================================
 
 def check_container_format(filepath: str, result: QAResult, cfg: dict):
-    """Validate the container extension and that the file is non-empty."""
+    """Validate the container extension, its real signature and that the file is non-empty.
+
+    The extension used to be the only evidence, so a Matroska or MPEG-TS
+    file renamed .mp4 passed (container_checks.extension_mismatch).
+    """
     if not os.path.isfile(filepath):
         result.add_fail("Container Format", f"File not found: {filepath}")
         return
@@ -998,6 +1081,10 @@ def check_container_format(filepath: str, result: QAResult, cfg: dict):
         return
     if ext not in cfg["accepted_containers"]:
         result.add_fail("Container Format", f"Container '{ext}' not in accepted list {cfg['accepted_containers']}.")
+        return
+    mismatch = container_checks.extension_mismatch(filepath, ext)
+    if mismatch:
+        result.add_fail("Container Format", mismatch)
         return
     result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
 
@@ -1045,6 +1132,25 @@ def _orientation_mismatch(width: int, height: int, tw: int, th: int, rotation: i
             f"{tw}x{th} {wanted} target.")
 
 
+def _flat_display_transform_warning(video: dict, cfg: dict) -> str:
+    """Advisory text for a flat picture shown upside down or mirrored by its matrix.
+
+    90/270-degree flags are ordinary portrait captures and are judged through
+    the displayed size; 180 degrees and mirroring leave the size unchanged,
+    so an NLE or player that ignores the display matrix shows the picture
+    upside down or reversed with nothing else to warn the operator. Spherical
+    files are judged in XR Metadata instead.
+    """
+    if cfg.get("allow_display_rotation", False) or _side_data(video.get("side_data_list"), "Spherical Mapping"):
+        return ""
+    rotation, mirrored = container_checks.display_transform(video)
+    parts = (["rotated 180°"] if abs(rotation) % 360 == 180 else []) + (["mirrored"] if mirrored else [])
+    if not parts:
+        return ""
+    return (f"The display matrix shows the picture {' and '.join(parts)}: players and editors that ignore "
+            f"it present the stored picture as is.")
+
+
 def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     """The displayed frame must equal the target exactly.
 
@@ -1071,7 +1177,11 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     rot_note = f" (displayed after {abs(rotation)}° rotation)" if rotation else ""
 
     orientation = _orientation_mismatch(width, height, tw, th, rotation)
-    if (width, height) == (tw, th):
+    turned = _flat_display_transform_warning(video, cfg)
+    if (width, height) == (tw, th) and turned:
+        result.add_warn("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}. {turned}",
+                        confidence=70)
+    elif (width, height) == (tw, th):
         result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}")
     elif orientation:
         result.add_fail("Resolution", orientation, confidence=95)
@@ -1110,10 +1220,16 @@ def check_aspect_ratio(probe_data: dict, result: QAResult, cfg: dict):
     if video is None:
         result.add_skip("Aspect Ratio", "No video stream found.")
         return
-    width, height, _ = _displayed_size(video)
+    width, height, rotation = _displayed_size(video)
     tw, th = int(cfg["target_width"]), int(cfg["target_height"])
     if not width or not height or not tw or not th:
         result.add_not_verified("Aspect Ratio", "frame size is unknown.")
+        return
+    if _orientation_mismatch(width, height, tw, th, rotation):
+        # Resolution already fails a picture turned the other way; judging
+        # its shape again would report one cause twice.
+        result.add_skip("Aspect Ratio", f"Not judged separately: the picture is {_orientation_name(width, height)} "
+                                        f"and the target {_orientation_name(tw, th)} (see Resolution).")
         return
     sar = _ratio(video.get("sample_aspect_ratio")) or 1.0
     if abs(_stream_rotation_degrees(video)) % 180 == 90:
@@ -1122,19 +1238,69 @@ def check_aspect_ratio(probe_data: dict, result: QAResult, cfg: dict):
     target = tw / th
     result.set_metadata("display_aspect_ratio", round(display, 4))
     sar_note = f", SAR {video.get('sample_aspect_ratio')}" if abs(sar - 1.0) > 1e-3 else ""
-    if abs(display - target) / target <= 0.005:
+    shape_ok = abs(display - target) / target <= 0.005
+    if sar_note and cfg.get("require_square_pixels", False):
+        # Meta Media Studio 360/180 requirements: "Pixel aspect ratio (SAR): 1:1".
+        result.add_fail("Aspect Ratio", f"Non-square pixels{sar_note}: this spec requires square pixels (SAR 1:1); "
+                                        f"displays at {display:.3f}:1, target {target:.3f}:1.", confidence=95)
+    elif shape_ok and sar_note:
+        result.add_warn("Aspect Ratio", f"{display:.3f}:1 matches the target {target:.3f}:1 only through non-square "
+                                        f"pixels{sar_note}: platforms that ignore the pixel aspect show it "
+                                        f"stretched.", confidence=70)
+    elif shape_ok:
         result.add_pass("Aspect Ratio", f"{display:.3f}:1 matches the target {target:.3f}:1{sar_note}")
     else:
         result.add_fail("Aspect Ratio", f"Displays at {display:.3f}:1, target is {target:.3f}:1 "
                                         f"({tw}x{th}){sar_note}.", confidence=95)
 
 
-def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
-    """The frame rate must match the target within ``fps_tolerance``.
+# NTSC-family rates are N x 1000/1001 (23.976, 29.97, 59.94...). They are
+# distinct rates, not roundings of 24/30/60: conforming one to the other needs
+# a 0.1% speed change (and pitch shift) or pulldown.
+_NTSC_BASES = (24, 30, 48, 60, 120, 240)
 
-    25p against a 24p spec used to be a warning; conforming it needs a speed
-    change, so any mismatch now fails. Integer multiples (60p for a 30p
-    spec) pass only with ``allow_fps_multiples``.
+
+def _exact_target_rate(rate: float) -> float:
+    """A typed target such as 29.97 or 23.976 as its exact NTSC rational."""
+    for base in _NTSC_BASES:
+        ntsc = base * 1000 / 1001
+        if abs(rate - ntsc) < 0.006:
+            return ntsc
+    return rate
+
+
+def _same_rate(a: float, b: float) -> bool:
+    """Equal within 0.02%: container timestamp rounding, far below the 0.1% NTSC gap."""
+    return abs(a - b) <= max(a, b) * 2e-4
+
+
+def _rate_relation(fps: float, target: float, tolerance: float) -> str:
+    """'exact', 'ntsc' (the x1000/1001 counterpart), 'tolerance' or 'none'."""
+    if _same_rate(fps, target):
+        return "exact"
+    if _same_rate(fps, target * 1000 / 1001) or _same_rate(fps, target * 1001 / 1000):
+        return "ntsc"
+    if abs(fps - target) <= tolerance:
+        return "tolerance"
+    return "none"
+
+
+def _rate_text(fps: float) -> str:
+    for base in _NTSC_BASES:
+        if _same_rate(fps, base * 1000 / 1001):
+            return f"{fps:.3f} fps (NTSC {base * 1000}/1001)"
+    return f"{fps:.3f} fps"
+
+
+def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
+    """The frame rate must equal the target rate exactly, as a rational.
+
+    29.97 (30000/1001) passed a 30p spec because ``fps_tolerance`` (0.5)
+    bridged the 0.1% NTSC gap. NTSC and integer rates now match only with
+    ``allow_ntsc_rate_match``; ``fps_tolerance`` still absorbs measurement
+    jitter between other rates. 25p against a 24p spec fails (conforming
+    needs a speed change). Integer multiples (60p for a 30p spec) pass only
+    with ``allow_fps_multiples``.
     """
     video = _primary_video_stream(probe_data)
     if video is None:
@@ -1150,21 +1316,41 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
         result.add_warn("Frame Rate", "Could not determine the frame rate from the container.",
                         confidence=50)
         return
-    target = float(cfg["target_fps"])
+    typed = float(cfg["target_fps"])
+    target = _exact_target_rate(typed)
     tolerance = float(cfg["fps_tolerance"])
-    if abs(fps - target) <= tolerance:
-        result.add_pass("Frame Rate", f"{fps:.3f} fps (target: {target:g} ± {tolerance:g} fps)")
+    allow_ntsc = bool(cfg.get("allow_ntsc_rate_match", False))
+    relation = _rate_relation(fps, target, tolerance)
+    ntsc_fail = (f"{_rate_text(fps)} does not match the {typed:g} fps target: NTSC (x1000/1001) and integer "
+                 f"rates are different rates, and conforming needs a 0.1% speed change or pulldown. "
+                 f"Allow NTSC rate matching only if the spec treats them as equal.")
+    if relation == "exact":
+        result.add_pass("Frame Rate", f"{_rate_text(fps)} (matches the {typed:g} fps target)")
+        return
+    if relation == "ntsc":
+        if allow_ntsc:
+            result.add_pass("Frame Rate", f"{_rate_text(fps)} is the NTSC counterpart of the {typed:g} fps "
+                                          f"target (NTSC rate matching allowed by this spec)")
+        else:
+            result.add_fail("Frame Rate", ntsc_fail)
+        return
+    if relation == "tolerance":
+        result.add_pass("Frame Rate", f"{fps:.3f} fps (target: {typed:g} ± {tolerance:g} fps)", confidence=90)
         return
     multiple = round(fps / target) if target > 0 else 0
-    if multiple >= 2 and abs(fps / multiple - target) <= tolerance:
-        if cfg.get("allow_fps_multiples", False):
-            result.add_pass("Frame Rate", f"{fps:.3f} fps is {multiple}x the {target:g} fps target "
+    base = _rate_relation(fps / multiple, target, tolerance) if multiple >= 2 else "none"
+    if base != "none":
+        base_ok = base != "ntsc" or allow_ntsc
+        if cfg.get("allow_fps_multiples", False) and base_ok:
+            result.add_pass("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target "
                                           f"(integer multiples allowed by this spec)")
-            return
-        result.add_fail("Frame Rate", f"{fps:.3f} fps is {multiple}x the {target:g} fps target; "
-                                      f"integer multiples are not allowed by this spec.")
+        elif not base_ok:
+            result.add_fail("Frame Rate", ntsc_fail)
+        else:
+            result.add_fail("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target; "
+                                          f"integer multiples are not allowed by this spec.")
         return
-    result.add_fail("Frame Rate", f"{fps:.3f} fps does not match the {target:g} ± {tolerance:g} fps target.")
+    result.add_fail("Frame Rate", f"{_rate_text(fps)} does not match the {typed:g} ± {tolerance:g} fps target.")
 
 
 # Intervals ignored at each edge of every packet window. Within a window
@@ -1362,12 +1548,69 @@ def check_color_hdr(probe_data: dict, result: QAResult, cfg: dict,
         if transfer not in allowed:
             problems.append(f"transfer is {label}, spec requires {required.upper()}")
 
+    hdr_gaps = _hdr_metadata_gaps(video, first_frame, transfer)
+    if hdr_gaps and required in ("pq", "hdr"):
+        problems.append(hdr_gaps)
+    advisories = _colour_signalling_advisories(video, first_frame, transfer, depth, cfg)
+    if hdr_gaps and required not in ("pq", "hdr"):
+        advisories.append(hdr_gaps)
+
     if problems:
-        result.add_fail("Color / HDR", f"{summary}. " + "; ".join(problems) + ".")
+        result.add_fail("Color / HDR", f"{summary}. " + "; ".join(problems + advisories) + ".")
+    elif advisories:
+        result.add_warn("Color / HDR", f"{summary}. " + "; ".join(advisories) + ".", confidence=80)
     else:
         enforced = [n for n, v in (("bit depth", min_depth), ("transfer", required)) if v not in ("any", None)]
         note = f" (meets spec: {', '.join(enforced)})" if enforced else " (not enforced by this spec)"
         result.add_pass("Color / HDR", summary + note)
+
+
+_UNSIGNALLED = ("", "unknown", "unspecified", "reserved", "none")
+
+
+def _hdr_metadata_gaps(video: dict, first_frame: dict, transfer: str) -> str:
+    """What a PQ (HDR10) stream lacks of its static metadata, or ''.
+
+    PQ is display-referred: without SMPTE ST 2086 mastering-display metadata
+    and a real MaxCLL/MaxFALL (CTA-861.3; 0 means "unknown") a display
+    tone-maps blindly, and HDR10 delivery specs (Netflix, Apple, Amazon)
+    require both. HLG is scene-referred (ITU-R BT.2100) and needs neither.
+    """
+    if transfer != "pq":
+        return ""
+    sides = list(video.get("side_data_list") or []) + list((first_frame or {}).get("side_data_list") or [])
+    missing = []
+    if not _side_data(sides, "Mastering display metadata"):
+        missing.append("SMPTE ST 2086 mastering-display metadata")
+    light = _side_data(sides, "Content light level metadata")
+    if not light:
+        missing.append("MaxCLL/MaxFALL")
+    elif not _safe_int(light.get("max_content"), 0):
+        missing.append("a real MaxCLL (it is 0, meaning unknown)")
+    if not missing:
+        return ""
+    return f"PQ HDR without {' or '.join(missing)}: displays tone-map without knowing the grade"
+
+
+def _colour_signalling_advisories(video: dict, first_frame: dict, transfer: str,
+                                  depth: Optional[int], cfg: dict) -> List[str]:
+    """Colour tags that are absent or contradict the picture (advisory; ITU-T H.273)."""
+    first_frame = first_frame or {}
+    matrix = str(video.get("color_space") or first_frame.get("color_space") or "").lower()
+    primaries = str(video.get("color_primaries") or first_frame.get("color_primaries") or "").lower()
+    width = _safe_int(video.get("width"), 0) or 0
+    out = []
+    if (cfg.get("warn_untagged_color", True) and matrix in _UNSIGNALLED and primaries in _UNSIGNALLED
+            and transfer == "unspecified"):
+        out.append("colour primaries, transfer and matrix are all unsignalled, so players guess "
+                   "(BT.601 or BT.709 by frame size) and colours can differ between players")
+    if width >= 1280 and matrix in ("smpte170m", "bt470bg"):
+        out.append(f"a BT.601 (SD) matrix is signalled on a {width}-wide HD picture; HD and UHD SDR use "
+                   f"BT.709, so colours decode shifted if the tag is wrong")
+    if transfer in ("pq", "hlg") and depth is not None and depth < 10:
+        out.append(f"{transfer.upper()} HDR is signalled on {depth}-bit video; ITU-R BT.2100 requires 10 or "
+                   f"12 bits, so this is most likely SDR tagged as HDR")
+    return out
 
 
 def _normalise_projection(name) -> str:
@@ -1406,11 +1649,18 @@ def _xr_metadata(video: dict, first_frame: dict) -> Tuple[Optional[str], Optiona
 
 
 def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
-                      first_frame: Optional[dict] = None):
+                      first_frame: Optional[dict] = None,
+                      structure: Optional["container_checks.Structure"] = None,
+                      grabber: Optional["container_checks.FrameGrabber"] = None):
     """Require the spherical / stereo-3D signalling a 360 or VR spec declares.
 
     A 360 file without spherical metadata plays flat on every headset and
     web player. With "any" the findings are reported but not enforced.
+    ``structure`` (the box reader's view) adds what ffprobe merges away:
+    V1-only or conflicting V1/V2 metadata, per-eye geometry, display
+    rotation on a spherical picture (container_checks.xr_metadata_findings).
+    ``grabber`` lets a spherical file's picture be compared with its stereo
+    tag (advisory content check, two downscaled frames).
     """
     video = _primary_video_stream(probe_data)
     if video is None:
@@ -1434,12 +1684,20 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
     if want_stereo != "any" and actual_stereo != want_stereo:
         problems.append(f"spec requires stereo layout {want_stereo}, file declares {actual_stereo}")
 
+    hard, soft, notes = container_checks.xr_metadata_findings(
+        video, projection, stereo, structure, cfg, grabber, _stream_duration(video) or _probed_duration(probe_data))
+    problems += hard
+    note = f" ({'; '.join(notes)})" if notes else ""
     if problems:
-        result.add_fail("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(problems) + ".")
+        result.add_fail("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(problems + soft) + "." + note)
+    elif soft:
+        content_only = all("content check" in text for text in soft)
+        result.add_warn("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(soft) + "." + note,
+                        confidence=60 if content_only else 80)
     else:
         enforced = want_projection != "any" or want_stereo != "any"
         result.add_pass("XR Metadata", f"{found[0].upper()}{found[1:]}"
-                        + (" (matches spec)" if enforced else " (not enforced by this spec)"))
+                        + (" (matches spec)" if enforced else " (not enforced by this spec)") + note)
 
 
 def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
@@ -1553,8 +1811,40 @@ def check_audio(probe_data: dict, result: QAResult, cfg: dict):
     _add_aggregate(result, "Audio Sample Rate", rates)
 
 
+def _av_end_entry(signed: float, frame: float, cfg: dict) -> Tuple[str, str]:
+    """(status, note) for audio ending ``signed`` seconds after (+) or before (-) the picture.
+
+    Telestream Qualify FC-108: audio may be no more than 2 frames shorter
+    than the video and no more than 2 s longer. Short audio up to
+    ``duration_mismatch_threshold`` is a warning (encoder tail padding varies
+    by an AAC frame or two); beyond it the end of the programme is silent.
+    """
+    short_tol = int(cfg.get("av_short_tolerance_frames", 2)) * frame
+    long_tol = float(cfg.get("av_long_tolerance_s", 2.0))
+    fail_short = max(float(cfg["duration_mismatch_threshold"]), short_tol)
+    frames = abs(signed) / frame if frame else 0.0
+    if signed < 0:
+        gap = -signed
+        text = f"audio ends {gap:.3f} s ({frames:.1f} frames) before the last frame"
+        if gap <= short_tol + 1e-3:
+            return "PASS", ""
+        if gap <= fail_short:
+            return "WARN", f"; {text} (Telestream FC-108 allows {short_tol / frame:g} frames)"
+        return "FAIL", f"; {text}: the end of the programme has no sound"
+    if signed <= short_tol + 1e-3:
+        return "PASS", ""
+    if signed <= long_tol:
+        return "PASS", f"; audio runs {signed:.3f} s past the last frame (within {long_tol:g} s)"
+    return "FAIL", f"; audio runs {signed:.3f} s past the last frame (more than {long_tol:g} s)"
+
+
 def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
-    """Compare each audio track's end against the video's end, tiered."""
+    """Compare each audio track's end against the video's end (asymmetric, Telestream FC-108).
+
+    A symmetric 0.5 s window passed audio that stopped 0.3 s early and
+    warned on audio that ran 1 s long, the opposite of what QC cares about:
+    short audio leaves the programme's end silent, long audio is trimmed.
+    """
     video = _primary_video_stream(probe_data)
     tracks = _audio_streams(probe_data)
     if video is None or not tracks:
@@ -1565,7 +1855,9 @@ def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
     def _start_of(stream):
         return _safe_float(stream.get("start_time"), 0.0) or 0.0
 
-    threshold = cfg["duration_mismatch_threshold"]
+    fps = (parse_frame_rate(video.get("avg_frame_rate", "0/0"))
+           or parse_frame_rate(video.get("r_frame_rate", "0/0")))
+    frame = 1.0 / fps if fps > 0 else 1.0 / 30
     entries = []
     worst_diff = 0.0
     for position, track in enumerate(tracks):
@@ -1574,16 +1866,14 @@ def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
         if v_dur is None or a_dur is None or v_dur <= 0 or a_dur <= 0:
             entries.append(("WARN", _with_track(label, "Per-stream duration not available.")))
             continue
-        # Compare stream ENDS: streams routinely start at different offsets.
-        diff = abs((_start_of(video) + v_dur) - (_start_of(track) + a_dur))
+        # Compare stream ENDS: streams routinely start at different offsets
+        # (the start offset itself is A/V Sync Offset's verdict).
+        signed = (_start_of(track) + a_dur) - (_start_of(video) + v_dur)
+        diff = abs(signed)
         worst_diff = max(worst_diff, diff)
-        text = f"Video: {v_dur:.2f}s, Audio: {a_dur:.2f}s (diff: {diff:.3f}s)"
-        if diff <= threshold:
-            entries.append(("PASS", _with_track(label, text)))
-        elif diff <= 2.0:
-            entries.append(("WARN", _with_track(label, text + ". Minor offset — usually safe but verify lip sync on dialogue.")))
-        else:
-            entries.append(("FAIL", _with_track(label, text + " -- significant mismatch")))
+        status, note = _av_end_entry(signed, frame, cfg)
+        text = f"Video: {v_dur:.2f}s, Audio: {a_dur:.2f}s (diff: {diff:.3f}s){note}"
+        entries.append((status, _with_track(label, text)))
     if v_dur:
         result.set_metadata("video_duration", round(v_dur, 3))
     first_audio = _safe_float(_stream_duration_text(tracks[0]))
@@ -2912,11 +3202,18 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
     check_cfr(probe_data, result, cfg, timing)
     check_scan_type(probe_data, result, cfg, first_frame)
     check_color_hdr(probe_data, result, cfg, first_frame)
-    check_xr_metadata(probe_data, result, cfg, first_frame)
+    # Box-level view of MP4/MOV files for the container/XR/conformance checks
+    # (container_checks.py); bounded and never raises.
+    structure = container_checks.read_structure(filepath)
+    check_xr_metadata(probe_data, result, cfg, first_frame, structure,
+                      container_checks.FrameGrabber(filepath, process_owner, cancel_event))
     check_bitrate(probe_data, result, cfg)
     check_audio(probe_data, result, cfg)
     check_av_duration_mismatch(probe_data, result, cfg)
     check_frame_count(probe_data, result, cfg)
+    projection = result.metadata.get("projection")
+    container_checks.run_structure_checks(filepath, structure, probe_data, result, cfg,
+                                          None if projection in (None, "none") else projection)
 
 
 def run_qa_checks(filepath: str, cfg: dict = None,

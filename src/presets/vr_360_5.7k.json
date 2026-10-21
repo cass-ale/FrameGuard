@@ -17,6 +17,7 @@
       "mp4"
     ],
     "audio_required": true,
-    "required_projection": "equirectangular"
+    "required_projection": "equirectangular",
+    "require_square_pixels": true
   }
 }

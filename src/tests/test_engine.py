@@ -41,7 +41,7 @@ def defect_clip(tmp_path_factory):
         "[1:a]volume=enable='between(t,10,16)':volume=0[a]",
         "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", str(out),
+        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-c:a", "aac", "-b:a", "128k", str(out),
     ], check=True, capture_output=True)
     return str(out)
 
@@ -57,7 +57,7 @@ def clean_clip(tmp_path_factory):
         "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=40",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=40",
         "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k", str(out),
+        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-c:a", "aac", "-b:a", "128k", str(out),
     ], check=True, capture_output=True)
     return str(out)
 

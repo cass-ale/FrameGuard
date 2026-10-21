@@ -287,7 +287,11 @@ class TestRotationAwareResolution:
         probe = self._probe(1920, 1080, side_data_list=[
             {"side_data_type": "Display Matrix", "rotation": 180}])
         check_resolution(probe, r, _cfg(target_width=1920, target_height=1080))
-        assert _status(r, "Resolution") == "PASS"
+        # 0.9.1: the size still matches (axes not swapped), but a 180-degree
+        # display matrix on a flat picture is now an advisory warning: NLEs
+        # that ignore it show the picture upside down.
+        assert _status(r, "Resolution") == "WARN"
+        assert "matches 1920x1080" in r.checks[-1][2] and "180" in r.checks[-1][2]
 
 
 # ---------------------------------------------------------------------------
@@ -317,12 +321,19 @@ class TestAVDurationAlignment:
 
     def test_equal_durations_with_shifted_audio_fail_to_warn_tier(self):
         """Equal durations but audio shifted 0.8s: ends differ by 0.8s,
-        which the old comparison scored as a perfect match."""
+        which the old comparison scored as a perfect match.
+
+        0.9.1: the ends follow Telestream FC-108 (audio may run up to 2 s
+        past the picture), so the end check passes; the 0.8 s start offset
+        is now judged, and failed, by A/V Sync Offset (EBU R37 budget)."""
+        from frameguard.container_checks import check_av_sync_offset
         r = QAResult("shifted.mov")
-        check_av_duration_mismatch(
-            self._probe(10.0, 10.0, v_start=0.0, a_start=0.8), r, _cfg())
-        assert _status(r, "A/V Duration") == "WARN"
+        probe = self._probe(10.0, 10.0, v_start=0.0, a_start=0.8)
+        check_av_duration_mismatch(probe, r, _cfg())
+        assert _status(r, "A/V Duration") == "PASS"
         assert r.metadata["av_duration_diff"] == 0.8
+        check_av_sync_offset(None, probe, r, _cfg())
+        assert _status(r, "A/V Sync Offset") == "FAIL"
 
     def test_missing_start_time_falls_back_to_duration_diff(self):
         r = QAResult("legacy.mov")

@@ -19,11 +19,15 @@ needs_ffmpeg = pytest.mark.skipif(not FFMPEG, reason="FFmpeg not available")
 SIZE = "320x240"
 DURATION = 6
 
+# Real encoders and cameras signal at least the colour matrix; a fully
+# untagged clip is now (0.9.1) an advisory Color / HDR finding, so the clean
+# fixtures carry BT.709 like real deliverables do.
+_COLOUR_TAGS = ["-colorspace", "bt709"]
 _VIDEO_ENCODERS = {
-    "h264": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p"],
+    "h264": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", *_COLOUR_TAGS],
     "hevc": ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-             "-x265-params", "log-level=error", "-tag:v", "hvc1"],
-    "prores": ["-c:v", "prores_ks", "-profile:v", "2"],
+             "-x265-params", "log-level=error", "-tag:v", "hvc1", *_COLOUR_TAGS],
+    "prores": ["-c:v", "prores_ks", "-profile:v", "2", *_COLOUR_TAGS],
 }
 
 
@@ -179,7 +183,7 @@ def make_open_gop_source(path, vcodec="h264", rate="30", duration=12):
                  "-x264-params", "keyint=45:min-keyint=45:open-gop=1:bframes=3:scenecut=0"]
     ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={SIZE}:r={rate}:d={duration}",
            "-f", "lavfi", "-i", f"sine=f=440:sample_rate=48000:d={duration}",
-           *video, "-pix_fmt", "yuv420p", "-c:a", "aac", str(path))
+           *video, "-pix_fmt", "yuv420p", *_COLOUR_TAGS, "-c:a", "aac", str(path))
     return str(path)
 
 

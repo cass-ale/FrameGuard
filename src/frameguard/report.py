@@ -1069,6 +1069,33 @@ def _loudness_spec(c: dict) -> str:
             f"TP ≤ {c.get('true_peak_max_dbtp')} dBTP")
 
 
+def _conformance_spec_rows(c: dict) -> List[tuple]:
+    """Spec rows for the 0.9.1 container / XR / conformance keys (container_checks.py)."""
+    def listed(key):
+        values = c.get(key) or ["any"]
+        return "any" if "any" in [str(v).lower() for v in values] else ", ".join(map(str, values))
+    rows = [
+        ("A/V start offset", f"warn beyond ±{c.get('av_offset_warn_ms', 5.0):g} ms; fail beyond "
+                             f"{c.get('av_offset_max_early_ms', 40.0):g} ms early / {c.get('av_offset_max_late_ms', 60.0):g} ms late"),
+        ("A/V end", f"audio ≤{c.get('av_short_tolerance_frames', 2)} frames short, ≤{c.get('av_long_tolerance_s', 2.0):g} s long"),
+        ("Profiles / pixel formats", f"{listed('allowed_video_profiles')} / {listed('allowed_pix_fmts')}"),
+    ]
+    if c.get("max_frame_pixels") or c.get("max_pixel_rate"):
+        rows.append(("Decoder ceiling", f"{int(c.get('max_frame_pixels') or 0):,} px/frame, "
+                                        f"{int(c.get('max_pixel_rate') or 0):,} px/s (0 = none)"))
+    flags = [label for key, label in (("require_square_pixels", "square pixels"),
+                                      ("require_faststart", "fast-start"),
+                                      ("allow_ntsc_rate_match", "NTSC rates match integer rates"))
+             if c.get(key)]
+    if str(c.get("spatial_audio", "any")) == "required":
+        flags.append("spatial audio required")
+    if flags:
+        rows.append(("Also required", ", ".join(flags)))
+    if c.get("disabled_checks"):
+        rows.append(("Checks switched off", ", ".join(c["disabled_checks"])))
+    return rows
+
+
 def spec_rows(config: dict) -> List[tuple]:
     """(label, value) pairs summarising the effective spec for the PDF."""
     if not config:
@@ -1090,6 +1117,7 @@ def spec_rows(config: dict) -> List[tuple]:
         ("Scan type", "progressive required" if c.get("require_progressive") else "interlaced allowed"),
         ("Bit depth / transfer", f"{_fmt_choice(c.get('min_bit_depth'))} / {_fmt_choice(c.get('required_transfer'))}"),
         ("Projection / stereo", f"{_fmt_choice(c.get('required_projection'))} / {_fmt_choice(c.get('required_stereo_mode'))}"),
+        *_conformance_spec_rows(c),
         ("Decode errors allowed", str(c.get("max_decode_errors"))),
         ("Black / freeze", f"≥{c.get('black_detect_duration')} s (pix {c.get('black_detect_pix_threshold')}) / "
                            f"≥{c.get('freeze_detect_duration')} s (noise {c.get('freeze_detect_noise')})"),

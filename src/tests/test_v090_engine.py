@@ -368,12 +368,16 @@ class TestXRMetadata:
         assert xr[1] == "FAIL" and "flat" in xr[2], xr
 
     def test_injected_equirect_top_bottom_is_found_and_matched(self, media):
+        # 0.9.1: a square frame (each eye 2:1, as Meta's top-bottom 360 spec
+        # requires) and V1-only metadata, which is now an advisory warning
+        # because the Spherical V2 RFC supersedes V1.
         clip = media.get("eq_tb.mp4", lambda p: inject_spherical(
-            make_clip(p, size="640x320", duration=3), stereo="top-bottom"))
-        assert _row(_scan(clip), "XR Metadata")[1] == "PASS"
+            make_clip(p, size="640x640", duration=3), stereo="top-bottom"))
+        relaxed = _row(_scan(clip), "XR Metadata")
+        assert relaxed[1] == "WARN" and "Spherical V1" in relaxed[2], relaxed
         matched = _row(_scan(clip, required_projection="equirectangular",
                              required_stereo_mode="top_bottom"), "XR Metadata")
-        assert matched[1] == "PASS" and "equirectangular" in matched[2], matched
+        assert matched[1] == "WARN" and "equirectangular" in matched[2], matched
         assert _row(_scan(clip, required_stereo_mode="mono"), "XR Metadata")[1] == "FAIL"
 
     def test_builtin_360_preset_requires_equirect(self):
