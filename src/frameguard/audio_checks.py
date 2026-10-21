@@ -153,7 +153,22 @@ HUM_NEIGHBOUR_HZ = 6          # reference bands 6 Hz either side of the mains to
 HUM_PROMINENCE_DB = 6.0       # mains band at least 6 dB above both neighbours
 HUM_STATIONARY_DB = 6.0       # 1 s RMS trough within 6 dB of the mean
 EDGE_MARGIN_S = 0.05          # dropouts this close to either end are fades
+# Line-up idents interrupt a steady tone on purpose: GLITS (BBC; also the
+# stereo part of EBU Tech 3304's BLITS) cuts L once and R twice for 250 ms
+# in a 4 s cycle of 1 kHz at -18 dBFS. A gap in this range with a steady
+# sinusoid on both sides is the ident, not a dropout.
+LINEUP_GAP_S = (0.20, 0.30)
+LINEUP_TONE_MIN_S = 0.08      # shortest steady-tone stretch the detector reports
+LINEUP_BEFORE_S = 0.15        # the tone must end within this of the gap start
+LINEUP_AFTER_S = 0.25         # ...and resume within this of its end (onset settling)
+# Steady-sinusoid detector (see _steady_tone_detector).
+TONE_FAST_S, TONE_SLOW_S, TONE_PEAK_S = 0.010, 0.040, 0.050
+TONE_STEADY_RATIO = 1.105     # fast/slow power within +-0.43 dB (e^+-0.1)
+TONE_CREST_POWER = 2.6        # peak^2 / mean power: sine 2 (3 dB crest), noise > 9
+TONE_FLOOR_DB = -50.0         # quieter than this is not a line-up tone
+TONE_RATE = 12000             # the detector runs on a copy resampled to this
 DROPOUT_SILENCE_GAP_S = 0.25  # a dropout this close to a long silence is part of it
+DROPOUT_JOIN_S = 0.005        # dropout / tone regions closer than this are one event
 
 
 def _number(cfg: dict, key: str) -> float:
@@ -389,21 +404,56 @@ def _signal_branches(i: int, names: Sequence[str], cfg: dict, max_split: int) ->
     return [(f"a{i}s", body)]
 
 
-def _channel_branches(i: int, names: Sequence[str], cfg: dict, max_split: int) -> List[Branch]:
+def _steady_tone_detector(sample_rate: int) -> str:
+    """aeval that outputs 0 while the channel is a steady sinusoid, else 1.
+
+    Per sample it keeps a 10 ms and a 40 ms one-pole average of x^2 and a
+    50 ms-decay peak follower. Steady: the two averages agree within
+    +-0.43 dB (a level that is not moving). Sinusoidal: peak^2 over mean
+    power below 2.6 (a sine is 2, i.e. a 3 dB crest factor; noise, speech
+    and chords exceed 9). Audible: above -50 dBFS. Frequency- and
+    level-independent above ~200 Hz, which covers line-up tones (1 kHz
+    GLITS/EBU R 68, 400 Hz); the 1-pole coefficients are computed for the
+    track's sample rate so the expression stays a few multiply-adds.
+    """
+    rate = max(8000, int(sample_rate or 48000))
+    fast = 1 - math.exp(-1 / (TONE_FAST_S * rate))
+    slow = 1 - math.exp(-1 / (TONE_SLOW_S * rate))
+    decay = math.exp(-1 / (TONE_PEAK_S * rate))
+    floor = 10 ** (TONE_FLOOR_DB / 10)
+    low = 1 / TONE_STEADY_RATIO
+    return ("aeval=exprs='"
+            f"st(0,ld(0)+{fast:.8g}*(val(0)*val(0)-ld(0)));"
+            f"st(1,ld(1)+{slow:.8g}*(val(0)*val(0)-ld(1)));"
+            f"st(2,max(abs(val(0)),ld(2)*{decay:.10g}));"
+            f"if(gt(ld(1),{floor:g})*lt(ld(0),{TONE_STEADY_RATIO:g}*ld(1))*gt(ld(0),{low:.6g}*ld(1))"
+            f"*lt(ld(2)*ld(2),{TONE_CREST_POWER:g}*ld(0)),0,1)'")
+
+
+def _channel_branches(i: int, track: dict, names: Sequence[str], cfg: dict,
+                      max_split: int) -> List[Branch]:
     """One mono branch per channel: silence at the channel threshold (dead
     channels, per-channel stretches) and dropouts (not on the LFE, which is
-    legitimately near-silent)."""
+    legitimately near-silent). With dropouts on, the steady-tone detector
+    feeds ``silencedetect@a<N>t<K>``, whose "silences" are the stretches
+    of steady sinusoid that line-up gaps are judged against."""
     if not 1 <= len(names) <= max_split:
         return []
     noise = _number(cfg, "channel_silence_noise_db")
     duration = float(cfg["silence_duration"])
     dropout = (f"silencedetect@a{i}d{{k}}=n={_number(cfg, 'dropout_noise_db')}dB"
                f":d={_number(cfg, 'dropout_min_ms') / 1000.0}")
+    # The detector needs no more than a 12 kHz rate for tones up to ~4 kHz
+    # (line-up tones are 1 kHz or 400 Hz); aeval interprets per sample, so
+    # this quarters its cost at 48 kHz.
+    rate = min(int(track.get("sample_rate") or 48000), TONE_RATE)
+    tone = f"aresample={rate},{_steady_tone_detector(rate)}"
     branches = []
     for k, name in enumerate(names):
         body = f"pan=mono|c0=c{k},silencedetect@a{i}c{k}=n={noise}dB:d={duration}"
         if check_enabled(cfg, DROPOUTS) and name != "LFE":
             body += "," + dropout.format(k=k)
+            body += f",{tone},silencedetect@a{i}t{k}=n=0.5:d={LINEUP_TONE_MIN_S:g}"
         branches.append((f"a{i}c{k}", body))
     return branches
 
@@ -473,7 +523,7 @@ def track_filter_chains(position: int, track: dict, names: Sequence[str], cfg: d
     i = position
     source = f"[0:{int(track['index'])}]"
     meter = loudness_meter(track, len(names), multichannel_meter) if loudness else METER_NONE
-    branches = (_signal_branches(i, names, cfg, max_split) + _channel_branches(i, names, cfg, max_split)
+    branches = (_signal_branches(i, names, cfg, max_split) + _channel_branches(i, track, names, cfg, max_split)
                 + _pair_branches(i, track, names, cfg))
     if meter == METER_LOUDNORM:
         # loudnorm resamples to 192 kHz internally: keep it off the mapped output.
@@ -655,14 +705,14 @@ Events = List[Tuple[float, float]]
 class ScanEvidence:
     """What core captured for one scan.
 
-    ``silence_events(instance, end)`` returns merged (start, duration)
-    silencedetect regions for a filter instance, open regions closed at
-    ``end``; ``detect_events(text, prefix)`` pairs ``<prefix>_start/_end``
+    ``silence_events(instance, end[, join_gap])`` returns merged (start,
+    duration) silencedetect regions for a filter instance, open regions
+    closed at ``end`` and regions closer than ``join_gap`` (0.25 s) fused; ``detect_events(text, prefix)`` pairs ``<prefix>_start/_end``
     tokens. Both are core's own parsers, so there is one implementation.
     """
 
     log_text: str
-    silence_events: Callable[[str, float], Events]
+    silence_events: Callable[..., Events]
     detect_events: Callable[[str, str], Events]
 
 
@@ -1069,21 +1119,30 @@ def dual_mono_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
     return ("WARN" if flagged else "PASS"), _with_label(ctx.label, "; ".join(texts) + suffix), confidence
 
 
-def dropout_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
-    """Short falls to digital silence inside otherwise active audio.
+def _inside_steady_tone(tones: Events, start: float, end: float) -> bool:
+    """A steady sinusoid ends just before the gap and resumes just after it
+    (one merged stretch spanning a short gap also counts)."""
+    before = any(s <= start - LINEUP_TONE_MIN_S and s + d >= start - LINEUP_BEFORE_S for s, d in tones)
+    after = any(s <= end + LINEUP_AFTER_S and s + d >= end + LINEUP_TONE_MIN_S for s, d in tones)
+    return before and after
 
-    A -90 dBFS region of 5 ms to ``silence_duration`` that does not touch a
-    long (-70 dB, >= silence_duration) silence of the same channel and does
-    not sit at either end of the track. Regions of different channels that
-    overlap are one event.
-    """
+
+def _dropout_candidates(evidence: ScanEvidence, ctx: TrackContext,
+                        cfg: dict) -> Tuple[List[Tuple[float, float, int, bool]], int]:
+    """(start, duration, channel, inside a steady tone) per candidate, and
+    the number of line-up ident gaps set aside."""
     longest = float(cfg["silence_duration"])
-    candidates: List[Tuple[float, float, int]] = []
+    candidates, lineup = [], 0
     for k in range(len(ctx.names)):
         if ctx.names[k] == "LFE" or k in ctx.dead_channels:
             continue
         silences = evidence.silence_events(f"silencedetect@a{ctx.position}c{k}", ctx.duration)
-        for start, dur in evidence.silence_events(f"silencedetect@a{ctx.position}d{k}", ctx.duration):
+        # Short gaps 250 ms apart (GLITS R) are separate events: the 0.25 s
+        # merge used for long silences would fuse them.
+        tones = evidence.silence_events(f"silencedetect@a{ctx.position}t{k}", ctx.duration,
+                                        DROPOUT_JOIN_S)
+        for start, dur in evidence.silence_events(f"silencedetect@a{ctx.position}d{k}",
+                                                  ctx.duration, DROPOUT_JOIN_S):
             end = start + dur
             if dur >= longest or start < EDGE_MARGIN_S:
                 continue
@@ -1092,20 +1151,44 @@ def dropout_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
             if any(s - DROPOUT_SILENCE_GAP_S < end and start < s + d + DROPOUT_SILENCE_GAP_S
                    for s, d in silences):
                 continue
-            candidates.append((start, dur, k))
+            in_tone = _inside_steady_tone(tones, start, end)
+            if in_tone and LINEUP_GAP_S[0] <= dur <= LINEUP_GAP_S[1]:
+                lineup += 1
+                continue
+            candidates.append((start, dur, k, in_tone))
+    return candidates, lineup
+
+
+def dropout_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
+    """Short falls to digital silence inside otherwise active audio.
+
+    A -90 dBFS region of 5 ms to ``silence_duration`` that does not touch a
+    long (-70 dB, >= silence_duration) silence of the same channel and does
+    not sit at either end of the track. Regions of different channels that
+    overlap are one event. A 200-300 ms gap with a steady sinusoid on both
+    sides is a line-up ident interruption (GLITS) and is not reported; any
+    other gap inside a tone still is, as a dropout in the line-up.
+    """
+    longest = float(cfg["silence_duration"])
+    candidates, lineup = _dropout_candidates(evidence, ctx, cfg)
+    ident = (f" {lineup} line-up ident interruption(s) (250 ms gaps in a steady tone) ignored."
+             if lineup else "")
     if not candidates:
         return "PASS", _with_label(ctx.label, f"No dropouts to ≤ {_number(cfg, 'dropout_noise_db'):g} dBFS "
-                                              f"between {_number(cfg, 'dropout_min_ms'):g} ms and {longest:g} s."), 100
-    merged = _merge([(s, d) for s, d, _ in candidates], gap=0.005)
+                                              f"between {_number(cfg, 'dropout_min_ms'):g} ms and "
+                                              f"{longest:g} s.{ident}"), 100
+    merged = _merge([(s, d) for s, d, _, _ in candidates], gap=0.005)
     labelled = []
     for start, dur in merged:
-        channels = sorted({k for s, d, k in candidates if s < start + dur and start < s + d})
-        labelled.append((start, dur, "+".join(_channel_text(ctx, k) for k in channels)))
+        hits = [c for c in candidates if c[0] < start + dur and start < c[0] + c[1]]
+        channels = "+".join(_channel_text(ctx, k) for k in sorted({c[2] for c in hits}))
+        where = ", in a steady tone" if all(c[3] for c in hits) else ""
+        labelled.append((start, dur, channels + where))
     shown = ", ".join(f"{_timecode(s)} ({d * 1000:.0f} ms, {names})" for s, d, names in labelled[:5])
     if len(labelled) > 5:
         shown += f", +{len(labelled) - 5} more"
     return "WARN", _with_label(ctx.label, f"{len(labelled)} dropout(s) to digital silence "
-                                          f"(≤ {_number(cfg, 'dropout_noise_db'):g} dBFS): {shown}."), 85
+                                          f"(≤ {_number(cfg, 'dropout_noise_db'):g} dBFS): {shown}.{ident}"), 85
 
 
 def channel_silence_entries(evidence: ScanEvidence, ctx: TrackContext, cfg: dict,

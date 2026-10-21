@@ -309,6 +309,50 @@ class TestDropouts:
         assert _row(result, "Audio Dropouts")[1] == "PASS"
         assert _row(result, "Audio Silence")[1] == "WARN"
 
+    # GLITS (EBU Tech 3304 / BBC): 1 kHz at -18 dBFS; in each 4 s cycle L is
+    # cut for 250 ms at 0 s and R twice, at 0.5 s and 1.0 s.
+    GLITS_TONE = "0.1259*sin(2*PI*1000*t)"
+
+    @classmethod
+    def _glits_then_programme(cls, gap_left, gap_right):
+        programme = NOISE.replace("random(0)", "random({seed})")
+        def channel(gaps, seed):
+            return (f"if(lt(t,8),if({gaps},0,{cls.GLITS_TONE}),"
+                    f"{programme.format(seed=seed)})")
+        return [channel(gap_left, 0), channel(gap_right, 1)]
+
+    def test_glits_ident_then_programme_is_not_a_dropout(self, media):
+        left = "lt(mod(t,4),0.25)"
+        right = "between(mod(t,4),0.5,0.75)+between(mod(t,4),1,1.25)"
+        clip = media.get("glits", lambda p: make_audio(
+            p, self._glits_then_programme(left, right), seconds=11))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "PASS" and "line-up ident" in row[2], row
+
+    def test_dropout_in_programme_after_the_ident_still_warns(self, media):
+        left = "lt(mod(t,4),0.25)+between(t,9.5,10)"
+        right = "between(mod(t,4),0.5,0.75)+between(mod(t,4),1,1.25)+between(t,9.5,10)"
+        exprs = [e.replace("if(lt(t,8),", "if(lt(t,8)+between(t,9.5,10),")
+                 for e in self._glits_then_programme(left, right)]
+        clip = media.get("glits_drop", lambda p: make_audio(p, exprs, seconds=11))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "00:00:09.5" in row[2] and "line-up ident" in row[2], row
+
+    @pytest.mark.parametrize("gap_s", [0.03, 0.1, 0.5])
+    def test_gap_in_a_tone_that_is_not_the_ident_pattern_warns(self, media, gap_s):
+        """Only the 250 ms ident interruption is exempt; other gaps in a
+        line-up tone are dropouts in the line-up."""
+        gap = f"if(between(t,2,{2 + gap_s}),0,{self.GLITS_TONE})"
+        clip = media.get(f"tonegap{gap_s}", lambda p: make_audio(p, [gap, gap]))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "in a steady tone" in row[2], row
+
+    def test_250ms_gap_in_programme_is_still_a_dropout(self, media):
+        gap = f"if(between(t,2,2.25),0,{NOISE})"
+        clip = media.get("prog250", lambda p: make_audio(p, [gap, gap.replace("random(0)", "random(1)")]))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "steady tone" not in row[2], row
+
     def test_clean_has_no_dropouts(self, clean):
         assert _row(_scan(clean), "Audio Dropouts")[1] == "PASS"
 
