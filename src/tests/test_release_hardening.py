@@ -7,6 +7,7 @@ build-time and release-pipeline contracts that have no other home.
 
 import hashlib
 import importlib.util
+import os
 import re
 from pathlib import Path
 from unittest import mock
@@ -815,3 +816,117 @@ class TestVersionValidatorLocations:
         result = self._run(tree)
         assert result.returncode == 1
         assert "installer_info.txt" in result.stdout
+
+
+@pytest.fixture
+def fg_main(tmp_path, monkeypatch):
+    """main.py loaded as a module (not __main__), logging into tmp_path."""
+    spec = importlib.util.spec_from_file_location(
+        "fgmain_crash_handling", str(SRC / "main.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(module, "_log_dir", lambda: str(tmp_path))
+    return module
+
+
+class TestCrashHandling:
+    """C-L1: unraisable/GC errors are logged without a modal dialog, and
+    per-crash logs are pruned to the newest few."""
+
+    def test_unraisable_errors_are_logged_without_a_dialog(
+            self, fg_main, tmp_path, monkeypatch):
+        import types
+
+        monkeypatch.setattr(
+            fg_main, "_show_error",
+            lambda *_a: pytest.fail("unraisable errors must not show a dialog"))
+        try:
+            raise RuntimeError("wrapped C/C++ object has been deleted")
+        except RuntimeError as error:
+            fg_main._unraisable_hook(types.SimpleNamespace(
+                exc_type=type(error), exc_value=error,
+                exc_traceback=error.__traceback__,
+                err_msg="Exception ignored in", object=object()))
+        log = (tmp_path / "frameguard_crash.log").read_text(encoding="utf-8")
+        assert "Unraisable Exception (logged only)" in log
+        assert "wrapped C/C++ object has been deleted" in log
+        assert "Context:   Exception ignored in" in log
+        assert list(tmp_path.glob("crash_*.log")) == []
+
+    def test_a_real_finalizer_error_reaches_the_log_not_a_dialog(
+            self, fg_main, tmp_path, monkeypatch):
+        import gc
+        import sys
+
+        monkeypatch.setattr(
+            fg_main, "_show_error",
+            lambda *_a: pytest.fail("unraisable errors must not show a dialog"))
+        monkeypatch.setattr(sys, "unraisablehook", fg_main._unraisable_hook)
+
+        class _Noisy:
+            def __del__(self):
+                raise ValueError("finalizer failed")
+
+        _Noisy()
+        gc.collect()
+        log = (tmp_path / "frameguard_crash.log").read_text(encoding="utf-8")
+        assert "finalizer failed" in log
+
+    def test_a_broken_unraisable_payload_never_raises(self, fg_main, monkeypatch):
+        monkeypatch.setattr(fg_main, "_append_crash_log",
+                            mock.Mock(side_effect=OSError("disk full")))
+        fg_main._unraisable_hook(object())  # no attributes at all
+
+    def test_real_crashes_still_tell_the_user_on_the_main_thread(
+            self, fg_main, tmp_path, monkeypatch):
+        shown = []
+        monkeypatch.setattr(fg_main, "_show_error", shown.append)
+        try:
+            raise KeyError("boom")
+        except KeyError as error:
+            fg_main._global_excepthook(type(error), error, error.__traceback__)
+        assert shown and "Unexpected Error" in shown[0]
+        assert len(list(tmp_path.glob("crash_*.log"))) == 1
+        assert "KeyError" in (tmp_path / "frameguard_crash.log").read_text(
+            encoding="utf-8")
+
+    def test_crash_logs_are_pruned_to_the_newest(self, fg_main, tmp_path, monkeypatch):
+        monkeypatch.setattr(fg_main, "_show_error", lambda *_a: None)
+        for index in range(25):
+            path = tmp_path / f"crash_20260101_0000{index:02d}_0.9.0.log"
+            path.write_text("old", encoding="utf-8")
+            stamp = 1_700_000_000 + index
+            os.utime(path, (stamp, stamp))
+        keep = tmp_path / "frameguard_fault.log"
+        keep.write_text("native", encoding="utf-8")
+
+        try:
+            raise RuntimeError("new crash")
+        except RuntimeError as error:
+            fg_main._global_excepthook(type(error), error, error.__traceback__)
+
+        remaining = sorted(p.name for p in tmp_path.glob("crash_*.log"))
+        assert len(remaining) == fg_main._MAX_CRASH_LOGS == 20
+        assert "crash_20260101_000000_0.9.0.log" not in remaining
+        assert "crash_20260101_000005_0.9.0.log" not in remaining
+        assert "crash_20260101_000006_0.9.0.log" in remaining
+        assert any("new crash" in (tmp_path / name).read_text(encoding="utf-8")
+                   for name in remaining)
+        assert keep.exists()
+
+    def test_running_crash_log_rotates_instead_of_growing_forever(
+            self, fg_main, tmp_path):
+        log = tmp_path / "frameguard_crash.log"
+        log.write_bytes(b"x" * (fg_main._MAX_CRASH_LOG_BYTES + 1))
+        fg_main._append_crash_log(str(tmp_path), "fresh entry\n")
+        assert log.read_text(encoding="utf-8") == "fresh entry\n"
+        assert (tmp_path / "frameguard_crash.log.1").stat().st_size > \
+            fg_main._MAX_CRASH_LOG_BYTES
+
+    def test_entry_point_installs_all_three_hooks(self):
+        source = (SRC / "main.py").read_text(encoding="utf-8")
+        entry = source[source.index('if __name__ == "__main__":'):]
+        for line in ("sys.excepthook = _global_excepthook",
+                     "threading.excepthook = _thread_excepthook",
+                     "sys.unraisablehook = _unraisable_hook"):
+            assert line in entry

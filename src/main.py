@@ -81,6 +81,162 @@ def _show_error(msg: str):
         pass
 
 
+# Per-crash files (crash_<timestamp>_<version>.log) are kept for diagnosis but
+# never pruned before 0.9.0; each holds full user file paths. Keep the newest
+# few, and bound the running frameguard_crash.log the same way.
+_MAX_CRASH_LOGS = 20
+_MAX_CRASH_LOG_BYTES = 1024 * 1024
+_CRASH_LOG_NAME = "frameguard_crash.log"
+
+
+def _prune_crash_logs(log_dir: str, keep: int = _MAX_CRASH_LOGS) -> int:
+    """Delete all but the newest ``keep`` per-crash files; return how many
+    were removed. Never raises: this runs inside the crash handler."""
+    try:
+        candidates = []
+        for name in os.listdir(log_dir):
+            if not (name.startswith("crash_") and name.endswith(".log")):
+                continue
+            path = os.path.join(log_dir, name)
+            try:
+                if os.path.isfile(path) and not os.path.islink(path):
+                    candidates.append((os.path.getmtime(path), name, path))
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    candidates.sort(reverse=True)
+    removed = 0
+    for _mtime, _name, path in candidates[max(keep, 0):]:
+        try:
+            os.remove(path)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _append_crash_log(log_dir: str, text: str) -> None:
+    """Append to frameguard_crash.log, rotating it to .1 past 1 MiB."""
+    path = os.path.join(log_dir, _CRASH_LOG_NAME)
+    try:
+        if os.path.getsize(path) > _MAX_CRASH_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _crash_report(title: str, exc_type, exc_value, exc_tb, timestamp,
+                  detail: str = "") -> str:
+    import traceback
+
+    tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        from frameguard import __version__ as ver
+    except Exception:
+        ver = "unknown"
+    name = getattr(exc_type, "__name__", str(exc_type))
+    return (
+        f"FrameGuard Desktop {title}\n"
+        f"{'=' * 60}\n"
+        f"Version:   {ver}\n"
+        f"Timestamp: {timestamp.isoformat()}\n"
+        f"Platform:  {sys.platform}\n"
+        f"Python:    {sys.version.split()[0]}\n"
+        f"Frozen:    {getattr(sys, 'frozen', False)}\n"
+        f"{'=' * 60}\n\n"
+        f"{detail}"
+        f"Exception: {name}: {exc_value}\n\n"
+        f"Traceback:\n{tb_text}\n"
+    )
+
+
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    """Log locally, keep a per-crash copy, and tell the user (main thread
+    only). Nothing is uploaded anywhere."""
+    from datetime import datetime as _dt
+
+    timestamp = _dt.now()
+    try:
+        crash_report = _crash_report(
+            "Crash Report", exc_type, exc_value, exc_tb, timestamp)
+    except Exception:
+        crash_report = f"FrameGuard Desktop Crash Report\n{exc_type}: {exc_value}\n"
+    log_dir = _log_dir()
+
+    # 1. Write to the running local log file.
+    try:
+        _append_crash_log(log_dir, crash_report)
+    except Exception:
+        pass
+
+    # 2. Keep a per-crash copy in the private log dir for diagnosis, and
+    #    prune old copies. Deliberately NOT ~/Documents: on macOS that
+    #    triggers a TCC consent dialog, and prompting from inside a crash
+    #    handler is the worst possible moment for it.
+    try:
+        try:
+            from frameguard import __version__ as ver
+        except Exception:
+            ver = "unknown"
+        crash_filename = f"crash_{timestamp.strftime('%Y%m%d_%H%M%S')}_{ver}.log"
+        with open(os.path.join(log_dir, crash_filename), "w",
+                  encoding="utf-8") as f:
+            f.write(crash_report)
+    except Exception:
+        pass  # Don't let crash reporting crash the crash handler
+    _prune_crash_logs(log_dir)
+
+    # 3. Show error dialog to user - only from the main thread. These
+    # hooks also fire on scan threads and thread-pool workers; building a
+    # QMessageBox there touches AppKit off the main thread, which macOS
+    # answers by aborting the whole process.
+    if threading.current_thread() is not threading.main_thread():
+        return
+    _show_error(
+        f"[FrameGuard] Unexpected Error\n\n"
+        f"{getattr(exc_type, '__name__', exc_type)}: {exc_value}\n\n"
+        f"A crash log has been saved locally for review."
+    )
+
+
+def _thread_excepthook(args):
+    """sys.excepthook only fires for the MAIN thread. Scans run on a QThread
+    and segment work on a QThreadPool, so an exception there used to vanish
+    with no log and no dialog - exactly the crashes worth hearing about."""
+    if args.exc_type is SystemExit:
+        return
+    _global_excepthook(args.exc_type, args.exc_value, args.exc_traceback)
+
+
+def _unraisable_hook(unraisable):
+    """Exceptions Python could not propagate (a failing __del__, a GC
+    callback, interpreter shutdown) are logged, never shown: they are not
+    crashes, and a modal "Unexpected Error" for one alarmed users over
+    harmless clean-up noise."""
+    try:
+        from datetime import datetime as _dt
+
+        detail = ""
+        message = getattr(unraisable, "err_msg", None)
+        if message:
+            detail += f"Context:   {message}\n"
+        obj = getattr(unraisable, "object", None)
+        if obj is not None:
+            try:
+                detail += f"Object:    {obj!r}"[:300] + "\n"
+            except Exception:
+                pass
+        _append_crash_log(_log_dir(), _crash_report(
+            "Unraisable Exception (logged only)",
+            unraisable.exc_type, unraisable.exc_value,
+            unraisable.exc_traceback, _dt.now(), detail + "\n"))
+    except Exception:
+        pass  # an unraisable hook must never raise
+
+
 def _extract_startup_preflight(argv):
     """Remove hidden startup-gate options before Qt sees the argument list."""
     scalar = {
@@ -189,85 +345,9 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-    # Global exception hook — prevents silent crashes in windowed mode
-    def _global_excepthook(exc_type, exc_value, exc_tb):
-        """Show error dialog and log locally. Nothing is uploaded anywhere."""
-        import traceback
-        from datetime import datetime as _dt
-        
-        timestamp = _dt.now()
-        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
-        
-        # Build crash report content
-        try:
-            from frameguard import __version__
-            ver = __version__
-        except Exception:
-            ver = "unknown"
-        
-        crash_report = (
-            f"FrameGuard Desktop Crash Report\n"
-            f"{'='*60}\n"
-            f"Version:   {ver}\n"
-            f"Timestamp: {timestamp.isoformat()}\n"
-            f"Platform:  {sys.platform}\n"
-            f"Python:    {sys.version.split()[0]}\n"
-            f"Frozen:    {getattr(sys, 'frozen', False)}\n"
-            f"{'='*60}\n\n"
-            f"Exception: {exc_type.__name__}: {exc_value}\n\n"
-            f"Traceback:\n{tb_text}\n"
-        )
-        
-        # 1. Write to local log file
-        try:
-            with open(os.path.join(_log_dir(), "frameguard_crash.log"), "a",
-                      encoding="utf-8") as f:
-                f.write(crash_report)
-        except Exception:
-            pass
-
-        # 2. Keep a per-crash copy in the private log dir for diagnosis.
-        #    Deliberately NOT ~/Documents: on macOS that triggers a TCC
-        #    consent dialog, and prompting from inside a crash handler is
-        #    the worst possible moment for it.
-        try:
-            crash_filename = f"crash_{timestamp.strftime('%Y%m%d_%H%M%S')}_{ver}.log"
-            with open(os.path.join(_log_dir(), crash_filename), "w",
-                      encoding="utf-8") as f:
-                f.write(crash_report)
-        except Exception:
-            pass  # Don't let crash reporting crash the crash handler
-        
-        # 3. Show error dialog to user - only from the main thread. These
-        # hooks also fire on scan threads, thread-pool workers and the GC;
-        # building a QMessageBox there touches AppKit off the main thread,
-        # which macOS answers by aborting the whole process.
-        if threading.current_thread() is not threading.main_thread():
-            return
-        _show_error(
-            f"[FrameGuard] Unexpected Error\n\n"
-            f"{exc_type.__name__}: {exc_value}\n\n"
-            f"A crash log has been saved locally for review."
-        )
-
+    # Global exception hooks — prevent silent crashes in windowed mode.
     sys.excepthook = _global_excepthook
-
-    # sys.excepthook only fires for the MAIN thread. Scans run on a QThread and
-    # segment work on a QThreadPool, so an exception there used to vanish with
-    # no log and no dialog - exactly the crashes worth hearing about.
-    def _thread_excepthook(args):
-        if args.exc_type is SystemExit:
-            return
-        _global_excepthook(args.exc_type, args.exc_value, args.exc_traceback)
-
     threading.excepthook = _thread_excepthook
-
-    # Exceptions Python could not propagate (e.g. inside __del__ during
-    # interpreter shutdown, or a failing C-level callback).
-    def _unraisable_hook(unraisable):
-        _global_excepthook(unraisable.exc_type, unraisable.exc_value,
-                           unraisable.exc_traceback)
-
     sys.unraisablehook = _unraisable_hook
 
     # Native crashes (segfault in a Qt or FFmpeg binding) bypass Python
