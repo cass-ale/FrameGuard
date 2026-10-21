@@ -12,7 +12,10 @@ Features:
 - Batch collection: accumulates files during a settling window before emitting
 - Burst detection: speeds up polling when new files are arriving
 - Manual sync: button to re-scan and pick up missed files
-- Robust stability check: files must be stable for 2 consecutive polls
+- Robust stability check: files must be stable for 3 consecutive polls and
+  10 s, plus an exclusive-open probe on Windows
+- Subfolders (camera-card layouts such as DCIM/100GOPRO, PRIVATE/M4ROOT/CLIP)
+  are scanned to a bounded depth, skipping hidden and system folders
 """
 
 import os
@@ -57,11 +60,24 @@ BATCH_SETTLE_MS = 4000  # 4 seconds after last new file detected
 MAX_BATCH_AGE_MS = 60_000   # flush at least once a minute
 MAX_BATCH_SIZE = 50         # or once this many files are waiting
 
-# A file must hold the same size across this many consecutive polls AND for at
-# least this long in wall-clock terms before it is considered finished. One
-# unchanged poll (the old behaviour) declares a stalled network copy complete.
-STABLE_POLLS_REQUIRED = 2
-MIN_STABLE_SECONDS = 3.0
+# A file must hold the same identity across this many consecutive polls AND
+# for at least this long in wall-clock terms before it is considered finished.
+# Two polls over 3 s declared stalled network copies complete; with a 10 s
+# window a copy has to stall for longer than most SMB/Drive hiccups, and a
+# truncated file that still slips through now FAILs File Integrity.
+STABLE_POLLS_REQUIRED = 3
+MIN_STABLE_SECONDS = 10.0
+
+# Subfolder scanning. Depth 4 below the watch root covers camera-card layouts
+# (PRIVATE/M4ROOT/CLIP, CONTENTS/CLIPS001, DCIM/100GOPRO).
+DEFAULT_RECURSIVE = True
+DEFAULT_MAX_DEPTH = 4
+# The poll runs on the GUI thread; a pathological tree must not stall it.
+MAX_SCAN_ENTRIES = 20000
+IGNORED_DIR_NAMES = frozenset(name.lower() for name in (
+    "$RECYCLE.BIN", "System Volume Information", "RECYCLER", "__MACOSX",
+    "@eaDir", "#recycle", "#snapshot", "lost+found", "node_modules",
+))
 
 # Stop hammering a folder that keeps failing (unmounted share, revoked rights).
 MAX_CONSECUTIVE_ERRORS = 5
@@ -135,6 +151,11 @@ def _get_file_identity_safe(filepath: str) -> Optional[FileIdentity]:
     )
 
 
+def _is_scannable_dir(name: str) -> bool:
+    """Skip hidden folders (.Trashes, .Spotlight-V100 ...) and system folders."""
+    return not name.startswith(".") and name.lower() not in IGNORED_DIR_NAMES
+
+
 def _get_file_size_safe(filepath: str) -> int:
     """Get regular-file size, returning -1 when it cannot be read safely."""
     identity = _get_file_identity_safe(filepath)
@@ -146,21 +167,41 @@ def _is_watch_directory(path: Optional[str]) -> bool:
     return bool(path) and not os.path.islink(path) and os.path.isdir(path)
 
 
+def _windows_exclusive_open(filepath: str) -> bool:
+    """Open with share mode 0: refused while any other process has the file open.
+
+    CPython's open() always shares, so it cannot tell whether a copy tool is
+    still writing. CreateFileW with dwShareMode=0 fails with a sharing
+    violation exactly when another handle exists.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    generic_read, open_existing = 0x80000000, 3
+    handle = create_file(filepath, generic_read, 0, None, open_existing, 0x80, None)
+    invalid = wintypes.HANDLE(-1).value
+    if handle in (None, invalid):
+        return False
+    kernel32.CloseHandle(handle)
+    return True
+
+
 def _can_open_exclusively(filepath: str) -> bool:
     """Best-effort check that nothing else is still writing the file.
 
-    On Windows the rename-onto-itself is the meaningful part: it is refused
-    while another process holds the file without FILE_SHARE_DELETE. The plain
-    open is NOT exclusive (CPython opens with full sharing), and on POSIX
-    there is no equivalent guarantee at all, so this only ever supplements the
-    size/age checks — it never replaces them.
+    Windows: a genuinely exclusive open (share mode 0). POSIX has no
+    equivalent guarantee, so there this only proves the file is readable and
+    the size/age window does the real work.
     """
     try:
         if os.name == "nt":
-            handle = os.open(filepath, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-            os.close(handle)
-            os.rename(filepath, filepath)
-            return True
+            return _windows_exclusive_open(filepath)
         with open(filepath, "rb"):
             return True
     except OSError:
@@ -216,6 +257,9 @@ class WatchFolderMonitor(QObject):
         self._enabled = False
         self._poll_interval = DEFAULT_POLL_INTERVAL_MS
         self._in_burst_mode = False
+        self._recursive = DEFAULT_RECURSIVE
+        self._max_depth = DEFAULT_MAX_DEPTH
+        self._entry_cap_reported = False
         
         # Main polling timer
         self._timer = QTimer(self)
@@ -348,6 +392,29 @@ class WatchFolderMonitor(QObject):
             if self._batch_queue:
                 self._settle_timer.start(BATCH_SETTLE_MS)
     
+    def set_recursive(self, enabled: bool, max_depth: int = DEFAULT_MAX_DEPTH):
+        """Scan subfolders (default on) down to ``max_depth`` levels below the root.
+
+        Re-baselines on the current folder so switching it on does not
+        suddenly queue every clip already sitting in subfolders.
+        """
+        self._recursive = bool(enabled)
+        self._max_depth = max(0, int(max_depth))
+        if self._watch_path:
+            found = self._scan_directory()
+            if found is not None:
+                new_known = found - self._known_files
+                for path in new_known:
+                    identity = _get_file_identity_safe(path)
+                    if identity is not None:
+                        self._known_files.add(path)
+                        self._known_identities[path] = identity
+                        self._emitted_files.add(path)
+
+    @property
+    def recursive(self) -> bool:
+        return self._recursive
+
     def set_poll_interval(self, ms: int):
         """Set polling interval in milliseconds (minimum 1000ms)."""
         self._poll_interval = max(1000, ms)
@@ -416,30 +483,23 @@ class WatchFolderMonitor(QObject):
             self.status_changed.emit("Sync: no new files found")
     
     def _scan_directory(self) -> Optional[Set[str]]:
-        """Video files in the watch folder, or None if the folder can't be read.
+        """Video files under the watch folder, or None if it can't be read.
 
         Returning None rather than a partial set matters: a scandir that throws
         part-way used to hand back whatever it had collected, which then pruned
-        live stability state for every file it hadn't reached yet.
+        live stability state for every file it hadn't reached yet. Only the
+        root counts: an unreadable subfolder is skipped, not fatal.
         """
         if not _is_watch_directory(self._watch_path):
             return None
 
-        files = set()
+        files: Set[str] = set()
+        budget = [MAX_SCAN_ENTRIES]
         try:
-            with os.scandir(self._watch_path) as it:
-                for entry in it:
-                    try:
-                        if (not entry.is_symlink()
-                                and entry.is_file(follow_symlinks=False)
-                                and _is_video_file(entry.path)):
-                            files.add(entry.path)
-                    except OSError:
-                        continue  # entry vanished mid-iteration
+            self._scan_level(self._watch_path, 0, files, budget, root=True)
         except OSError as e:
             self._consecutive_errors += 1
-            # Report once, not on every poll: this used to spam the status
-            # label several times a second for as long as the fault persisted.
+            # Report once, not on every poll.
             if self._consecutive_errors == 1:
                 self.error.emit(f"Cannot read the watch folder: {e}")
             if self._consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
@@ -448,7 +508,48 @@ class WatchFolderMonitor(QObject):
                 self.status_changed.emit("Stopped \u2014 folder could not be read")
             return None
 
+        if budget[0] <= 0 and not self._entry_cap_reported:
+            self._entry_cap_reported = True
+            self.status_changed.emit(
+                f"Watch folder has more than {MAX_SCAN_ENTRIES} entries; only the "
+                f"first {MAX_SCAN_ENTRIES} are monitored. Watch a narrower folder.")
         return files
+
+    def _scan_level(self, directory: str, depth: int, files: Set[str],
+                    budget: list, root: bool = False) -> None:
+        """Collect videos in ``directory``; recurse into eligible subfolders.
+
+        Symlinked folders are never followed (loops, escapes from the root);
+        hidden and system folders are skipped. OSError from the root
+        propagates; from a subfolder it is ignored.
+        """
+        subdirs = []
+        try:
+            with os.scandir(directory) as it:
+                for entry in it:
+                    if budget[0] <= 0:
+                        break
+                    budget[0] -= 1
+                    try:
+                        if entry.is_symlink():
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            if _is_video_file(entry.path):
+                                files.add(entry.path)
+                        elif (entry.is_dir(follow_symlinks=False)
+                              and self._recursive and depth < self._max_depth
+                              and _is_scannable_dir(entry.name)):
+                            subdirs.append(entry.path)
+                    except OSError:
+                        continue  # entry vanished mid-iteration
+        except OSError:
+            if root:
+                raise
+            return
+        for subdir in sorted(subdirs):
+            if budget[0] <= 0:
+                return
+            self._scan_level(subdir, depth + 1, files, budget)
 
     def _enter_burst_mode(self):
         """Switch to faster polling to catch straggling files."""

@@ -28,6 +28,10 @@ def _stable_test_environment(qapp, monkeypatch):
     default, while TestExclusiveOpenProbe calls the saved real implementation.
     """
     monkeypatch.setattr(W, "_can_open_exclusively", lambda _path: True)
+    # State-transition tests were written against a two-poll window; the
+    # shipped window (three polls, ten seconds) is pinned separately in
+    # TestStableWindow.
+    monkeypatch.setattr(W, "STABLE_POLLS_REQUIRED", 2)
     return qapp
 
 
