@@ -8386,6 +8386,13 @@ class _SingleInstanceServer(QObject):
         data = self._buffers.pop(socket, None)
         if data is None:
             return
+        # The client disconnects straight after writing; read anything not
+        # yet delivered through readyRead so a disconnect that arrives first
+        # can never drop the forwarded paths.
+        try:
+            data += bytes(socket.readAll())
+        except RuntimeError:
+            pass
         try:
             paths = json.loads(data.decode("utf-8") or "{}").get("paths", [])
         except (ValueError, AttributeError):
