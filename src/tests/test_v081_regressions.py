@@ -236,10 +236,8 @@ class TestUpdaterTrustAndFailures:
             raise urllib.error.URLError("certificate verify failed")
 
         monkeypatch.setattr("urllib.request.urlopen", _boom)
-        monkeypatch.setattr(U, "get_default_search_paths", lambda: [])
         manager = U.UpdateManager()
         monkeypatch.setattr(manager, "check_channel_for_delta", lambda: False)
-        monkeypatch.setattr(manager, "get_update_source", lambda: "")
         failures, none = [], []
         manager.check_failed.connect(failures.append)
         manager.update_not_found.connect(lambda: none.append(True))
@@ -520,14 +518,33 @@ class TestReviewFollowUps:
         monkeypatch.setattr(U.sys, "platform", "darwin")
         monkeypatch.setattr(U.subprocess, "Popen",
                             lambda *_a, **_k: (_ for _ in ()).throw(OSError("launch failed")))
-        installer = tmp_path / "FrameGuard-arm64.dmg"
-        installer.write_bytes(b"installer")
+
+        class _Response:
+            status = 200
+            headers = {"Content-Length": "9"}
+
+            def __init__(self):
+                import io
+                self._io = io.BytesIO(b"installer")
+
+            def read(self, size=-1):
+                return self._io.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _Response())
         manager = U.UpdateManager()
         applied = []
         manager.apply_failed.connect(applied.append)
         manager._do_apply(U.UpdateInfo(
-            version="9.9.9", installer_path=str(installer),
-            sha256=hashlib.sha256(b"installer").hexdigest(), size_bytes=9))
+            version="9.9.9",
+            installer_path="https://example.test/FrameGuard-arm64.dmg",
+            sha256=hashlib.sha256(b"installer").hexdigest(), size_bytes=9,
+            asset_name="FrameGuard-arm64.dmg"))
         qapp.processEvents()
         assert applied and "launch failed" in applied[-1]
 

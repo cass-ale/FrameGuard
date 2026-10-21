@@ -296,7 +296,7 @@ class TestUpdaterApi:
         from frameguard.updater import UpdateManager
 
         for m in ("start_auto_check", "check_now", "apply_update",
-                  "get_update_source", "set_update_source"):
+                  "cancel_update", "check_channel_for_delta"):
             assert callable(getattr(UpdateManager, m, None)), m
 
     def test_deleted_qobject_signal_is_safe_during_background_shutdown(self):
