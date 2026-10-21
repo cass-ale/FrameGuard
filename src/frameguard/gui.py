@@ -2765,6 +2765,13 @@ class ResultsPanel(QWidget):
         if hasattr(self, "table"):
             self._rebalance_name_columns()
 
+    def showEvent(self, event):
+        # Results that arrive while another page is showing are laid out
+        # against a stale viewport; re-fit once the page is visible.
+        super().showEvent(event)
+        if hasattr(self, "table"):
+            QTimer.singleShot(0, self._rebalance_name_columns)
+
     def _autosize_metadata_columns(self):
         """Fit Status/Codec/Resolution/Duration to their widest actual value.
 
@@ -4409,15 +4416,20 @@ class ChecksPanel(QWidget):
         self._results = list(results)
         t = get_theme()
 
-        # Column order: first-seen order across the batch, so it matches the
-        # order checks actually run in rather than an arbitrary sort.
-        columns, seen = [], set()
+        # Column order: checks with a failure first, then warnings, then the
+        # rest, each group in the order checks run. 0.9.0 has ~20 checks, so
+        # in run order the failing columns sat off-screen to the right.
+        columns, seen, worst = [], set(), {}
+        rank = {"FAIL": 0, "WARN": 1}
         for r in self._results:
             for check in r.checks:
                 name = check[0]
                 if name not in seen:
                     seen.add(name)
                     columns.append(name)
+                status = check[1] if len(check) > 1 else ""
+                worst[name] = min(worst.get(name, 2), rank.get(status, 2))
+        columns.sort(key=lambda name: worst.get(name, 2))  # stable: keeps run order
         self._columns = columns
 
         has_data = bool(self._results and columns)

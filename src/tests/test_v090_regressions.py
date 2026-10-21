@@ -473,3 +473,19 @@ def test_lazily_imported_modules_are_frozen_into_the_app():
     spec = (SRC / "frameguard.spec").read_text(encoding="utf-8")
     for module in ("'PySide6.QtNetwork'", "'truststore'", "'truststore._api'"):
         assert module in spec, module
+
+
+def test_checks_matrix_puts_problem_columns_first(qapp):
+    from frameguard.gui import ChecksPanel
+    from tests.conftest import make_result
+    clean = make_result(name="a.mov", outcome="pass")
+    failing = make_result(name="b.mov", outcome="fail")
+    panel = ChecksPanel()
+    panel.set_results([clean, failing])
+    worst = {}
+    for r in (clean, failing):
+        for name, status, *_ in r.checks:
+            worst[name] = min(worst.get(name, 2), {"FAIL": 0, "WARN": 1}.get(status, 2))
+    ranks = [worst[name] for name in panel._columns]
+    assert ranks == sorted(ranks), ranks
+    assert ranks and ranks[0] == 0

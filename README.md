@@ -1,26 +1,48 @@
-# FrameGuard Desktop
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/banner-dark.png">
+    <img alt="FrameGuard: video QA for XR deliverables, macOS and Windows" src="assets/brand/banner-light.png" width="100%">
+  </picture>
+</p>
 
-**Video QA for XR Deliverables — Windows and macOS**
+<p align="center">
+  <a href="https://github.com/cass-ale/FrameGuard/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/cass-ale/FrameGuard?label=release&color=2E6BFF"></a>
+  <a href="https://github.com/cass-ale/FrameGuard/actions/workflows/tests.yml"><img alt="Tests" src="https://github.com/cass-ale/FrameGuard/actions/workflows/tests.yml/badge.svg?branch=main"></a>
+  <img alt="Platforms: macOS 12+ and Windows 10/11" src="https://img.shields.io/badge/platforms-macOS%2012%2B%20%C2%B7%20Windows%2010%2F11-151722">
+  <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-151722"></a>
+</p>
 
-**Published by Capri la Ria · Developed by Cassian Aléria**
+<p align="center">
+  <b>Published by Capri la Ria · Developed by Cassian Aléria</b><br>
+  <a href="#download">Download</a> · <a href="#see-it-work">See it work</a> · <a href="#what-it-checks">What it checks</a> · <a href="#presets">Presets</a> · <a href="#build-from-source">Build from source</a>
+</p>
 
-[![Tests](https://github.com/cass-ale/FrameGuard/actions/workflows/tests.yml/badge.svg?branch=main)](https://github.com/cass-ale/FrameGuard/actions/workflows/tests.yml)
+FrameGuard checks video files against a delivery specification before they leave set
+or the edit: resolution, frame rate, codecs, audio, loudness, XR metadata and every
+decoded frame. Each file gets a plain-language verdict, the evidence behind it, and a
+report you can hand over. Everything runs locally; no footage leaves the machine.
 
-FrameGuard validates video files against configurable delivery specifications, running
-automated checks across metadata, codec compliance, audio integrity, and deep signal
-analysis. All processing happens locally — no data leaves your machine.
+## See it work
 
-## Demo
+![A real FrameGuard v0.9.0 deep scan of six files in the Blue Hour theme: two pass, two pass with warnings and two fail, shown on the Results page and in the Checks matrix](assets/screenshots/scan.gif)
 
-![A real FrameGuard v0.8.3 deep scan of six files in the Blue Hour theme: two pass, two pass with warnings and two fail, shown on the Results page and in the Checks matrix](assets/screenshots/scan.gif)
+A real deep scan in FrameGuard v0.9.0: six test files against the 4K UHD @ 30 fps
+profile. Two pass, two pass with warnings (a burst of black frames, a stretch of
+silence) and two fail (a 1080p 24 fps proxy, and a 4K file encoded at less than half
+the minimum bitrate). It ends on the Checks matrix, where the failing checks come first.
 
-A real deep scan in FrameGuard v0.8.3: six test files checked against the 4K UHD @ 30 fps profile. Two pass, two pass with warnings (a burst of black frames, a stretch of silence) and two fail (a 1080p 24 fps proxy, and a 4K file encoded at less than half the minimum bitrate). The demo then steps through a failure, a warning and a pass on the Results page and ends on the Checks matrix.
-
-[Watch the longer v0.8.0 walkthrough (MP4)](assets/frameguard-demo.mp4). It shows an earlier version of the interface.
+<table>
+  <tr>
+    <td width="33%" valign="top"><b>Catches what breaks deliveries</b><br>Truncated copies, decode errors, wrong frame rate or size, variable frame rate, interlacing, silent or dead audio channels, missing 360 metadata.</td>
+    <td width="33%" valign="top"><b>Explains every verdict</b><br>One readable line per file, the measured value next to the spec for every check, and anything that could not be verified says so instead of passing.</td>
+    <td width="33%" valign="top"><b>Fits the workflow</b><br>Drop a card or folder, watch a folder unattended, open results in any player, and export a PDF with JSON and CSV data beside it.</td>
+  </tr>
+</table>
 
 ## Screenshots
 
-Every image below was captured from the running application (v0.8.3) after a real scan of the same six test files. Nothing was mocked up or edited.
+Every image was captured from the running application (v0.9.0) after a real scan of
+the same six files. Nothing was mocked up or edited.
 
 | | |
 |:---:|:---:|
@@ -28,20 +50,24 @@ Every image below was captured from the running application (v0.8.3) after a rea
 | **Results** · Blue Hour | **Results** · Clean Light |
 | ![Scan page during a deep scan, showing the queue and progress](assets/screenshots/scan-running-blue-hour.png) | ![Scan page after the scan, with the completion banner](assets/screenshots/scan-clean-light.png) |
 | **Scanning** · Blue Hour | **Scan complete** · Clean Light |
-| ![Checks matrix: every file against every check](assets/screenshots/checks-nord-frost.png) | ![Open With menu listing the video players installed on the Mac](assets/screenshots/open-with-blue-hour.png) |
+| ![Checks matrix with the failing Resolution, Frame Rate and Bitrate columns first](assets/screenshots/checks-nord-frost.png) | ![Open With menu listing the video players installed on the Mac](assets/screenshots/open-with-blue-hour.png) |
 | **Checks matrix** · Nord Frost | **Open With** · Blue Hour |
 | ![Settings page](assets/screenshots/settings-warm-cream.png) | ![Watch Folder page with the activity log](assets/screenshots/watch-abyss-teal.png) |
 | **Settings** · Warm Cream | **Watch Folder** · Abyss Teal |
 
-The menus in the Open With image were captured from the live menus and composited onto the window, because they open as separate pop-up windows. The players listed are the ones installed on the capture machine.
+The Open With image composites the live menus onto the window, because they open as
+separate pop-up windows. The players listed are the ones installed on the capture machine.
 
-### PDF report
+### Reports
 
-The same scan exported as a PDF. The report follows the active theme. Download the [sample report (PDF)](assets/screenshots/sample-report.pdf).
+The same scan exported as a PDF that follows the active theme. Page 1 records the
+exact specification, thresholds and tool versions the verdicts were made against.
+JSON and CSV files with every check, the metadata and the effective configuration are
+written next to each PDF. Download the [sample report (PDF)](assets/screenshots/sample-report.pdf).
 
 | | |
 |:---:|:---:|
-| ![PDF report page 1 in Clean Light: summary badges, batch summary table and the first file's checks](assets/screenshots/report-clean-light-p1.png) | ![PDF report page 2 in Blue Hour: a file's checks continued from page 1, with the next file kept together](assets/screenshots/report-blue-hour-p2.png) |
+| ![PDF report page 1 in Clean Light: summary badges, batch summary and the scan specification](assets/screenshots/report-clean-light-p1.png) | ![PDF report page 2 in Blue Hour: per-file check detail](assets/screenshots/report-blue-hour-p2.png) |
 | Page 1 · Clean Light | Page 2 · Blue Hour |
 
 ## Download
@@ -82,80 +108,114 @@ for the signing status and roadmap.
 
 **Updates:** FrameGuard checks GitHub Releases automatically and offers the
 correct Windows, Apple Silicon, or Intel installer when a newer version is
-available. Teams with their own filesystem or static artifact host can opt into
-differential updates from Settings; no extra channel is required for normal use.
+available. Downloads are verified against the release's published SHA-256
+over a connection checked with the operating system's own certificate store,
+and Windows updates install silently and reopen FrameGuard. Teams with their own
+file share or HTTPS artifact host can opt into differential updates from
+Settings; no extra channel is required for normal use.
 
-Prefer to run from source? See [Quick start](#quick-start) below.
+Prefer to run from source? See [Build from source](#build-from-source) below.
 
 ## Why
 
-XR and high-volume video shoots produce hundreds of files a day. Checking each one by
-hand — resolution, frame rate, codecs, audio, corrupt frames — is slow, inconsistent,
-and easy to get wrong at the end of a long shoot day. A bad file discovered in post
-can mean an expensive reshoot or a compromised deliverable.
+XR and high-volume shoots produce hundreds of files a day. Checking each one by hand
+(resolution, frame rate, codecs, audio, corrupt frames) is slow, inconsistent and easy
+to get wrong at the end of a long day. A bad file discovered in post can mean an
+expensive reshoot or a compromised deliverable.
 
-FrameGuard automates the tedious, error-prone part: point it at a folder and it checks
-every file against your delivery spec, tells you what failed and why, and hands you a
-PDF report. Hours of manual QC become a background task.
+FrameGuard automates the error-prone part: point it at a folder and it checks every
+file against your delivery spec, tells you what failed and why, and hands you a report.
+Hours of manual QC become a background task.
+
+## What it checks
+
+Only **essential** checks decide pass or fail. **Advisory** checks produce a warning
+(`PASS_WITH_WARNINGS`), as does anything that could not be verified, so a file is never
+a clean pass on the strength of a check that did not run.
+
+| Area | Check | Verdict | What it means |
+|------|-------|---------|---------------|
+| File | Container Format | Essential | Extension is in the accepted containers |
+| File | **File Integrity** | Essential | Every stream decodes to at least 98% of what its header declares, with no more decoder errors than allowed (default 0). Catches truncated copies and corrupt media |
+| Video | Video Codec | Essential | Codec is in the accepted list |
+| Video | Resolution | Essential | Matches the spec exactly (optionally allow larger frames) |
+| Video | Aspect Ratio | Essential | Display aspect, accounting for pixel aspect ratio |
+| Video | Frame Rate | Essential | Within tolerance of the target (optionally allow integer multiples) |
+| Video | CFR Check | Essential | Measured from real frame timestamps; fails when more than 1% of intervals are irregular |
+| Video | Scan Type | Essential | Interlaced content fails when the spec requires progressive (the default) |
+| Video | Color / HDR | Essential | Reports bit depth and transfer (SDR, PQ, HLG); enforced when the spec sets them |
+| Video | XR Metadata | Essential | Spherical projection and stereo layout; required on 360 presets, reported otherwise |
+| Video | Bitrate | Essential | Passes within 10% under the minimum, warns at 10–25% under, fails beyond |
+| Audio | Audio Stream, Codec, Channels, Sample Rate | Essential | Checked on **every** audio track |
+| Audio | A/V Duration | Essential | Each track's end time against the video |
+| Audio | Audio Silence | Essential | Sustained silence per track; a track silent for 95% or more fails |
+| Audio | Dead Channel | Essential | A silent channel in stereo fails; in multichannel it warns (LFE is reported only) |
+| Audio | Audio Loudness | Advisory by default | EBU R128 integrated loudness and true peak (default −23 LUFS ± 2, TP ≤ −1 dBTP); can be made essential or turned off |
+| Frames | Black Frames, Freeze Frames | Advisory | Absolute timestamps; short fades are ignored |
+| Frames | Frame Count | Advisory | Frames against duration × frame rate |
+
+Deep scans decode every frame once, in software, so damaged files get the same
+verdict on every machine. Quick scans read only the headers and therefore always
+finish with a warning.
 
 ## Features
 
-### Scan engine
+**Scanning**
+- Drag files, folders, camera cards or `.fg` presets anywhere in the window; results
+  stream in file by file
+- Watch folder with subfolders (camera-card layouts), a copy-finished check, tray
+  notifications and an activity log; unattended errors are logged, never left as dialogs
+- 9 built-in delivery presets (4K 24/30/60, 1080p 24/30/60, 720p30, 5.7K VR 360, 8K)
+- File names can suggest a matching preset, but never switch the one you chose
 
-- Automated checks across container, codec, resolution, frame rate, CFR, bitrate,
-  audio codec/channels, A/V sync, and frame count
-- **Deep scan** — black frame, freeze frame, and silence detection with absolute
-  timestamps
-- **Decode integrity** — detects dropped frames and decode errors during a full decode
-- **Keyframe-aware segment splitting** for faster parallel deep scans on long files
-- **Hardware-accelerated decode** (CUDA / VAAPI / D3D11VA / VideoToolbox, auto-detected)
-- **MediaInfo enrichment** when MediaInfo is available
-- **9 built-in delivery presets** (4K 24/30/60, 1080p 24/30/60, 720p30, 5.7K VR, 8K)
-- **Confidence-weighted results** — borderline failures are reported as advisory rather
-  than hard failures
-- **Plain-language summaries** — one line per file, free of technical jargon
-
-### Desktop GUI
-
-- Drag-and-drop files, folders, and `.fg` presets — anywhere in the window
-- Results stream in one file at a time as the scan progresses
-- **Failures first, severity-weighted** — failed files sort to the top with
-  critical corruption above minor framerate issues, tinted red with a headline
-  banner; toggle back to scan order at any time
-- Verdict banner auto-dismisses clean results and clears on new files,
-  navigation, or errors — no stale messages
-- **Checks matrix** — every file against every check in one grid, so a systemic
+**Reviewing**
+- Failures first, ranked by severity, with a headline banner and an Issues only filter
+- Checks matrix: every file against every check, failing checks first, so a systemic
   problem ("all 40 files failing Bitrate") is obvious at a glance
-- **Issues only** filter to hide files that passed cleanly
-- **Open With** — open one or many results in any video player installed on the
-  machine (QuickTime Player, VLC, IINA, TV and others on macOS; VLC, MPC-HC/BE,
-  PotPlayer, mpv and the system chooser on Windows). The last player you used is
-  remembered. Right-click a result to reveal it in Explorer or Finder, or to copy its path.
-- **PDF handoff reports** with a batch summary and per-file detail. File names in any
-  language render correctly, each file's checks stay together across page breaks, and
-  pages are numbered "Page X of Y"
-- **15 color themes** with live switching and persistence — the
-  theme also recolors the app icon, title bar, and system tray icon
-- Scan settings persist between sessions
-- Watch folder with automatic scanning and tray notifications
-- Standard window behaviour: Aero Snap, drag-to-maximize, Win+Arrow tiling
-- Keyboard shortcuts: `Ctrl+1..5` panels, `Ctrl+O` browse, `F5` scan, `Ctrl+E` export,
-  `Return` opens the highlighted result and `Ctrl+Shift+O` opens the checked results in
-  your player (`Cmd` on macOS)
-- Quitting always quits, even while a watch folder is running in the menu bar or tray
+- Open With: send one or many results to any installed player (QuickTime Player, VLC,
+  IINA, MPC-HC/BE, PotPlayer, mpv and more); the last one used is remembered
+- PDF report with the scan specification and tool versions, plus JSON and CSV data
 
-### Packaging
+**Desktop**
+- 15 themes; the Dock, taskbar and window icons follow the theme, and dialogs and
+  title bars follow its light or dark appearance
+- macOS menu bar with Settings (⌘,), File, View, Window and Help, and a menu-bar icon
+  that adapts like other professional apps
+- FrameGuard appears in Finder's and Explorer's Open With menus for videos and folders
+  (never as the default app); on Windows a second launch hands its files to the
+  running app
+- Keyboard and screen-reader support: named controls, keyboard-operable summary badges
+  and queue, 3:1 control contrast in every theme
+- Settings, window size and layout are saved as you change them
+- Shortcuts: `Ctrl+1..5` pages, `Ctrl+O` add videos, `F5` scan, `Ctrl+E` export,
+  `Return` opens the highlighted result, `Ctrl+Shift+O` opens the checked results
+  (`Cmd` on macOS)
 
-- Single-file installer with FFmpeg, FFprobe, and MediaInfo bundled — no dependencies
-  for end users
-- `.fg` preset files are registered with Windows: they show the FrameGuard icon and
-  import on double-click
+**Packaging**
+- One installer per platform with FFmpeg, FFprobe and MediaInfo bundled, each pinned
+  to an exact version and verified against a checksum committed in this repository
+- Releases publish SHA-256 sums, build-provenance attestations and SBOMs
 
-## Tech stack
+## Brand
 
-Python · PySide6 (Qt) · FFmpeg / FFprobe · MediaInfo · PyInstaller · Inno Setup (Windows) / DMG (macOS)
+The Monogram is an F drawn from the corner of a frame whose crossbar turns into the
+tick: the letter and the verdict in one stroke. It is defined as vector geometry in
+[`src/frameguard/brand.py`](src/frameguard/brand.py), with a heavier optical master for
+16–32 px, and every icon is generated from it.
 
-## Quick start
+| File | Use |
+|------|-----|
+| [`src/branding/frameguard-glyph.svg`](src/branding/frameguard-glyph.svg) | Two-tone mark |
+| [`src/branding/frameguard-glyph-mono.svg`](src/branding/frameguard-glyph-mono.svg) | Single colour (`currentColor`) |
+| [`src/branding/frameguard-app-icon.svg`](src/branding/frameguard-app-icon.svg) | App icon on Apple's 1024 / 824 grid |
+| [`assets/brand/`](assets/brand) | README banners and the GitHub social preview |
+
+Regenerate with `python tools_dev/make_brand_assets.py` (icons; `--check` verifies the
+committed files) and `python tools_dev/make_readme_banner.py` (banners). The wordmark
+uses Instrument Serif and Instrument Sans under the SIL Open Font License
+(`src/branding/fonts/`).
+
+## Build from source
 
 ### Run from source
 
@@ -171,6 +231,7 @@ python main.py
 | PySide6 | 6.6+ | GUI framework |
 | fpdf2 | 2.7+ | PDF report generation |
 | psutil | 5.9+ | Subprocess cleanup |
+| truststore | 0.10+ | OS certificate store for update checks |
 | FFmpeg + FFprobe | 4.0+ | Video analysis (required) |
 | MediaInfo | any | Enriched metadata (optional) |
 
@@ -213,34 +274,34 @@ pytest
 ## Presets
 
 Presets use the `.fg` extension (JSON internally). They capture a complete delivery
-spec — resolution, frame rate and tolerance, minimum bitrate, accepted codecs and
-containers, audio requirements, and deep-scan tuning.
+spec: resolution, frame rate and tolerance, minimum bitrate, accepted codecs and
+containers, audio requirements, and the stricter 0.9 options below.
 
 | Action | How |
 |--------|-----|
 | Use a built-in | Pick it from the dropdown on the Scan page |
 | Enter your own values | Scan page → **Edit values…** (jumps to the delivery controls and selects the Custom profile) |
 | Save your setup as a `.fg` | Settings → Scan Presets → **Export Current**, then give it a name |
-| Load one | **Import Preset** in Settings, drag the `.fg` onto the window, or double-click it |
-| Share with the team | Send the `.fg` file — it is a few KB of plain JSON |
+| Load one | **Import Preset** in the sidebar or Settings, drag the `.fg` onto the window, or double-click it |
+| Share with the team | Send the `.fg` file; it is a few KB of plain JSON |
 
-### Creating a `.fg` file
+Presets are validated on import: an out-of-range value, an unknown key or an empty
+codec list is rejected with a message naming every problem, never silently loosened.
 
-There is no separate file format to learn: a preset is just the values already on
-the Settings page, written to disk.
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `allow_larger_resolution` | `false` | Accept frames larger than the target |
+| `allow_fps_multiples` | `false` | Accept integer multiples of the target frame rate |
+| `require_progressive` | `true` | Fail interlaced content |
+| `min_bit_depth`, `required_transfer` | `"any"` | Enforce bit depth and SDR / PQ / HLG |
+| `required_projection`, `required_stereo_mode` | `"any"` | Enforce XR metadata (set on the 5.7K 360 presets) |
+| `max_decode_errors` | `0` | Decoder errors allowed before File Integrity fails |
+| `loudness_mode` | `"advisory"` | `advisory`, `essential` or `off` |
+| `min_audio_sample_rate` | `44100` | Minimum sample rate for every track |
 
-1. Scan page → **Edit values…** (or Settings → Delivery Profile).
-2. Set resolution, frame rate, tolerance and minimum bitrate. Expand
-   **Show Advanced Settings** for audio and deep-scan parameters.
-3. Settings → Scan Presets → **Export Current** → name it → Save.
-
-The result is a small JSON file you can email, drop in a shared folder, or commit.
-Anyone who drags it onto FrameGuard gets your exact spec. Hand-authoring one also
-works — see `PRESET_CONFIG_KEYS` in `src/frameguard/presets.py` for the accepted keys,
-and `src/presets/` for worked examples.
-
-User-imported presets are stored in `~/.frameguard/presets/` and persist across
-reinstalls.
+See `PRESET_CONFIG_KEYS` in `src/frameguard/presets.py` for every accepted key and
+`src/presets/` for worked examples. User-imported presets are stored in
+`~/.frameguard/presets/` and persist across reinstalls.
 
 ---
 
@@ -250,6 +311,7 @@ reinstalls.
 FrameGuard/
 ├── README.md                 # This file
 ├── LICENSE                   # MIT
+├── assets/                   # README media: banner, screenshots, demo GIF, sample report
 ├── src/
 │   ├── main.py               # Entry point (handles .fg paths from argv)
 │   ├── requirements.txt      # Runtime dependencies
@@ -277,9 +339,9 @@ FrameGuard/
 │   │   └── updater.py        # Auto-update from GitHub Releases
 │   ├── presets/              # Bundled .json presets (shipped in the installer)
 │   ├── assets/               # Windows .ico and the macOS .icns packer
-│   ├── branding/             # Generated brand artwork (SVG marks, macOS icon PNGs)
+│   ├── branding/             # Brand artwork generated from brand.py (SVG marks, macOS icon PNGs, OFL fonts)
 │   ├── tests/                # pytest suite
-│   ├── tools_dev/            # Developer-only utilities (pre-push gate, GUI audit, smokes)
+│   ├── tools_dev/            # Developer utilities (pre-push gate, GUI audit, brand and banner generators)
 │   ├── build_installer.bat   # Windows build
 │   ├── build_mac.sh          # macOS build
 │   ├── download_tools.py     # Fetches the pinned FFmpeg/MediaInfo builds
@@ -299,47 +361,23 @@ overwrite the other's artifacts.
 
 ## Configuration
 
-Everything is configurable from the Settings panel and persists between sessions.
-Defaults live in `DEFAULT_CONFIG` in `frameguard/core.py`; the Settings panel emits
-those exact key names, and `tests/test_config_and_presets.py` enforces that they stay
-in sync.
+Everything on the Settings page applies immediately and is saved as you change it.
+Defaults live in `DEFAULT_CONFIG` in `frameguard/core.py`; the Settings page emits
+those exact key names, and `tests/test_config_and_presets.py` keeps them in sync.
 
 | Group | Controls |
 |-------|----------|
 | Delivery | Target resolution, frame rate, fps tolerance, minimum bitrate |
 | Audio | Audio required, silence duration threshold |
-| Deep scan | Hardware acceleration, segmented scanning, segment count |
-| Strict mode | Warnings are treated as failures |
-
----
-
-## Check reference
-
-| Category | Check | Severity | Notes |
-|----------|-------|----------|-------|
-| Container | Format | FAIL | Extension must be in accepted containers |
-| Video | Codec | FAIL | Must be in accepted codec list |
-| Video | Frame Rate | FAIL/WARN | FAIL below target, WARN above target (conformance-friendly) |
-| Video | CFR | FAIL/WARN | Constant frame rate (configurable) |
-| Video | Bitrate | FAIL/WARN | WARN 10-25% under target, FAIL beyond |
-| Video | Frame Count | WARN | Frame count vs duration × fps |
-| Audio | Codec | FAIL | Must be in accepted audio codec list |
-| Audio | Channels | INFO | Reports channel count and layout |
-| Audio | Silence | FAIL/WARN | Sustained silence detection |
-| Duration | A/V Sync | FAIL | Audio vs video duration mismatch |
-| Deep scan | Decode Integrity | WARN | Decode errors during full decode |
-| Deep scan | Black Frames | FAIL/WARN | Fade-filtered, absolute timestamps |
-| Deep scan | Freeze Frames | FAIL/WARN | Sustained frozen frames |
-| Metadata | MediaInfo | INFO | Enriched metadata when available |
-
-Only **essential** checks determine pass/fail. Advisory checks (decode integrity, frame
-count, black frames, freeze frames) produce `PASS_WITH_WARNINGS` rather than a failure.
+| Verdicts | Strict mode: warnings count as failures |
+| Results | Clear results on each new scan |
 
 ---
 
 ## Privacy
 
-All video processing is local. Nothing is uploaded, transmitted, or shared.
+All video processing is local. Nothing is uploaded, transmitted or shared. Update
+checks contact GitHub Releases only.
 
 ---
 
