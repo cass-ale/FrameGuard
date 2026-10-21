@@ -1094,6 +1094,8 @@ def _conformance_spec_rows(c: dict) -> List[tuple]:
     if c.get("disabled_checks"):
         rows.append(("Checks switched off", ", ".join(c["disabled_checks"])))
     return rows
+
+
 def _black_freeze_spec(c: dict) -> str:
     black = (f"black ≥{c.get('black_detect_duration')} s at ≤{c.get('black_detect_pix_threshold')} "
              f"level on ≥{float(c.get('black_detect_picture_threshold') or 0) * 100:g}% of the picture"

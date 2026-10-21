@@ -237,6 +237,11 @@ class TestFrameRate:
         assert _row(_scan(_rate_clip(media, "25"), target_fps=24.0), "Frame Rate")[1] == "FAIL"
         assert _row(_scan(_rate_clip(media, "60"), allow_fps_multiples=True), "Frame Rate")[1] == "PASS"
         ntsc_double = _rate_clip(media, "60000/1001")
+        # Review B3: a multiple that the spec forbids is a FAIL even when its
+        # base is an NTSC rate (0.9.0 behaviour), never the softer NTSC WARN.
+        forbidden = _row(_scan(ntsc_double), "Frame Rate")
+        assert forbidden[1] == "FAIL" and "not allowed" in forbidden[2], forbidden
+        assert _row(_scan(_rate_clip(media, "60")), "Frame Rate")[1] == "FAIL"
         assert _row(_scan(ntsc_double, allow_fps_multiples=True), "Frame Rate")[1] == "WARN"
         assert _row(_scan(ntsc_double, allow_fps_multiples=True, allow_ntsc_rate_match=True),
                     "Frame Rate")[1] == "PASS"

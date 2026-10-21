@@ -1386,15 +1386,21 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     multiple = round(fps / target) if target > 0 else 0
     base = _rate_relation(fps / multiple, target, tolerance) if multiple >= 2 else "none"
     if base != "none":
-        base_ok = base != "ntsc" or allow_ntsc
-        if cfg.get("allow_fps_multiples", False) and base_ok:
-            result.add_pass("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target "
-                                          f"(integer multiples allowed by this spec)")
-        elif not base_ok:
-            result.add_warn("Frame Rate", ntsc_fail, confidence=90)
-        else:
+        # A multiple is judged as a multiple first: 59.94 against a 30 fps
+        # spec that forbids multiples is the wrong rate (FAIL), not a mere
+        # NTSC difference. Only when multiples are allowed does the NTSC gap
+        # of the base rate decide between PASS and the NTSC warning.
+        if not cfg.get("allow_fps_multiples", False):
             result.add_fail("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target; "
                                           f"integer multiples are not allowed by this spec.")
+        elif base == "ntsc" and not allow_ntsc:
+            result.add_warn("Frame Rate", f"{_rate_text(fps)} is {multiple}x the NTSC counterpart of the "
+                                          f"{typed:g} fps target, not an exact multiple: the rates drift "
+                                          f"3.6 s per hour. Allow NTSC rate matching if the spec treats "
+                                          f"them as equal.", confidence=90)
+        else:
+            result.add_pass("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target "
+                                          f"(integer multiples allowed by this spec)")
         return
     result.add_fail("Frame Rate", f"{_rate_text(fps)} does not match the {typed:g} ± {tolerance:g} fps target.")
 

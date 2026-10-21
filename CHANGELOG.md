@@ -10,7 +10,7 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.9.1] — Signal QC: audio, picture and conformance checks from the benchmark
+## [0.9.1] — 2026-10-21 — Signal QC: audio, picture and conformance checks from the benchmark
 
 ### Fixed
 - 29.97 fps no longer passes a 30 fps spec silently (and 23.976/59.94 likewise): an NTSC rate against its integer target now warns (fails in Strict Mode) unless "Treat NTSC Rates as Integer" is on. The FPS tolerance now only absorbs measurement jitter.
