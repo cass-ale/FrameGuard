@@ -647,12 +647,21 @@ def probe_first_video_frame(filepath: str, stream_index: int, process_owner=None
 
 
 class FrameTiming:
-    """Presentation timestamps of a video stream, read from packets only."""
+    """Presentation timestamps of a video stream, read from packets only.
 
-    def __init__(self, windows: List[List[float]], sampled: bool, description: str):
-        self.windows = windows          # sorted pts lists, one per read window
+    ``windows`` hold only presented frames (sorted pts inside the stream's
+    presentation range). ``hidden_leadin`` counts packets before the stream
+    start: frames an edit list hides, as left by a lossless (stream-copy)
+    trim that had to keep the preceding GOP so the first shown frame can be
+    decoded. They are stored and counted in nb_frames but never displayed.
+    """
+
+    def __init__(self, windows: List[List[float]], sampled: bool, description: str,
+                 hidden_leadin: Optional[int] = None):
+        self.windows = windows
         self.sampled = sampled
         self.description = description
+        self.hidden_leadin = hidden_leadin
 
     @property
     def packet_count(self) -> int:
@@ -681,9 +690,14 @@ def _timing_windows(duration: Optional[float], file_size: int, cfg: dict) -> Lis
 
 def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[float],
                        cfg: dict, process_owner=None,
-                       cancel_event: Optional[threading.Event] = None) -> Optional[FrameTiming]:
+                       cancel_event: Optional[threading.Event] = None,
+                       start_time: float = 0.0,
+                       stream_duration: Optional[float] = None) -> Optional[FrameTiming]:
     """Read packet timestamps for one video stream (no decoding).
 
+    Packets outside [start_time, start_time + stream_duration] are not
+    presented (edit-list lead-in before, reorder spill-over after a cut), so
+    they are counted as hidden lead-in or dropped rather than read as gaps.
     Returns None when ffprobe fails, so the CFR check can say "not verified"
     instead of passing on no evidence.
     """
@@ -696,6 +710,9 @@ def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[floa
         return None
     specs = _timing_windows(duration, file_size, cfg)
     windows = []
+    hidden_leadin = None
+    epsilon = 1e-4
+    end_time = (start_time + stream_duration) if stream_duration else None
     for spec in specs:
         cmd = [ffprobe, "-v", "error", "-select_streams", str(stream_index)]
         if spec:
@@ -712,14 +729,19 @@ def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[floa
             value = _safe_float(line.strip().strip(","))
             if value is not None:
                 pts.append(value)
-        windows.append(sorted(pts))
+        if spec is None or spec.startswith("0.000%") or spec.startswith("%"):
+            # Only a window read from the very start sees the lead-in.
+            hidden_leadin = sum(1 for p in pts if p < start_time - epsilon)
+        presented = [p for p in pts if p >= start_time - epsilon
+                     and (end_time is None or p < end_time - epsilon)]
+        windows.append(sorted(presented))
     sampled = specs != [None]
     if sampled:
         description = (f"sampled {len(specs)} windows "
-                       f"(file is {file_size / 1024 ** 3:.1f} GB)")
+                       f"(file is {_format_size(file_size / 1024 ** 2)})")
     else:
         description = "all packets"
-    return FrameTiming(windows, sampled, description)
+    return FrameTiming(windows, sampled, description, hidden_leadin)
 
 
 def _safe_float(value, default=None):
@@ -917,7 +939,9 @@ def _side_data(entries, kind: str) -> Optional[dict]:
 
 
 def _format_size(size_mb: float) -> str:
-    """'40.3 MB', or KB below 0.1 MB: a 7 KB file read as '0.0 MB'."""
+    """'40.3 MB' ('4.8 GB' from 1 GB), or KB below 0.1 MB: a 7 KB file read as '0.0 MB'."""
+    if size_mb >= 1024:
+        return f"{size_mb / 1024:.1f} GB"
     if size_mb < 0.1:
         return f"{max(size_mb * 1024, 0.0):.0f} KB"
     return f"{size_mb:.1f} MB"
@@ -1105,6 +1129,23 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     result.add_fail("Frame Rate", f"{fps:.3f} fps does not match the {target:g} ± {tolerance:g} fps target.")
 
 
+# Intervals ignored at each edge of every packet window. Within a window
+# read from a seek point (or cut by a lossless trim) the first and last few
+# presentation timestamps are incomplete: B-frames whose packets fall
+# outside the window leave holes up to the reorder depth, and the stream's
+# own first/last intervals absorb edit-list and priming offsets (a
+# fragmented MP4's first frame lasts 55 ms instead of 33 ms). None of that
+# says anything about the cadence; real VFR runs through the middle.
+WINDOW_EDGE_INTERVALS = 8
+
+
+def _trim_window_edges(window_gaps: list) -> list:
+    edge = WINDOW_EDGE_INTERVALS
+    if len(window_gaps) > 4 * edge:
+        return window_gaps[edge:-edge]
+    return window_gaps[1:-1]
+
+
 def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
     """(dominant interval, total intervals, irregular count, irregular samples).
 
@@ -1114,17 +1155,8 @@ def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, Lis
     from it is irregular: a dropped/held frame or a genuine rate change.
     """
     gaps = []
-    last = len(timing.windows) - 1
-    for number, window in enumerate(timing.windows):
-        window_gaps = [(b, b - a) for a, b in zip(window, window[1:])]
-        # The stream's first and last intervals absorb edit-list and priming
-        # offsets (a fragmented MP4's first frame lasts 55 ms instead of
-        # 33 ms); they say nothing about the cadence.
-        if number == 0:
-            window_gaps = window_gaps[1:]
-        if number == last:
-            window_gaps = window_gaps[:-1]
-        gaps.extend(window_gaps)
+    for window in timing.windows:
+        gaps.extend(_trim_window_edges([(b, b - a) for a, b in zip(window, window[1:])]))
     if not gaps:
         return None, 0, 0, []
     counts = Counter(round(delta, 4) for _, delta in gaps if delta > 0)
@@ -1548,6 +1580,10 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     if actual_frames is None or actual_frames < 0:
         result.add_warn("Frame Count", f"Could not parse frame count: {nb_frames_str}")
         return
+    hidden = int(result.metadata.get("edit_list_hidden_frames", 0) or 0)
+    hidden_note = (f" ({hidden} lead-in frame(s) stored but hidden by an edit list, "
+                   f"as left by a lossless trim)") if hidden else ""
+    actual_frames = max(0, actual_frames - hidden)
     duration = _safe_float(vs.get("duration") or probe_data.get("format", {}).get("duration"))
     fps = parse_frame_rate(vs.get("r_frame_rate", "0/1"))
     if duration is None or duration <= 0 or fps <= 0:
@@ -1556,11 +1592,15 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     expected_frames = int(round(duration * fps))
     diff = abs(expected_frames - actual_frames)
     tolerance = max(2, int(fps * 0.1))
+    if hidden:
+        # A stream-copy cut also drops the B-frames at its tail whose
+        # reference fell outside the cut: up to the reorder depth.
+        tolerance = max(tolerance, 8)
     result.set_metadata("expected_frames", expected_frames)
     result.set_metadata("actual_frames", actual_frames)
     result.set_metadata("frame_count_diff", diff)
     if diff <= tolerance:
-        result.add_pass("Frame Count", f"{actual_frames} frames (expected ~{expected_frames}, diff: {diff})")
+        result.add_pass("Frame Count", f"{actual_frames} frames (expected ~{expected_frames}, diff: {diff}){hidden_note}")
     elif diff <= expected_frames * 0.10:
         result.add_warn("Frame Count", f"{actual_frames} frames vs ~{expected_frames} (diff: {diff}, {diff/expected_frames*100:.1f}%). May be normal for static/slow-motion content.")
     else:
@@ -2084,7 +2124,9 @@ def _channel_names(track: dict, count: int) -> List[str]:
 class _ScanPlan:
     """What the integrity pass decodes and what it should find."""
 
-    def __init__(self, probe_data: dict, cfg: dict, variable_rate: bool = False):
+    def __init__(self, probe_data: dict, cfg: dict, variable_rate: bool = False,
+                 hidden_frames: int = 0):
+        self.hidden_frames = max(0, int(hidden_frames or 0))
         self.video = _primary_video_stream(probe_data)
         self.audio = _audio_streams(probe_data)
         self.duration = _probed_duration(probe_data)
@@ -2103,17 +2145,27 @@ class _ScanPlan:
                 or parse_frame_rate(self.video.get("r_frame_rate", "0/0")))
 
     def video_expected_frames(self) -> Optional[int]:
-        """Frames the container says exist: nb_frames, else duration x rate."""
+        """Frames that should be presented.
+
+        ``nb_frames`` counts stored packets, including the lead-in an edit
+        list hides after a lossless trim (up to a GOP: a 15 s open-GOP H.264
+        cut stores 498 frames and shows 452), so the hidden lead-in is
+        subtracted and the result capped by duration x rate. A truncated
+        copy keeps its original header, so both values still describe the
+        full file and the shortfall is caught.
+        """
         if not self.video:
             return None
         declared = _safe_int(self.video.get("nb_frames"))
-        if declared and declared > 0:
-            return declared
+        if declared is not None and declared > 0:
+            declared = max(0, declared - self.hidden_frames)
+        else:
+            declared = None
         fps = self.video_fps()
         duration = _stream_duration(self.video) or self.duration
-        if fps > 0 and duration:
-            return int(round(duration * fps))
-        return None
+        by_time = int(round(duration * fps)) if fps > 0 and duration else None
+        candidates = [v for v in (declared, by_time) if v]
+        return min(candidates) if candidates else None
 
     @staticmethod
     def channels(track: dict) -> int:
@@ -2648,7 +2700,8 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     if probe_data is None:
         probe_data = run_ffprobe(filepath, process_owner, cancel_event)
     plan = _ScanPlan(probe_data or {}, cfg,
-                     variable_rate=bool(result.metadata.get("vfr_detected")))
+                     variable_rate=bool(result.metadata.get("vfr_detected")),
+                     hidden_frames=result.metadata.get("edit_list_hidden_frames", 0))
     if quick:
         _mark_not_verified(result, plan.frame_check_names(),
                            "quick scan — the file was not decoded.")
@@ -2786,7 +2839,11 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
                                               process_owner, cancel_event)
         timing = probe_frame_timing(filepath, int(video["index"]),
                                     _probed_duration(probe_data), cfg,
-                                    process_owner, cancel_event)
+                                    process_owner, cancel_event,
+                                    start_time=_safe_float(video.get("start_time"), 0.0) or 0.0,
+                                    stream_duration=_stream_duration(video))
+        if timing is not None and timing.hidden_leadin:
+            result.set_metadata("edit_list_hidden_frames", timing.hidden_leadin)
     check_video_codec(probe_data, result, cfg)
     check_resolution(probe_data, result, cfg)
     check_aspect_ratio(probe_data, result, cfg)

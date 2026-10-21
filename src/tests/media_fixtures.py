@@ -165,3 +165,26 @@ class MediaLibrary:
         if name not in self._built:
             self._built[name] = builder(os.path.join(self.root, name))
         return self._built[name]
+
+
+def make_open_gop_source(path, vcodec="h264", rate="30", duration=12):
+    """A long-GOP, open-GOP clip with B-frames, the shape camera and
+    mezzanine encodes have, so a stream-copy cut lands mid-GOP."""
+    if vcodec == "hevc":
+        video = ["-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1",
+                 "-x265-params", "log-level=error:keyint=48:min-keyint=48:open-gop=1:"
+                                 "bframes=4:scenecut=0"]
+    else:
+        video = ["-c:v", "libx264", "-preset", "ultrafast",
+                 "-x264-params", "keyint=45:min-keyint=45:open-gop=1:bframes=3:scenecut=0"]
+    ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={SIZE}:r={rate}:d={duration}",
+           "-f", "lavfi", "-i", f"sine=f=440:sample_rate=48000:d={duration}",
+           *video, "-pix_fmt", "yuv420p", "-c:a", "aac", str(path))
+    return str(path)
+
+
+def stream_copy_trim(src, dst, start, length):
+    """Lossless cut (no re-encode), as LosslessCut or ``ffmpeg -c copy`` makes:
+    the muxer keeps the GOP before ``start`` and hides it with an edit list."""
+    ffmpeg("-ss", str(start), "-i", str(src), "-t", str(length), "-c", "copy", str(dst))
+    return str(dst)
