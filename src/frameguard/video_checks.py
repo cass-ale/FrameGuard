@@ -143,6 +143,17 @@ BLACK_EDGE_ALLOWANCE = 1.0
 # as 17-83 % interlaced; at 1.5 they read 0 % while woven 60p content still
 # reads 98-100 % (and a 2 s woven section 25 % of a 10 s clip).
 IDET_OPTIONS = "intl_thres=1.5"
+# A vertical scroll (end credits) moving an integer number of lines per
+# frame is, field by field, a valid interlaced sequence: idet reads it as
+# 99 % TFF/BFF although no frame is combed. Such motion leaves every
+# column's mean unchanged while the row profile slides, so a combed window
+# is discounted when column-profile change is under this share of the total
+# profile change (measured: credit rolls 0.001-0.034; woven interlaced
+# clips 0.175-0.74 - natural, graphics and vertically tilting content).
+INTERLACE_VERTICAL_SHARE = 0.08
+# Profile change (mean |delta| in 8-bit codes) below which motion is too
+# small to judge; such frames are not counted either way.
+INTERLACE_MOTION_FLOOR = 0.02
 INTERLACE_WINDOW_SHARE = 0.5
 INTERLACE_MIN_SECONDS = 1.0
 FIELD_ORDER_MAJORITY = 0.8
@@ -381,7 +392,8 @@ class VideoAnalysis:
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
         self._cleanup = weakref.finalize(self, shutil.rmtree, self.directory, True)
-        names = ("mafd", "idet", "luma", "band1", "band2", "gam_r", "gam_g", "gam_b", "yavg")
+        names = ("mafd", "idet", "colmo", "rowmo", "luma", "band1", "band2",
+                 "gam_r", "gam_g", "gam_b", "yavg")
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         self.paths["flash"] = os.path.join(self.directory, "flash.rgb")
         return self
@@ -432,15 +444,33 @@ class VideoAnalysis:
         """
         graphs: List[Tuple[str, Optional[str]]] = []
         if self.needs_interlace_branch:
-            graphs.append((
-                f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
-                f"idet@il={IDET_OPTIONS},"
-                f"{_print('lavfi.idet.multiple.current_frame', self.paths['idet'])}[vs_il]",
-                "[vs_il]"))
+            graphs.append((";".join(self._interlace_chains()), "[vs_il]"))
         if self.needs_area_branch:
             label = None if self.flash_enabled else "[vs_area]"
             graphs.append((";".join(self._area_chains()), label))
         return graphs
+
+    def _interlace_chains(self) -> List[str]:
+        """idet plus the column and row luma profiles' frame-to-frame change.
+
+        The profiles tell a vertical scroll (rows slide, columns unchanged)
+        from motion that can comb. Column means come from area reductions
+        of at most 16x per step (a single large reduction is not an exact
+        mean); tblend difference + signalstats gives mean |delta| per frame.
+        """
+        reduce16 = "scale=w={w}:h='max(1,trunc(ih/16))':flags=area"
+        return [
+            f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
+            "split=3[il_det][il_col][il_row]",
+            f"[il_det]idet@il={IDET_OPTIONS},"
+            f"{_print('lavfi.idet.multiple.current_frame', self.paths['idet'])}[vs_il]",
+            f"[il_col]format=gray,{reduce16.format(w=64)},{reduce16.format(w=64)},"
+            "scale=w=64:h=1:flags=area,tblend=all_mode=difference,signalstats,"
+            f"{_print('lavfi.signalstats.YAVG', self.paths['colmo'])},nullsink",
+            "[il_row]format=gray,scale=w='max(1,trunc(iw/16))':h=ih:flags=area,"
+            "scale=w=1:h=ih:flags=area,tblend=all_mode=difference,signalstats,"
+            f"{_print('lavfi.signalstats.YAVG', self.paths['rowmo'])},nullsink",
+        ]
 
     def _area_chains(self) -> List[str]:
         """Levels, gamut, mean luma and flash from one area-averaged copy.
@@ -521,6 +551,9 @@ class VideoAnalysis:
         series = VideoSeries(times=times, mafd=[_to_float(v) for v in mafd])
         if self.needs_interlace_branch:
             series.idet = read_metadata_series(self.paths["idet"])[1]
+            # tblend has no output for the first frame: align by time.
+            series.col_motion = align_by_time(times, *read_metadata_series(self.paths["colmo"]))
+            series.row_motion = align_by_time(times, *read_metadata_series(self.paths["rowmo"]))
         if self.needs_area_branch and self.config.levels:
             fraction = {name: [_to_float(v) / 255.0 for v in read_metadata_series(self.paths[name])[1]]
                         for name in ("luma", "band1", "band2", "gam_r", "gam_g", "gam_b")}
@@ -568,6 +601,13 @@ def read_metadata_series(path: str) -> Tuple[List[float], List[str]]:
     return times, values
 
 
+def align_by_time(times: Sequence[float], value_times: Sequence[float],
+                  values: Sequence[str]) -> List[Optional[float]]:
+    """``values`` placed at the frames of ``times`` they belong to (None if absent)."""
+    lookup = {round(t, 4): _to_float(v, None) for t, v in zip(value_times, values) if v != ""}
+    return [lookup.get(round(t, 4)) for t in times]
+
+
 def read_flash_grid(path: str) -> List[Tuple[bytes, bytes, bytes]]:
     """Per-frame (G, B, R) planes of the 16x9 linear-light grid (gbrp)."""
     cols, rows = FLASH_GRID
@@ -596,6 +636,8 @@ class VideoSeries:
     times: List[float] = field(default_factory=list)
     mafd: List[float] = field(default_factory=list)
     idet: List[str] = field(default_factory=list)
+    col_motion: List[Optional[float]] = field(default_factory=list)
+    row_motion: List[Optional[float]] = field(default_factory=list)
     luma: List[float] = field(default_factory=list)   # tv: outside R 103; pc: extremes used
     gam: List[float] = field(default_factory=list)
     band1: List[float] = field(default_factory=list)
@@ -610,7 +652,8 @@ class VideoSeries:
         length difference only arises when FFmpeg stopped mid-flush; the
         common prefix is the part every branch measured.
         """
-        names = ("times", "mafd", "idet", "luma", "gam", "band1", "band2", "yavg", "flash")
+        names = ("times", "mafd", "idet", "col_motion", "row_motion", "luma", "gam",
+                 "band1", "band2", "yavg", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1238,17 +1281,41 @@ class InterlaceFindings:
     content_order: Optional[str]     # "tff"/"bff" when idet has a majority
     flagged_order: Optional[str]     # from the stream's field_order
     interlaced_share: float
+    scrolls: List[Interval] = field(default_factory=list)  # idet hits that are vertical scrolls
+
+
+def _vertical_scroll(first: int, last: int, col_motion: Sequence[Optional[float]],
+                     row_motion: Sequence[Optional[float]]) -> bool:
+    """True when the motion in frames first..last is a vertical translation.
+
+    Needs measurable profile motion on at least half the frames, with the
+    column-profile change under INTERLACE_VERTICAL_SHARE of the total.
+    """
+    shares = []
+    frames = last - first + 1
+    for k in range(first, min(last + 1, len(col_motion), len(row_motion))):
+        col, row = col_motion[k], row_motion[k]
+        if col is None or row is None or col + row <= INTERLACE_MOTION_FLOOR:
+            continue
+        shares.append(col / (col + row))
+    if len(shares) < max(1, frames // 2):
+        return False
+    return statistics.median(shares) < INTERLACE_VERTICAL_SHARE
 
 
 def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
-                     field_order: str) -> InterlaceFindings:
+                     field_order: str, col_motion: Sequence[Optional[float]] = (),
+                     row_motion: Sequence[Optional[float]] = ()) -> InterlaceFindings:
     """Combing in progressive-flagged video; field order vs metadata.
 
     Uses idet's multiple-frame classification (each frame judged with its
     neighbours, steadier than single-frame). A section is combed when more
     than half the frames in a one-second window are called TFF or BFF; at
-    least a second of such windows is required. Field order compares idet's
-    TFF/BFF majority with the declared order when the stream is interlaced.
+    least a second of such windows is required. A section whose motion is a
+    vertical translation (see INTERLACE_VERTICAL_SHARE) is set aside as a
+    scroll: whichever way its fields are paired, an integer-line vertical
+    move shows no feathering. Field order compares idet's TFF/BFF majority
+    with the declared order when the stream is interlaced.
     """
     count = min(len(labels), len(times))
     labels = [str(v).lower() for v in labels[:count]]
@@ -1278,6 +1345,15 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
             else:
                 merged.append((start, length))
         combed = [m for m in merged if m[1] >= min_frames * period - 1e-6]
+    scrolls: List[Interval] = []
+    if combed and col_motion and row_motion:
+        kept = []
+        for start, length in combed:
+            first = next(i for i, t in enumerate(times[:count]) if t >= start - 1e-6)
+            last = max(first, max(i for i, t in enumerate(times[:count]) if t < start + length - 1e-6))
+            (scrolls if _vertical_scroll(first, last, col_motion, row_motion) else kept).append(
+                (start, length))
+        combed = kept
     tff, bff = labels.count("tff"), labels.count("bff")
     content = None
     if tff + bff >= FIELD_ORDER_MIN_FRAMES:
@@ -1285,7 +1361,7 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
             content = "tff"
         elif bff >= FIELD_ORDER_MAJORITY * (tff + bff):
             content = "bff"
-    return InterlaceFindings(combed, content, flagged, share)
+    return InterlaceFindings(combed, content, flagged, share, scrolls)
 
 
 def interlace_entry(findings: InterlaceFindings) -> Tuple[str, str, int]:
@@ -1307,7 +1383,11 @@ def interlace_entry(findings: InterlaceFindings) -> Tuple[str, str, int]:
                 if findings.content_order else "")
         return "PASS", f"Declared {names[findings.flagged_order]}{seen} ({share}).", 100
     if not findings.combed:
-        return "PASS", f"No interlace combing found ({share}).", 100
+        scroll = ""
+        if findings.scrolls:
+            scroll = (f"; frames that read as interlaced at {event_list(findings.scrolls)} are a "
+                      f"vertical scroll (e.g. rolling credits) with no combing")
+        return "PASS", f"No interlace combing found ({share}{scroll}).", 100
     total = sum(d for _, d in findings.combed)
     return ("WARN", f"Interlace combing in video declared progressive: {total:.1f}s at "
             f"{event_list(findings.combed)} ({share}). Fine horizontal detail in "
@@ -1433,6 +1513,7 @@ def _report_interlace(result, config, series, analysis, video, fps, decoded, rea
         result.add_not_verified(INTERLACE, reason)
         return
     field_order = str((video or {}).get("field_order") or "unknown").lower()
-    findings = assess_interlace(series.idet, series.times, fps, field_order)
+    findings = assess_interlace(series.idet, series.times, fps, field_order,
+                                series.col_motion, series.row_motion)
     result.set_metadata("interlaced_frame_share", round(findings.interlaced_share, 3))
     _add(result, INTERLACE, *interlace_entry(findings))

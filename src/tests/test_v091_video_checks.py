@@ -220,6 +220,33 @@ class TestInterlaceAssessment:
         status, detail, _ = vc.interlace_entry(found)
         assert status == "WARN" and "mismatch" in detail
 
+    def test_vertical_scroll_is_not_combing(self):
+        labels = ["bff"] * 240
+        col = [None] + [0.02] * 239          # columns unchanged
+        row = [None] + [6.0] * 239           # row profile slides
+        found = vc.assess_interlace(labels, _times(240), FPS, "progressive", col, row)
+        assert found.combed == [] and found.scrolls
+        status, detail, _ = vc.interlace_entry(found)
+        assert status == "PASS" and "vertical scroll" in detail
+
+    def test_mixed_motion_keeps_combing(self):
+        labels = ["tff"] * 240
+        found = vc.assess_interlace(labels, _times(240), FPS, "progressive",
+                                    [None] + [0.4] * 239, [None] + [1.5] * 239)
+        assert found.combed and not found.scrolls
+
+    def test_vertical_share_boundary(self):
+        share = vc.INTERLACE_VERTICAL_SHARE
+        def combed(col):
+            return vc.assess_interlace(["tff"] * 60, _times(60), FPS, "progressive",
+                                       [col] * 60, [1.0 - col] * 60).combed
+        assert combed(share * 1.05) and not combed(share * 0.95)
+
+    def test_no_measurable_motion_keeps_idet_verdict(self):
+        found = vc.assess_interlace(["tff"] * 60, _times(60), FPS, "progressive",
+                                    [0.0] * 60, [0.01] * 60)
+        assert found.combed
+
     def test_declared_interlaced_matching_order_passes(self):
         found = vc.assess_interlace(["tff"] * 240, _times(240), FPS, "tt")
         assert vc.interlace_entry(found)[0] == "PASS"
@@ -362,6 +389,41 @@ class TestRealScan:
         source = f"testsrc2=s={SIZE}:r=60:d=6,{GRAIN},tinterlace=mode=interleave_top,setfield=prog"
         path = _clip(tmp_path / "combed.mp4", "setfield=prog", source=source,
                      extra=["-r", "30"])
+        row = _row(_scan(path), "Interlace Detection")
+        assert row[1] == "WARN" and "combing" in row[2], row
+
+    @pytest.mark.parametrize("speed", [1, 2, 3, 4])
+    def test_credit_roll_is_not_interlaced(self, tmp_path, speed):
+        """Rolling credits: thin white strokes scrolling up on black. At an
+        integer number of lines per field idet reads them as 99 % interlaced
+        (the corpus hard negative); no frame is combed."""
+        row = f"mod(Y+{speed}*N,48)"
+        glyph = f"lt({row},14)*between(X,120,520)*lt(mod(X,9),6)"
+        stroke = (f"gt(lt({row},2)+between({row},6,7)+between({row},12,13)"
+                  f"+eq(mod(X,9),0)+eq(mod(X,9),5),0)")
+        source = f"color=black:s={SIZE}:r=30:d=3,format=yuv420p"
+        path = _clip(tmp_path / f"credits{speed}.mp4", source=source,
+                     vf=f"geq=lum='16+219*{glyph}*{stroke}':cb=128:cr=128")
+        row = _row(_scan(path), "Interlace Detection")
+        assert row[1] == "PASS", row
+        if speed == 2:   # one line per field: idet calls it interlaced
+            assert "vertical scroll" in row[2], row
+
+    @pytest.mark.parametrize("pixels_per_second", [60, 110])
+    def test_overlay_credit_bar_roll_is_set_aside(self, tmp_path, pixels_per_second):
+        """The corpus recipe: a bar overlaid at y = H - t*speed (2 and 3.67
+        lines per frame). idet reads ~99 % interlaced; the row says why not."""
+        graph = ("color=white:s=400x6:r=30:d=4[s];color=black:s=640x360:r=30:d=4[b];"
+                 f"[b][s]overlay=x=120:y='H-mod(t*{pixels_per_second},H+20)',format=yuv420p")
+        path = str(tmp_path / f"roll{pixels_per_second}.mp4")
+        ffmpeg("-filter_complex", graph, *X264, "-an", path)
+        row = _row(_scan(path), "Interlace Detection")
+        assert row[1] == "PASS" and "vertical scroll" in row[2], row
+
+    def test_woven_clip_with_vertical_tilt_is_still_combed(self, tmp_path):
+        source = ("testsrc2=s=640x720:r=60:d=4,crop=640:360:0:'mod(n*3,360)',"
+                  "tinterlace=mode=interleave_top,setfield=prog")
+        path = _clip(tmp_path / "tilt.mp4", "setfield=prog", source=source, extra=["-r", "30"])
         row = _row(_scan(path), "Interlace Detection")
         assert row[1] == "WARN" and "combing" in row[2], row
 
