@@ -444,35 +444,10 @@ def test_finder_open_with_lists_frameguard_for_videos():
 
 
 class TestSingleInstance:
-    def test_second_launch_hands_its_files_to_the_running_app(self, qapp, tmp_path, monkeypatch):
-        import uuid
-        from frameguard import gui
-        name = f"fg-test-{uuid.uuid4().hex[:12]}"
-        monkeypatch.setattr(gui, "_instance_server_name", lambda: name)
-        received = []
-
-        class Receiver:
-            def accept_paths(self, paths):
-                received.extend(paths)
-
-        server = gui._SingleInstanceServer(Receiver())
-        try:
-            assert server.is_listening()
-            clip = tmp_path / "take one.mov"
-            clip.write_bytes(b"\0")
-            # The second launch is another process; run the client off the GUI
-            # thread so this event loop can accept and read (Windows pipes
-            # have no buffer, so a same-thread write would never complete).
-            import threading
-            outcome = {}
-            client = threading.Thread(target=lambda: outcome.update(
-                ok=gui._forward_to_running_instance([str(clip)], timeout_ms=5000)))
-            client.start()
-            assert _wait_for(qapp, lambda: received == [str(clip)] and not client.is_alive())
-            client.join(5)
-            assert outcome.get("ok") is True
-        finally:
-            server.deleteLater()
+    # The handoff is exercised end to end by a real second process below.
+    # An in-process variant (client on a Python thread) was dropped: on
+    # Windows a pipe client without an event loop blocks in its disconnect
+    # wait, which says nothing about the shipped two-process behaviour.
 
     def test_a_real_second_process_reports_success(self, qapp, tmp_path, monkeypatch):
         """End to end, as Windows Explorer does it: a separate process
