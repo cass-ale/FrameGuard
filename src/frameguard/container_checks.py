@@ -748,10 +748,6 @@ def _sentence(parts: List[str]) -> str:
     return (text[0].upper() + text[1:] + ".") if text else ""
 
 
-def _ms(seconds: float) -> str:
-    return f"{seconds * 1000:+.0f} ms"
-
-
 def _clock(seconds: float) -> str:
     return _core()._timecode(max(0.0, seconds))
 
