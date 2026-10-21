@@ -99,7 +99,8 @@ class TestLockedFiles:
             monitor._poll()
 
         assert waiting == [path]
-        assert statuses.count("Waiting: open_in_player.mp4 is open in another app") == 1
+        from frameguard.watchfolder import locked_file_message
+        assert statuses.count(locked_file_message("open_in_player.mp4")) == 1
         assert path not in monitor._batch_queue
         assert not monitor._in_burst_mode
         assert monitor._timer.interval() == W.DEFAULT_POLL_INTERVAL_MS

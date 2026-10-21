@@ -550,3 +550,20 @@ class TestReviewFollowUps:
         assert len(asked) == 1
         monkeypatch.setattr(window, "_worker_thread", None)
         assert window._confirm_close_during_scan() is True
+
+
+    def test_preset_rule_values_are_never_substituted_or_inherited(self, window):
+        panel = window.settings_panel
+        base = panel.get_config_overrides()
+        panel._apply_preset_config({**base, "min_audio_sample_rate": 22050,
+                                    "max_decode_errors": 5000, "loudness_mode": "essential",
+                                    "allow_fps_multiples": True})
+        cfg = panel.get_config_overrides()
+        assert cfg["min_audio_sample_rate"] == 22050
+        assert cfg["max_decode_errors"] == 5000
+        # A second preset that does not mention the rules gets the defaults back.
+        plain = {k: v for k, v in base.items() if k not in panel._rule_controls}
+        panel._apply_preset_config(plain)
+        cfg = panel.get_config_overrides()
+        assert cfg["loudness_mode"] == panel._defaults["loudness_mode"]
+        assert cfg["allow_fps_multiples"] is bool(panel._defaults["allow_fps_multiples"])

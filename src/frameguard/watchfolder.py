@@ -156,6 +156,17 @@ def _is_scannable_dir(name: str) -> bool:
     return not name.startswith(".") and name.lower() not in IGNORED_DIR_NAMES
 
 
+def locked_file_message(name: str) -> str:
+    """What to tell the operator about a settled file we cannot take yet.
+
+    Only Windows can tell that another app holds the file open (an exclusive
+    open fails); elsewhere the probe only knows the file is not readable.
+    """
+    if sys.platform == "win32":
+        return f"Waiting: {name} is open in another app"
+    return f"Waiting: {name} cannot be read yet (check its permissions)"
+
+
 def _get_file_size_safe(filepath: str) -> int:
     """Get regular-file size, returning -1 when it cannot be read safely."""
     identity = _get_file_identity_safe(filepath)
@@ -727,8 +738,7 @@ class WatchFolderMonitor(QObject):
         if state.get("lock_reported"):
             return
         state["lock_reported"] = True
-        self.status_changed.emit(
-            f"Waiting: {os.path.basename(filepath)} is open in another app")
+        self.status_changed.emit(locked_file_message(os.path.basename(filepath)))
         self.file_waiting.emit(filepath)
 
     def _flush_if_batch_is_overdue(self):

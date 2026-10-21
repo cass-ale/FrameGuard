@@ -3751,9 +3751,11 @@ class SettingsPanel(QWidget):
         if "silence_duration" in config:
             self._set_float_slider(self.silence_slider, 1.0, 30.0, 0.5, float(config["silence_duration"]))
 
+        # A preset is a complete spec on top of the defaults: a rule it does
+        # not mention returns to its default rather than keeping whatever the
+        # previously selected preset set.
         for key in self._rule_controls:
-            if key in config:
-                self._set_rule_value(key, config[key])
+            self._set_rule_value(key, config.get(key, self._defaults.get(key)))
 
 
 
@@ -3935,7 +3937,7 @@ class SettingsPanel(QWidget):
          (("report", "Report only"), ("advisory", "Warn outside target"),
           ("essential", "Fail outside target"), ("off", "Off"))),
         ("verdicts", "max_decode_errors", "int", "Allowed Decode Errors",
-         "Decoder errors tolerated before File Integrity fails (0 = none)", (0, 1000)),
+         "Decoder errors tolerated before File Integrity fails (0 = none)", (0, 1_000_000)),
     )
 
     def _add_rule_controls(self, layout, group: str):
@@ -3966,10 +3968,16 @@ class SettingsPanel(QWidget):
             control.setChecked(bool(value))
         elif isinstance(control, QComboBox):
             index = control.findData(value)
-            if index < 0 and isinstance(value, (int, float)):
+            if index < 0 and isinstance(value, float) and value.is_integer():
                 index = control.findData(int(value))
-            if index >= 0:
-                control.setCurrentIndex(index)
+            if index < 0:
+                # A preset may ask for a value the list does not offer (22.05
+                # or 192 kHz): add it rather than silently substituting.
+                label = (f"{value / 1000:g} kHz" if key == "min_audio_sample_rate"
+                         and isinstance(value, (int, float)) else str(value))
+                control.addItem(label, value)
+                index = control.count() - 1
+            control.setCurrentIndex(index)
         else:
             control.setValue(int(value))
 
