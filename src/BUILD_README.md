@@ -159,9 +159,10 @@ Python and every binary wheel would also need to be universal2.
 
 Each build leaves an arch-tagged copy (`Output/FrameGuard-arm64.dmg` or
 `Output/FrameGuard-x86_64.dmg`) beside the canonical `FrameGuard.dmg`.
-FFmpeg and FFprobe come from pinned Martin Riedl releases with publisher
-SHA-256 sidecars, separately for arm64 and x86_64. The builder rejects a tool
-whose Mach-O architecture does not match the target; Rosetta is not required.
+FFmpeg and FFprobe come from pinned Martin Riedl releases, separately for
+arm64 and x86_64 (see Tool Cache below for how every tool is pinned). The
+builder rejects a tool whose Mach-O architecture does not match the target;
+Rosetta is not required.
 
 ### Known macOS differences
 
@@ -221,7 +222,15 @@ tools_cache/
 └── darwin-x86_64/    ffmpeg, ffprobe, mediainfo
 ```
 
-They are downloaded once and reused. Useful commands:
+Every tool is pinned in `download_tools.py` to a versioned, immutable URL and
+the SHA-256 of that exact archive. A download whose hash differs is refused,
+and there is no "latest" fallback, so a build bundles exactly the pinned bytes
+or stops. A cached tool is reused only if it was extracted from the currently
+pinned archive; otherwise it is downloaded again. To bump a tool, change its
+version, URL and hash together, after checking the new archive against the
+publisher's own checksum where one exists.
+
+Downloaded tools are reused across builds. Useful commands:
 
 ```bash
 python download_tools.py --verify-only          # check the cache
@@ -248,7 +257,7 @@ The cache is gitignored — these are large binaries, not source.
 | macOS: `bad interpreter` | `build_mac.sh` has CRLF endings — `dos2unix build_mac.sh` |
 | macOS: `Permission denied` | `chmod +x build_mac.sh` |
 | "Inno Setup not found" | Install from jrsoftware.org to the default path |
-| FFmpeg download fails | The build stops; verify the pinned source and checksum sidecar, then retry |
+| FFmpeg download fails or reports a SHA-256 mismatch | The build stops; check that the pinned URL still serves the pinned archive (`download_tools.py`), then retry. Never replace a hash without verifying the new file |
 | Antivirus flags the exe | Add this folder to exclusions during the build |
 
 ---
