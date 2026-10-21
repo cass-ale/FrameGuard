@@ -477,7 +477,7 @@ class TestVersionValidatorCoverage:
         again at the next literal change.)"""
         (tmp_path / "frameguard").mkdir()
         for rel in ("frameguard/__init__.py", "frameguard.spec",
-                    "installer.iss", "version.json"):
+                    "installer.iss", "version.json", "installer_info.txt"):
             src = os.path.join(ROOT, rel)
             dst = tmp_path / rel
             with open(src, encoding="utf-8") as f:

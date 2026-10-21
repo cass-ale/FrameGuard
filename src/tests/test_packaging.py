@@ -34,9 +34,11 @@ class TestVersionConsistency:
     def test_windows_file_version_matches(self):
         from frameguard import __version__
 
-        spec = _read("frameguard.spec")
+        spec = _read("frameguard.spec").replace(" ", "")
         expected = tuple(int(p) for p in __version__.split(".")) + (0,)
-        assert f"filevers={expected}".replace(" ", "") in spec.replace(" ", "")
+        for name in ("filevers", "prodvers"):
+            assert f"{name}={expected}".replace(" ", "") in spec, name
+            assert len(re.findall(rf"\b{name}=", spec)) == 1, name
 
     def test_core_reports_the_package_version(self):
         import frameguard

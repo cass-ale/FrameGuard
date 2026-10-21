@@ -1,9 +1,13 @@
 # FrameGuard release pipeline — audited design: docs/RELEASE_PLAN.md
 #
 # HOW A RELEASE HAPPENS:
-#   1. Bump the version in the four places validate_version.py checks
-#      (frameguard/__init__.py, frameguard.spec, installer.iss,
-#      version.json — changelog lives in version.json), commit, push main.
+#   1. Bump the version everywhere validate_version.py checks
+#      (frameguard/__init__.py; frameguard.spec APP_VERSION, filevers,
+#      prodvers and the version StringStructs; installer.iss AppVersion;
+#      version.json version plus a new first changelog entry
+#      "vX.Y.Z - <title>"; installer_info.txt title and WHAT'S NEW
+#      heading), commit, push main. Only that changelog entry becomes the
+#      release notes.
 #   2. Wait for Tests and Release Candidate to pass on that exact commit SHA.
 #      The candidate proves the installed Windows package and both native DMGs.
 #   3. Tag that proven commit: git tag -a v0.8.0 -m "FrameGuard v0.8.0"
@@ -109,7 +113,7 @@ jobs:
         with:
           python-version-file: src/.python-version
 
-      - name: Validate the four version sources agree
+      - name: Validate every version location agrees
         working-directory: ${{ env.APP_DIR }}
         run: python validate_version.py
 

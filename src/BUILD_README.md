@@ -205,9 +205,10 @@ Still verify by hand:
 | File | Field |
 |------|-------|
 | `frameguard/__init__.py` | `__version__` |
-| `frameguard.spec` | `APP_VERSION` and the Windows `filevers`/`prodvers` tuples |
-| `installer.iss` | `AppVersion`, `VersionInfoVersion`, registry `Version` |
-| `version.json` | `version`, `changelog` (published for auto-update) |
+| `frameguard.spec` | `APP_VERSION`, the Windows `filevers`/`prodvers` tuples and the `FileVersion`/`ProductVersion` strings |
+| `installer.iss` | `AppVersion` (`VersionInfoVersion`, the registry `Version` and the wizard labels derive from it) |
+| `version.json` | `version`, and a new first `changelog` entry starting `vX.Y.Z - <title>`; only that entry becomes the release notes and the in-app "what's new" text |
+| `installer_info.txt` | The title line `FrameGuard Desktop vX.Y.Z` and the `WHAT'S NEW IN vX.Y.Z` heading |
 
 ---
 

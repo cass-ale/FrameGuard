@@ -734,3 +734,84 @@ class TestDeltaHardening:
                 settings.remove(U._CHANNEL_KEY)
             else:
                 settings.setValue(U._CHANNEL_KEY, original)
+
+
+_VERSION_FILES = ("frameguard/__init__.py", "frameguard.spec", "installer.iss",
+                  "version.json", "installer_info.txt")
+
+
+class TestVersionValidatorLocations:
+    """C-O2: validate_version.py checks every location a version ships in,
+    including the spec's integer prodvers tuple the literal scan cannot see."""
+
+    @staticmethod
+    def _tree(tmp_path, mutate=None):
+        (tmp_path / "frameguard").mkdir()
+        for rel in _VERSION_FILES:
+            text = (SRC / rel).read_text(encoding="utf-8-sig")
+            if mutate and rel == mutate[0]:
+                new = mutate[1](text)
+                assert new != text, f"mutation did not apply to {rel}"
+                text = new
+            encoding = "utf-8-sig" if rel == "installer.iss" else "utf-8"
+            (tmp_path / rel).write_text(text, encoding=encoding)
+        return tmp_path
+
+    @staticmethod
+    def _run(cwd):
+        import subprocess
+        import sys
+        return subprocess.run(
+            [sys.executable, str(SRC / "validate_version.py")],
+            cwd=str(cwd), capture_output=True, text=True, timeout=60)
+
+    def test_copied_tree_is_consistent(self, tmp_path):
+        result = self._run(self._tree(tmp_path))
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    @staticmethod
+    def _version():
+        from frameguard import __version__
+        return __version__
+
+    @pytest.mark.parametrize("rel, mutate, message", [
+        ("frameguard.spec",
+         lambda t, v: re.sub(r"prodvers=\([^)]*\)", "prodvers=(0, 0, 1, 0)", t),
+         "prodvers"),
+        ("frameguard.spec",
+         lambda t, v: re.sub(r"filevers=\([^)]*\)", "filevers=(0, 0, 1, 0)", t),
+         "filevers"),
+        ("frameguard.spec",
+         lambda t, v: re.sub(r"\s*prodvers=\([^)]*\),", "", t),
+         "no prodvers"),
+        ("frameguard.spec",
+         lambda t, v: t.replace(f"'ProductVersion', '{v}.0'",
+                                "'ProductVersion', '0.0.1.0'"),
+         "0.0.1.0"),
+        ("installer_info.txt",
+         lambda t, v: t.replace(f"FrameGuard Desktop v{v}\n",
+                                "FrameGuard Desktop v0.0.1\n", 1),
+         "installer_info.txt title"),
+        ("installer_info.txt",
+         lambda t, v: t.replace(f"WHAT'S NEW IN v{v}", "WHAT'S NEW IN v0.0.1"),
+         "WHAT'S NEW"),
+        ("version.json",
+         lambda t, v: t.replace(f'"changelog": "v{v} - ', '"changelog": "v0.0.1 - ', 1),
+         "changelog must start"),
+        ("installer.iss",
+         lambda t, v: t.replace(f"AppVersion={v}\n", "AppVersion=0.0.1\n"),
+         "installer.iss"),
+    ])
+    def test_each_version_location_is_checked(self, tmp_path, rel, mutate, message):
+        version = self._version()
+        tree = self._tree(tmp_path, (rel, lambda t: mutate(t, version)))
+        result = self._run(tree)
+        assert result.returncode == 1, result.stdout
+        assert message in result.stdout, result.stdout
+
+    def test_missing_installer_information_fails_with_a_reason(self, tmp_path):
+        tree = self._tree(tmp_path)
+        (tree / "installer_info.txt").unlink()
+        result = self._run(tree)
+        assert result.returncode == 1
+        assert "installer_info.txt" in result.stdout
