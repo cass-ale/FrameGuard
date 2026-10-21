@@ -21,7 +21,7 @@ from collections import Counter, deque
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Callable
 
-from frameguard import container_checks
+from frameguard import audio_checks, container_checks
 
 # Live handles remain observable for diagnostics, but cancellation never reads
 # this global set. Every cancellable scan subprocess is registered explicitly
@@ -419,6 +419,17 @@ DEFAULT_CONFIG = {
     "segment_count": min(os.cpu_count() or 4, 4),
 }
 
+# --- Audio signal QC (frameguard.audio_checks) ------------------------------
+# Loudness profiles, true peak, clipping, dropouts, phase, dual mono, DC and
+# hum: their names, verdict classes, weights and defaults live in that module.
+ESSENTIAL_CHECKS |= audio_checks.ESSENTIAL_CHECKS
+ADVISORY_CHECKS |= audio_checks.ADVISORY_CHECKS
+FRAME_LEVEL_CHECKS += tuple(sorted(audio_checks.ESSENTIAL_CHECKS | audio_checks.ADVISORY_CHECKS))
+CHECK_SEVERITY_WEIGHTS.update(audio_checks.SEVERITY_WEIGHTS)
+DEFAULT_CONFIG.update(audio_checks.DEFAULT_CONFIG)
+LOUDNESS_PROFILES = audio_checks.LOUDNESS_PROFILE_CHOICES
+# --- end audio signal QC -----------------------------------------------------
+
 COMPAT_ONLY_CONFIG_KEYS = frozenset({"use_hwaccel", "segment_enabled", "segment_count"})
 
 # Keys removed in 0.9.0. Old saved settings and presets may still carry them;
@@ -590,6 +601,7 @@ class QAResult:
             "FFprobe": "file could not be read (may be corrupt)",
             "Internal Error": "an unexpected error occurred during the scan",
         }
+        _PLAIN.update(audio_checks.PLAIN_SUMMARIES)
 
         issues = []
         for check_name, status, *_ in self.checks:
@@ -1799,12 +1811,16 @@ def check_audio(probe_data: dict, result: QAResult, cfg: dict):
             channels.append(("WARN", _with_track(label, "Could not determine audio channel configuration.")))
 
         rate = _safe_int(track.get("sample_rate"), 0) or 0
+        profile_rate = audio_checks.sample_rate_entry(rate, cfg)
         if rate <= 0:
             rates.append(("WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}sample rate unknown.")))
-        elif rate >= min_rate:
-            rates.append(("PASS", _with_track(label, f"{rate} Hz (minimum {min_rate} Hz)")))
-        else:
+        elif rate < min_rate:
             rates.append(("FAIL", _with_track(label, f"{rate} Hz is below the {min_rate} Hz minimum")))
+        elif profile_rate:
+            # An enforced delivery profile (EBU R 128, A/85, Netflix) needs 48 kHz exactly.
+            rates.append((profile_rate[0], _with_track(label, profile_rate[1])))
+        else:
+            rates.append(("PASS", _with_track(label, f"{rate} Hz (minimum {min_rate} Hz)")))
 
     _add_aggregate(result, "Audio Codec", codecs)
     _add_aggregate(result, "Audio Channels", channels)
@@ -1961,6 +1977,8 @@ def _stderr_evidence_categories(line: str) -> tuple:
         categories.append("decode")
     if _LOUDNESS_LINE_RE.search(line):
         categories.append("loudness")
+    if audio_checks.is_evidence_line(line):
+        categories.append("audio")
     for category in ("freeze", "silence", "black"):
         if any(token in line for token in _STDERR_EVIDENCE_TOKENS[category]):
             categories.append(category)
@@ -1989,7 +2007,7 @@ def _clip_evidence_line(line: str, categories: tuple, limit: int) -> str:
                        // max(1, len(categories)))
     snippets = []
     for category in categories:
-        if category in ("decode", "loudness"):
+        if category in ("decode", "loudness", "audio"):
             positions = [0]
         else:
             positions = [line.find(token)
@@ -2306,7 +2324,7 @@ _CORRUPT_PACKET_RE = re.compile(r"corrupt input packet in stream (\d+)")
 _INPUT_STREAM_CONTEXT_RE = re.compile(r"^[vas]ist#\d+:(\d+)")
 _LOUDNESS_LINE_RE = re.compile(
     r"\[ebur128@|^\s*(?:I|Peak|Threshold|LRA(?: low| high)?):\s"
-    r"|Integrated loudness:|True peak:|Loudness range:")
+    r"|Integrated loudness:|True peak:|Sample peak:|Loudness range:")
 _DECODER_UNAVAILABLE_RE = re.compile(
     r"no decoder|decoder \(codec [^)]*\) not found|unknown decoder|unsupported codec"
     r"|could not find codec|decoding requested, but no decoder", re.IGNORECASE)
@@ -2459,6 +2477,9 @@ class _ScanPlan:
         self.audio = _audio_streams(probe_data)
         self.duration = _probed_duration(probe_data)
         self.loudness = (cfg.get("loudness_mode", "report") != "off") and bool(self.audio)
+        self.cfg = cfg
+        # Set by _build_scan_command once the bundled ebur128 is self-tested.
+        self.multichannel_meter = audio_checks.METER_EBUR128
         self.variable_rate = variable_rate
 
     def video_frames_unreliable(self) -> bool:
@@ -2510,7 +2531,46 @@ class _ScanPlan:
             names += ["Audio Silence", "Dead Channel"]
             if self.loudness:
                 names.append("Audio Loudness")
+            names += audio_checks.frame_check_names(self.cfg, self.loudness)
         return names
+
+
+_EBUR128_MULTICHANNEL_OK: Dict[str, bool] = {}
+_EBUR128_REFERENCE_RE = re.compile(r"^\s*I:\s+(-?\d+(?:\.\d+)?)\s+LUFS", re.MULTILINE)
+
+
+def _ebur128_multichannel_ok(ffmpeg: str) -> bool:
+    """Known-answer test of the bundled ebur128 on three channels, cached.
+
+    1 kHz at -23 dBFS in L and R of a 3.0 layout is -23.0 LUFS by EBU Tech
+    3341 case 1. The darwin-arm64 FFmpeg 9.0.2 build reads -5.0 (its >2
+    channel K-weighting is broken; stereo is exact), the x86_64 build of the
+    same release reads -23.0. A binary that fails or cannot run is treated
+    as unreliable so the independent fallback meter is used.
+    """
+    if ffmpeg in _EBUR128_MULTICHANNEL_OK:
+        return _EBUR128_MULTICHANNEL_OK[ffmpeg]
+    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-f", "lavfi",
+           "-i", "sine=f=1000:d=2:sample_rate=48000,volume=0.5663568",
+           "-af", "pan=3.0|c0=c0|c1=c0,ebur128", "-f", "null", "-"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30, env=_get_clean_env(),
+                              **_subprocess_kwargs())
+        match = _EBUR128_REFERENCE_RE.search(proc.stderr or "")
+        ok = bool(match) and abs(float(match.group(1)) + 23.0) <= 0.3
+    except (OSError, ValueError, subprocess.SubprocessError):
+        ok = False
+    _EBUR128_MULTICHANNEL_OK[ffmpeg] = ok
+    return ok
+
+
+def _multichannel_meter(ffmpeg: str, plan: "_ScanPlan") -> str:
+    """The loudness meter for tracks of three or more channels."""
+    needs = plan.loudness and any(plan.channels(t) > 2 and not audio_checks.treated_as_ambisonic(t)
+                                  for t in plan.audio)
+    if not needs or _ebur128_multichannel_ok(ffmpeg):
+        return audio_checks.METER_EBUR128
+    return audio_checks.METER_LOUDNORM
 
 
 def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) -> List[str]:
@@ -2521,8 +2581,6 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     errors and no freeze in software), so the verdict depended on the machine
     and on which file happened to be scanned first.
     """
-    noise = float(cfg["silence_noise_db"])
-    silence = float(cfg["silence_duration"])
     chains, maps = [], []
     if plan.video is not None:
         chains.append(
@@ -2532,20 +2590,14 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
             f"freezedetect@v=n={float(cfg['freeze_detect_noise'])}"
             f":d={float(cfg['freeze_detect_duration'])}[v]")
         maps += ["-map", "[v]"]
+    meter = _multichannel_meter(ffmpeg, plan)
+    plan.multichannel_meter = meter
     for i, track in enumerate(plan.audio):
-        source = f"[0:{int(track['index'])}]"
-        count = plan.channels(track)
-        if 1 < count <= MAX_CHANNEL_SPLIT:
-            labels = [f"[a{i}m]"] + [f"[a{i}c{k}]" for k in range(count)]
-            chains.append(f"{source}asplit={count + 1}{''.join(labels)}")
-            source = f"[a{i}m]"
-            for k in range(count):
-                chains.append(f"[a{i}c{k}]pan=mono|c0=c{k},"
-                              f"silencedetect@a{i}c{k}=n={noise}dB:d={silence},anullsink")
-        chain = f"{source}silencedetect@a{i}=n={noise}dB:d={silence}"
-        if plan.loudness:
-            chain += f",ebur128@a{i}=peak=true:framelog=quiet"
-        chains.append(chain + f"[a{i}]")
+        # Audio branches (silence, loudness, per-channel signal checks):
+        # frameguard.audio_checks.track_filter_chains.
+        names = _channel_names(track, plan.channels(track))
+        chains += audio_checks.track_filter_chains(i, track, names, cfg, plan.loudness,
+                                                   MAX_CHANNEL_SPLIT, meter)
         maps += ["-map", f"[a{i}]"]
     threads = max(1, int(cfg.get("filter_threads", 4) or 4))
     return ([ffmpeg, "-nostdin", "-hide_banner", "-nostats",
@@ -2879,12 +2931,26 @@ def _track_silence_entry(label: str, events, duration: float, cfg: dict,
     return "WARN", _with_track(label, f"{count} silence region(s), total {total:.1f}s. At: {positions}")
 
 
-def _dead_channel_entry(label: str, track: dict, position: int, log_text: str,
-                        duration: float, track_dead: bool, cfg: dict) -> Tuple[str, str]:
+def _dead_channels(track: dict, position: int, log_text: str, duration: float,
+                   cfg: dict) -> List[int]:
+    """Indices of channels silent (at ``channel_silence_noise_db``) for at
+    least ``dead_channel_ratio`` of the track."""
+    count = _ScanPlan.channels(track)
+    if count <= 1 or count > MAX_CHANNEL_SPLIT or duration <= 0:
+        return []
+    ratio = float(cfg.get("dead_channel_ratio", 0.95))
+    return [k for k in range(count)
+            if sum(d for _, d in _silence_events(log_text, f"silencedetect@a{position}c{k}", duration))
+            >= duration * ratio]
+
+
+def _dead_channel_entry(label: str, track: dict, dead_channels: List[int],
+                        track_dead: bool) -> Tuple[str, str]:
     """Per-channel silence: one dead channel in a live track.
 
     silencedetect on a whole track only fires when every channel is silent,
-    so a stereo file with a dead right channel passed.
+    so a stereo file with a dead right channel passed. Channels are judged
+    at Qualify's -70 dBFS per-channel default (``channel_silence_noise_db``).
     """
     count = _ScanPlan.channels(track)
     if count <= 1:
@@ -2895,12 +2961,7 @@ def _dead_channel_entry(label: str, track: dict, position: int, log_text: str,
     if track_dead:
         return "SKIP", _with_track(label, "Whole track is silent (see Audio Silence).")
     names = _channel_names(track, count)
-    ratio = float(cfg.get("dead_channel_ratio", 0.95))
-    dead = []
-    for k in range(count):
-        events = _silence_events(log_text, f"silencedetect@a{position}c{k}", duration)
-        if duration > 0 and sum(d for _, d in events) >= duration * ratio:
-            dead.append(names[k])
+    dead = [names[k] for k in dead_channels]
     if not dead:
         return "PASS", _with_track(label, f"All {count} channels carry signal.")
     live_dead = [n for n in dead if n != "LFE"]
@@ -2912,67 +2973,54 @@ def _dead_channel_entry(label: str, track: dict, position: int, log_text: str,
     return "WARN", _with_track(label, text + " Verify the mix is intentionally sparse.")
 
 
-def _parse_loudness(log_text: str) -> Dict[int, dict]:
-    """Integrated loudness and true peak per ebur128@aN summary block."""
-    results: Dict[int, dict] = {}
-    current = None
-    number = r"(-?inf|-?\d+(?:\.\d+)?)"
-    for line in log_text.splitlines():
-        header = re.search(r"\[ebur128@a(\d+) @ [0-9A-Fa-fx]+\].*Summary:", line)
-        if header:
-            current = int(header.group(1))
-            results[current] = {}
-            continue
-        if current is None:
-            continue
-        integrated = re.match(rf"^\s*I:\s+{number}\s+LUFS", line)
-        if integrated:
-            results[current]["integrated"] = float(integrated.group(1))
-            continue
-        peak = re.match(rf"^\s*Peak:\s+{number}\s+dBFS", line)
-        if peak:
-            results[current]["true_peak"] = float(peak.group(1))
-            current = None
-    return results
+def _add_audio_row(result: QAResult, name: str, row) -> None:
+    status, detail, confidence = row
+    {"FAIL": result.add_fail, "WARN": result.add_warn,
+     "PASS": result.add_pass, "SKIP": result.add_skip}[status](name, detail, confidence)
 
 
-def _loudness_entry(label: str, measured: Optional[dict], cfg: dict) -> Tuple[str, str]:
-    """One track's loudness row for the configured ``loudness_mode``."""
-    mode = cfg.get("loudness_mode", "report")
-    if not measured or "integrated" not in measured:
-        if mode == "report":
-            return "SKIP", _with_track(label, "Loudness summary not reported by FFmpeg.")
-        return "WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}loudness summary not reported by FFmpeg.")
-    integrated = measured["integrated"]
-    peak = measured.get("true_peak")
-    peak_text = f"{peak:.1f} dBTP" if peak is not None and math.isfinite(peak) else "-inf dBTP"
-    loudness_text = ("no measurable loudness (silent)" if integrated <= -69.9
-                     else f"{integrated:.1f} LUFS")
-    if mode == "report":
-        return "PASS", _with_track(label, f"{loudness_text}, true peak {peak_text}; not enforced")
-    target = float(cfg["target_loudness_lufs"])
-    tolerance = float(cfg["loudness_tolerance_lu"])
-    peak_max = float(cfg["true_peak_max_dbtp"])
-    issues = []
-    if integrated <= -69.9:
-        issues.append("no measurable programme loudness (silent)")
-    elif abs(integrated - target) > tolerance:
-        issues.append(f"integrated {integrated:.1f} LUFS is outside {target:g} ± {tolerance:g} LUFS")
-    if peak is not None and peak > peak_max:
-        issues.append(f"true peak {peak:.1f} dBTP exceeds {peak_max:g} dBTP")
-    text = (f"{loudness_text}, true peak {peak_text} "
-            f"(target {target:g} ± {tolerance:g} LUFS, max {peak_max:g} dBTP)")
-    if not issues:
-        return "PASS", _with_track(label, text)
-    status = "FAIL" if mode == "essential" else "WARN"
-    return status, _with_track(label, f"{text}: " + "; ".join(issues))
+def _audio_evidence(log_text: str) -> "audio_checks.ScanEvidence":
+    return audio_checks.ScanEvidence(
+        log_text=log_text,
+        silence_events=lambda instance, end: _silence_events(log_text, instance, end),
+        detect_events=lambda text, prefix: _merge_event_intervals(_pair_detect_events(text, prefix)))
+
+
+def _record_loudness_metadata(result: QAResult, entry: Optional[dict], cfg: dict) -> None:
+    if not entry:
+        return
+    result.set_metadata("integrated_loudness_lufs", entry.get("integrated"))
+    result.set_metadata("true_peak_dbtp", entry.get("true_peak"))
+    for source, key in (("lra", "loudness_range_lu"), ("sample_peak", "sample_peak_dbfs"),
+                        ("meter", "loudness_meter")):
+        if entry.get(source) is not None:
+            result.set_metadata(key, entry[source])
+    result.set_metadata("loudness_profile", audio_checks.resolve_profile(cfg).key)
+
+
+def _with_channel_silence(status: str, detail: str, label: str,
+                          alone: List[str]) -> Tuple[str, str]:
+    """Add per-channel silent stretches (a WARN) to a track's silence entry."""
+    if not alone:
+        return status, detail
+    extra = "; ".join(alone)
+    if status == "PASS":
+        return "WARN", _with_track(label, extra)
+    return status, f"{detail}; {extra}"
 
 
 def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:
-    silence, dead, loudness = [], [], []
-    measured = _parse_loudness(outcome.log_text) if plan.loudness else {}
+    """Audio rows of the integrity pass.
+
+    Whole-track silence and dead channels keep their 0.9.0 rules; loudness,
+    true peak and the per-channel signal checks come from audio_checks.
+    """
+    evidence = _audio_evidence(outcome.log_text)
+    silence, dead, loudness, true_peak, contexts = [], [], [], [], []
+    measured = audio_checks.parse_meters(outcome.log_text) if plan.loudness else {}
     total = len(plan.audio)
     primary = _primary_track_position(plan.audio)
+    channel_warning = False
     for position, track in enumerate(plan.audio):
         label = _track_label(position, track, total)
         duration = (_decoded_audio_seconds(track, outcome.accounting)
@@ -2980,28 +3028,47 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
         events = _silence_events(outcome.log_text, f"silencedetect@a{position}", duration)
         status, detail = _track_silence_entry(label, events, duration, cfg,
                                               primary=position == primary, number=position + 1)
-        silence.append((status, detail))
         if position == 0 and events:
             result.set_metadata("silence_regions", len(events))
             result.set_metadata("silence_total_seconds", round(sum(d for _, d in events), 2))
             result.set_metadata("silence_timestamps", _format_event_list(events))
         track_dead = (duration > 0 and sum(d for _, d in events)
                       >= duration * float(cfg.get("dead_channel_ratio", 0.95)))
-        dead.append(_dead_channel_entry(label, track, position, outcome.log_text,
-                                        duration, track_dead, cfg))
+        dead_channels = _dead_channels(track, position, outcome.log_text, duration, cfg)
+        ctx = audio_checks.TrackContext(
+            position=position, track=track, names=_channel_names(track, plan.channels(track)),
+            label=label, duration=duration, dead_channels=dead_channels, track_silent=track_dead,
+            meter=audio_checks.loudness_meter(track, plan.channels(track), plan.multichannel_meter))
+        contexts.append(ctx)
+        alone = audio_checks.channel_silence_entries(evidence, ctx, cfg, events)
+        channel_warning = channel_warning or bool(alone)
+        silence.append(_with_channel_silence(status, detail, label, alone))
+        dead.append(_dead_channel_entry(label, track, dead_channels, track_dead))
         if plan.loudness:
             entry = measured.get(position)
-            loudness.append(_loudness_entry(label, entry, cfg))
-            if entry and position == 0:
-                result.set_metadata("integrated_loudness_lufs", entry.get("integrated"))
-                result.set_metadata("true_peak_dbtp", entry.get("true_peak"))
-    confidence = 90 if any(s == "FAIL" for s, _ in silence) else 100
+            loudness.append(audio_checks.loudness_row(entry, ctx, cfg))
+            true_peak.append(audio_checks.true_peak_row(
+                entry, ctx, cfg, audio_checks.track_sample_peak(evidence, ctx)))
+            if position == 0:
+                _record_loudness_metadata(result, entry, cfg)
+    if any(s == "FAIL" for s, _ in silence):
+        confidence = 90
+    else:
+        confidence = 80 if channel_warning else 100
     _add_aggregate(result, "Audio Silence", silence, confidence)
     _add_aggregate(result, "Dead Channel", dead)
     if plan.loudness:
-        _add_aggregate(result, "Audio Loudness", loudness)
+        _add_audio_row(result, "Audio Loudness", audio_checks.aggregate(loudness))
+        _add_audio_row(result, audio_checks.TRUE_PEAK, audio_checks.aggregate(true_peak))
     else:
         result.add_skip("Audio Loudness", "Loudness not measured (disabled by this spec).")
+        result.add_skip(audio_checks.TRUE_PEAK, "True peak not measured (loudness is off in this spec).")
+    rows = audio_checks.signal_rows(evidence, contexts, cfg)
+    rows.update(audio_checks.disabled_rows(cfg))
+    for name in (audio_checks.CLIPPING, audio_checks.DROPOUTS, audio_checks.PHASE,
+                 audio_checks.DUAL_MONO, audio_checks.DC_OFFSET, audio_checks.HUM):
+        if name in rows:
+            _add_audio_row(result, name, rows[name])
 
 
 def _report_scan(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:

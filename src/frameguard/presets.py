@@ -23,6 +23,8 @@ import unicodedata
 from pathlib import Path
 from typing import Optional, Dict, List
 
+from frameguard import audio_checks
+
 # Preset file format
 PRESET_FORMAT_VERSION = 2
 FG_EXTENSION = ".fg"
@@ -86,6 +88,8 @@ PRESET_CONFIG_KEYS = (
     "segment_enabled",
     "segment_count",
 )
+# Audio signal QC keys (loudness profile, per-check switches, thresholds).
+PRESET_CONFIG_KEYS = PRESET_CONFIG_KEYS + audio_checks.PRESET_KEYS
 
 # v1 presets (and anything exported by FrameGuard <= 0.5.1) used a different
 # spelling for a few keys. Map them onto the engine names on import.
@@ -156,7 +160,7 @@ def validate_preset_config(config: dict) -> dict:
             out[key] = coerced
     if problems or unknown:
         raise PresetValidationError(problems, unknown)
-    return out
+    return audio_checks.normalize_custom_profile(out)
 
 
 def normalize_preset_config(config: dict) -> dict:
@@ -178,7 +182,7 @@ def normalize_preset_config(config: dict) -> dict:
         coerced, problem = _coerce_preset_value(key, value)
         if not problem:
             out[key] = coerced
-    return out
+    return audio_checks.normalize_custom_profile(out)
 
 
 # Values are interpolated into FFmpeg filter graphs (e.g. silence_noise_db
@@ -212,6 +216,7 @@ _PRESET_VALUE_RANGES = {
     "max_pixel_rate": (0, 16384 * 16384 * 1000),
     "max_audio_tracks": (0, 64),
 }
+_PRESET_VALUE_RANGES.update(audio_checks.VALUE_RANGES)
 _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers",
                         "allowed_video_profiles", "allowed_pix_fmts")
 # Lists that may legitimately be empty (an empty acceptance list would fail
@@ -223,7 +228,7 @@ _INTEGER_PRESET_KEYS = frozenset({
     "target_width", "target_height", "min_audio_sample_rate", "segment_count",
     "max_decode_errors", "av_short_tolerance_frames", "max_frame_pixels",
     "max_pixel_rate", "max_audio_tracks",
-})
+}) | audio_checks.INTEGER_KEYS
 
 
 def _enum_choices(key: str):
@@ -235,6 +240,7 @@ def _enum_choices(key: str):
         "required_stereo_mode": core.STEREO_CHOICES,
         "loudness_mode": core.LOUDNESS_MODES,
         "spatial_audio": core.SPATIAL_AUDIO_CHOICES,
+        **audio_checks.ENUM_CHOICES,
     }.get(key)
 
 
