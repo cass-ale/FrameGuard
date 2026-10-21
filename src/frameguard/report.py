@@ -674,6 +674,9 @@ def _generate_report(results, output_path, preset_label, editor, colors, unicode
 
     pdf.ln(10)
 
+    # ---- Effective spec and tool versions (audit trail) ----
+    _draw_spec_table(pdf, results, c)
+
     # ---- Detailed results ----
     chk_cols = [w * USABLE_W for w in (0.13, 0.24, 0.63)]
     chk_headers = ["Status", "Check", "Detail"]
@@ -833,30 +836,45 @@ def _generate_report(results, output_path, preset_label, editor, colors, unicode
 
     # Save
     try:
-        if not os.path.dirname(output_path):
-            docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "FrameGuard")
-            os.makedirs(docs_dir, exist_ok=True)
-            output_path = os.path.join(docs_dir, os.path.basename(output_path))
-        else:
-            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        output_path = _resolve_output_path(output_path)
     except OSError as e:
         raise _OutputError(f"Failed to write PDF to '{output_path}': {e}") from e
     # Render first (font subsetting happens here), then write atomically: a
     # report interrupted mid-write never replaces a good one, and a reader
     # never sees a half-written file.
     data = bytes(pdf.output())
-    partial = f"{output_path}.part"
+    try:
+        _atomic_write_bytes(output_path, data)
+    except OSError as e:
+        raise _OutputError(f"Failed to write PDF to '{output_path}': {e}") from e
+    return output_path
+
+
+def _resolve_output_path(output_path: str) -> str:
+    """Where a report file really goes: a bare file name lands in
+    ~/Documents/FrameGuard. Creates the directory; raises OSError."""
+    if not os.path.dirname(output_path):
+        docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "FrameGuard")
+        os.makedirs(docs_dir, exist_ok=True)
+        return os.path.join(docs_dir, os.path.basename(output_path))
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    return output_path
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """Write via ``<path>.part`` + rename: a reader never sees a half file and
+    an interrupted export never replaces a good one. Raises OSError."""
+    partial = f"{path}.part"
     try:
         with open(partial, "wb") as handle:
             handle.write(data)
-        os.replace(partial, output_path)
-    except OSError as e:
+        os.replace(partial, path)
+    except OSError:
         try:
             os.remove(partial)
         except OSError:
             pass
-        raise _OutputError(f"Failed to write PDF to '{output_path}': {e}") from e
-    return output_path
+        raise
 
 
 def get_default_output_dir() -> str:
@@ -867,3 +885,247 @@ def get_default_output_dir() -> str:
     docs_dir = os.path.join(os.path.expanduser("~"), "Documents", "FrameGuard")
     os.makedirs(docs_dir, exist_ok=True)
     return docs_dir
+
+
+# ============================================================================
+# MACHINE-READABLE EXPORTS (JSON / CSV)
+# ============================================================================
+# The PDF is for people; these are for audit and automation. Each records
+# every check, the metadata, the exact settings and the tool versions that
+# produced the verdict, so a result can be reproduced or challenged later.
+
+EXPORT_SCHEMA = "frameguard.results/1"
+
+
+def _json_safe(value):
+    """Recursively convert sets/tuples/odd scalars into JSON-native values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted(_json_safe(v) for v in value)
+    if isinstance(value, float) and value != value:  # NaN
+        return None
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def _result_record(r: QAResult) -> dict:
+    checks = []
+    for check in getattr(r, "checks", ()) or ():
+        if not isinstance(check, (list, tuple)) or len(check) < 2:
+            continue
+        checks.append({
+            "name": check[0],
+            "status": check[1],
+            "detail": check[2] if len(check) > 2 else "",
+            "confidence": check[3] if len(check) > 3 else 100,
+        })
+    status = _result_status(r)
+    return _json_safe({
+        "file": os.path.abspath(r.filepath) if getattr(r, "filepath", "") else "",
+        "filename": getattr(r, "filename", ""),
+        "status": status,
+        "status_label": _status_label(status),
+        "strict": bool(getattr(r, "strict", False)),
+        "severity_score": _result_severity_score(r),
+        "summary": r.plain_summary() if hasattr(r, "plain_summary") else "",
+        "scan_started": getattr(r, "started_at", None),
+        "scan_finished": getattr(r, "finished_at", None),
+        "frameguard_version": getattr(r, "engine_version", __version__),
+        "tool_versions": getattr(r, "tool_versions", {}) or {},
+        "config": getattr(r, "config", {}) or {},
+        "checks": checks,
+        "metadata": getattr(r, "metadata", {}) or {},
+    })
+
+
+def build_export_document(results: List[QAResult], preset_label: str = "") -> dict:
+    """The JSON export as a dict (also the source for the CSV rows)."""
+    if not results:
+        raise ValueError("Cannot export with no scan results.")
+    return {
+        "schema": EXPORT_SCHEMA,
+        "frameguard_version": __version__,
+        "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "profile": preset_label or "Custom",
+        "file_count": len(results),
+        "results": [_result_record(r) for r in results],
+    }
+
+
+def export_results_json(results: List[QAResult], output_path: str,
+                        preset_label: str = "") -> str:
+    """Write the JSON export atomically; returns the path."""
+    import json
+    document = build_export_document(results, preset_label)
+    data = json.dumps(document, indent=2, ensure_ascii=False).encode("utf-8")
+    _atomic_write_bytes(output_path, data)
+    return output_path
+
+
+CSV_COLUMNS = (
+    "generated_at", "frameguard_version", "profile", "file", "filename",
+    "overall_status", "scan_started", "scan_finished", "ffmpeg_version",
+    "ffprobe_version", "record_type", "name", "status", "confidence", "value",
+)
+
+
+def _csv_rows(document: dict):
+    """Long format: one row per check, per metadata item, per config key."""
+    for record in document["results"]:
+        tools = record.get("tool_versions") or {}
+        base = {
+            "generated_at": document["generated_at"],
+            "frameguard_version": record.get("frameguard_version") or document["frameguard_version"],
+            "profile": document["profile"],
+            "file": record["file"],
+            "filename": record["filename"],
+            "overall_status": record["status_label"],
+            "scan_started": record.get("scan_started") or "",
+            "scan_finished": record.get("scan_finished") or "",
+            "ffmpeg_version": (tools.get("ffmpeg") or {}).get("version") or "",
+            "ffprobe_version": (tools.get("ffprobe") or {}).get("version") or "",
+        }
+        for check in record["checks"]:
+            yield {**base, "record_type": "check", "name": check["name"],
+                   "status": check["status"], "confidence": check["confidence"],
+                   "value": check["detail"]}
+        for key, value in record["metadata"].items():
+            yield {**base, "record_type": "metadata", "name": key, "status": "",
+                   "confidence": "", "value": _csv_value(value)}
+        for key, value in record["config"].items():
+            yield {**base, "record_type": "config", "name": key, "status": "",
+                   "confidence": "", "value": _csv_value(value)}
+
+
+def _csv_value(value) -> str:
+    import json
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False)
+    return "" if value is None else str(value)
+
+
+def export_results_csv(results: List[QAResult], output_path: str,
+                       preset_label: str = "") -> str:
+    """Write the CSV export atomically (UTF-8 with BOM so Excel reads it); returns the path."""
+    import csv
+    import io
+    document = build_export_document(results, preset_label)
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=CSV_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    for row in _csv_rows(document):
+        writer.writerow(row)
+    _atomic_write_bytes(output_path, buffer.getvalue().encode("utf-8-sig"))
+    return output_path
+
+
+def write_data_exports(results: List[QAResult], pdf_path: str,
+                       preset_label: str = "") -> tuple:
+    """Write ``<report>.json`` and ``<report>.csv`` next to a PDF report.
+
+    Resolves the path exactly as generate_report does, so the data files
+    always sit beside the PDF (a bare name means ~/Documents/FrameGuard).
+    """
+    stem = os.path.splitext(_resolve_output_path(pdf_path))[0]
+    json_path = export_results_json(results, stem + ".json", preset_label)
+    csv_path = export_results_csv(results, stem + ".csv", preset_label)
+    return json_path, csv_path
+
+
+# ============================================================================
+# PDF: SPEC / THRESHOLDS TABLE
+# ============================================================================
+
+def _fmt_choice(value) -> str:
+    return "not enforced" if value in (None, "any") else str(value)
+
+
+def spec_rows(config: dict) -> List[tuple]:
+    """(label, value) pairs summarising the effective spec for the PDF."""
+    if not config:
+        return []
+    c = config
+    rows = [
+        ("Resolution", f"{c.get('target_width')}x{c.get('target_height')}"
+                       + (" or larger (same shape)" if c.get("allow_larger_resolution") else " exactly")),
+        ("Frame rate", f"{c.get('target_fps')} ± {c.get('fps_tolerance')} fps"
+                       + (", multiples allowed" if c.get("allow_fps_multiples") else "")),
+        ("Min video bitrate", f"{c.get('min_bitrate_mbps')} Mbps"),
+        ("Video codecs", ", ".join(c.get("accepted_codecs") or [])),
+        ("Containers", ", ".join(c.get("accepted_containers") or [])),
+        ("Audio codecs", ", ".join(c.get("accepted_audio_codecs") or [])),
+        ("Audio", ("required" if c.get("audio_required") else "optional")
+                  + f", min {c.get('min_audio_sample_rate')} Hz"),
+        ("Frame timing", ("constant required" if c.get("require_cfr") else "variable allowed")
+                         + f" (>{float(c.get('vfr_threshold') or 0) * 100:g}% irregular = VFR)"),
+        ("Scan type", "progressive required" if c.get("require_progressive") else "interlaced allowed"),
+        ("Bit depth / transfer", f"{_fmt_choice(c.get('min_bit_depth'))} / {_fmt_choice(c.get('required_transfer'))}"),
+        ("Projection / stereo", f"{_fmt_choice(c.get('required_projection'))} / {_fmt_choice(c.get('required_stereo_mode'))}"),
+        ("Decode errors allowed", str(c.get("max_decode_errors"))),
+        ("Black / freeze", f"≥{c.get('black_detect_duration')} s (pix {c.get('black_detect_pix_threshold')}) / "
+                           f"≥{c.get('freeze_detect_duration')} s (noise {c.get('freeze_detect_noise')})"),
+        ("Silence", f"≤{c.get('silence_noise_db')} dB for ≥{c.get('silence_duration')} s; "
+                    f"dead at {float(c.get('dead_channel_ratio') or 0) * 100:g}%"),
+        ("Loudness", "not measured" if c.get("loudness_mode") == "off" else
+                     f"{c.get('loudness_mode')}: {c.get('target_loudness_lufs')} ± "
+                     f"{c.get('loudness_tolerance_lu')} LUFS, TP ≤ {c.get('true_peak_max_dbtp')} dBTP"),
+    ]
+    return [(label, value) for label, value in rows if value not in (None, "")]
+
+
+def _tools_line(results) -> str:
+    for r in results:
+        tools = getattr(r, "tool_versions", None) or {}
+        if tools:
+            parts = [f"FrameGuard {getattr(r, 'engine_version', __version__)}"]
+            for name in ("ffmpeg", "ffprobe"):
+                version = (tools.get(name) or {}).get("version")
+                if version:
+                    parts.append(version.split(" Copyright")[0])
+            return "   |   ".join(parts)
+    return f"FrameGuard {__version__}"
+
+
+def _draw_spec_table(pdf, results, colors) -> None:
+    """Compact two-column key/value table of the effective spec + tool versions."""
+    configs = [getattr(r, "config", None) or {} for r in results]
+    config = next((c for c in configs if c), {})
+    rows = spec_rows(config)
+    if not rows:
+        return
+    distinct = {repr(sorted(c.items())) for c in configs if c}
+    label_w, value_w = USABLE_W * 0.26, USABLE_W * 0.74
+    pdf.set_font(pdf.ff, "", 7.5)
+    heights = [max(5.0, pdf.text_height(value_w, pdf._text(v), 3.6) + 1.6) for _, v in rows]
+    needed = 7 + 2 + sum(heights) + 12
+    if not pdf.room_for(min(needed, 80)):
+        pdf.add_page()
+    pdf.set_font(pdf.ff, "B", 13)
+    pdf.set_text_color(*colors["text_primary"])
+    pdf.cell(0, 7, "Scan Specification", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1)
+    for index, ((label, value), height) in enumerate(zip(rows, heights)):
+        if not pdf.room_for(height):
+            pdf.add_page()
+        y = pdf.get_y()
+        pdf.row_band(y, height, colors["bg_secondary"] if index % 2 == 0 else colors["bg_primary"])
+        pdf.set_font(pdf.ff, "B", 7.5)
+        pdf.set_text_color(*colors["text_primary"])
+        pdf.cell_text(MARGIN_L, y, label_w, height, pdf._text(label))
+        pdf.set_font(pdf.ff, "", 7.5)
+        pdf.set_text_color(*colors["text_secondary"])
+        pdf.wrapped_text(MARGIN_L + label_w, y + 0.8, value_w, pdf._text(value), line_h=3.6)
+        pdf.set_xy(MARGIN_L, y + height)
+    pdf.ln(1.5)
+    pdf.set_font(pdf.ff, "I", 7.5)
+    pdf.set_text_color(*colors["text_tertiary"])
+    note = "Tools: " + _tools_line(results)
+    if len(distinct) > 1:
+        note += f"   |   {len(distinct)} different configurations in this batch; see the JSON export"
+    pdf.set_x(MARGIN_L)
+    pdf.multi_cell(USABLE_W, 3.8, pdf._text(note), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(6)

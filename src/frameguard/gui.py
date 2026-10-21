@@ -4154,12 +4154,15 @@ class _PdfExportRunner(QRunnable):
     def run(self):
         try:
             from frameguard.report import generate_report
-            generate_report(
+            pdf_path = generate_report(
                 self.results,
                 self.output_path,
                 preset_label=self.preset_label,
                 colors=self.colors,
             )
+            from frameguard.report import write_data_exports
+            write_data_exports(self.results, pdf_path or self.output_path,
+                               self.preset_label or "")
             self.signals.finished.emit(self.output_path)
         except Exception as e:
             self.signals.error.emit(str(e))
@@ -6170,7 +6173,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Information)
         box.setWindowTitle("Export Complete")
-        box.setText("PDF report saved.")
+        box.setText("PDF report saved, with JSON and CSV data alongside.")
         box.setInformativeText(path)
         open_btn = box.addButton("Open PDF", QMessageBox.AcceptRole)
         folder_btn = box.addButton("Show in Folder", QMessageBox.ActionRole)
