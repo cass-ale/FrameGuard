@@ -2907,7 +2907,8 @@ def _black_events(log_text: str, video_end: float) -> List[Tuple[float, float]]:
     return [(start, start + duration) for start, duration in _pair_detect_events(text, "black")]
 
 
-def _open_video_analysis(plan: _ScanPlan, cfg: dict):
+def _open_video_analysis(plan: _ScanPlan, cfg: dict,
+                         cancel_event: Optional[threading.Event] = None):
     """(analysis, error) for the picture checks; attaches it to ``plan``.
 
     The analysis owns a private temporary directory; it is removed by
@@ -2917,7 +2918,7 @@ def _open_video_analysis(plan: _ScanPlan, cfg: dict):
     """
     if plan.video is None or "index" not in plan.video:
         return None, None
-    analysis = video_checks.VideoAnalysis(plan.video, cfg)
+    analysis = video_checks.VideoAnalysis(plan.video, cfg, cancel_event)
     try:
         analysis.open()
     except OSError as exc:
@@ -3187,13 +3188,15 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         result.set_metadata("duration_seconds", round(plan.duration, 2))
         result.set_metadata("duration_display", _format_duration(plan.duration))
 
-    analysis, analysis_error = _open_video_analysis(plan, cfg)
+    analysis, analysis_error = _open_video_analysis(plan, cfg, cancel_event)
     cmd = _build_scan_command(ffmpeg_path, filepath, plan, cfg)
     if progress_callback:
         progress_callback("filter", 0, plan.duration or 0.0, "Integrity scan (software decode)")
     outcome = _run_scan_process(cmd, _calc_timeout(plan.duration, cfg), plan.duration, cfg,
                                 progress_callback, cancel_event, process_owner)
     if outcome is None:
+        if analysis is not None:
+            analysis.close()  # cancelled: stop the flash reader, remove the files
         return
     if getattr(outcome.log_text, "truncated_records", 0):
         result.set_metadata("deep_scan_stderr_truncated_lines", outcome.log_text.truncated_records)

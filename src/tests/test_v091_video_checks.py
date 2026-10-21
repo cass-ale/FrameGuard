@@ -150,21 +150,15 @@ class TestLevels:
         near = vc.assess_levels(self._series(gam=[0.012] * 60), FPS, False)
         assert vc.levels_entry(near, "essential", False)[2] < 70
 
-    def test_unsignalled_matrix_needs_every_candidate_to_agree(self):
-        """Untagged HD: judged under BT.709 and BT.601; a share counts only
-        when it is out of gamut under both (FFmpeg encodes untagged RGB with
-        BT.601, so BT.709 alone flagged ordinary pictures)."""
+    def test_unsignalled_matrix_notes(self):
+        """Untagged: shares already count only pixels outside under every
+        candidate matrix (intersected in the filter graph)."""
         n = 60
-        series = self._series(n=n)
-        series.gam_by_matrix = {"bt709": [0.6] * n, "bt601": [0.0] * n}
-        series.gam = [min(v) for v in zip(*series.gam_by_matrix.values())]
-        findings = vc.assess_levels(series, FPS, False, ("bt709", "bt601"))
-        status, detail, _ = vc.levels_entry(findings, "advisory", False)
-        assert status == "PASS" and "within R 103 under at least one" in detail
-        series.gam_by_matrix = {"bt709": [0.6] * n, "bt601": [0.5] * n}
-        series.gam = [min(v) for v in zip(*series.gam_by_matrix.values())]
-        findings = vc.assess_levels(series, FPS, False, ("bt709", "bt601"))
-        status, detail, confidence = vc.levels_entry(findings, "advisory", False)
+        quiet = vc.assess_levels(self._series(gam=[0.0] * n, n=n), FPS, False, ("bt709", "bt601"))
+        status, detail, _ = vc.levels_entry(quiet, "advisory", False)
+        assert status == "PASS" and "under every one" in detail
+        loud = vc.assess_levels(self._series(gam=[0.5] * n, n=n), FPS, False, ("bt709", "bt601"))
+        status, detail, confidence = vc.levels_entry(loud, "advisory", False)
         assert status == "WARN" and confidence >= 70 and "holds under BT.709 and BT.601" in detail
 
     def test_candidate_matrices(self):
@@ -543,3 +537,96 @@ class TestRealScan:
         result = core.QAResult(clean_clip)
         core.run_deep_scan(clean_clip, result, dict(DEFAULT_CONFIG))
         assert not [p for p in os.listdir(tmp_path) if p.startswith("frameguard-video-")]
+
+
+class TestStreamingAndCancel:
+    """Long programmes: bounded temporary files, cancellable evaluation."""
+
+    def test_streamed_flash_matches_whole_series(self):
+        grid = _flash_series(5).flash
+        raw = b"".join(g + b + r for g, b, r in grid)
+        accumulator = vc.FlashAccumulator(FPS)
+        for k in range(0, len(raw), 1000):           # chunks split frames mid-way
+            accumulator.feed(raw[k:k + 1000])
+        accumulator.finish()
+        streamed = accumulator.events(_times(len(grid)), FPS)
+        whole = vc.assess_flash(_flash_series(5), FPS)
+        assert [(e.start, e.end, e.kind) for e in streamed] == [(e.start, e.end, e.kind) for e in whole]
+        assert streamed
+        # Only frames near the hazard were kept, not the whole grid.
+        assert 0 < len(accumulator.retained) < len(grid)
+
+    def test_quiet_grid_keeps_nothing(self):
+        accumulator = vc.FlashAccumulator(FPS)
+        accumulator.feed(bytes(432) * 600)
+        accumulator.finish()
+        assert accumulator.retained == {} and accumulator.events(_times(600), FPS) == []
+
+    def test_cancel_during_evaluation_leaves_rows_not_verified(self, clean_clip, monkeypatch):
+        """Cancel lands after FFmpeg finished, while the measurements are read."""
+        cancel = core.threading.Event()
+        real_collect = vc.VideoAnalysis.collect
+
+        def collect_then_cancel(self):
+            cancel.set()
+            return real_collect(self)
+
+        monkeypatch.setattr(vc.VideoAnalysis, "collect", collect_then_cancel)
+        result = core.QAResult(clean_clip)
+        cfg = dict(DEFAULT_CONFIG, target_width=640, target_height=360, audio_required=False)
+        core.run_deep_scan(clean_clip, result, cfg, cancel_event=cancel)
+        for name in vc.VIDEO_CHECK_NAMES:
+            row = _row(result, name)
+            assert row[1] == "WARN" and "cancelled" in row[2], row
+
+    def test_cancel_stops_flash_evaluation(self):
+        cancel = core.threading.Event()
+        cancel.set()
+        with pytest.raises(vc.ScanCancelled):
+            vc.assess_flash(_flash_series(5), FPS, cancel)
+
+    def test_segments_are_consumed_while_ffmpeg_writes(self, tmp_path):
+        """A segment is read and deleted as soon as the next one opens, so
+        a long scan holds a couple of segments on disk, never the grid."""
+        import time
+        folder = tmp_path / "segments"
+        folder.mkdir()
+        reader = vc._FlashSegmentReader(str(folder), FPS, None)
+        reader.start()
+        segment = bytes(432) * 150
+
+        def write(number):
+            with open(reader._segment(number), "wb") as handle:
+                handle.write(segment)
+
+        def wait_gone(number):
+            deadline = time.monotonic() + 10
+            while os.path.exists(reader._segment(number)):
+                assert time.monotonic() < deadline, f"segment {number} was not consumed"
+                time.sleep(0.02)
+
+        try:
+            write(0)
+            write(1)
+            wait_gone(0)
+            for number in range(2, 6):
+                write(number)
+                wait_gone(number - 1)
+                assert len(os.listdir(folder)) <= 2
+            accumulator = reader.finish(None)
+        finally:
+            reader.stop()
+        assert accumulator.frames == 6 * 150 and os.listdir(folder) == []
+
+    def test_flash_scan_leaves_no_segments(self, clean_clip, tmp_path, monkeypatch):
+        monkeypatch.setattr("tempfile.tempdir", str(tmp_path))
+        removed = []
+        real_release = vc._release
+
+        def release(directory, reader):
+            removed.append(sorted(p for p in os.listdir(directory) if p.startswith("flash_")))
+            real_release(directory, reader)
+
+        monkeypatch.setattr(vc, "_release", release)
+        assert _row(_scan(clean_clip), "Flash Risk")[1] == "PASS"
+        assert removed == [[]]
