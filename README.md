@@ -183,8 +183,8 @@ finish with a warning.
 - PDF report with the scan specification and tool versions, plus JSON and CSV data
 
 **Desktop**
-- 15 themes; the Dock, taskbar and window icons follow the theme, and dialogs and
-  title bars follow its light or dark appearance
+- 15 themes; the Dock, taskbar (including a pinned button), Start menu and window icons
+  follow the theme, and the native title bar takes the theme's colours on macOS and Windows 11
 - macOS menu bar with Settings (⌘,), File, View, Window and Help, and a menu-bar icon
   that adapts like other professional apps
 - FrameGuard appears in Finder's and Explorer's Open With menus for videos and folders
