@@ -1888,12 +1888,15 @@ def _av_end_entry(signed: float, frame: float, cfg: dict) -> Tuple[str, str]:
     return "FAIL", f"; audio runs {signed:.3f} s past the last frame (more than {long_tol:g} s)"
 
 
-def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
+def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict,
+                               ends: Optional[Dict[int, float]] = None):
     """Compare each audio track's end against the video's end (asymmetric, Telestream FC-108).
 
     A symmetric 0.5 s window passed audio that stopped 0.3 s early and
     warned on audio that ran 1 s long, the opposite of what QC cares about:
     short audio leaves the programme's end silent, long audio is trimmed.
+    ``ends`` (stream index -> measured end of its last packet) replaces the
+    estimated durations of MPEG-TS/PS (container_checks.measured_stream_ends).
     """
     video = _primary_video_stream(probe_data)
     tracks = _audio_streams(probe_data)
@@ -1908,11 +1911,17 @@ def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
     fps = (parse_frame_rate(video.get("avg_frame_rate", "0/0"))
            or parse_frame_rate(video.get("r_frame_rate", "0/0")))
     frame = 1.0 / fps if fps > 0 else 1.0 / 30
+    ends = ends or {}
+    measured = _safe_int(video.get("index")) in ends
+    if measured:
+        v_dur = ends[_safe_int(video.get("index"))] - _start_of(video)
     entries = []
     worst_diff = 0.0
     for position, track in enumerate(tracks):
         label = _track_label(position, track, len(tracks))
         a_dur = _safe_float(_stream_duration_text(track))
+        if measured and _safe_int(track.get("index")) in ends:
+            a_dur = ends[_safe_int(track.get("index"))] - _start_of(track)
         if v_dur is None or a_dur is None or v_dur <= 0 or a_dur <= 0:
             entries.append(("WARN", _with_track(label, "Per-stream duration not available.")))
             continue
@@ -1937,7 +1946,7 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     """Advisory: header frame count vs duration x frame rate.
 
     Skipped when the CFR check found variable timing (the expectation is
-    meaningless) and for Matroska, which records no frame count.
+    meaningless) and for Matroska and MPEG-TS/PS, which record no frame count.
     """
     vs = _primary_video_stream(probe_data)
     if vs is None:
@@ -1951,6 +1960,10 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
         format_name = str((probe_data.get("format") or {}).get("format_name") or "")
         if "matroska" in format_name or "webm" in format_name:
             result.add_skip("Frame Count", "Frame count is not recorded in Matroska/WebM files.")
+        elif container_checks._estimated_durations(probe_data):
+            # MPEG-TS/PS index nothing: there is no declared count to check
+            # (File Integrity still counts every decoded frame).
+            result.add_skip("Frame Count", "Frame count is not recorded in MPEG transport/program streams.")
         else:
             result.add_warn("Frame Count", "nb_frames not available in container metadata.")
         return
@@ -3322,7 +3335,8 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
                       container_checks.FrameGrabber(filepath, process_owner, cancel_event))
     check_bitrate(probe_data, result, cfg)
     check_audio(probe_data, result, cfg)
-    check_av_duration_mismatch(probe_data, result, cfg)
+    check_av_duration_mismatch(probe_data, result, cfg, container_checks.measured_stream_ends(
+        filepath, probe_data, process_owner, cancel_event))
     check_frame_count(probe_data, result, cfg)
     projection = result.metadata.get("projection")
     container_checks.run_structure_checks(filepath, structure, probe_data, result, cfg,

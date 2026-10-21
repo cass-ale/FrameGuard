@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from frameguard import container_checks as cc
-from frameguard.core import DEFAULT_CONFIG, ESSENTIAL_CHECKS, run_qa_checks
+from frameguard.core import DEFAULT_CONFIG, ESSENTIAL_CHECKS, run_ffprobe, run_qa_checks
 from media_fixtures import MediaLibrary, ffmpeg, make_clip, needs_ffmpeg, stream_copy_trim, truncate
 from container_fixtures import movie_timescale, set_edit_list
 
@@ -216,6 +216,62 @@ class TestAVSyncOffset:
         ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", str(ts))
         check = _row(_scan(ts, accepted_containers=[".ts"]), "A/V Sync Offset")
         assert check[1] == "PASS", check
+
+    def _bframe_encode(self, path, *extra, audio=("-c:a", "aac")):
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=3", "-f", "lavfi",
+               "-i", "sine=f=440:sample_rate=48000:d=3", "-c:v", "libx264", "-preset", "medium",
+               "-bf", "3", "-pix_fmt", "yuv420p", *audio, *extra, str(path))
+        return str(path)
+
+    def test_bframes_without_edit_list_are_judged_with_priming(self, tmp_path):
+        """No edit list: the picture really starts 2 frames (80 ms) after the track.
+        PCM has no priming, so that is the programme offset; unsignalled AAC
+        priming (1024-2112 samples) plays first, so AAC is judged at -36 ms."""
+        pcm = self._bframe_encode(tmp_path / "noedit.mov", "-use_editlist", "0", audio=("-c:a", "pcm_s16le"))
+        check = _row(_scan(pcm, target_fps=25.0), "A/V Sync Offset")
+        assert check[1] == "FAIL" and "80 ms before" in check[2] and "no edit list" in check[2], check
+        aac = self._bframe_encode(tmp_path / "noedit.mp4", "-use_editlist", "0")
+        check = _row(_scan(aac, target_fps=25.0), "A/V Sync Offset")
+        assert check[1] == "WARN" and "36 ms before" in check[2] and "priming" in check[2], check
+
+    def test_ffmpeg_transport_stream_with_bframes_passes(self, tmp_path):
+        ts = self._bframe_encode(tmp_path / "bf.ts")
+        check = _row(_scan(ts, target_fps=25.0, accepted_containers=[".ts"]), "A/V Sync Offset")
+        assert check[1] == "PASS", check
+
+    def test_with_edit_list_is_clean(self, tmp_path):
+        mp4 = self._bframe_encode(tmp_path / "edit.mp4")
+        assert _row(_scan(mp4, target_fps=25.0), "A/V Sync Offset")[1] == "PASS"
+
+
+class TestTransportStreamEnds:
+    """MPEG-TS has no stream durations; ffprobe's tail estimate read a clean
+    remux as up to 0.3 s of audio short (release review 0.9.1, finding 1)."""
+
+    @pytest.mark.parametrize("seconds", [6, 10])
+    def test_clean_remux_passes_even_in_strict_mode(self, tmp_path, seconds):
+        mp4 = tmp_path / f"c{seconds}.mp4"
+        make_clip(mp4, duration=seconds, extra=("-movflags", "+faststart"))
+        ts = tmp_path / f"c{seconds}.ts"
+        ffmpeg("-i", str(mp4), "-c", "copy", str(ts))
+        result = run_qa_checks(str(ts), cfg=_cfg(accepted_containers=[".ts"]), strict=True)
+        result.finalize()
+        assert _row(result, "A/V Duration")[1] == "PASS", _row(result, "A/V Duration")
+        assert _row(result, "Frame Count")[1] == "SKIP"
+        assert result.status == "PASS", [c[:3] for c in result.checks if c[1] in ("WARN", "FAIL")]
+
+    @pytest.mark.parametrize("short,expected", [(0.3, "WARN"), (1.0, "FAIL"), (8.0, "FAIL")])
+    def test_genuinely_short_audio_still_flags(self, tmp_path, short, expected):
+        ts = tmp_path / f"short{short}.ts"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=12", "-f", "lavfi",
+               "-i", f"sine=f=440:sample_rate=48000:d={12 - short}", "-c:v", "libx264", "-preset", "ultrafast",
+               "-pix_fmt", "yuv420p", "-c:a", "aac", str(ts))
+        check = _row(_scan(ts, accepted_containers=[".ts"]), "A/V Duration")
+        assert check[1] == expected, check
+
+    def test_ends_are_only_measured_for_program_streams(self, media):
+        probe = run_ffprobe(_clean(media))
+        assert cc.measured_stream_ends(_clean(media), probe) == {}
 
 
 # ---------------------------------------------------------------------------

@@ -146,6 +146,23 @@ class TestContentLayout:
         mono = _v2(media, tmp_path, "mono_content.mp4")
         assert "looks top-bottom" not in _row(_scan(mono, **XR_SPEC), "XR Metadata")[2]
 
+    def test_frame_grab_that_cannot_start_is_a_note_not_an_error(self, media, tmp_path, monkeypatch):
+        """Release review 0.9.1, finding 2: an unstartable FFmpeg became an Internal Error."""
+        from frameguard import core
+        path = add_to_sample_entry(_copy(self._stacked(media), tmp_path / "nograb.mp4"), b"vide", st3d(0), sv3d())
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: str(tmp_path / "no-such-ffmpeg"))
+        result = _scan(path, **XR_SPEC)
+        assert not _has_row(result, "Internal Error"), [c[:3] for c in result.checks]
+        check = _row(result, "XR Metadata")
+        assert check[1] == "PASS" and "content check not verified" in check[2], check
+        assert result.status != "MISMATCH", [c[:3] for c in result.checks if c[1] != "PASS"]
+
+    def test_frame_grab_problems_never_raise(self, tmp_path, monkeypatch):
+        from frameguard import core
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: None)
+        grabber = cc.FrameGrabber(str(tmp_path / "x.mp4"))
+        assert grabber.gray(0, 0.0) is None and "not found" in grabber.problem
+
     def test_flat_pictures_are_not_grabbed(self, media, monkeypatch):
         def fail(*args, **kwargs):
             raise AssertionError("no frame grab for a flat file")
