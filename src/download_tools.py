@@ -43,24 +43,72 @@ TOOLS_CACHE_ROOT = SCRIPT_DIR / "tools_cache"
 # ---------------------------------------------------------------------------
 # Per-platform sources
 #
+# Every artifact is pinned: an immutable, versioned URL (optionally a byte-
+# identical mirror of the same file) plus the SHA-256 of that exact file,
+# committed here. fetch() refuses any download whose hash differs, and there
+# are no moving "latest"/nightly fallbacks: a build either bundles exactly
+# these bytes or fails. Bump a tool deliberately, like a dependency: change
+# the version, download the new artifact, verify it against the publisher's
+# own checksum where one exists, and update the hash in the same commit.
+#
 # macOS: ffmpeg and ffprobe ship as SEPARATE archives, unlike the Windows
-# builds which ship both in one zip. Each entry is therefore a list of
-# (url, archive_member_basename) pairs.
+# builds which ship both in one zip; each archive is its own entry.
 #
 # The previous macOS source, evermeet.cx, returns HTTP 410 Gone for every
 # getrelease download (verified live 2026-10-14) and its builds were
-# Intel-only. macOS tools now come from Martin Riedl's build site, which
-# publishes per-architecture zips (arm64 and amd64) with a .sha256 sidecar
-# next to every archive. The pinned URLs below are the reproducible source;
-# the redirect/latest URL is the fallback, and its checksum is taken from
-# the sidecar of the version it actually resolved to, so the fallback is
-# verified too. Bump _RIEDL_RELEASES deliberately, like a dependency.
+# Intel-only. macOS tools come from Martin Riedl's build site, which
+# publishes per-architecture zips (arm64 and amd64) in timestamped,
+# never-reused build directories with a .sha256 sidecar per archive.
+#
+# Pins verified 2026-10-21:
+#   - Windows FFmpeg 9.0.2 essentials (Gyan Doshi): the GitHub release asset
+#     and the versioned gyan.dev package are byte-identical and match both
+#     gyan.dev's published .sha256 and GitHub's asset digest.
+#   - macOS FFmpeg/FFprobe 9.0.2 (Martin Riedl): each hash matches the
+#     publisher's .sha256 sidecar; the binaries report "ffmpeg version 9.0.2"
+#     and are thin Mach-O for the expected architecture.
+#   - MediaInfo CLI 26.10 (MediaArea, current release): MediaArea publishes
+#     no checksum, so each hash was confirmed by two independent downloads.
 # ---------------------------------------------------------------------------
+FFMPEG_VERSION = "9.0.2"
+MEDIAINFO_VERSION = "26.10"
+
+_WINDOWS_FFMPEG_ARCHIVE = f"ffmpeg-{FFMPEG_VERSION}-essentials_build.zip"
+_WINDOWS_FFMPEG_URLS = [
+    # Primary: Gyan Doshi's official GitHub release (immutable asset).
+    f"https://github.com/GyanD/codexffmpeg/releases/download/"
+    f"{FFMPEG_VERSION}/{_WINDOWS_FFMPEG_ARCHIVE}",
+    # Mirror: the same file under gyan.dev's versioned package path.
+    f"https://www.gyan.dev/ffmpeg/builds/packages/{_WINDOWS_FFMPEG_ARCHIVE}",
+]
+_WINDOWS_FFMPEG_SHA256 = (
+    "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba")
+
 _RIEDL_BASE = "https://ffmpeg.martin-riedl.de"
 _RIEDL_RELEASES = {  # pinned build directories, per architecture segment
     "arm64": "1789931890_9.0.2",
     "amd64": "1789931006_9.0.2",
 }
+_RIEDL_SHA256 = {  # (architecture segment, tool) -> archive SHA-256
+    ("arm64", "ffmpeg"):
+        "c8ed4c4e6978a03c485edbfe4e0a5dc2380f8a30bba5150531b31b094492d924",
+    ("arm64", "ffprobe"):
+        "fcbe839537485eaee7a7a8bc5cbc0f90d53617e80943e8a5b2e31cb851197ea6",
+    ("amd64", "ffmpeg"):
+        "7c6b4125b191cbf773832dc51f424cf2b6bb7da43007d1e066f95909e47cacd4",
+    ("amd64", "ffprobe"):
+        "2322438ed2f6319a691291b247d09c69dcaa3a982460d1f269a7e1af335cfdfd",
+}
+
+_MEDIAINFO_BASE = (
+    f"https://mediaarea.net/download/binary/mediainfo/{MEDIAINFO_VERSION}")
+_MEDIAINFO_WINDOWS_URL = (
+    f"{_MEDIAINFO_BASE}/MediaInfo_CLI_{MEDIAINFO_VERSION}_Windows_x64.zip")
+_MEDIAINFO_WINDOWS_SHA256 = (
+    "4cc94bd272903914c04f4f9a9f53a6c94b5ea6c6454cf738d29fa182c41e8a29")
+_MEDIAINFO_MAC_URL = f"{_MEDIAINFO_BASE}/MediaInfo_CLI_{MEDIAINFO_VERSION}_Mac.dmg"
+_MEDIAINFO_MAC_SHA256 = (
+    "2345a52f6e5281a15e9ef87acbe5756a9c4727d5629873c013f148a8f82525ab")
 
 
 def _norm_arch(arch: str) -> str:
@@ -77,29 +125,22 @@ def _riedl_segment(arch: str) -> str:
     return "arm64" if _norm_arch(arch) == "arm64" else "amd64"
 
 
-def _riedl_urls(tool: str, arch: str):
+def _riedl_entry(tool: str, arch: str) -> dict:
     seg = _riedl_segment(arch)
-    pinned = (f"{_RIEDL_BASE}/download/macos/{seg}/"
-              f"{_RIEDL_RELEASES[seg]}/{tool}.zip")
-    latest = f"{_RIEDL_BASE}/redirect/latest/macos/{seg}/release/{tool}.zip"
-    return [pinned, latest]
+    return {
+        "required": True,
+        "members": [tool],
+        "urls": [f"{_RIEDL_BASE}/download/macos/{seg}/"
+                 f"{_RIEDL_RELEASES[seg]}/{tool}.zip"],
+        "sha256": _RIEDL_SHA256[(seg, tool)],
+    }
 
 
 def _darwin_sources(arch: str) -> dict:
     return {
         "suffix": "",
-        "ffmpeg": {
-            "required": True,
-            "members": ["ffmpeg"],
-            "urls": _riedl_urls("ffmpeg", arch),
-            "sha256_from_url": True,
-        },
-        "ffprobe": {
-            "required": True,
-            "members": ["ffprobe"],
-            "urls": _riedl_urls("ffprobe", arch),
-            "sha256_from_url": True,
-        },
+        "ffmpeg": _riedl_entry("ffmpeg", arch),
+        "ffprobe": _riedl_entry("ffprobe", arch),
         "mediainfo": {
             "required": False,
             "members": ["mediainfo"],
@@ -114,9 +155,8 @@ def _darwin_sources(arch: str) -> dict:
             # universal (x86_64+arm64) CLI release. .dmg extraction
             # requires a Mac host (hdiutil); on other hosts the archive
             # is cached and extraction is retried on the Mac.
-            "urls": [
-                "https://mediaarea.net/download/binary/mediainfo/26.10/MediaInfo_CLI_26.10_Mac.dmg",
-            ],
+            "urls": [_MEDIAINFO_MAC_URL],
+            "sha256": _MEDIAINFO_MAC_SHA256,
         },
     }
 
@@ -127,17 +167,14 @@ SOURCES = {
         "ffmpeg": {
             "required": True,
             "members": ["ffmpeg.exe", "ffprobe.exe"],
-            "urls": [
-                "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
-                "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
-            ],
+            "urls": list(_WINDOWS_FFMPEG_URLS),
+            "sha256": _WINDOWS_FFMPEG_SHA256,
         },
         "mediainfo": {
             "required": False,
             "members": ["mediainfo.exe"],
-            "urls": [
-                "https://mediaarea.net/download/binary/mediainfo/26.10/MediaInfo_CLI_26.10_Windows_x64.zip",
-            ],
+            "urls": [_MEDIAINFO_WINDOWS_URL],
+            "sha256": _MEDIAINFO_WINDOWS_SHA256,
         },
     },
     # "darwin" is intentionally absent here: its sources are
@@ -235,24 +272,43 @@ def _sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
-def _expected_sha256(final_url: str):
-    """Read the '<archive>.sha256' sidecar published next to an archive and
-    return the hex digest, or None when it cannot be read or parsed. The
-    caller treats None as a failed source: an unverifiable required tool is
-    a failed tool, never a silently trusted one."""
-    import urllib.request
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+def is_valid_sha256(value) -> bool:
+    """True for a lowercase 64-character hex SHA-256 digest."""
+    return (isinstance(value, str) and len(value) == 64
+            and set(value) <= _SHA256_HEX)
+
+
+# Records, per cache directory, the pinned archive hash each cached tool was
+# extracted from. A cache filled from an older (or formerly unpinned) source
+# no longer matches the pin, so it is re-fetched instead of silently bundled.
+_CACHE_STAMP = ".frameguard-tool-pins.json"
+
+
+def _read_cache_stamp(cache: Path) -> dict:
+    import json
     try:
-        req = urllib.request.Request(final_url + ".sha256",
-                                     headers={"User-Agent": "FrameGuard-Builder/1.0"})
-        with urllib.request.urlopen(req, timeout=60) as response:
-            text = response.read().decode("utf-8", "replace").strip()
-        parts = text.split()
-        token = parts[0].lower() if parts else ""
-        if len(token) == 64 and all(c in "0123456789abcdef" for c in token):
-            return token
-    except Exception as e:
-        print(f"  ERROR: Could not read checksum sidecar: {e}")
-    return None
+        data = json.loads((cache / _CACHE_STAMP).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_cache_stamp(cache: Path, name: str, sha256: str) -> None:
+    import json
+    data = _read_cache_stamp(cache)
+    data[name] = sha256
+    (cache / _CACHE_STAMP).write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def is_cached(name: str, entry: dict, cache: Path) -> bool:
+    """True when every member is cached AND came from the pinned archive."""
+    if any(not (cache / m).is_file() for m in entry["members"]):
+        return False
+    return _read_cache_stamp(cache).get(name) == entry.get("sha256")
 
 
 def make_executable(path: Path):
@@ -560,12 +616,18 @@ def verify_binary(path: Path) -> bool:
 
 def fetch(target: str, name: str, entry: dict, cache: Path, force: bool) -> bool:
     members = entry["members"]
-    missing = [m for m in members if not (cache / m).is_file()]
-    if not missing and not force:
-        print(f"[{name}] Using cached copy.")
+    expected = entry.get("sha256")
+    if not is_valid_sha256(expected):
+        # Fail closed: an entry without a pinned hash is a configuration
+        # error, never a reason to trust whatever the URL serves today.
+        print(f"\n[{name}] ERROR: no pinned SHA-256 for this tool; "
+              f"refusing to download it.")
+        return False
+    if not force and is_cached(name, entry, cache):
+        print(f"[{name}] Using cached copy (pinned {expected[:12]}...).")
         return True
 
-    print(f"\n[{name}] Fetching {', '.join(missing or members)}...")
+    print(f"\n[{name}] Fetching {', '.join(members)}...")
     for url in entry["urls"]:
         if url.endswith(".tar.bz2"):
             suffix = ".tar.bz2"
@@ -576,23 +638,20 @@ def fetch(target: str, name: str, entry: dict, cache: Path, force: bool) -> bool
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            ok, final_url = download_file(url, tmp_path, name)
+            ok, _final_url = download_file(url, tmp_path, name)
             if not ok:
                 continue
-            if entry.get("sha256_from_url"):
-                expected = _expected_sha256(final_url or url)
-                if expected is None:
-                    print("  No checksum sidecar available; refusing this source.")
-                    continue
-                actual = _sha256_of(tmp_path)
-                if actual != expected:
-                    print(f"  ERROR: SHA-256 mismatch (expected "
-                          f"{expected[:16]}..., got {actual[:16]}...); "
-                          f"trying next source.")
-                    continue
-                print("  SHA-256 verified.")
+            actual = _sha256_of(tmp_path)
+            if actual != expected:
+                print(f"  ERROR: SHA-256 mismatch for {url}\n"
+                      f"    expected {expected}\n"
+                      f"    got      {actual}\n"
+                      f"  Refusing this download.")
+                continue
+            print(f"  SHA-256 verified ({expected[:12]}...).")
             found = extract_members(tmp_path, members, cache)
             if found >= {m.lower() for m in members}:
+                _write_cache_stamp(cache, name, expected)
                 print(f"  {name} ready.")
                 return True
             print(f"  Archive did not contain {members}; trying next source.")
@@ -652,15 +711,22 @@ def main():
                 required_ok = False
 
     # --- Verify ---
+    # Only tools extracted from their pinned archive count. Files left in
+    # the cache by an older or unverified source (or by a failed fetch) are
+    # never verified, staged or shipped.
     print("\n[Verify] Checking binaries...")
+    pinned = {name: is_cached(name, entry, cache)
+              for name, entry in entries.items()}
     for name, entry in entries.items():
+        if not pinned[name]:
+            if entry["required"]:
+                print(f"    {name}: MISSING (no copy from the pinned archive)")
+                required_ok = False
+            else:
+                print(f"    {name}: not available (optional)")
+            continue
         for member in entry["members"]:
             path = cache / member
-            if not path.is_file():
-                if entry["required"]:
-                    print(f"    {member}: MISSING")
-                    required_ok = False
-                continue
             if target == host:
                 if verify_binary(path) is False and entry["required"]:
                     required_ok = False
@@ -685,7 +751,9 @@ def main():
     if dest.parent.exists() or dest.exists():
         dest.mkdir(parents=True, exist_ok=True)
         print(f"\n[Stage] -> {dest}")
-        for entry in entries.values():
+        for name, entry in entries.items():
+            if not pinned[name]:
+                continue
             for member in entry["members"]:
                 src = cache / member
                 if src.is_file():

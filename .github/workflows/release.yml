@@ -1,9 +1,13 @@
 # FrameGuard release pipeline — audited design: docs/RELEASE_PLAN.md
 #
 # HOW A RELEASE HAPPENS:
-#   1. Bump the version in the four places validate_version.py checks
-#      (frameguard/__init__.py, frameguard.spec, installer.iss,
-#      version.json — changelog lives in version.json), commit, push main.
+#   1. Bump the version everywhere validate_version.py checks
+#      (frameguard/__init__.py; frameguard.spec APP_VERSION, filevers,
+#      prodvers and the version StringStructs; installer.iss AppVersion;
+#      version.json version plus a new first changelog entry
+#      "vX.Y.Z - <title>"; installer_info.txt title and WHAT'S NEW
+#      heading), commit, push main. Only that changelog entry becomes the
+#      release notes.
 #   2. Wait for Tests and Release Candidate to pass on that exact commit SHA.
 #      The candidate proves the installed Windows package and both native DMGs.
 #   3. Tag that proven commit: git tag -a v0.8.0 -m "FrameGuard v0.8.0"
@@ -109,7 +113,7 @@ jobs:
         with:
           python-version-file: src/.python-version
 
-      - name: Validate the four version sources agree
+      - name: Validate every version location agrees
         working-directory: ${{ env.APP_DIR }}
         run: python validate_version.py
 
@@ -191,54 +195,11 @@ jobs:
           PY
 
       - name: Build the release notes from version.json
-        run: |
-          python - <<'PY'
-          import json, os
-          with open(os.path.join(os.environ["APP_DIR"], "version.json"), encoding="utf-8") as f:
-              data = json.load(f)
-          notes = f"""**Published by Capri la Ria · Developed by Cassian Aléria**
-
-          ## Download
-
-          | Platform | File | Requirements |
-          |----------|------|----------------|
-          | Windows | `FrameGuardInstaller.exe` | Windows 10/11, 64-bit |
-          | macOS (Apple Silicon) | `FrameGuard-arm64.dmg` | macOS 12 or later |
-          | macOS (Intel) | `FrameGuard-intel.dmg` | macOS 12 or later |
-
-          **Windows:** run the installer. FrameGuard is not yet code-signed, so
-          SmartScreen may ask once — choose "More info", then "Run anyway".
-
-          **macOS:** open the DMG for your Mac's chip and drag FrameGuard into
-          Applications. The build is ad-hoc signed but not notarized, so the
-          first launch is blocked once. On macOS 15 or later: choose **Done** in
-          the dialog, then System Settings → Privacy & Security →
-          **Open Anyway**, authenticate, and launch again. On macOS 14 or
-          earlier: right-click FrameGuard → **Open**.
-
-          **Already installed?** FrameGuard checks GitHub Releases automatically
-          and offers the correct installer for this platform and architecture.
-          Reinstalling from this page is always a supported recovery path.
-
-          ## Verify your download
-
-          - Checksums: `SHA256SUMS.txt` (Windows `Get-FileHash`, macOS
-            `shasum -a 256 -c SHA256SUMS.txt`)
-          - Provenance: `gh attestation verify <file> --owner cass-ale`
-          - Components: `sbom-windows.cdx.json` / `sbom-macos.cdx.json`
-
-          ## Changes
-
-          ```
-          {data.get("changelog", "").strip()}
-          ```
-
-          © 2026 Cassian Aléria. MIT License.
-          """
-          with open("release-notes.md", "w", encoding="utf-8") as f:
-              f.write(notes)
-          print("release-notes.md written")
-          PY
+        # Only this version's changelog entry is published (release_notes.py
+        # fails if version.json has none); the in-app update prompt shows
+        # the text under "## Changes".
+        working-directory: ${{ env.APP_DIR }}
+        run: python release_notes.py --output "$GITHUB_WORKSPACE/release-notes.md"
 
       - name: Save the release notes for the publish job
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

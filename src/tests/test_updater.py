@@ -1,67 +1,16 @@
 """Full-installer updater safety tests.
 
 The optional differential updater has its own regression suite. These tests cover
-only the shipped GitHub/local full-installer flow.
+only the shipped GitHub Releases full-installer flow.
 """
 
 import hashlib
 import io
 import json
-import time
 
 import pytest
 
 from frameguard import updater as U
-
-
-def _capture_error(errors, callback, *args):
-    try:
-        callback(*args)
-    except Exception as error:
-        errors.append(error)
-
-
-def _stalled_local_copy_worker(_source, destination, _size, _digest,
-                               connection):
-    with open(destination, "xb") as output:
-        output.write(b"partial")
-        output.flush()
-        connection.send(("progress", len(b"partial")))
-        while True:
-            time.sleep(60)
-
-
-def _slow_local_copy_worker(source, destination, expected_size, expected_digest,
-                            connection):
-    copied = 0
-    hasher = hashlib.sha256()
-    try:
-        with open(source, "rb") as input_file, open(destination, "xb") as output:
-            while True:
-                chunk = input_file.read(64 * 1024)
-                if not chunk:
-                    break
-                time.sleep(0.02)
-                output.write(chunk)
-                hasher.update(chunk)
-                copied += len(chunk)
-                connection.send(("progress", copied))
-        if copied != expected_size or hasher.hexdigest() != expected_digest:
-            raise RuntimeError("slow worker integrity mismatch")
-        connection.send(("done", copied))
-    except Exception as error:
-        connection.send(("error", str(error)))
-    finally:
-        connection.close()
-
-
-def _wait_until(predicate, timeout=5):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if predicate():
-            return True
-        time.sleep(0.01)
-    return bool(predicate())
 
 
 class _Response:
@@ -242,24 +191,83 @@ class TestReleaseMetadata:
         assert U.check_github_for_update() is None
 
 
-class TestLocalInstallerSource:
-    def test_path_requires_a_trusted_digest(
-            self, qapp, tmp_path, monkeypatch):
-        installer = tmp_path / "FrameGuardInstaller.exe"
+class TestNoLocalInstallerFallback:
+    """The local-folder fallback trusted the SHA-256 in the version.json
+    sitting next to the installer (the folder vouched for itself), joined
+    unsanitised installer names, and still searched ~/Downloads/FGv0.2.2.
+    It is gone: only HTTPS GitHub Releases installers are ever applied."""
+
+    def test_fallback_api_is_removed(self):
+        for name in ("get_default_search_paths", "_check_path_for_update",
+                     "create_version_json", "_copy_local_installer_worker",
+                     "_LOCAL_COPY_WORKER_TARGET"):
+            assert not hasattr(U, name), name
+        for name in ("test_path", "get_update_source", "set_update_source",
+                     "_stage_local_installer", "_stop_local_copy_process"):
+            assert not hasattr(U.UpdateManager, name), name
+        source = open(U.__file__, encoding="utf-8").read()
+        assert "FGv0.2.2" not in source
+        assert "multiprocessing" not in source
+
+    def test_dropped_installer_and_version_json_are_never_offered(
+            self, qapp, monkeypatch, tmp_path):
+        """A folder that looks like an old local release must be ignored:
+        with GitHub reporting nothing newer, the check is 'up to date'."""
+        home = tmp_path / "home"
+        folder = home / "Downloads" / "FGv0.2.2"
+        folder.mkdir(parents=True)
+        installer = folder / "FrameGuardInstaller.exe"
         installer.write_bytes(b"installer")
-        manifest = {
-            "version": "9.9.9",
-            "installer_windows": installer.name,
-        }
-        (tmp_path / "version.json").write_text(json.dumps(manifest))
-        monkeypatch.setattr(U.sys, "platform", "win32")
+        (folder / "version.json").write_text(json.dumps({
+            "version": "99.0.0", "installer_windows": installer.name,
+            "sha256": hashlib.sha256(b"installer").hexdigest()}))
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.setenv("USERPROFILE", str(home))
+        monkeypatch.setattr(U, "check_github_for_update", lambda: None)
         manager = U.UpdateManager()
+        monkeypatch.setattr(manager, "check_channel_for_delta", lambda: False)
+        found, none = [], []
+        manager.update_available.connect(found.append)
+        manager.update_not_found.connect(lambda: none.append(True))
 
-        assert "SHA-256 digest is missing" in manager.test_path(str(tmp_path))
+        manager._do_check()
+        qapp.processEvents()
 
-        manifest["sha256"] = hashlib.sha256(installer.read_bytes()).hexdigest()
-        (tmp_path / "version.json").write_text(json.dumps(manifest))
-        assert manager.test_path(str(tmp_path)).startswith("Valid!")
+        assert found == []
+        assert none == [True]
+
+    @pytest.mark.parametrize("location", [
+        "FrameGuardInstaller.exe",
+        "../FrameGuardInstaller.exe",
+        "/tmp/FrameGuardInstaller.exe",
+        "C:\\Users\\x\\Downloads\\FrameGuardInstaller.exe",
+        "\\\\server\\share\\FrameGuardInstaller.exe",
+        "http://example.test/FrameGuardInstaller.exe",
+        "file:///tmp/FrameGuardInstaller.exe",
+        "",
+    ])
+    def test_non_https_installer_location_is_refused_before_staging(
+            self, qapp, monkeypatch, location):
+        monkeypatch.setattr(
+            U.tempfile, "mkdtemp",
+            lambda **_k: pytest.fail("a refused location must not stage"))
+        monkeypatch.setattr(
+            U.subprocess, "Popen",
+            lambda *_a, **_k: pytest.fail("a refused location must not launch"))
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *_a, **_k: pytest.fail("a refused location must not download"))
+        manager = U.UpdateManager()
+        failures = []
+        manager.apply_failed.connect(failures.append)
+        info = U.UpdateInfo(
+            version="9.9.9", installer_path=location,
+            sha256=hashlib.sha256(b"installer").hexdigest(), size_bytes=9)
+
+        manager._do_apply(info)
+
+        assert failures and "not an HTTPS URL" in failures[-1]
+        assert manager._applying is False
 
 
 class TestBoundedDownload:
@@ -460,175 +468,55 @@ class TestBoundedDownload:
         assert list(stage.iterdir()) == []
 
 
-class TestBoundedLocalStaging:
-    def test_copy_worker_is_spawn_picklable_and_frozen_entrypoint_is_ready(self):
-        from pathlib import Path
-
-        target = U._LOCAL_COPY_WORKER_TARGET
-        assert target.__module__ == "frameguard.updater"
-        assert "<locals>" not in target.__qualname__
-        main_source = (Path(U.__file__).resolve().parent.parent / "main.py").read_text()
-        assert "multiprocessing.freeze_support()" in main_source
-
-    def _paths(self, tmp_path, body=b"installer"):
-        source = tmp_path / "FrameGuardInstaller.exe"
-        source.write_bytes(body)
-        stage = tmp_path / "stage"
-        stage.mkdir()
-        return source, stage, hashlib.sha256(body).hexdigest()
-
-    def test_blocked_local_read_is_cancellable_without_leaking_process(
-            self, qapp, monkeypatch, tmp_path):
-        import threading
-
-        source, stage, digest = self._paths(tmp_path)
-        manager = U.UpdateManager()
-        monkeypatch.setattr(
-            U, "_LOCAL_COPY_WORKER_TARGET", _stalled_local_copy_worker)
-        errors = []
-        thread = threading.Thread(
-            target=lambda: _capture_error(
-                errors,
-                manager._stage_local_installer,
-                str(source),
-                str(stage),
-                source.stat().st_size,
-                digest,
-            ))
-        thread.start()
-        dest = stage / source.name
-        assert _wait_until(lambda: dest.exists())
-        process = manager._local_copy_process
-        assert process is not None and process.is_alive()
-        child_pid = process.pid
-
-        manager.cancel_update()
-        thread.join(3)
-
-        assert not thread.is_alive()
-        assert errors and "cancel" in str(errors[0]).lower()
-        assert not dest.exists()
-        assert manager._local_copy_process is None
-        assert child_pid not in {child.pid
-                                 for child in U.multiprocessing.active_children()}
-
-    def test_blocked_local_read_obeys_deadline_and_is_reaped(
-            self, qapp, monkeypatch, tmp_path):
-        source, stage, digest = self._paths(tmp_path)
-        manager = U.UpdateManager()
-        monkeypatch.setattr(
-            U, "_LOCAL_COPY_WORKER_TARGET", _stalled_local_copy_worker)
-        monkeypatch.setattr(U, "_MAX_LOCAL_COPY_SECONDS", 0.15)
-        monkeypatch.setattr(U, "_LOCAL_COPY_STOP_SECONDS", 0.5)
-        started = time.monotonic()
-
-        with pytest.raises(RuntimeError, match="deadline"):
-            manager._stage_local_installer(
-                str(source), str(stage), source.stat().st_size, digest)
-
-        assert time.monotonic() - started < 3
-        assert not (stage / source.name).exists()
-        assert manager._local_copy_process is None
-        assert not any(child.name == "FrameGuardLocalInstallerCopy"
-                       for child in U.multiprocessing.active_children())
-
-    def test_slow_local_copy_remains_bounded_and_verified(
-            self, qapp, monkeypatch, tmp_path):
-        body = b"slow but valid" * 40_000
-        source, stage, digest = self._paths(tmp_path, body)
-        manager = U.UpdateManager()
-        monkeypatch.setattr(
-            U, "_LOCAL_COPY_WORKER_TARGET", _slow_local_copy_worker)
-        monkeypatch.setattr(U, "_MAX_LOCAL_COPY_SECONDS", 5)
-
-        dest = manager._stage_local_installer(
-            str(source), str(stage), len(body), digest)
-
-        assert open(dest, "rb").read() == body
-        assert manager._local_copy_process is None
-
-    def test_normal_local_copy_preserves_bytes_and_hash_contract(
-            self, qapp, tmp_path):
-        body = b"ordinary local installer" * 20_000
-        source, stage, digest = self._paths(tmp_path, body)
-        manager = U.UpdateManager()
-
-        dest = manager._stage_local_installer(
-            str(source), str(stage), len(body), digest)
-
-        assert open(dest, "rb").read() == body
-        assert manager._local_copy_process is None
-
-    def test_local_size_mismatch_cleans_partial_staging(
-            self, qapp, tmp_path):
-        source, stage, digest = self._paths(tmp_path)
-        manager = U.UpdateManager()
-
-        with pytest.raises(RuntimeError, match="truncated"):
-            manager._stage_local_installer(
-                str(source), str(stage), source.stat().st_size + 1, digest)
-
-        assert list(stage.iterdir()) == []
-        assert manager._local_copy_process is None
-
-    def test_local_hash_mismatch_cleans_partial_staging(
-            self, qapp, tmp_path):
-        source, stage, _digest = self._paths(tmp_path)
-        manager = U.UpdateManager()
-
-        with pytest.raises(RuntimeError, match="integrity"):
-            manager._stage_local_installer(
-                str(source), str(stage), source.stat().st_size, "0" * 64)
-
-        assert list(stage.iterdir()) == []
-        assert manager._local_copy_process is None
-
-
 class TestStagingOwnership:
-    def test_cancelled_blocked_local_apply_removes_owned_staging_tree(
+    def test_cancelled_download_removes_owned_staging_tree(
             self, qapp, monkeypatch, tmp_path):
-        import threading
-
-        installer = tmp_path / "FrameGuard-arm64.dmg"
-        installer.write_bytes(b"installer")
-        digest = hashlib.sha256(installer.read_bytes()).hexdigest()
         stage = tmp_path / "stage"
+        body = b"a" * (512 * 1024)
         monkeypatch.setattr(U.tempfile, "mkdtemp", lambda **_kwargs: str(stage))
-        monkeypatch.setattr(
-            U, "_LOCAL_COPY_WORKER_TARGET", _stalled_local_copy_worker)
         monkeypatch.setattr(
             U.subprocess, "Popen",
             lambda *_a, **_k: pytest.fail("cancelled staging must not launch"))
         manager = U.UpdateManager()
+
+        class _CancellingResponse(_Response):
+            def read(self, size=-1):
+                chunk = super().read(size)
+                if chunk:
+                    manager.cancel_update()
+                return chunk
+
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *_args, **_kwargs: _CancellingResponse(
+                body, {"Content-Length": str(len(body))}))
         statuses = []
         manager.status_changed.connect(statuses.append)
         info = U.UpdateInfo(
             version="9.9.9",
-            installer_path=str(installer),
-            sha256=digest,
-            size_bytes=installer.stat().st_size,
+            installer_path="https://example.test/FrameGuard-arm64.dmg",
+            sha256=hashlib.sha256(body).hexdigest(),
+            size_bytes=len(body),
+            asset_name="FrameGuard-arm64.dmg",
         )
-        thread = threading.Thread(target=manager._do_apply, args=(info,))
-        thread.start()
-        assert _wait_until(lambda: (stage / installer.name).exists())
 
-        manager.cancel_update()
-        thread.join(3)
+        manager._do_apply(info)
         qapp.processEvents()
 
-        assert not thread.is_alive()
         assert not stage.exists()
-        assert manager._local_copy_process is None
         assert "Update cancelled." in statuses
 
     def test_launch_failure_cleans_the_single_staging_tree(
             self, qapp, monkeypatch, tmp_path):
-        installer = tmp_path / "FrameGuard-arm64.dmg"
-        installer.write_bytes(b"installer")
-        digest = hashlib.sha256(installer.read_bytes()).hexdigest()
+        body = b"installer"
+        digest = hashlib.sha256(body).hexdigest()
         stage = tmp_path / "stage"
         monkeypatch.setattr(U.tempfile, "mkdtemp", lambda **_kwargs: str(stage))
         monkeypatch.setattr(U.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *_args, **_kwargs: _Response(
+                body, {"Content-Length": str(len(body))}))
         monkeypatch.setattr(
             U.subprocess, "Popen", lambda *_a, **_k: (_ for _ in ()).throw(
                 OSError("launch failed")))
@@ -637,9 +525,10 @@ class TestStagingOwnership:
         manager.check_failed.connect(failures.append)
         info = U.UpdateInfo(
             version="9.9.9",
-            installer_path=str(installer),
+            installer_path="https://example.test/FrameGuard-arm64.dmg",
             sha256=digest,
-            size_bytes=installer.stat().st_size,
+            size_bytes=len(body),
+            asset_name="FrameGuard-arm64.dmg",
         )
 
         manager._do_apply(info)

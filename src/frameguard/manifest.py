@@ -74,6 +74,13 @@ def is_protected(rel_path: str) -> bool:
             or name.endswith(PROTECTED_SUFFIXES))
 
 _CHUNK = 1024 * 1024  # 1 MB; hashing a 90 MB tree must not load it into memory
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+def is_valid_sha256(value) -> bool:
+    """True for a lowercase 64-character hex digest (file_sha256 output)."""
+    return (isinstance(value, str) and len(value) == 64
+            and set(value) <= _SHA256_HEX)
 
 
 def file_sha256(path: str) -> str:
@@ -183,6 +190,20 @@ def manifest_paths_are_safe(data) -> bool:
     return all(_is_safe_rel_path(rel) for rel in files)
 
 
+def manifest_hashes_are_valid(data) -> bool:
+    """True if every file entry carries a valid SHA-256.
+
+    An entry without a hash cannot be verified after download. verify_tree()
+    used to skip such entries, so a manifest could ship any bytes for them;
+    the whole manifest is refused instead.
+    """
+    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(files, dict):
+        return False
+    return all(isinstance(meta, dict) and is_valid_sha256(meta.get("sha256"))
+               for meta in files.values())
+
+
 def load_manifest(path: str) -> Optional[Dict]:
     """Read a manifest, returning None if it is missing or unusable."""
     try:
@@ -199,6 +220,8 @@ def load_manifest(path: str) -> Optional[Dict]:
     if not manifest_paths_are_safe(data):
         # A path that escapes the tree (see _is_safe_rel_path). Refuse the
         # whole manifest rather than guess which entries are honest.
+        return None
+    if not manifest_hashes_are_valid(data):
         return None
     return data
 
@@ -287,13 +310,19 @@ def diff_against_install(install_root: str, remote: Dict) -> UpdatePlan:
 
 
 def verify_tree(root: str, manifest: Dict, paths: Optional[List[str]] = None) -> List[str]:
-    """Return the relative paths whose contents do not match the manifest."""
+    """Return the relative paths whose contents do not match the manifest.
+
+    A path the manifest lists without a valid SHA-256 (or does not list at
+    all) counts as a mismatch: unverifiable is never treated as verified.
+    """
     files = manifest.get("files", {})
     targets = paths if paths is not None else list(files)
     bad = []
     for rel in targets:
-        expected = files.get(rel, {}).get("sha256")
-        if not expected:
+        meta = files.get(rel)
+        expected = meta.get("sha256") if isinstance(meta, dict) else None
+        if not is_valid_sha256(expected):
+            bad.append(rel)
             continue
         full = os.path.join(root, rel.replace("/", os.sep))
         try:

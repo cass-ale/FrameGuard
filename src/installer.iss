@@ -105,9 +105,10 @@ Name: "{group}\Uninstall FrameGuard Desktop"; Filename: "{uninstallexe}"
 [Run]
 ; Launch app after install - WorkingDir ensures exe finds _internal/
 Filename: "{app}\FrameGuard.exe"; WorkingDir: "{app}"; Description: "Launch FrameGuard Desktop"; Flags: nowait postinstall skipifsilent
-; In-app updates run Setup /SILENT /RESTARTAPPLICATIONS. The entry above is
-; skipped in silent mode and FrameGuard never registers with Restart Manager,
-; so without this the user was left with no app after "Update & Restart".
+; In-app updates run Setup /SILENT /SUPPRESSMSGBOXES /NORESTART
+; /RESTARTAPPLICATIONS. The entry above is skipped in silent mode and
+; FrameGuard never registers with Restart Manager, so without this the user
+; was left with no app after "Update & Restart".
 Filename: "{app}\FrameGuard.exe"; WorkingDir: "{app}"; Flags: nowait; Check: ShouldRelaunchAfterUpdate
 
 [Registry]
@@ -172,22 +173,27 @@ begin
   GetWindowsVersionEx(WinVersion);
   if WinVersion.Major < 10 then
   begin
-    MsgBox('FrameGuard Desktop requires Windows 10 or later.' + #13#10 + #13#10 +
+    SuppressibleMsgBox('FrameGuard Desktop requires Windows 10 or later.' + #13#10 + #13#10 +
            'This computer is running an earlier version of Windows, so Setup cannot continue.',
-           mbError, MB_OK);
+           mbError, MB_OK, IDOK);
     Result := False;
     Exit;
   end;
 
   UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#SetupSetting("AppId")}_is1';
-  if RegQueryStringValue(HKEY_CURRENT_USER, UninstallKey, 'DisplayVersion', InstalledVersion) then
+  // A silent run (the in-app updater, an unattended install) must never stop
+  // at a message box: a same-version repair and an upgrade both just proceed.
+  // MsgBox ignores /SUPPRESSMSGBOXES, so these prompts are skipped outright
+  // when silent, and are SuppressibleMsgBox calls as a second line of defence.
+  if (not WizardSilent) and
+     RegQueryStringValue(HKEY_CURRENT_USER, UninstallKey, 'DisplayVersion', InstalledVersion) then
   begin
     if InstalledVersion = '{#SetupSetting("AppVersion")}' then
     begin
-      if MsgBox('FrameGuard Desktop v' + InstalledVersion + ' is already installed.' + #13#10 + #13#10 +
+      if SuppressibleMsgBox('FrameGuard Desktop v' + InstalledVersion + ' is already installed.' + #13#10 + #13#10 +
                 'Do you want to reinstall it to repair the installation?' + #13#10 +
                 'Your settings, presets and saved reports will not be affected.',
-                mbConfirmation, MB_YESNO) = IDNO then
+                mbConfirmation, MB_YESNO, IDYES) = IDNO then
       begin
         Result := False;
         Exit;
@@ -195,10 +201,10 @@ begin
     end
     else
     begin
-      MsgBox('FrameGuard Desktop will be updated from v' + InstalledVersion +
+      SuppressibleMsgBox('FrameGuard Desktop will be updated from v' + InstalledVersion +
              ' to v{#SetupSetting("AppVersion")}.' + #13#10 + #13#10 +
              'Your settings, custom presets and saved reports will be preserved.',
-             mbInformation, MB_OK);
+             mbInformation, MB_OK, IDOK);
     end;
   end;
 
@@ -215,15 +221,15 @@ begin
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, 0, 0);
 
     FFmpegPath := ExpandConstant('{app}\tools\ffmpeg.exe');
-    if not FileExists(FFmpegPath) then
+    if (not WizardSilent) and (not FileExists(FFmpegPath)) then
     begin
-      MsgBox('FFmpeg was not included in this installer package.' + #13#10 + #13#10 +
+      SuppressibleMsgBox('FFmpeg was not included in this installer package.' + #13#10 + #13#10 +
              'FrameGuard cannot scan video without it. To finish setting up, install ' +
              'FFmpeg and make sure ffmpeg.exe and ffprobe.exe are on your system PATH, ' +
              'or place them in:' + #13#10 + #13#10 +
              ExpandConstant('{app}\tools\') + #13#10 + #13#10 +
              'Then restart FrameGuard.',
-             mbInformation, MB_OK);
+             mbInformation, MB_OK, IDOK);
     end;
   end;
 end;
@@ -235,12 +241,13 @@ begin
   if CurUninstallStep = usPostUninstall then
   begin
     ExportPath := ExpandConstant('{userdocs}\FrameGuard');
-    if DirExists(ExportPath) then
+    // A silent uninstall keeps the user's reports and never waits on a prompt.
+    if (not UninstallSilent) and DirExists(ExportPath) then
     begin
-      if MsgBox('Do you want to delete your saved FrameGuard reports?' + #13#10 + #13#10 +
+      if SuppressibleMsgBox('Do you want to delete your saved FrameGuard reports?' + #13#10 + #13#10 +
                 ExportPath + #13#10 + #13#10 +
                 'Choose No to keep your exported PDF and CSV reports on this computer.',
-                mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES then
+                mbConfirmation, MB_YESNO or MB_DEFBUTTON2, IDNO) = IDYES then
         DelTree(ExportPath, True, True, True);
     end;
 

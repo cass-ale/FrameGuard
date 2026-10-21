@@ -196,18 +196,13 @@ class TestMacRuntimePaths:
         with mock.patch.object(updater.sys, "platform", "win32"):
             assert updater.installer_filename().endswith(".exe")
 
-    def test_updater_search_paths_have_no_platform_shares(self):
-        """The installer-flow fallback is platform-neutral now: Downloads
-        and the app's own folder. The retired Drive mounts, team shares
-        and UNC paths must not reappear on any platform's list."""
+    def test_updater_has_no_filesystem_installer_search(self):
+        """Retired Drive mounts, team shares and UNC paths can no longer
+        leak into any platform's update search: the filesystem installer
+        fallback is gone and GitHub Releases is the only source."""
         from frameguard import updater
 
-        with mock.patch.object(updater.sys, "platform", "darwin"):
-            paths = updater.get_default_search_paths()
-        assert any("Downloads" in p for p in paths)
-        assert not any("team-share" in p or "TPG" in p for p in paths)
-        assert not any(p.startswith("\\\\") for p in paths), \
-            "Windows-only update paths leaked into the macOS list"
+        assert not hasattr(updater, "get_default_search_paths")
 
 
 class TestNativeChrome:

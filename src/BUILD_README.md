@@ -24,20 +24,23 @@ exact-SHA Release Candidate workflow must prove the Windows installer and both
 native macOS DMGs. See [`../docs/PRE_PUSH.md`](../docs/PRE_PUSH.md) for the
 evidence format, profiles, resume command, and failure rules.
 
-Both platform build scripts perform the same gated sequence and fail loudly at each step:
+Both platform build scripts run a gated nine-step sequence and fail loudly at
+each step. The step numbers match what each script prints:
 
-```
-1. Check the host toolchain (Python 3.12)
-2. Create a CLEAN platform-specific build virtualenv
-3. Install requirements through constraints-3.12.txt
-4. validate_version.py   - refuses to build if versions disagree
-   write_build_stamp.py  - records when/where this build was made
-5. Run tests - Windows runs the full suite; macOS runs packaging/macOS tests
-6. Generate the app icon (macOS only: .icns)
-7. PyInstaller           - and verify the output actually exists
-8. Stage FFmpeg/FFprobe/MediaInfo  (macOS: + chmod +x, + codesign)
-9. Run `--selftest` against the BUILT app, then package
-```
+| Step | Windows (`build_installer.bat`) | macOS (`build_mac.sh`) |
+|------|---------------------------------|------------------------|
+| 1 | Check the host toolchain (Python 3.12) | Same |
+| 2 | Create a CLEAN build virtualenv | Same |
+| 3 | Install requirements through `constraints-3.12.txt` | Same |
+| 4 | `validate_version.py` (refuses to build if any version location disagrees) and `write_build_stamp.py` | Same, then pre-fetch the pinned FFmpeg/FFprobe/MediaInfo so a dead source fails in minutes |
+| 5 | Run the full test suite | Generate the app icon (`.icns`) from `branding/`. It runs before the tests because they check the icon, which a clean checkout does not have |
+| 6 | PyInstaller, then verify the output exists | Run the packaging and macOS tests |
+| 7 | Stage FFmpeg/FFprobe/MediaInfo | PyInstaller (`FrameGuard.app`), then verify the bundle exists |
+| 8 | Run `--selftest` against the built app | Stage the tools, `chmod +x`, codesign |
+| 9 | Build the Inno Setup installer | Run `--selftest` and the startup smoke against the built app, then build the DMG |
+
+The Windows icon (`assets/frameguard.ico`) is committed, so Windows has no icon
+step.
 
 > **Why a clean venv:** building from a dirty Python mixes incompatible
 > runtime libraries into the bundle. On Windows the app crashes with
@@ -159,9 +162,10 @@ Python and every binary wheel would also need to be universal2.
 
 Each build leaves an arch-tagged copy (`Output/FrameGuard-arm64.dmg` or
 `Output/FrameGuard-x86_64.dmg`) beside the canonical `FrameGuard.dmg`.
-FFmpeg and FFprobe come from pinned Martin Riedl releases with publisher
-SHA-256 sidecars, separately for arm64 and x86_64. The builder rejects a tool
-whose Mach-O architecture does not match the target; Rosetta is not required.
+FFmpeg and FFprobe come from pinned Martin Riedl releases, separately for
+arm64 and x86_64 (see Tool Cache below for how every tool is pinned). The
+builder rejects a tool whose Mach-O architecture does not match the target;
+Rosetta is not required.
 
 ### Known macOS differences
 
@@ -204,9 +208,10 @@ Still verify by hand:
 | File | Field |
 |------|-------|
 | `frameguard/__init__.py` | `__version__` |
-| `frameguard.spec` | `APP_VERSION` and the Windows `filevers`/`prodvers` tuples |
-| `installer.iss` | `AppVersion`, `VersionInfoVersion`, registry `Version` |
-| `version.json` | `version`, `changelog` (published for auto-update) |
+| `frameguard.spec` | `APP_VERSION`, the Windows `filevers`/`prodvers` tuples and the `FileVersion`/`ProductVersion` strings |
+| `installer.iss` | `AppVersion` (`VersionInfoVersion`, the registry `Version` and the wizard labels derive from it) |
+| `version.json` | `version`, and a new first `changelog` entry starting `vX.Y.Z - <title>`; only that entry becomes the release notes and the in-app "what's new" text |
+| `installer_info.txt` | The title line `FrameGuard Desktop vX.Y.Z` and the `WHAT'S NEW IN vX.Y.Z` heading |
 
 ---
 
@@ -221,7 +226,15 @@ tools_cache/
 └── darwin-x86_64/    ffmpeg, ffprobe, mediainfo
 ```
 
-They are downloaded once and reused. Useful commands:
+Every tool is pinned in `download_tools.py` to a versioned, immutable URL and
+the SHA-256 of that exact archive. A download whose hash differs is refused,
+and there is no "latest" fallback, so a build bundles exactly the pinned bytes
+or stops. A cached tool is reused only if it was extracted from the currently
+pinned archive; otherwise it is downloaded again. To bump a tool, change its
+version, URL and hash together, after checking the new archive against the
+publisher's own checksum where one exists.
+
+Downloaded tools are reused across builds. Useful commands:
 
 ```bash
 python download_tools.py --verify-only          # check the cache
@@ -248,7 +261,7 @@ The cache is gitignored — these are large binaries, not source.
 | macOS: `bad interpreter` | `build_mac.sh` has CRLF endings — `dos2unix build_mac.sh` |
 | macOS: `Permission denied` | `chmod +x build_mac.sh` |
 | "Inno Setup not found" | Install from jrsoftware.org to the default path |
-| FFmpeg download fails | The build stops; verify the pinned source and checksum sidecar, then retry |
+| FFmpeg download fails or reports a SHA-256 mismatch | The build stops; check that the pinned URL still serves the pinned archive (`download_tools.py`), then retry. Never replace a hash without verifying the new file |
 | Antivirus flags the exe | Add this folder to exclusions during the build |
 
 ---
@@ -266,7 +279,8 @@ The cache is gitignored — these are large binaries, not source.
 | `write_build_stamp.py` | Records build metadata for the About dialog |
 | `validate_version.py` | Pre-build version consistency check |
 | `installer.iss` | Inno Setup script (Windows shortcuts, `.fg` association) |
-| `version.json` | Published update manifest for the in-app updater (`installer_windows` / `installer_darwin` keys) |
+| `version.json` | Release version and curated changelog; the release workflow publishes the current entry as the release notes |
+| `release_notes.py` | Renders the GitHub release notes (download instructions plus the current changelog entry) |
 | `diagnostic.bat` | Collects environment info when debugging a user's machine (Windows) |
 | `diagnostic.sh` | Same for macOS (bundle layout, signature, `--selftest`) |
 | `entitlements.plist` | Hardened-runtime entitlements for Developer ID / notarized Mac builds (ad-hoc builds do not use it) |

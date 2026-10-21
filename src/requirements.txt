@@ -1,4 +1,6 @@
 PySide6>=6.6.0,<7.0.0
 fpdf2>=2.7.0,<3.0.0
 psutil>=5.9.0,<8.0.0
-
+# OS-native TLS verification for update checks (macOS keychain trust
+# settings, Windows certificate store). Pure Python, no dependencies.
+truststore>=0.10.5,<1.0

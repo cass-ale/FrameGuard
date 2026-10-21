@@ -693,3 +693,34 @@ def test_package_profile_uses_clean_builder_and_explicit_final_dmg_smoke(tmp_pat
     assert "--allow-unsigned" not in build
     assert "tools_dev/macos_package_smoke.py" in smoke
     assert "Output/FrameGuard-arm64.dmg" in smoke
+
+
+def test_branding_sources_and_brand_module_are_classified_as_ui():
+    """Every src/branding/* path used to be unclassified (a hard pre-push
+    failure), and brand.py was 'runtime', so a brand-only change skipped
+    the UI suites."""
+    assert pre_push.classify_path("src/branding/icon_mac_16.png") == {
+        "ui", "workflow_packaging"}
+    assert pre_push.classify_path("src/branding/frameguard-glyph.svg") == {
+        "ui", "workflow_packaging"}
+    assert pre_push.classify_path("src/frameguard/brand.py") == {"ui"}
+    classified = pre_push.classify_changes([
+        "src/branding/icon_mac_16.png", "src/frameguard/brand.py"])
+    assert classified["unclassified_paths"] == []
+    suites = pre_push.focused_tests(classified, [])
+    assert "tests/test_gui.py" in suites
+    assert "tests/test_packaging.py" in suites
+
+
+def test_every_tracked_release_file_is_classified():
+    """Release commits touch CHANGELOG.md and the README media; an
+    unclassified path fails the whole pre-push gate."""
+    for path, expected in [
+        ("CHANGELOG.md", {"documentation"}),
+        ("SECURITY.md", {"documentation"}),
+        ("assets/screenshots/scan.gif", {"documentation"}),
+        ("src/LICENSE", {"documentation", "workflow_packaging"}),
+        ("src/.gitignore", {"repository_config"}),
+        ("src/release_notes.py", {"workflow_packaging"}),
+    ]:
+        assert pre_push.classify_path(path) == expected, path

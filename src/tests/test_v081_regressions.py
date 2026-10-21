@@ -225,21 +225,8 @@ class TestUpdaterTrustAndFailures:
         assert context.verify_mode == ssl.CERT_REQUIRED
         assert context.check_hostname is True
 
-    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS keychain only")
-    def test_macos_context_loads_system_keychain_roots(self):
-        from frameguard import updater as U
-        U._macos_pem_cache = None
-        assert U._macos_keychain_certificates(), "no roots read from the system keychains"
-        assert U.https_context().cert_store_stats()["x509_ca"] > 0
-
-    def test_keychain_discovery_failure_never_breaks_a_check(self, monkeypatch):
-        from frameguard import updater as U
-        monkeypatch.setattr(U, "_macos_pem_cache", None)
-        monkeypatch.setattr(U.os.path, "exists", lambda _p: True)
-        monkeypatch.setattr(U.subprocess, "run",
-                            mock.Mock(side_effect=TypeError("patched Popen")))
-        assert U._macos_keychain_certificates() == []
-        assert U._macos_pem_cache is None   # retried next time, not cached
+    # OS-native trust (truststore) replaced the keychain-loading context;
+    # see TestOsNativeTls in test_release_hardening.py.
 
     def test_unreachable_github_reports_failure_not_up_to_date(self, qapp, monkeypatch):
         from frameguard import updater as U
@@ -249,10 +236,8 @@ class TestUpdaterTrustAndFailures:
             raise urllib.error.URLError("certificate verify failed")
 
         monkeypatch.setattr("urllib.request.urlopen", _boom)
-        monkeypatch.setattr(U, "get_default_search_paths", lambda: [])
         manager = U.UpdateManager()
         monkeypatch.setattr(manager, "check_channel_for_delta", lambda: False)
-        monkeypatch.setattr(manager, "get_update_source", lambda: "")
         failures, none = [], []
         manager.check_failed.connect(failures.append)
         manager.update_not_found.connect(lambda: none.append(True))
@@ -533,14 +518,33 @@ class TestReviewFollowUps:
         monkeypatch.setattr(U.sys, "platform", "darwin")
         monkeypatch.setattr(U.subprocess, "Popen",
                             lambda *_a, **_k: (_ for _ in ()).throw(OSError("launch failed")))
-        installer = tmp_path / "FrameGuard-arm64.dmg"
-        installer.write_bytes(b"installer")
+
+        class _Response:
+            status = 200
+            headers = {"Content-Length": "9"}
+
+            def __init__(self):
+                import io
+                self._io = io.BytesIO(b"installer")
+
+            def read(self, size=-1):
+                return self._io.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _Response())
         manager = U.UpdateManager()
         applied = []
         manager.apply_failed.connect(applied.append)
         manager._do_apply(U.UpdateInfo(
-            version="9.9.9", installer_path=str(installer),
-            sha256=hashlib.sha256(b"installer").hexdigest(), size_bytes=9))
+            version="9.9.9",
+            installer_path="https://example.test/FrameGuard-arm64.dmg",
+            sha256=hashlib.sha256(b"installer").hexdigest(), size_bytes=9,
+            asset_name="FrameGuard-arm64.dmg"))
         qapp.processEvents()
         assert applied and "launch failed" in applied[-1]
 

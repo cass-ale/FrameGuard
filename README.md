@@ -262,22 +262,30 @@ FrameGuard/
 │   │   ├── core.py           # Scan engine, checks, deep scan
 │   │   ├── worker.py         # Background scan thread
 │   │   ├── gui.py            # PySide6 UI
+│   │   ├── design.py         # Design tokens: fonts, spacing, sizes
+│   │   ├── icons.py          # Interface icons
+│   │   ├── brand.py          # Vector brand mark (app, Dock, taskbar, tray icons)
+│   │   ├── players.py        # "Open With" video player integration
 │   │   ├── report.py         # PDF report generation
 │   │   ├── presets.py        # .fg preset schema, import/export
 │   │   ├── theme.py          # 15 color themes
 │   │   ├── tools.py          # FFmpeg/MediaInfo discovery
 │   │   ├── watchfolder.py    # Watch folder monitor
 │   │   ├── manifest.py       # File manifest for differential updates
+│   │   ├── updatesource.py   # Differential update channel (folder or HTTPS)
 │   │   ├── deltaupdate.py    # Differential update staging and swap
-│   │   └── updater.py        # Auto-update
+│   │   └── updater.py        # Auto-update from GitHub Releases
 │   ├── presets/              # Bundled .json presets (shipped in the installer)
-│   ├── assets/               # Icons and logos
+│   ├── assets/               # Windows .ico and the macOS .icns packer
+│   ├── branding/             # Generated brand artwork (SVG marks, macOS icon PNGs)
 │   ├── tests/                # pytest suite
-│   ├── tools_dev/            # Developer-only utilities (GUI audit)
+│   ├── tools_dev/            # Developer-only utilities (pre-push gate, GUI audit, smokes)
 │   ├── build_installer.bat   # Windows build
 │   ├── build_mac.sh          # macOS build
+│   ├── download_tools.py     # Fetches the pinned FFmpeg/MediaInfo builds
 │   ├── frameguard.spec       # PyInstaller config
 │   ├── installer.iss         # Inno Setup config
+│   ├── release_notes.py      # Builds the GitHub release notes
 │   └── validate_version.py   # Build-time version consistency check
 ```
 

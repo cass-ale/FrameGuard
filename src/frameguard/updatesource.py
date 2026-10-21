@@ -14,7 +14,12 @@ configure one of these transports when it has a suitable payload host.
 LocalSource  - any filesystem path: a local test mirror, a UNC share, a
                mapped drive. Costs nothing to operate and needs no server.
 HttpSource   - an internal static host or artifact store that serves a
-               directory-shaped tree over HTTP(S).
+               directory-shaped tree over HTTPS. Plain http:// (and any
+               other URL scheme) is refused: the manifest carries the hashes
+               every file is verified against, and an optional bearer token
+               rides on every request, so neither may cross the network in
+               clear text. Redirects must stay on HTTPS, and the token is
+               dropped when a redirect leaves the configured host.
 
 NOTE ON GOOGLE DRIVE (the retired channel)
     Drive hosted this channel until it moved to the repository. As an
@@ -38,7 +43,7 @@ from typing import Optional
 def _https_context():
     """Trust what the OS trusts (see frameguard.updater.https_context)."""
     from frameguard.updater import https_context
-    return https_context(include_admin=True)
+    return https_context()
 
 from frameguard import manifest as M
 
@@ -48,6 +53,37 @@ _USER_AGENT = "FrameGuard-Updater/1.0"
 
 class UpdateSourceError(Exception):
     """A release could not be read from the configured channel."""
+
+
+def _is_https_url(url: str) -> bool:
+    parsed = urllib.parse.urlsplit(url or "")
+    return parsed.scheme.lower() == "https" and bool(parsed.hostname)
+
+
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to HTTPS, and never carry the channel's bearer
+    token to a different host (urllib copies it onto every redirect)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_https_url(newurl):
+            raise urllib.error.HTTPError(
+                newurl, code,
+                "Update channel redirected to a non-HTTPS location; refused.",
+                headers, fp)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None:
+            old_host = (urllib.parse.urlsplit(req.full_url).hostname or "").lower()
+            new_host = (urllib.parse.urlsplit(newurl).hostname or "").lower()
+            if old_host != new_host:
+                new.remove_header("Authorization")
+        return new
+
+
+def _open_https(request, timeout: float):
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=_https_context()),
+        _HttpsOnlyRedirectHandler())
+    return opener.open(request, timeout=timeout)
 
 
 class BaseSource:
@@ -102,6 +138,11 @@ class HttpSource(BaseSource):
     """A release served over HTTP(S) from a directory-shaped URL."""
 
     def __init__(self, base_url: str, token: Optional[str] = None):
+        if not _is_https_url(base_url):
+            raise UpdateSourceError(
+                "Update channels must use https://. A plain-HTTP channel "
+                "would expose the release manifest (and any access token) "
+                "to the network; refusing it.")
         self.base_url = base_url.rstrip("/")
         self.token = token
 
@@ -118,8 +159,7 @@ class HttpSource(BaseSource):
     def read_manifest(self) -> dict:
         url = f"{self.base_url}/{M.MANIFEST_FILENAME}"
         try:
-            with urllib.request.urlopen(self._request(url), timeout=_TIMEOUT,
-                                        context=_https_context()) as r:
+            with _open_https(self._request(url), _TIMEOUT) as r:
                 data = json.loads(r.read().decode("utf-8"))
         except (urllib.error.URLError, OSError) as e:
             raise UpdateSourceError(f"Could not reach the update channel:\n{url}\n{e}")
@@ -132,6 +172,10 @@ class HttpSource(BaseSource):
             raise UpdateSourceError(
                 f"The manifest at {url} contains a file path that escapes "
                 f"the release tree; refusing it.")
+        if not M.manifest_hashes_are_valid(data):
+            raise UpdateSourceError(
+                f"The manifest at {url} lists a file without a valid SHA-256; "
+                f"refusing it.")
         if data.get("manifest_version", 0) > M.MANIFEST_VERSION:
             raise UpdateSourceError(
                 "This release was published by a newer version of the build "
@@ -143,8 +187,7 @@ class HttpSource(BaseSource):
         url = f"{self.base_url}/{M.PAYLOAD_DIRNAME}/{quoted}"
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         try:
-            with urllib.request.urlopen(self._request(url), timeout=_TIMEOUT,
-                                        context=_https_context()) as r, \
+            with _open_https(self._request(url), _TIMEOUT) as r, \
                     open(dest_path, "wb") as f:
                 shutil.copyfileobj(r, f, length=1024 * 256)
         except (urllib.error.URLError, OSError) as e:
@@ -154,12 +197,17 @@ class HttpSource(BaseSource):
 def make_source(channel: str, token: Optional[str] = None) -> BaseSource:
     """Build the right source for a channel string.
 
-    Accepts an http(s) URL or any filesystem path, so one setting covers a
-    Drive-synced folder, a UNC share and a web endpoint.
+    Accepts an https:// URL or any filesystem path, so one setting covers a
+    local mirror, a UNC share and a web endpoint. Any other URL scheme,
+    plain http:// included, raises UpdateSourceError.
     """
     if not channel or not channel.strip():
         raise UpdateSourceError("No update channel is configured.")
     channel = channel.strip()
-    if channel.lower().startswith(("http://", "https://")):
+    if "://" in channel:
+        if not _is_https_url(channel):
+            raise UpdateSourceError(
+                "Update channels must be an https:// URL or a folder path; "
+                f"refusing {channel.split('://', 1)[0]}:// .")
         return HttpSource(channel, token=token)
     return LocalSource(channel)

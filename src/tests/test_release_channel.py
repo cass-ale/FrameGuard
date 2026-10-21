@@ -178,15 +178,13 @@ class TestConfiguredChannel:
             else:
                 settings.setValue(U._CHANNEL_KEY, original)
 
-    def test_search_paths_carry_no_retired_locations(self):
-        """The installer-flow fallback searches Downloads and the app's
-        own folder — never the retired Drive root or team shares."""
-        from frameguard.updater import get_default_search_paths
+    def test_no_filesystem_installer_search_remains(self):
+        """The installer-flow filesystem fallback (Downloads, the legacy
+        FGv0.2.2 folder, the app's own folder) was removed: a local
+        version.json vouched for its own installer."""
+        from frameguard import updater as U
 
-        paths = get_default_search_paths()
-        assert paths
-        assert not any("TPG" in p or "team-share" in p
-                       or "Shared drives" in p for p in paths)
+        assert not hasattr(U, "get_default_search_paths")
 
     def test_no_delta_channel_falls_through_to_github_releases(
             self, qapp, monkeypatch):
