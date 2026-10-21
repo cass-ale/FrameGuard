@@ -336,8 +336,10 @@ except ImportError as e:
     sys.exit(1)
 
 if __name__ == "__main__":
-    # Create named mutex so the installer can detect a running instance
-    # (matches AppMutex=FrameGuardDesktopApp in installer.iss)
+    # Named mutex for the installer: during a silent in-app update,
+    # installer.iss (InitializeSetup -> WaitForRunningApp) waits for it to
+    # clear before installing. installer.iss deliberately has no AppMutex:
+    # it turned that hand-off into a blocking "FrameGuard is running" prompt.
     if sys.platform == "win32":
         try:
             import ctypes

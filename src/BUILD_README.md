@@ -24,20 +24,23 @@ exact-SHA Release Candidate workflow must prove the Windows installer and both
 native macOS DMGs. See [`../docs/PRE_PUSH.md`](../docs/PRE_PUSH.md) for the
 evidence format, profiles, resume command, and failure rules.
 
-Both platform build scripts perform the same gated sequence and fail loudly at each step:
+Both platform build scripts run a gated nine-step sequence and fail loudly at
+each step. The step numbers match what each script prints:
 
-```
-1. Check the host toolchain (Python 3.12)
-2. Create a CLEAN platform-specific build virtualenv
-3. Install requirements through constraints-3.12.txt
-4. validate_version.py   - refuses to build if versions disagree
-   write_build_stamp.py  - records when/where this build was made
-5. Run tests - Windows runs the full suite; macOS runs packaging/macOS tests
-6. Generate the app icon (macOS only: .icns)
-7. PyInstaller           - and verify the output actually exists
-8. Stage FFmpeg/FFprobe/MediaInfo  (macOS: + chmod +x, + codesign)
-9. Run `--selftest` against the BUILT app, then package
-```
+| Step | Windows (`build_installer.bat`) | macOS (`build_mac.sh`) |
+|------|---------------------------------|------------------------|
+| 1 | Check the host toolchain (Python 3.12) | Same |
+| 2 | Create a CLEAN build virtualenv | Same |
+| 3 | Install requirements through `constraints-3.12.txt` | Same |
+| 4 | `validate_version.py` (refuses to build if any version location disagrees) and `write_build_stamp.py` | Same, then pre-fetch the pinned FFmpeg/FFprobe/MediaInfo so a dead source fails in minutes |
+| 5 | Run the full test suite | Generate the app icon (`.icns`) from `branding/`. It runs before the tests because they check the icon, which a clean checkout does not have |
+| 6 | PyInstaller, then verify the output exists | Run the packaging and macOS tests |
+| 7 | Stage FFmpeg/FFprobe/MediaInfo | PyInstaller (`FrameGuard.app`), then verify the bundle exists |
+| 8 | Run `--selftest` against the built app | Stage the tools, `chmod +x`, codesign |
+| 9 | Build the Inno Setup installer | Run `--selftest` and the startup smoke against the built app, then build the DMG |
+
+The Windows icon (`assets/frameguard.ico`) is committed, so Windows has no icon
+step.
 
 > **Why a clean venv:** building from a dirty Python mixes incompatible
 > runtime libraries into the bundle. On Windows the app crashes with
@@ -276,7 +279,8 @@ The cache is gitignored — these are large binaries, not source.
 | `write_build_stamp.py` | Records build metadata for the About dialog |
 | `validate_version.py` | Pre-build version consistency check |
 | `installer.iss` | Inno Setup script (Windows shortcuts, `.fg` association) |
-| `version.json` | Published update manifest for the in-app updater (`installer_windows` / `installer_darwin` keys) |
+| `version.json` | Release version and curated changelog; the release workflow publishes the current entry as the release notes |
+| `release_notes.py` | Renders the GitHub release notes (download instructions plus the current changelog entry) |
 | `diagnostic.bat` | Collects environment info when debugging a user's machine (Windows) |
 | `diagnostic.sh` | Same for macOS (bundle layout, signature, `--selftest`) |
 | `entitlements.plist` | Hardened-runtime entitlements for Developer ID / notarized Mac builds (ad-hoc builds do not use it) |
