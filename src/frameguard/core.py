@@ -16,6 +16,8 @@ import json
 import math
 import os
 import re
+import shutil
+import tempfile
 import threading
 from collections import Counter, deque
 from datetime import datetime
@@ -2025,6 +2027,9 @@ def _stderr_evidence_categories(line: str) -> tuple:
     Evidence records are always retained by _BoundedStderrCapture because the
     verdicts are parsed from them; everything else is a bounded tail.
     """
+    if audio_checks.is_file_routed_line(line):
+        # Read from the scan's measurement files (audio_checks), not the log.
+        return ()
     categories = []
     if _is_decode_evidence(line):
         categories.append("decode")
@@ -2074,9 +2079,12 @@ def _clip_evidence_line(line: str, categories: tuple, limit: int) -> str:
 class _CapturedStderr(str):
     def __new__(cls, text: str, truncated_records: int,
                 peak_lines: int, peak_chars: int,
-                peak_pending_chars: int):
+                peak_pending_chars: int, evidence_dropped: int = 0):
         value = super().__new__(cls, text)
         value.truncated_records = truncated_records
+        # Evidence records (detections, summaries) the capture had to drop:
+        # a verdict parsed from this text is then incomplete.
+        value.evidence_dropped = evidence_dropped
         value.peak_lines = peak_lines
         value.peak_chars = peak_chars
         value.peak_pending_chars = peak_pending_chars
@@ -2122,6 +2130,7 @@ class _BoundedStderrCapture:
         self._tail_chars = 0
         self._sequence = 0
         self.truncated_records = 0
+        self.evidence_dropped = 0
         self.peak_lines = 0
         self.peak_chars = 0
         self.peak_pending_chars = 0
@@ -2154,6 +2163,7 @@ class _BoundedStderrCapture:
             if (len(self._kept) >= self.max_event_lines
                     or self._kept_chars + len(clipped) > self.max_event_chars):
                 self.truncated_records += 1
+                self.evidence_dropped += 1
                 return
             self._kept.append(entry)
             self._kept_chars += len(clipped)
@@ -2181,6 +2191,7 @@ class _BoundedStderrCapture:
             self.peak_lines,
             self.peak_chars,
             self.peak_pending_chars,
+            self.evidence_dropped,
         )
 
 
@@ -2534,8 +2545,16 @@ class _ScanPlan:
         self.duration = _probed_duration(probe_data)
         self.loudness = (cfg.get("loudness_mode", "report") != "off") and bool(self.audio)
         self.cfg = cfg
-        # Set by _build_scan_command once the bundled ebur128 is self-tested.
+        # Audio (audio_checks), set by run_deep_scan: the loudness meter for
+        # 3+ channel tracks once the bundled ebur128 is self-tested, the
+        # tracks to treat as ambisonics, and the scan's private directory for
+        # measurement files and filter-graph scripts.
         self.multichannel_meter = audio_checks.METER_EBUR128
+        self.ambisonic = frozenset(
+            i for i, t in enumerate(self.audio) if audio_checks.is_ambisonic(t))
+        self.audio_files: Optional["audio_checks.MeasurementFiles"] = None
+        self.graph_dir: Optional[str] = None
+        self.graph_option = GRAPH_FILE_OPTION
         self.variable_rate = variable_rate
 
     def video_frames_unreliable(self) -> bool:
@@ -2595,14 +2614,17 @@ _EBUR128_MULTICHANNEL_OK: Dict[str, bool] = {}
 _EBUR128_REFERENCE_RE = re.compile(r"^\s*I:\s+(-?\d+(?:\.\d+)?)\s+LUFS", re.MULTILINE)
 
 
-def _ebur128_multichannel_ok(ffmpeg: str) -> bool:
-    """Known-answer test of the bundled ebur128 on three channels, cached.
+def _ebur128_multichannel_ok(ffmpeg: str, process_owner=None,
+                             cancel_event: Optional[threading.Event] = None) -> Optional[bool]:
+    """Known-answer test of the bundled ebur128 on three channels.
 
     1 kHz at -23 dBFS in L and R of a 3.0 layout is -23.0 LUFS by EBU Tech
     3341 case 1. The darwin-arm64 FFmpeg 9.0.2 build reads -5.0 (its >2
     channel K-weighting is broken; stereo is exact), the x86_64 build of the
-    same release reads -23.0. A binary that fails or cannot run is treated
-    as unreliable so the independent fallback meter is used.
+    same release reads -23.0. Only a definite reading is cached; a run that
+    fails, times out or prints no summary says nothing about the binary, so
+    this scan uses the independent fallback meter and the next one retries.
+    The process belongs to the scan, so Cancel stops it. None: cancelled.
     """
     if ffmpeg in _EBUR128_MULTICHANNEL_OK:
         return _EBUR128_MULTICHANNEL_OK[ffmpeg]
@@ -2610,23 +2632,66 @@ def _ebur128_multichannel_ok(ffmpeg: str) -> bool:
            "-i", "sine=f=1000:d=2:sample_rate=48000,volume=0.5663568",
            "-af", "pan=3.0|c0=c0|c1=c0,ebur128", "-f", "null", "-"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=30, env=_get_clean_env(),
-                              **_subprocess_kwargs())
-        match = _EBUR128_REFERENCE_RE.search(proc.stderr or "")
-        ok = bool(match) and abs(float(match.group(1)) + 23.0) <= 0.3
-    except (OSError, ValueError, subprocess.SubprocessError):
-        ok = False
+        proc = _run_owned_subprocess(cmd, 30, process_owner, cancel_event)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return False
+    if proc is None or (cancel_event is not None and cancel_event.is_set()):
+        return None
+    match = _EBUR128_REFERENCE_RE.search(proc.stderr or "")
+    if proc.returncode != 0 or not match:
+        return False
+    ok = abs(float(match.group(1)) + 23.0) <= 0.3
     _EBUR128_MULTICHANNEL_OK[ffmpeg] = ok
     return ok
 
 
-def _multichannel_meter(ffmpeg: str, plan: "_ScanPlan") -> str:
-    """The loudness meter for tracks of three or more channels."""
-    needs = plan.loudness and any(plan.channels(t) > 2 and not audio_checks.treated_as_ambisonic(t)
-                                  for t in plan.audio)
-    if not needs or _ebur128_multichannel_ok(ffmpeg):
+def _multichannel_meter(ffmpeg: str, plan: "_ScanPlan", process_owner=None,
+                        cancel_event: Optional[threading.Event] = None) -> Optional[str]:
+    """The loudness meter for tracks of three or more channels (None: cancelled)."""
+    needs = plan.loudness and any(plan.channels(t) > 2 and i not in plan.ambisonic
+                                  for i, t in enumerate(plan.audio))
+    if not needs:
         return audio_checks.METER_EBUR128
-    return audio_checks.METER_LOUDNORM
+    ok = _ebur128_multichannel_ok(ffmpeg, process_owner, cancel_event)
+    if ok is None:
+        return None
+    return audio_checks.METER_EBUR128 if ok else audio_checks.METER_LOUDNORM
+
+
+# FFmpeg >= 7 reads any option's value from a file with "-/option file";
+# older builds only know -filter_complex_script (removed in 8). Every bundled
+# build is 9.0.2.
+GRAPH_FILE_OPTION = "-/filter_complex"
+LEGACY_GRAPH_FILE_OPTION = "-filter_complex_script"
+_FFMPEG_MAJOR_RE = re.compile(r"ffmpeg version n?(\d+)\.")
+
+
+def _graph_file_option(version_banner: Optional[str]) -> str:
+    """How to pass a filter graph from a file to this FFmpeg. Unparseable
+    banners (git builds, "N-12345-g...") are current."""
+    match = _FFMPEG_MAJOR_RE.search(version_banner or "")
+    if match and int(match.group(1)) < 7:
+        return LEGACY_GRAPH_FILE_OPTION
+    return GRAPH_FILE_OPTION
+
+
+def _graph_arguments(graphs: List[str], plan: "_ScanPlan") -> List[str]:
+    """Each filter graph as a file in the scan's private directory.
+
+    Inline, a 16-track master's graphs exceed Windows' 32,767-character
+    command line (CreateProcess fails and nothing is decoded); as files the
+    command stays a few hundred characters whatever the track count.
+    Without a directory (unit tests building a command) they stay inline.
+    """
+    if not plan.graph_dir:
+        return [arg for graph in graphs for arg in ("-filter_complex", graph)]
+    args = []
+    for number, graph in enumerate(graphs):
+        path = os.path.join(plan.graph_dir, f"graph{number}.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(graph)
+        args += [plan.graph_option, path]
+    return args
 
 
 def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) -> List[str]:
@@ -2638,43 +2703,60 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     and on which file happened to be scanned first.
 
     The picture detectors come from ``plan.video_analysis`` (video_checks.py);
-    it may add a second output (the flash grid) after the null output.
+    it may add a second output (the flash grid) after the null output. The
+    audio event detectors run in graphs of their own: FFmpeg runs each
+    filter graph in its own thread, so a 16-track master is analysed in
+    parallel (audio_checks.TrackGraphs). The graphs are passed as files
+    (_graph_arguments).
     """
-    chains, maps = [], []
-    extra_graphs: List[str] = []
+    graphs: List[str] = []
+    maps: List[str] = []
     extra_outputs: List[str] = []
     if plan.video is not None:
         # --- video branch (video_checks.py) ---
         video_analysis = plan.video_analysis
         if video_analysis is not None:
-            chains.extend(video_analysis.filter_chains("v"))
+            graphs.append(";".join(video_analysis.filter_chains("v")))
             for graph, label in video_analysis.extra_graphs():
-                extra_graphs += ["-filter_complex", graph]
+                graphs.append(graph)
                 if label:
                     maps += ["-map", label]
             extra_outputs = video_analysis.extra_outputs()
         else:
-            chains.append(f"[0:{int(plan.video['index'])}]"
+            graphs.append(f"[0:{int(plan.video['index'])}]"
                           f"{video_checks.black_filter(plan.video_checks)}[v]")
         maps += ["-map", "[v]"]
         # --- end video branch ---
-    meter = _multichannel_meter(ffmpeg, plan)
-    plan.multichannel_meter = meter
+    # --- audio branch (audio_checks.py) ---
+    # Summary-printing filters join the first graph (as in 0.9.0); the
+    # file-writing detectors get graphs of their own (see TrackGraphs).
+    summary: List[str] = []
+    units: List["audio_checks.MeasurementUnit"] = []
     for i, track in enumerate(plan.audio):
-        # Audio branches (silence, loudness, per-channel signal checks):
-        # frameguard.audio_checks.track_filter_chains.
         names = _channel_names(track, plan.channels(track))
-        chains += audio_checks.track_filter_chains(i, track, names, cfg, plan.loudness,
-                                                   MAX_CHANNEL_SPLIT, meter)
+        parts = audio_checks.track_graphs(
+            i, track, names, cfg, plan.loudness, MAX_CHANNEL_SPLIT, plan.multichannel_meter,
+            ambisonic=i in plan.ambisonic, files=plan.audio_files)
+        summary += parts.summary
+        units += parts.units
         maps += ["-map", f"[a{i}]"]
+    if summary:
+        if graphs:
+            graphs[0] = ";".join([graphs[0]] + summary)
+        else:
+            graphs.append(";".join(summary))
+    for graph, stub in audio_checks.measurement_graphs(units):
+        graphs.append(graph)
+        maps += ["-map", stub]
+    # --- end audio branch ---
     threads = max(1, int(cfg.get("filter_threads", 4) or 4))
     return ([ffmpeg, "-nostdin", "-hide_banner", "-nostats",
              "-loglevel", "level+verbose", "-progress", "pipe:1",
              # Coded orientation: rotating a 4K picture costs more than the
              # analysis, and interlace detection needs the coded lines.
              "-noautorotate",
-             "-i", filepath, "-filter_complex_threads", str(threads),
-             "-filter_complex", ";".join(chains)] + extra_graphs
+             "-i", filepath, "-filter_complex_threads", str(threads)]
+            + _graph_arguments(graphs, plan)
             + maps + ["-f", "null", "-"] + extra_outputs)
 
 
@@ -2954,11 +3036,20 @@ def _report_video(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome,
         analysis=analysis, analysis_error=analysis_error)
 
 
-def _silence_events(log_text: str, instance: str, end_time: float,
-                    join_gap: float = 0.25) -> List[Tuple[float, float]]:
-    text = _close_open_regions(_lines_with_context(log_text, instance), end_time)
+def _silence_events_text(text: str, end_time: float,
+                         join_gap: float = 0.25) -> List[Tuple[float, float]]:
+    """Merged (start, duration) silencedetect regions from a log or from a
+    measurement file (``lavfi.silence_start=...``); a region still open at
+    the end closes at ``end_time``. Only for complete text: a file FFmpeg
+    wrote, never a log the capture truncated."""
+    text = _close_open_regions(text, end_time)
     events = _merge_event_intervals(_pair_detect_events(text, "silence"), join_gap)
     return [(start, dur if dur > 0 else max(0.0, end_time - start)) for start, dur in events]
+
+
+def _silence_events(log_text: str, instance: str, end_time: float,
+                    join_gap: float = 0.25) -> List[Tuple[float, float]]:
+    return _silence_events_text(_lines_with_context(log_text, instance), end_time, join_gap)
 
 
 def _primary_track_position(tracks: List[dict]) -> int:
@@ -2996,8 +3087,8 @@ def _track_silence_entry(label: str, events, duration: float, cfg: dict,
     return "WARN", _with_track(label, f"{count} silence region(s), total {total:.1f}s. At: {positions}")
 
 
-def _dead_channels(track: dict, position: int, log_text: str, duration: float,
-                   cfg: dict) -> List[int]:
+def _dead_channels(track: dict, position: int, evidence: "audio_checks.ScanEvidence",
+                   duration: float, cfg: dict) -> List[int]:
     """Indices of channels silent (at ``channel_silence_noise_db``) for at
     least ``dead_channel_ratio`` of the track."""
     count = _ScanPlan.channels(track)
@@ -3005,7 +3096,7 @@ def _dead_channels(track: dict, position: int, log_text: str, duration: float,
         return []
     ratio = float(cfg.get("dead_channel_ratio", 0.95))
     return [k for k in range(count)
-            if sum(d for _, d in _silence_events(log_text, f"silencedetect@a{position}c{k}", duration))
+            if sum(d for _, d in evidence.silence_events(f"silencedetect@a{position}c{k}", duration))
             >= duration * ratio]
 
 
@@ -3044,12 +3135,21 @@ def _add_audio_row(result: QAResult, name: str, row) -> None:
      "PASS": result.add_pass, "SKIP": result.add_skip}[status](name, detail, confidence)
 
 
-def _audio_evidence(log_text: str) -> "audio_checks.ScanEvidence":
-    return audio_checks.ScanEvidence(
-        log_text=log_text,
-        silence_events=lambda instance, end, join_gap=0.25: _silence_events(
-            log_text, instance, end, join_gap),
-        detect_events=lambda text, prefix: _merge_event_intervals(_pair_detect_events(text, prefix)))
+def _audio_evidence(log_text: str, files: Optional["audio_checks.MeasurementFiles"]
+                    ) -> "audio_checks.ScanEvidence":
+    """Silence events come from the measurement files, which FFmpeg writes in
+    full; the log only supplies the end-of-scan summaries, and is marked
+    incomplete when the bounded capture dropped evidence records."""
+    def silence_events(instance: str, end: float, join_gap: float = 0.25):
+        text = files.read(instance) if files is not None else None
+        if text is None:
+            raise audio_checks.EvidenceMissing(instance)
+        return _silence_events_text(text, end, join_gap)
+
+    dropped = int(getattr(log_text, "evidence_dropped", 0) or 0)
+    return audio_checks.ScanEvidence(log_text=log_text, silence_events=silence_events,
+                                     files=files, log_complete=dropped == 0,
+                                     dropped_records=dropped)
 
 
 def _record_loudness_metadata(result: QAResult, entry: Optional[dict], cfg: dict) -> None:
@@ -3075,13 +3175,27 @@ def _with_channel_silence(status: str, detail: str, label: str,
     return status, f"{detail}; {extra}"
 
 
+def _audio_files_complete(files: Optional["audio_checks.MeasurementFiles"]) -> Optional[str]:
+    """Why the measurement files cannot be trusted, or None."""
+    if files is None:
+        return "no temporary directory for the audio measurement files."
+    missing = [name for name, path in files.paths.items() if not os.path.exists(path)]
+    if missing:
+        return f"FFmpeg did not write {len(missing)} audio measurement file(s) ({missing[0]})."
+    return None
+
+
 def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:
     """Audio rows of the integrity pass.
 
     Whole-track silence and dead channels keep their 0.9.0 rules; loudness,
     true peak and the per-channel signal checks come from audio_checks.
+    Silence-type events are read from the measurement files; when those are
+    missing, or the log lost evidence records, the affected rows are "Not
+    verified" instead of judged from partial data.
     """
-    evidence = _audio_evidence(outcome.log_text)
+    files_problem = _audio_files_complete(plan.audio_files)
+    evidence = _audio_evidence(outcome.log_text, None if files_problem else plan.audio_files)
     silence, dead, loudness, true_peak, contexts = [], [], [], [], []
     measured = audio_checks.parse_meters(outcome.log_text) if plan.loudness else {}
     total = len(plan.audio)
@@ -3091,44 +3205,53 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
         label = _track_label(position, track, total)
         duration = (_decoded_audio_seconds(track, outcome.accounting)
                     or plan.audio_expected_seconds(track) or 0.0)
-        events = _silence_events(outcome.log_text, f"silencedetect@a{position}", duration)
-        status, detail = _track_silence_entry(label, events, duration, cfg,
-                                              primary=position == primary, number=position + 1)
-        if position == 0 and events:
-            result.set_metadata("silence_regions", len(events))
-            result.set_metadata("silence_total_seconds", round(sum(d for _, d in events), 2))
-            result.set_metadata("silence_timestamps", _format_event_list(events))
-        track_dead = (duration > 0 and sum(d for _, d in events)
-                      >= duration * float(cfg.get("dead_channel_ratio", 0.95)))
-        dead_channels = _dead_channels(track, position, outcome.log_text, duration, cfg)
+        ambisonic = position in plan.ambisonic
         ctx = audio_checks.TrackContext(
             position=position, track=track, names=_channel_names(track, plan.channels(track)),
-            label=label, duration=duration, dead_channels=dead_channels, track_silent=track_dead,
-            meter=audio_checks.loudness_meter(track, plan.channels(track), plan.multichannel_meter))
+            label=label, duration=duration, ambisonic=ambisonic,
+            meter=audio_checks.loudness_meter(track, plan.channels(track),
+                                              plan.multichannel_meter, ambisonic))
         contexts.append(ctx)
-        alone = audio_checks.channel_silence_entries(evidence, ctx, cfg, events)
-        channel_warning = channel_warning or bool(alone)
-        silence.append(_with_channel_silence(status, detail, label, alone))
-        dead.append(_dead_channel_entry(label, track, dead_channels, track_dead))
+        if not files_problem:
+            events = evidence.silence_events(f"silencedetect@a{position}", duration)
+            status, detail = _track_silence_entry(label, events, duration, cfg,
+                                                  primary=position == primary, number=position + 1)
+            if position == 0 and events:
+                result.set_metadata("silence_regions", len(events))
+                result.set_metadata("silence_total_seconds", round(sum(d for _, d in events), 2))
+                result.set_metadata("silence_timestamps", _format_event_list(events))
+            ctx.track_silent = (duration > 0 and sum(d for _, d in events)
+                                >= duration * float(cfg.get("dead_channel_ratio", 0.95)))
+            ctx.dead_channels = _dead_channels(track, position, evidence, duration, cfg)
+            alone = audio_checks.channel_silence_entries(evidence, ctx, cfg, events)
+            channel_warning = channel_warning or bool(alone)
+            silence.append(_with_channel_silence(status, detail, label, alone))
+            dead.append(_dead_channel_entry(label, track, ctx.dead_channels, ctx.track_silent))
         if plan.loudness:
             entry = measured.get(position)
             loudness.append(audio_checks.loudness_row(entry, ctx, cfg))
             true_peak.append(audio_checks.true_peak_row(
                 entry, ctx, cfg, audio_checks.track_sample_peak(evidence, ctx)))
-            if position == 0:
+            if position == 0 and evidence.log_complete:
                 _record_loudness_metadata(result, entry, cfg)
-    if any(s == "FAIL" for s, _ in silence):
-        confidence = 90
+    if files_problem:
+        _mark_not_verified(result, ["Audio Silence", "Dead Channel"], files_problem)
     else:
-        confidence = 80 if channel_warning else 100
-    _add_aggregate(result, "Audio Silence", silence, confidence)
-    _add_aggregate(result, "Dead Channel", dead)
-    if plan.loudness:
-        _add_audio_row(result, "Audio Loudness", audio_checks.aggregate(loudness))
-        _add_audio_row(result, audio_checks.TRUE_PEAK, audio_checks.aggregate(true_peak))
-    else:
+        if any(s == "FAIL" for s, _ in silence):
+            confidence = 90
+        else:
+            confidence = 80 if channel_warning else 100
+        _add_aggregate(result, "Audio Silence", silence, confidence)
+        _add_aggregate(result, "Dead Channel", dead)
+    if not plan.loudness:
         result.add_skip("Audio Loudness", "Loudness not measured (disabled by this spec).")
         result.add_skip(audio_checks.TRUE_PEAK, "True peak not measured (loudness is off in this spec).")
+    elif not evidence.log_complete:
+        overflow = audio_checks.log_overflow_text(evidence)[len(NOT_VERIFIED_PREFIX):]
+        _mark_not_verified(result, ["Audio Loudness", audio_checks.TRUE_PEAK], overflow)
+    else:
+        _add_audio_row(result, "Audio Loudness", audio_checks.aggregate(loudness))
+        _add_audio_row(result, audio_checks.TRUE_PEAK, audio_checks.aggregate(true_peak))
     rows = audio_checks.signal_rows(evidence, contexts, cfg)
     rows.update(audio_checks.disabled_rows(cfg))
     for name in (audio_checks.CLIPPING, audio_checks.DROPOUTS, audio_checks.PHASE,
@@ -3202,23 +3325,50 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         result.set_metadata("duration_display", _format_duration(plan.duration))
 
     analysis, analysis_error = _open_video_analysis(plan, cfg, cancel_event)
-    cmd = _build_scan_command(ffmpeg_path, filepath, plan, cfg)
-    if progress_callback:
-        progress_callback("filter", 0, plan.duration or 0.0, "Integrity scan (software decode)")
-    outcome = _run_scan_process(cmd, _calc_timeout(plan.duration, cfg), plan.duration, cfg,
-                                progress_callback, cancel_event, process_owner)
-    if outcome is None:
+    scan_dir = _prepare_scan_files(plan, result)
+    try:
+        meter = _multichannel_meter(ffmpeg_path, plan, process_owner, cancel_event)
+        if meter is None:
+            return
+        plan.multichannel_meter = meter
+        cmd = _build_scan_command(ffmpeg_path, filepath, plan, cfg)
+        if progress_callback:
+            progress_callback("filter", 0, plan.duration or 0.0, "Integrity scan (software decode)")
+        outcome = _run_scan_process(cmd, _calc_timeout(plan.duration, cfg), plan.duration, cfg,
+                                    progress_callback, cancel_event, process_owner)
+        if outcome is None:
+            return
+        if getattr(outcome.log_text, "truncated_records", 0):
+            result.set_metadata("deep_scan_stderr_truncated_lines", outcome.log_text.truncated_records)
+        if getattr(outcome.log_text, "evidence_dropped", 0):
+            result.set_metadata("deep_scan_evidence_dropped", outcome.log_text.evidence_dropped)
+        if progress_callback:
+            end = plan.duration or outcome.last_out_time or 0.0
+            progress_callback("filter", end, end, "Integrity scan (software decode)")
+        _report_scan(result, plan, outcome, cfg, analysis, analysis_error)
+    finally:
         if analysis is not None:
-            analysis.close()  # cancelled: stop the flash reader, remove the files
-        return
-    if getattr(outcome.log_text, "truncated_records", 0):
-        result.set_metadata("deep_scan_stderr_truncated_lines", outcome.log_text.truncated_records)
-    if progress_callback:
-        end = plan.duration or outcome.last_out_time or 0.0
-        progress_callback("filter", end, end, "Integrity scan (software decode)")
-    _report_scan(result, plan, outcome, cfg, analysis, analysis_error)
-    if analysis is not None:
-        analysis.close()
+            analysis.close()
+        if scan_dir:
+            shutil.rmtree(scan_dir, ignore_errors=True)
+
+
+def _prepare_scan_files(plan: _ScanPlan, result: QAResult) -> Optional[str]:
+    """The scan's private directory for filter-graph scripts and the audio
+    measurement files, and the plan settings that use it; None (graphs
+    inline, file-based audio rows not verified) when none can be created."""
+    plan.graph_option = _graph_file_option(
+        (result.tool_versions.get("ffmpeg") or {}).get("version") if result.tool_versions else None)
+    tracks = result.metadata.get("ambisonic_audio_tracks")
+    if tracks is not None:
+        plan.ambisonic = frozenset(int(n) - 1 for n in tracks)
+    try:
+        scan_dir = tempfile.mkdtemp(prefix="frameguard-scan-")
+    except OSError:
+        return None
+    plan.graph_dir = scan_dir
+    plan.audio_files = audio_checks.MeasurementFiles(scan_dir)
+    return scan_dir
 
 
 
@@ -3350,6 +3500,13 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
     projection = result.metadata.get("projection")
     container_checks.run_structure_checks(filepath, structure, probe_data, result, cfg,
                                           None if projection in (None, "none") else projection)
+    # --- audio: tracks analysed as ambisonics (audio_checks.ambisonic_positions) ---
+    tracks = _audio_streams(probe_data)
+    if tracks:
+        positions = audio_checks.ambisonic_positions(
+            tracks, [container_checks._sa3d_for(structure, t) for t in tracks],
+            spherical=projection not in (None, "none"))
+        result.set_metadata("ambisonic_audio_tracks", [p + 1 for p in positions])
 
 
 def run_qa_checks(filepath: str, cfg: dict = None,

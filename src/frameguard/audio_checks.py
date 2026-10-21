@@ -3,10 +3,17 @@ FrameGuard audio signal QC: loudness delivery profiles and per-channel checks.
 
 Everything here runs inside the single software-decode pass that
 ``core.run_deep_scan`` already makes (``core._build_scan_command`` asks
-``track_filter_chains`` for each audio track's branches), so no audio is
+``track_filter_chains`` for each audio track's graph), so no audio is
 decoded twice. The module is a leaf: it imports nothing from ``core``.
-``core._report_audio`` hands it the captured FFmpeg log through
-``ScanEvidence`` and records the rows this module returns.
+
+Event detectors (silencedetect, aphasemeter) write their events to files in
+the scan's private temporary directory (``MeasurementFiles``), not to the
+log: a file is complete however many events there are, while the bounded
+stderr capture has to drop records under pressure. Only short end-of-stream
+summaries (astats, ebur128, loudnorm) are read from the log, and when the
+capture dropped evidence records those rows are reported not verified.
+``core._report_audio`` hands both over through ``ScanEvidence`` and records
+the rows this module returns.
 
 Measurements and the standard each threshold comes from:
 
@@ -30,6 +37,7 @@ Measurements and the standard each threshold comes from:
 """
 
 import math
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
@@ -147,7 +155,7 @@ DUAL_MONO_RESIDUAL_DB = -90.0
 DUAL_MONO_MIN_CORRELATION = 0.999
 PHASE_INVERTED_SHARE = 0.5    # out of phase for half the active programme
 HUM_FREQUENCIES = (50, 60)
-HUM_RATE = 4000
+HUM_RATE = 1000
 HUM_BAND_HZ = 2               # each band: three cascaded 2 Hz-wide biquads
 HUM_NEIGHBOUR_HZ = 6          # reference bands 6 Hz either side of the mains tone
 HUM_PROMINENCE_DB = 6.0       # mains band at least 6 dB above both neighbours
@@ -166,9 +174,17 @@ TONE_FAST_S, TONE_SLOW_S, TONE_PEAK_S = 0.010, 0.040, 0.050
 TONE_STEADY_RATIO = 1.105     # fast/slow power within +-0.43 dB (e^+-0.1)
 TONE_CREST_POWER = 2.6        # peak^2 / mean power: sine 2 (3 dB crest), noise > 9
 TONE_FLOOR_DB = -50.0         # quieter than this is not a line-up tone
-TONE_RATE = 12000             # the detector runs on a copy resampled to this
+TONE_RATE = 4000              # the detector runs on a copy resampled to this
 DROPOUT_SILENCE_GAP_S = 0.25  # a dropout this close to a long silence is part of it
 DROPOUT_JOIN_S = 0.005        # dropout / tone regions closer than this are one event
+
+
+def _whole(value, default: int = 0) -> int:
+    """A probe field as an int; ffprobe output can be malformed ("stereo")."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _number(cfg: dict, key: str) -> float:
@@ -286,26 +302,45 @@ def is_ambisonic(track: dict) -> bool:
 
 # Channel counts of full-sphere ambisonics: (order + 1)^2 for orders 1-3.
 _AMBISONIC_COUNTS = (4, 9, 16)
-_NAMED_LAYOUTS = ("mono", "stereo", "2.1", "3.0", "5.0", "5.0(side)", "5.1", "5.1(side)",
-                  "6.1", "7.0", "7.1", "7.1(wide)", "octagonal", "hexadecagonal")
+# The layout FFmpeg assigns when a file signals none: AAC channel
+# configuration 4 decodes as "4.0", 16 channels default to "hexadecagonal".
+_DEFAULT_LAYOUTS = {4: ("4.0",), 9: (), 16: ("hexadecagonal",)}
+_UNNAMED = ("", "unknown")
 
 
-def treated_as_ambisonic(track: dict) -> bool:
-    """Tracks measured and analysed as B-format.
+def _sa3d_is_ambisonic(sa3d: Optional[dict]) -> bool:
+    """SA3D (Google Spatial Audio RFC v0): ambisonic_type 0 is periphonic."""
+    return bool(sa3d) and "error" not in sa3d and sa3d.get("ambisonic_type") == 0
 
-    Four channels are first-order ambisonics in practice for 360/XR work
-    (Quest and YouTube spatial audio): an AAC FOA track even decodes as
-    "4.0" with its SA3D box present, so the layout name cannot tell. 9 and
-    16 channels without a named loudspeaker layout are 2nd/3rd order.
+
+def ambisonic_positions(tracks: Sequence[dict], sa3d: Sequence[Optional[dict]],
+                        spherical: bool) -> List[int]:
+    """Positions of the audio tracks measured and analysed as B-format.
+
+    Ambisonic when the file says so: an SA3D box marks the track ambisonic,
+    or FFmpeg names the layout "ambisonic N". Without SA3D, only on a
+    spherical (projection-tagged) picture, and only when the channel count
+    is an ambisonic one and the layout is unsignalled (unnamed, or the
+    default FFmpeg assigns for that count, as AAC first-order ambisonics
+    decodes as "4.0"). Camera and field-recorder 4.0/quad tracks on flat
+    video are discrete loudspeaker channels.
     """
-    count = int(track.get("channels") or 0)
-    layout = str(track.get("channel_layout") or "").lower()
-    if is_ambisonic(track) or count == 4:
-        return True
-    return count in _AMBISONIC_COUNTS and layout not in _NAMED_LAYOUTS
+    found = []
+    for position, track in enumerate(tracks):
+        box = sa3d[position] if position < len(sa3d) else None
+        count = _whole(track.get("channels"))
+        layout = str(track.get("channel_layout") or "").lower()
+        if is_ambisonic(track) or _sa3d_is_ambisonic(box):
+            found.append(position)
+        elif (spherical and count in _AMBISONIC_COUNTS
+              and (layout in _UNNAMED or layout.endswith(" channels")
+                   or layout in _DEFAULT_LAYOUTS.get(count, ()))):
+            found.append(position)
+    return found
 
 
-def stereo_pairs(track: dict, names: Sequence[str]) -> List[Tuple[int, int, str]]:
+def stereo_pairs(track: dict, names: Sequence[str],
+                 ambisonic: bool = False) -> List[Tuple[int, int, str]]:
     """Left/right pairs whose correlation means something.
 
     Only true L/R pairs are correlated: FL/FR, BL/BR and SL/SR of named
@@ -314,7 +349,7 @@ def stereo_pairs(track: dict, names: Sequence[str]) -> List[Tuple[int, int, str]
     negatively for sources on one side, so they are never paired.
     """
     count = len(names)
-    if count < 2 or treated_as_ambisonic(track):
+    if count < 2 or ambisonic:
         return []
     if count == 2:
         return [(0, 1, "L/R")]
@@ -329,14 +364,14 @@ def _non_lfe(names: Sequence[str]) -> List[int]:
     return [k for k, name in enumerate(names) if name != "LFE"]
 
 
-def _hum_mix(track: dict, names: Sequence[str]) -> Optional[str]:
+def _hum_mix(names: Sequence[str], ambisonic: bool) -> Optional[str]:
     """pan expression averaging the non-LFE channels (LFE legitimately
-    carries 50/60 Hz programme). Ambiguous 4-channel tracks use channel 0
-    (W for ambisonics), since summing B-format components is meaningless."""
+    carries 50/60 Hz programme). Ambisonic tracks use channel 0 (W), since
+    summing B-format components is meaningless."""
     count = len(names)
     if count == 1:
         return None
-    channels = [0] if treated_as_ambisonic(track) else _non_lfe(names)
+    channels = [0] if ambisonic else _non_lfe(names)
     if not channels:
         return None
     gain = 1.0 / len(channels)
@@ -354,20 +389,59 @@ METER_NONE = "none"
 LOUDNORM_MAX_CHANNELS = 6
 
 _SIGNAL_STATS = "DC_offset+Peak_level+Flat_factor+Peak_count+RMS_level"
-# Full-scale clip runs, counted exactly: aeval keeps the current run length of
-# samples at |x| >= 0.9999 (s16 32767 and the s24 maximum both qualify) in
-# expression variable 0 and outputs 1 on the third sample of each run, so
-# astats' "Abs Peak count" of that 0/1 signal is the number of runs of
-# three or more samples at full scale (Peak level -inf means none).
 FULL_SCALE_AMPLITUDE = 0.9999
 CLIP_RUN_SAMPLES = 3
-_FULL_SCALE_RUNS = (f"aeval=exprs='st(0,if(gte(abs(val(0)),{FULL_SCALE_AMPLITUDE}),ld(0)+1,0));"
-                    f"eq(ld(0),{CLIP_RUN_SAMPLES})'")
-_RUN_STATS = "measure_perchannel=Abs_Peak_count+Peak_level:measure_overall=none"
 _PAIR_STATS = "Peak_level+RMS_level"
-_HUM_STATS = "RMS_level+RMS_trough"
 
 Branch = Tuple[str, str]  # (pad label, chain body ending before anullsink)
+
+
+def _filter_path(path: str) -> str:
+    """A path quoted for a filter option inside a filter graph: escaped for
+    the option parser (``\\ ' :``), then for the graph parser
+    (``\\ ' [ ] , ;``) - FFmpeg filters documentation, "Notes on
+    filtergraph escaping". Windows paths carry a drive colon and backslashes."""
+    def escape(text: str, specials: str) -> str:
+        return "".join("\\" + ch if ch in specials else ch for ch in text)
+    return escape(escape(path, "\\':"), "\\'[],;")
+
+
+class MeasurementFiles:
+    """Where FFmpeg writes one scan's event series: a private directory the
+    caller owns (core creates and removes it). One file per detector
+    instance, written by ``ametadata=mode=print:file=`` - unbounded and
+    lossless, unlike the stderr capture."""
+
+    def __init__(self, directory: str):
+        self.directory = directory
+        self.paths: Dict[str, str] = {}
+
+    def path(self, instance: str) -> str:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", instance)
+        path = os.path.join(self.directory, f"{name}.txt")
+        self.paths[instance] = path
+        return path
+
+    def read(self, instance: str) -> Optional[str]:
+        """The file's text; None when the detector never ran (not requested,
+        or FFmpeg did not create the file)."""
+        path = self.paths.get(instance)
+        if not path or not os.path.exists(path):
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return handle.read()
+
+
+def _record(instance: str, files: Optional[MeasurementFiles], key: Optional[str] = None) -> str:
+    """Filters after a detector that copy its frame metadata to the
+    instance's file, then strip it so the next detector's file holds only
+    its own events. Nothing without a directory (the rows then report not
+    verified)."""
+    if files is None:
+        return ""
+    selector = f":key={key}" if key else ""
+    return (f",ametadata=mode=print{selector}:file={_filter_path(files.path(instance))}"
+            f",ametadata=mode=delete")
 
 
 def _phase_angle(cfg: dict) -> float:
@@ -381,27 +455,14 @@ def _bandpass(freq: float, width: float) -> str:
     return ",".join([stage] * 3)
 
 
-def _full_scale_run_counter(count: int) -> str:
-    """aeval with one expression per channel: each expression has its own
-    variable store, so every channel keeps its own run length."""
-    expr = ("st(0,if(gte(abs(val({k})),{amp}),ld(0)+1,0));eq(ld(0),{run})")
-    exprs = "|".join(expr.format(k=k, amp=FULL_SCALE_AMPLITUDE, run=CLIP_RUN_SAMPLES)
-                     for k in range(count))
-    return f"aeval=exprs='{exprs}':c=same"
-
-
-def _signal_branches(i: int, names: Sequence[str], cfg: dict, max_split: int) -> List[Branch]:
-    """Per-channel peak, RMS, DC, flat factor and peak count (clipping, DC,
-    and the L/R levels of the correlation), then the exact full-scale run
-    counter on the same samples."""
+def _signal_branches(i: int, cfg: dict) -> List[Branch]:
+    """Per-channel peak, RMS, DC, flat factor and peak count (DC, flat tops
+    below full scale, and the L/R levels of the correlation)."""
     wanted = (CLIPPING, DC_OFFSET, PHASE, DUAL_MONO)
     if not any(check_enabled(cfg, name) for name in wanted):
         return []
-    body = (f"aformat=sample_fmts=dblp,astats@a{i}s="
-            f"measure_perchannel={_SIGNAL_STATS}:measure_overall=none")
-    if check_enabled(cfg, CLIPPING) and len(names) <= max_split:
-        body += f",{_full_scale_run_counter(len(names))},astats@a{i}k={_RUN_STATS}"
-    return [(f"a{i}s", body)]
+    return [(f"a{i}s", f"aformat=sample_fmts=dblp,astats@a{i}s="
+                       f"measure_perchannel={_SIGNAL_STATS}:measure_overall=none")]
 
 
 def _steady_tone_detector(sample_rate: int) -> str:
@@ -412,11 +473,11 @@ def _steady_tone_detector(sample_rate: int) -> str:
     +-0.43 dB (a level that is not moving). Sinusoidal: peak^2 over mean
     power below 2.6 (a sine is 2, i.e. a 3 dB crest factor; noise, speech
     and chords exceed 9). Audible: above -50 dBFS. Frequency- and
-    level-independent above ~200 Hz, which covers line-up tones (1 kHz
-    GLITS/EBU R 68, 400 Hz); the 1-pole coefficients are computed for the
-    track's sample rate so the expression stays a few multiply-adds.
+    level-independent from ~200 Hz to the copy's Nyquist, which covers
+    line-up tones (1 kHz GLITS/EBU R 68, 400 Hz); the one-pole coefficients
+    are computed for the copy's rate.
     """
-    rate = max(8000, int(sample_rate or 48000))
+    rate = int(sample_rate or TONE_RATE)
     fast = 1 - math.exp(-1 / (TONE_FAST_S * rate))
     slow = 1 - math.exp(-1 / (TONE_SLOW_S * rate))
     decay = math.exp(-1 / (TONE_PEAK_S * rate))
@@ -430,78 +491,99 @@ def _steady_tone_detector(sample_rate: int) -> str:
             f"*lt(ld(2)*ld(2),{TONE_CREST_POWER:g}*ld(0)),0,1)'")
 
 
-def _channel_branches(i: int, track: dict, names: Sequence[str], cfg: dict,
-                      max_split: int) -> List[Branch]:
-    """One mono branch per channel: silence at the channel threshold (dead
-    channels, per-channel stretches) and dropouts (not on the LFE, which is
-    legitimately near-silent). With dropouts on, the steady-tone detector
-    feeds ``silencedetect@a<N>t<K>``, whose "silences" are the stretches
-    of steady sinusoid that line-up gaps are judged against."""
-    if not 1 <= len(names) <= max_split:
+# Full-scale clip runs, counted exactly: aeval keeps the current run length of
+# samples at |x| >= 0.9999 (s16 32767 and the s24 maximum both qualify) and
+# outputs 0 from the third sample of a run to its end, 1 elsewhere; each run
+# of three or more is then one "silence" event (n=0.5, any length) in the
+# channel's run file.
+_FULL_SCALE_RUNS = (f"aeval=exprs='st(0,if(gte(abs(val(0)),{FULL_SCALE_AMPLITUDE}),ld(0)+1,0));"
+                    f"if(gte(ld(0),{CLIP_RUN_SAMPLES}),0,1)'")
+
+
+def _channel_chain(i: int, k: int, track: dict, name: str, cfg: dict,
+                   files: Optional[MeasurementFiles]) -> List[str]:
+    """``[a<N>c<K>]``: one channel's event detectors, all writing files.
+
+    Silence at the channel threshold (``c``: dead channels, per-channel
+    stretches), dropouts (``d``; not on the LFE, which is legitimately
+    near-silent), the steady-tone stretches line-up gaps are judged against
+    (``t``, on a 4 kHz copy: line-up tones are 1 kHz or 400 Hz, and the
+    per-sample aeval costs a twelfth of what it does at 48 kHz) and the
+    full-scale runs (``k``).
+    """
+    head = (f"[a{i}c{k}]pan=mono|c0=c{k},"
+            f"silencedetect@a{i}c{k}=n={_number(cfg, 'channel_silence_noise_db')}dB"
+            f":d={float(cfg['silence_duration'])}" + _record(f"silencedetect@a{i}c{k}", files))
+    tails = []
+    if check_enabled(cfg, DROPOUTS) and name != "LFE":
+        rate = min(_whole(track.get("sample_rate"), 48000) or 48000, TONE_RATE)
+        head += (f",silencedetect@a{i}d{k}=n={_number(cfg, 'dropout_noise_db')}dB"
+                 f":d={_number(cfg, 'dropout_min_ms') / 1000.0}"
+                 + _record(f"silencedetect@a{i}d{k}", files))
+        tails.append(f"aresample={rate},{_steady_tone_detector(rate)},"
+                     f"silencedetect@a{i}t{k}=n=0.5:d={LINEUP_TONE_MIN_S:g}"
+                     + _record(f"silencedetect@a{i}t{k}", files))
+    if check_enabled(cfg, CLIPPING):
+        tails.append(f"{_FULL_SCALE_RUNS},silencedetect@a{i}k{k}=n=0.5:d=0"
+                     + _record(f"silencedetect@a{i}k{k}", files))
+    if not tails:
+        return [head + ",anullsink"]
+    if len(tails) == 1:
+        return [f"{head},{tails[0]},anullsink"]
+    labels = [f"[a{i}c{k}x{n}]" for n in range(len(tails))]
+    return ([f"{head},asplit={len(tails)}{''.join(labels)}"]
+            + [f"{label}{tail},anullsink" for label, tail in zip(labels, tails)])
+
+
+def _phase_chains(i: int, track: dict, names: Sequence[str], cfg: dict, ambisonic: bool,
+                  files: Optional[MeasurementFiles]) -> List[Tuple[str, str]]:
+    """(label, chain) per L/R pair: aphasemeter's sustained out-of-phase
+    regions, written to a start and an end file."""
+    if not check_enabled(cfg, PHASE):
         return []
-    noise = _number(cfg, "channel_silence_noise_db")
-    duration = float(cfg["silence_duration"])
-    dropout = (f"silencedetect@a{i}d{{k}}=n={_number(cfg, 'dropout_noise_db')}dB"
-               f":d={_number(cfg, 'dropout_min_ms') / 1000.0}")
-    # The detector needs no more than a 12 kHz rate for tones up to ~4 kHz
-    # (line-up tones are 1 kHz or 400 Hz); aeval interprets per sample, so
-    # this quarters its cost at 48 kHz.
-    rate = min(int(track.get("sample_rate") or 48000), TONE_RATE)
-    tone = f"aresample={rate},{_steady_tone_detector(rate)}"
-    branches = []
-    for k, name in enumerate(names):
-        body = f"pan=mono|c0=c{k},silencedetect@a{i}c{k}=n={noise}dB:d={duration}"
-        if check_enabled(cfg, DROPOUTS) and name != "LFE":
-            body += "," + dropout.format(k=k)
-            body += f",{tone},silencedetect@a{i}t{k}=n=0.5:d={LINEUP_TONE_MIN_S:g}"
-        branches.append((f"a{i}c{k}", body))
-    return branches
+    chains = []
+    for j, (left, right, _) in enumerate(stereo_pairs(track, names, ambisonic)):
+        # pan gives the pair a definite stereo layout: cameras write 2-channel
+        # tracks with an unknown layout, which aphasemeter rejects.
+        chains.append((f"[a{i}q{j}]", (
+            f"[a{i}q{j}]pan=stereo|c0=c{left}|c1=c{right},"
+            f"aphasemeter@a{i}p{j}=video=0:phasing=1:angle={_phase_angle(cfg):.4f}"
+            f":duration={_number(cfg, 'phase_min_duration'):g}"
+            + _record(f"aphasemeter@a{i}p{j}.start", files, "lavfi.aphasemeter.out_phase_start")
+            + _record(f"aphasemeter@a{i}p{j}.end", files, "lavfi.aphasemeter.out_phase_end")
+            + ",anullsink")))
+    return chains
 
 
-def _pair_branches(i: int, track: dict, names: Sequence[str], cfg: dict) -> List[Branch]:
-    """Per L/R pair: astats over L+R and L-R (with the L and R levels from
-    ``astats@a<N>s``: correlation and the dual-mono residual) and
-    aphasemeter's sustained out-of-phase regions."""
-    if not (check_enabled(cfg, PHASE) or check_enabled(cfg, DUAL_MONO)):
-        return []
-    branches = []
-    for j, (left, right, _) in enumerate(stereo_pairs(track, names)):
-        branches.append((f"a{i}p{j}", (
-            f"pan=stereo|c0=c{left}+c{right}|c1=c{left}-c{right},aformat=sample_fmts=dblp,"
-            f"astats@a{i}p{j}=measure_perchannel={_PAIR_STATS}:measure_overall=none")))
-        if check_enabled(cfg, PHASE):
-            # pan gives the pair a definite stereo layout: cameras write
-            # 2-channel tracks with an unknown layout, which aphasemeter rejects.
-            branches.append((f"a{i}q{j}", (
-                f"pan=stereo|c0=c{left}|c1=c{right},"
-                f"aphasemeter@a{i}p{j}=video=0:phasing=1:angle={_phase_angle(cfg):.4f}"
-                f":duration={_number(cfg, 'phase_min_duration'):g}")))
-    return branches
-
-
-def _hum_chains(i: int, track: dict, names: Sequence[str], cfg: dict) -> List[str]:
-    """``[a<N>h]`` -> 2 Hz bands at 50/60 Hz and 6 Hz either side."""
-    mix = _hum_mix(track, names)
+def _hum_chains(i: int, names: Sequence[str], cfg: dict, ambisonic: bool,
+                files: Optional[MeasurementFiles]) -> List[str]:
+    """``[a<N>h]`` -> 2 Hz bands at 50/60 Hz and 6 Hz either side, each
+    band's RMS per 1 s window written to a file (``astats@a<N>h<F><tag>``).
+    44-66 Hz bands need no more than a 1 kHz rate: resampling first makes the
+    18 biquads 48 times cheaper and better conditioned."""
+    mix = _hum_mix(names, ambisonic)
     if not check_enabled(cfg, HUM) or (len(names) != 1 and not mix):
         return []
     bands = [(freq, tag, freq + offset) for freq in HUM_FREQUENCIES
              for tag, offset in (("c", 0), ("l", -HUM_NEIGHBOUR_HZ), ("u", HUM_NEIGHBOUR_HZ))]
     outputs = "".join(f"[a{i}h{freq}{tag}]" for freq, tag, _ in bands)
-    # 50-66 Hz bands need no more than a 4 kHz rate: resampling first makes
-    # the 18 biquads twelve times cheaper and better conditioned.
     chains = [f"[a{i}h]{mix + ',' if mix else ''}aresample={HUM_RATE},asplit={len(bands)}{outputs}"]
     chains.extend(
-        f"[a{i}h{freq}{tag}]{_bandpass(centre, HUM_BAND_HZ)},astats@a{i}h{freq}{tag}="
-        f"measure_perchannel={_HUM_STATS}:measure_overall=none:length=1,anullsink"
+        f"[a{i}h{freq}{tag}]{_bandpass(centre, HUM_BAND_HZ)},asetnsamples=n={HUM_RATE}:p=0,"
+        f"astats@a{i}h{freq}{tag}=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none"
+        + _record(f"astats@a{i}h{freq}{tag}", files, "lavfi.astats.1.RMS_level")
+        + ",anullsink"
         for freq, tag, centre in bands)
     return chains
 
 
-def _main_chain(i: int, track: dict, main: str, cfg: dict, meter: str, loudness: bool) -> str:
+def _main_chain(i: int, main: str, cfg: dict, meter: str, loudness: bool, ambisonic: bool,
+                files: Optional[MeasurementFiles]) -> str:
     """0.9.0's whole-track silence plus the BS.1770 meter, ending in [a<N>]."""
-    chain = f"{main}silencedetect@a{i}=n={float(cfg['silence_noise_db'])}dB:d={float(cfg['silence_duration'])}"
+    chain = (f"{main}silencedetect@a{i}=n={float(cfg['silence_noise_db'])}dB"
+             f":d={float(cfg['silence_duration'])}" + _record(f"silencedetect@a{i}", files))
     if loudness and meter in (METER_EBUR128, METER_NONE):
-        if meter == METER_EBUR128 and treated_as_ambisonic(track):
+        if meter == METER_EBUR128 and ambisonic:
             # W only: BS.1770-5 defines no scene-based method; summing B-format
             # components over-reads by ~3.5 LU (benchmark F13).
             chain += ",pan=mono|c0=c0"
@@ -510,37 +592,116 @@ def _main_chain(i: int, track: dict, main: str, cfg: dict, meter: str, loudness:
     return chain + f"[a{i}]"
 
 
-def track_filter_chains(position: int, track: dict, names: Sequence[str], cfg: dict,
-                        loudness: bool, max_split: int,
-                        multichannel_meter: str = METER_EBUR128) -> List[str]:
-    """Every audio branch for one track; the main branch ends in ``[a<N>]``.
+@dataclass
+class MeasurementUnit:
+    """One file-writing detector chain fed from ``source`` through ``label``."""
 
-    The main branch keeps 0.9.0's whole-track ``silencedetect@a<N>`` and the
-    loudness meter; the measurement branches (see the ``_*_branches``
-    helpers) split off it with ``asplit`` and end in ``anullsink``, so the
-    track is still decoded once.
+    source: str
+    label: str
+    chains: List[str]
+
+
+@dataclass
+class TrackGraphs:
+    """One track's share of the scan command.
+
+    ``summary``: chains for the scan's first filter graph, the one whose
+    filters print end-of-scan summaries to the log (ebur128, astats,
+    loudnorm); the main branch ends in ``[a<N>]``. They share one graph, and
+    so one thread, because a filter graph frees its filters on its own
+    thread at the end: ebur128 prints its peaks without a line end, and a
+    line another thread prints meanwhile is glued to it without its source
+    prefix. ``units``: the file-writing detectors, which
+    ``measurement_graphs`` packs into parallel graphs.
     """
+
+    summary: List[str]
+    units: List[MeasurementUnit]
+
+
+# At most this many measurement graphs (threads) per scan: more threads than
+# cores buys nothing, and every graph adds a file path to the command line.
+MAX_MEASUREMENT_GRAPHS = 16
+
+
+def measurement_graphs(units: Sequence[MeasurementUnit],
+                       max_graphs: int = MAX_MEASUREMENT_GRAPHS) -> List[Tuple[str, str]]:
+    """(graph, stub label) per graph: consecutive units in at most
+    ``max_graphs`` graphs, each splitting the streams it reads and giving
+    FFmpeg the one-sample output it requires of every graph."""
+    if not units:
+        return []
+    count = min(max_graphs, len(units))
+    size = -(-len(units) // count)
+    graphs = []
+    for number, start in enumerate(range(0, len(units), size)):
+        part = units[start:start + size]
+        sources: Dict[str, List[MeasurementUnit]] = {}
+        for unit in part:
+            sources.setdefault(unit.source, []).append(unit)
+        stub = f"[ag{number}]"
+        lines = []
+        for position, (source, members) in enumerate(sources.items()):
+            labels = "".join(unit.label for unit in members)
+            extra = f"[ag{number}s]" if position == 0 else ""
+            lines.append(f"{source}asplit={len(members) + bool(extra)}{extra}{labels}")
+        lines.append(f"[ag{number}s]atrim=end_sample=1{stub}")
+        for unit in part:
+            lines.extend(unit.chains)
+        graphs.append((";".join(lines), stub))
+    return graphs
+
+
+def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
+                 loudness: bool, max_split: int, multichannel_meter: str = METER_EBUR128,
+                 ambisonic: bool = False,
+                 files: Optional[MeasurementFiles] = None) -> TrackGraphs:
+    """Every audio branch for one track (see TrackGraphs)."""
     i = position
     source = f"[0:{int(track['index'])}]"
-    meter = loudness_meter(track, len(names), multichannel_meter) if loudness else METER_NONE
-    branches = (_signal_branches(i, names, cfg, max_split) + _channel_branches(i, track, names, cfg, max_split)
-                + _pair_branches(i, track, names, cfg))
+    meter = loudness_meter(track, len(names), multichannel_meter, ambisonic) if loudness else METER_NONE
+    branches = _signal_branches(i, cfg)
+    if check_enabled(cfg, DUAL_MONO) or check_enabled(cfg, PHASE):
+        for j, (left, right, _) in enumerate(stereo_pairs(track, names, ambisonic)):
+            branches.append((f"a{i}p{j}", (
+                f"pan=stereo|c0=c{left}+c{right}|c1=c{left}-c{right},aformat=sample_fmts=dblp,"
+                f"astats@a{i}p{j}=measure_perchannel={_PAIR_STATS}:measure_overall=none")))
     if meter == METER_LOUDNORM:
         # loudnorm resamples to 192 kHz internally: keep it off the mapped output.
         branches.append((f"a{i}l", f"loudnorm@a{i}=print_format=summary"))
-    hum = _hum_chains(i, track, names, cfg)
-    labels = [f"[{label}]" for label, _ in branches] + ([f"[a{i}h]"] if hum else [])
-    if not labels:
-        return [_main_chain(i, track, source, cfg, meter, loudness)]
-    main = f"[a{i}m]"
-    chains = [f"{source}asplit={len(labels) + 1}{main}{''.join(labels)}"]
-    chains += [f"[{label}]{body},anullsink" for label, body in branches]
-    chains += hum
-    chains.append(_main_chain(i, track, main, cfg, meter, loudness))
-    return chains
+    if branches:
+        main = f"[a{i}m]"
+        summary = [f"{source}asplit={len(branches) + 1}{main}"
+                   + "".join(f"[{label}]" for label, _ in branches)]
+        summary += [f"[{label}]{body},anullsink" for label, body in branches]
+        summary.append(_main_chain(i, main, cfg, meter, loudness, ambisonic, files))
+    else:
+        summary = [_main_chain(i, source, cfg, meter, loudness, ambisonic, files)]
+
+    units = []
+    if 1 <= len(names) <= max_split:
+        units += [MeasurementUnit(source, f"[a{i}c{k}]", _channel_chain(i, k, track, name, cfg, files))
+                  for k, name in enumerate(names)]
+    units += [MeasurementUnit(source, label, [body])
+              for label, body in _phase_chains(i, track, names, cfg, ambisonic, files)]
+    hum = _hum_chains(i, names, cfg, ambisonic, files)
+    if hum:
+        units.append(MeasurementUnit(source, f"[a{i}h]", hum))
+    return TrackGraphs(summary, units)
 
 
-def loudness_meter(track: dict, count: int, multichannel_meter: str) -> str:
+def track_filter_chains(position: int, track: dict, names: Sequence[str], cfg: dict,
+                        loudness: bool, max_split: int,
+                        multichannel_meter: str = METER_EBUR128, ambisonic: bool = False,
+                        files: Optional[MeasurementFiles] = None) -> List[str]:
+    """Every chain of ``track_graphs`` as one list (for inspection)."""
+    graphs = track_graphs(position, track, names, cfg, loudness, max_split,
+                          multichannel_meter, ambisonic, files)
+    return graphs.summary + [chain for unit in graphs.units for chain in unit.chains]
+
+
+def loudness_meter(track: dict, count: int, multichannel_meter: str,
+                   ambisonic: bool = False) -> str:
     """Which BS.1770 meter measures this track.
 
     ``ebur128`` for mono, stereo and ambisonic W. For three or more channels
@@ -552,15 +713,24 @@ def loudness_meter(track: dict, count: int, multichannel_meter: str) -> str:
     correct for up to six channels but ignores channels 7+ (7.1 reads
     without its side pair). Beyond six channels that leaves ``none``.
     """
-    if count <= 2 or treated_as_ambisonic(track):
+    if count <= 2 or ambisonic:
         return METER_EBUR128
     if multichannel_meter == METER_LOUDNORM and count > LOUDNORM_MAX_CHANNELS:
         return METER_NONE
     return multichannel_meter
 
 
-_EVIDENCE_RE = re.compile(r"\[(?:astats|aphasemeter)@a\d+[a-z]\d*[a-z]? @ |\[loudnorm@a\d+ @ "
+_EVIDENCE_RE = re.compile(r"\[astats@a\d+[sp]\d* @ |\[loudnorm@a\d+ @ "
                           r"|^Input (?:Integrated|True Peak|LRA|Threshold):")
+# Detectors whose events are read from measurement files: their log lines
+# are diagnostics, not evidence (with thousands of dropouts they would
+# otherwise crowd the summaries out of the bounded capture).
+_FILE_ROUTED_RE = re.compile(r"\[(?:silencedetect@a\d+[a-z]?\d*|aphasemeter@a\d+p\d+"
+                             r"|astats@a\d+h\d+[clu]) @ ")
+
+
+def is_file_routed_line(line: str) -> bool:
+    return bool(_FILE_ROUTED_RE.search(line))
 
 
 def is_evidence_line(line: str) -> bool:
@@ -701,19 +871,27 @@ def parse_meters(log_text: str) -> Dict[int, dict]:
 Events = List[Tuple[float, float]]
 
 
+class EvidenceMissing(Exception):
+    """A row's evidence was not produced: report it not verified."""
+
+
 @dataclass
 class ScanEvidence:
     """What core captured for one scan.
 
     ``silence_events(instance, end[, join_gap])`` returns merged (start,
-    duration) silencedetect regions for a filter instance, open regions
-    closed at ``end`` and regions closer than ``join_gap`` (0.25 s) fused; ``detect_events(text, prefix)`` pairs ``<prefix>_start/_end``
-    tokens. Both are core's own parsers, so there is one implementation.
+    duration) silencedetect regions read from the instance's measurement
+    file (core's parser), open regions closed at ``end`` and regions closer
+    than ``join_gap`` (0.25 s) fused; it raises EvidenceMissing when there
+    is no file. ``log_complete`` is False when the bounded stderr capture
+    dropped evidence records, so the log's summaries cannot be trusted.
     """
 
     log_text: str
     silence_events: Callable[..., Events]
-    detect_events: Callable[[str, str], Events]
+    files: Optional[MeasurementFiles] = None
+    log_complete: bool = True
+    dropped_records: int = 0
 
 
 @dataclass
@@ -726,6 +904,7 @@ class TrackContext:
     dead_channels: List[int] = field(default_factory=list)
     track_silent: bool = False
     meter: str = METER_EBUR128
+    ambisonic: bool = False
 
 
 Row = Tuple[str, str, int]  # (status, detail, confidence)
@@ -806,12 +985,9 @@ def _violation_confidence(margin: float, meter_tolerance: float) -> int:
 
 def _loudness_caveat(ctx: TrackContext) -> Tuple[str, Optional[int]]:
     """(note, confidence cap) for measurements no standard fully defines."""
-    if is_ambisonic(ctx.track):
+    if ctx.ambisonic:
         return (" (ambisonic: W-channel loudness; BS.1770-5 defines no scene-based method)",
                 LOW_CONFIDENCE)
-    if treated_as_ambisonic(ctx.track):
-        return (f" ({len(ctx.names)}-channel track treated as ambisonics: W-channel loudness; "
-                f"BS.1770-5 defines no scene-based method)", LOW_CONFIDENCE)
     if ctx.duration and ctx.duration < 3.0:
         return " (under 3 s: gating is unreliable)", LOW_CONFIDENCE
     return "", None
@@ -906,14 +1082,17 @@ def _channel_text(ctx: TrackContext, k: int) -> str:
     return ctx.names[k] if k < len(ctx.names) else f"ch{k + 1}"
 
 
-def _full_scale_runs(runs: List[Dict[str, float]], k: int) -> Optional[int]:
-    """Runs counted for channel ``k`` by the aeval counter (None: not run)."""
-    if k >= len(runs):
-        return None
-    peak = runs[k].get("peak_db")
-    if peak is None or not math.isfinite(peak):
-        return 0
-    return int(runs[k].get("abs_peak_count", 0))
+_START_RE = re.compile(r"silence_start\s*=")
+
+
+def _full_scale_runs(evidence: "ScanEvidence", ctx: "TrackContext", k: int) -> int:
+    """Runs of >= 3 full-scale samples in channel ``k``: one event each in
+    the channel's run file (see ``_FULL_SCALE_RUNS``)."""
+    instance = f"silencedetect@a{ctx.position}k{k}"
+    text = evidence.files.read(instance) if evidence.files else None
+    if text is None:
+        raise EvidenceMissing(instance)
+    return len(_START_RE.findall(text))
 
 
 def clipping_row(stats: List[Dict[str, float]], evidence: "ScanEvidence", ctx: "TrackContext",
@@ -934,13 +1113,10 @@ def clipping_row(stats: List[Dict[str, float]], evidence: "ScanEvidence", ctx: "
     peak is below -20 dBFS (quantisation) are ignored.
     """
     minimum = max(1, int(_number(cfg, "clipping_min_events")))
-    counted = parse_astats(evidence.log_text, f"astats@a{ctx.position}k")
-    full, isolated, below, unmeasured = [], [], [], 0
+    full, isolated, below = [], [], []
     for k in range(len(ctx.names)):
-        runs = _full_scale_runs(counted, k)
-        if runs is None:
-            unmeasured += 1
-        elif runs >= minimum:
+        runs = _full_scale_runs(evidence, ctx, k)
+        if runs >= minimum:
             full.append((k, runs))
             continue
         elif runs > 0:
@@ -955,7 +1131,7 @@ def clipping_row(stats: List[Dict[str, float]], evidence: "ScanEvidence", ctx: "
         if mean_run >= CLIP_BELOW_FS_MEAN_RUN and estimate >= minimum:
             below.append((k, estimate, mean_run, peak))
 
-    if unmeasured == len(ctx.names) and not stats:
+    if not stats:
         return "WARN", _with_label(ctx.label, "Not verified: sample statistics were not reported."), 100
     enforced = {"essential": "FAIL", "advisory": "WARN"}.get(cfg.get("loudness_mode", "report"))
     note = "" if enforced else "; not enforced (camera originals clip; enforce a delivery profile to judge)"
@@ -1050,8 +1226,37 @@ def _pair_usable(ctx: TrackContext, left: int, right: int) -> bool:
     return not ctx.track_silent and left not in ctx.dead_channels and right not in ctx.dead_channels
 
 
+_VALUE_RE = re.compile(r"=\s*(-?\d+(?:\.\d+)?(?:e-?\d+)?)")
+
+
+def _file_values(evidence: ScanEvidence, instance: str) -> List[float]:
+    text = evidence.files.read(instance) if evidence.files else None
+    if text is None:
+        raise EvidenceMissing(instance)
+    return [float(m.group(1)) for m in _VALUE_RE.finditer(text)]
+
+
+def phase_events(evidence: ScanEvidence, ctx: TrackContext, j: int) -> Events:
+    """aphasemeter's sustained out-of-phase regions of pair ``j``, from its
+    start and end files; a region still open at the end of the stream (its
+    end is only logged, never attached to a frame) closes at the track end."""
+    base = f"aphasemeter@a{ctx.position}p{j}"
+    marks = sorted([(t, 0) for t in _file_values(evidence, f"{base}.start")]
+                   + [(t, 1) for t in _file_values(evidence, f"{base}.end")])
+    events, open_start = [], None
+    for t, kind in marks:
+        if kind == 0 and open_start is None:
+            open_start = t
+        elif kind == 1 and open_start is not None:
+            events.append((open_start, max(0.0, t - open_start)))
+            open_start = None
+    if open_start is not None and ctx.duration:
+        events.append((open_start, max(0.0, ctx.duration - open_start)))
+    return _merge(events, 0.25)
+
+
 def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
-    pairs = stereo_pairs(ctx.track, ctx.names)
+    pairs = stereo_pairs(ctx.track, ctx.names, ctx.ambisonic)
     if not pairs:
         reason = ("ambisonic track: W, Y, Z, X are not a stereo pair"
                   if len(ctx.names) >= 2 else "single-channel track")
@@ -1062,8 +1267,7 @@ def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
         if not _pair_usable(ctx, left, right):
             continue
         correlation, _ = _pair_stats(evidence, ctx, j, left, right)
-        text = evidence.log_text and "\n".join(_context_lines(evidence.log_text, f"aphasemeter@a{ctx.position}p{j}"))
-        events = evidence.detect_events(text or "", "out_phase")
+        events = phase_events(evidence, ctx, j)
         active = _active_seconds(ctx, evidence, (left, right)) or ctx.duration
         total = sum(d for _, d in events)
         corr_text = f"correlation {correlation:+.2f}" if correlation is not None else "correlation n/a"
@@ -1088,7 +1292,7 @@ def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
 
 
 def dual_mono_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
-    pairs = stereo_pairs(ctx.track, ctx.names)
+    pairs = stereo_pairs(ctx.track, ctx.names, ctx.ambisonic)
     if not pairs:
         return "SKIP", _with_label(ctx.label, "Not applicable (no L/R pair)."), 100
     texts, flagged, confidence = [], False, 100
@@ -1211,26 +1415,44 @@ def channel_silence_entries(evidence: ScanEvidence, ctx: TrackContext, cfg: dict
     return texts
 
 
+def _band_windows(evidence: ScanEvidence, instance: str) -> List[float]:
+    """1 s RMS levels (dBFS) of a hum band, from its file. The first window
+    is dropped when there are three or more: the 2 Hz filters ring up over
+    about half a second."""
+    text = evidence.files.read(instance) if evidence.files else None
+    if text is None:
+        raise EvidenceMissing(instance)
+    levels = []
+    for match in re.finditer(r"RMS_level=(\S+)", text):
+        value = _to_float(match.group(1))
+        levels.append(value if value is not None else -math.inf)
+    return levels[1:] if len(levels) >= 3 else levels
+
+
+def _mean_level(levels: Sequence[float]) -> Optional[float]:
+    if not levels:
+        return None
+    power = sum(10 ** (v / 10) for v in levels if math.isfinite(v)) / len(levels)
+    return 10 * math.log10(power) if power > 0 else -math.inf
+
+
 def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
     """Mains hum: a steady tone in a 2 Hz band at 50 or 60 Hz.
 
     The mains band must stand ``HUM_PROMINENCE_DB`` above both 2 Hz bands
     6 Hz away (broadband programme fills all three alike; a tone fills one),
-    sit above ``hum_min_db``, and be steady: its 1 s RMS trough within 6 dB
-    of its mean, which a bass line or a passing note is not. The rules and
-    the -65 dBFS floor are inferred (Qualify AQ-118 publishes only
+    sit above ``hum_min_db``, and be steady: its quietest 1 s window within
+    6 dB of its mean, which a bass line or a passing note is not. The rules
+    and the -65 dBFS floor are inferred (Qualify AQ-118 publishes only
     "50/60 Hz +-1 Hz"), so the result is advisory with confidence below 70.
     """
     floor = _number(cfg, "hum_min_db")
     found, measured = [], []
     for freq in HUM_FREQUENCIES:
-        bands = {}
-        for tag in ("c", "l", "u"):
-            stats = parse_astats(evidence.log_text, f"astats@a{ctx.position}h{freq}{tag}")
-            bands[tag] = stats[0] if stats else {}
-        level = bands["c"].get("rms_db")
-        trough = bands["c"].get("trough_db")
-        neighbours = [bands[t].get("rms_db") for t in ("l", "u")]
+        windows = {tag: _band_windows(evidence, f"astats@a{ctx.position}h{freq}{tag}")
+                   for tag in ("c", "l", "u")}
+        level = _mean_level(windows["c"])
+        neighbours = [_mean_level(windows[t]) for t in ("l", "u")]
         if level is None or any(n is None for n in neighbours):
             continue
         if not math.isfinite(level):
@@ -1238,7 +1460,8 @@ def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
             continue
         prominence = level - max(n if math.isfinite(n) else -math.inf for n in neighbours)
         measured.append(f"{freq} Hz {level:.1f} dBFS")
-        steady = trough is not None and math.isfinite(trough) and level - trough <= HUM_STATIONARY_DB
+        trough = min(windows["c"])
+        steady = math.isfinite(trough) and level - trough <= HUM_STATIONARY_DB
         if level >= floor and prominence >= HUM_PROMINENCE_DB and steady:
             found.append(f"{freq} Hz tone at {level:.1f} dBFS, {prominence:.1f} dB above the bands "
                          f"±{HUM_NEIGHBOUR_HZ} Hz, steady throughout")
@@ -1254,23 +1477,45 @@ def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
 # Whole-file reporting
 # ---------------------------------------------------------------------------
 
+# Rows judged from the end-of-scan summaries in the log (astats); a capture
+# that dropped evidence records cannot vouch for them.
+LOG_DERIVED = frozenset({TRUE_PEAK, CLIPPING, PHASE, DUAL_MONO, DC_OFFSET})
+
+
+def log_overflow_text(evidence: ScanEvidence) -> str:
+    return (f"Not verified: FFmpeg's log overflowed the capture ({evidence.dropped_records} "
+            f"evidence record(s) dropped), so its end-of-scan measurements are incomplete.")
+
+
+def missing_text(error: EvidenceMissing) -> str:
+    return f"Not verified: the measurement file for {error} was not written."
+
+
+def _guarded(row: Callable[[], Row], ctx: TrackContext) -> Row:
+    try:
+        return row()
+    except EvidenceMissing as error:
+        return "WARN", _with_label(ctx.label, missing_text(error)), 100
+
+
 def signal_rows(evidence: ScanEvidence, contexts: List[TrackContext], cfg: dict) -> Dict[str, Row]:
     """One aggregated row per enabled signal check."""
     rows: Dict[str, List[Row]] = {name: [] for name in enabled_signal_checks(cfg)}
     for ctx in contexts:
         stats = parse_astats(evidence.log_text, f"astats@a{ctx.position}s")
-        if CLIPPING in rows:
-            rows[CLIPPING].append(clipping_row(stats, evidence, ctx, cfg))
-        if DC_OFFSET in rows:
-            rows[DC_OFFSET].append(dc_offset_row(stats, ctx, cfg))
-        if DROPOUTS in rows:
-            rows[DROPOUTS].append(dropout_row(evidence, ctx, cfg))
-        if PHASE in rows:
-            rows[PHASE].append(phase_row(evidence, ctx, cfg))
-        if DUAL_MONO in rows:
-            rows[DUAL_MONO].append(dual_mono_row(evidence, ctx, cfg))
-        if HUM in rows:
-            rows[HUM].append(hum_row(evidence, ctx, cfg))
+        builders = {
+            CLIPPING: lambda: clipping_row(stats, evidence, ctx, cfg),
+            DC_OFFSET: lambda: dc_offset_row(stats, ctx, cfg),
+            DROPOUTS: lambda: dropout_row(evidence, ctx, cfg),
+            PHASE: lambda: phase_row(evidence, ctx, cfg),
+            DUAL_MONO: lambda: dual_mono_row(evidence, ctx, cfg),
+            HUM: lambda: hum_row(evidence, ctx, cfg),
+        }
+        for name in rows:
+            if name in LOG_DERIVED and not evidence.log_complete:
+                rows[name].append(("WARN", _with_label(ctx.label, log_overflow_text(evidence)), 100))
+            else:
+                rows[name].append(_guarded(builders[name], ctx))
     return {name: aggregate(entries) for name, entries in rows.items() if entries}
 
 
