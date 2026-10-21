@@ -346,62 +346,67 @@ def _resource_path(relative_path: str) -> str:
 
 
 _ASSET_DIR = _resource_path("assets")
-_LOGO_PATH = os.path.join(_ASSET_DIR, "frameguard_logo.png")
-_ICON_PATH = os.path.join(_ASSET_DIR, "frameguard.ico")
+_THEMED_ICON_CACHE: dict = {}
 
 
-def _tint_pixmap(pixmap: QPixmap, color: QColor) -> QPixmap:
-    """Tint a pixmap to match the given color (for logo recoloring)."""
-    tinted = QPixmap(pixmap.size())
-    tinted.fill(Qt.transparent)
-    painter = QPainter(tinted)
-    painter.drawPixmap(0, 0, pixmap)
-    painter.setCompositionMode(QPainter.CompositionMode_SourceAtop)
-    painter.fillRect(tinted.rect(), color)
-    painter.end()
-    return tinted
+def _themed_app_icon(theme) -> QIcon:
+    """The app icon in `theme`'s colours, for the Dock, taskbar and windows.
 
-
-def _colorize_pixmap(pixmap: QPixmap, color: QColor) -> QPixmap:
-    """Recolour artwork to `color` while keeping its internal shading.
-
-    _tint_pixmap flattens everything to one flat colour, which is fine for a
-    16px tray badge but destroys the logo's structure (film strip, play mark,
-    shield layers) at hero size. This converts to greyscale to preserve the
-    light/dark detail, multiplies by the target colour, then restores the
-    original alpha so the silhouette is unchanged.
-
-    Composition modes do the work, so this stays fast enough to run on every
-    theme switch.
+    macOS takes its Dock icon from QApplication.setWindowIcon, never from a
+    window's own icon, so this is what has to change for the Dock to follow
+    the theme. The shipped .icns/.ico (brand colours) is what macOS and
+    Windows show while the app is closed.
     """
-    from PySide6.QtGui import QImage
+    return _themed_icon_assets(theme)[0]
 
-    source = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
 
-    # Greyscale, but lifted: multiplying by the accent darkens everything, so
-    # start brighter or the result turns muddy.
-    grey = source.convertToFormat(QImage.Format_Grayscale8) \
-                 .convertToFormat(QImage.Format_ARGB32)
+def _themed_icon_assets(theme):
+    """(QIcon, 1024 px Dock QImage) for `theme`, rendered once per theme."""
+    from frameguard import brand
+    key = (theme.name, theme.bg_primary, theme.bg_secondary, theme.bg_tertiary,
+           theme.text_primary, theme.accent, theme.accent_hover, sys.platform)
+    assets = _THEMED_ICON_CACHE.get(key)
+    if assets is None:
+        palette = brand.theme_palette(theme)
+        grid = brand.platform_grid(sys.platform)
+        icon = brand.app_icon(palette, grid)
+        dock = brand.app_icon_image(1024, palette, "mac") if grid == "mac" else None
+        assets = (icon, dock)
+        _THEMED_ICON_CACHE.clear()  # one theme at a time; switching is rare
+        _THEMED_ICON_CACHE[key] = assets
+    return assets
 
-    out = QPixmap(pixmap.size())
-    out.fill(Qt.transparent)
 
-    painter = QPainter(out)
-    painter.setRenderHint(QPainter.SmoothPixmapTransform)
-    painter.drawImage(0, 0, grey)
+def _apply_application_icon(theme) -> None:
+    """Theme the application-wide icon: every window's default icon, and on
+    macOS the Dock tile.
 
-    # Lighten first so mid-tones survive the multiply.
-    painter.setCompositionMode(QPainter.CompositionMode_Screen)
-    painter.fillRect(out.rect(), QColor(90, 90, 90))
+    Qt 6.9 hands AppKit only a 16 pt (32 px) rendition of the application
+    icon, which the Dock then upscales into a blurry tile, so on Cocoa the
+    full 1024 px image is set on NSApp directly afterwards.
+    """
+    app = QApplication.instance()
+    if app is None:
+        return
+    icon, dock = _themed_icon_assets(theme)
+    app.setWindowIcon(icon)
+    if dock is not None:
+        _set_macos_dock_icon(dock)
 
-    painter.setCompositionMode(QPainter.CompositionMode_Multiply)
-    painter.fillRect(out.rect(), color)
 
-    # Grayscale conversion drops alpha; put the original silhouette back.
-    painter.setCompositionMode(QPainter.CompositionMode_DestinationIn)
-    painter.drawPixmap(0, 0, pixmap)
-    painter.end()
-    return out
+def _tray_icon_for(theme) -> QIcon:
+    """macOS: a template glyph that AppKit colours to match the menu bar, as
+    Drive or Creative Cloud do. Elsewhere: the small themed app icon."""
+    from frameguard import brand
+    if sys.platform == "darwin":
+        return brand.menubar_template_icon()
+    return brand.app_icon(brand.theme_palette(theme), "full", sizes=(16, 20, 24, 32, 40, 48, 64))
+
+
+def _brand_glyph(theme, size: int) -> QPixmap:
+    """The two-tone in-app mark: stem in the text colour, tick in the accent."""
+    from frameguard import brand
+    return brand.glyph_pixmap(size, theme.text_primary, theme.accent)
 
 
 def _hex_to_rgb(hex_color: str) -> str:
@@ -810,12 +815,8 @@ class TitleBar(QWidget):
 
         # App icon (small)
         self._icon_label = QLabel()
-        if os.path.isfile(_ICON_PATH):
-            pix = QPixmap(_ICON_PATH).scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._icon_label.setPixmap(pix)
-        elif os.path.isfile(_LOGO_PATH):
-            pix = QPixmap(_LOGO_PATH).scaled(18, 18, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._icon_label.setPixmap(pix)
+        self._icon_label.setPixmap(_brand_glyph(get_theme(), 18))
+        self._icon_label.setAlignment(Qt.AlignCenter)
         self._icon_label.setFixedSize(20, 20)
         layout.addWidget(self._icon_label)
 
@@ -4824,8 +4825,6 @@ class MainWindow(QMainWindow):
         self._watch_dispatch_pending: Optional[list] = None
         self._watch_retry_scheduled = False
 
-        # Logo pixmaps for recoloring
-        self._logo_pixmap_original = None
         self._sidebar_logo_label = None
         self._sidebar_logo_small = None
 
@@ -4910,10 +4909,8 @@ class MainWindow(QMainWindow):
 
         # Logo icon (small, next to text)
         self._sidebar_logo_small = QLabel()
-        if os.path.isfile(_LOGO_PATH):
-            self._logo_pixmap_original = QPixmap(_LOGO_PATH)
-            pix = self._logo_pixmap_original.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            self._sidebar_logo_small.setPixmap(pix)
+        self._sidebar_logo_small.setObjectName("sidebar_logo_mark")
+        self._sidebar_logo_small.setPixmap(_brand_glyph(get_theme(), 28))
         self._sidebar_logo_small.setFixedSize(28, 28)
         logo_layout.addWidget(self._sidebar_logo_small)
 
@@ -5118,9 +5115,7 @@ class MainWindow(QMainWindow):
         self._tray_scan_count = 0  # Files scanned while minimized
         if QSystemTrayIcon.isSystemTrayAvailable():
             self._tray_icon = QSystemTrayIcon(self)
-            icon_path = _resource_path(os.path.join("assets", "frameguard.ico"))
-            if os.path.isfile(icon_path):
-                self._tray_icon.setIcon(QIcon(icon_path))
+            self._tray_icon.setIcon(_tray_icon_for(get_theme()))
             self._tray_icon.setToolTip("FrameGuard Desktop — Idle")
             
             # Tray context menu (richer controls while minimized)
@@ -5178,11 +5173,9 @@ class MainWindow(QMainWindow):
         self._size_grip.setStyleSheet("background: transparent; border: none;")
         self._size_grip.setVisible(USE_CUSTOM_CHROME)
 
-        # Set window icon
-        if os.path.isfile(_ICON_PATH):
-            self.setWindowIcon(QIcon(_ICON_PATH))
-        elif os.path.isfile(_LOGO_PATH):
-            self.setWindowIcon(QIcon(_LOGO_PATH))
+        # Window (taskbar) icon in the current theme; _apply_theme keeps it,
+        # the Dock and the tray in step from here on.
+        self.setWindowIcon(_themed_app_icon(get_theme()))
 
         self._assign_semantic_roles()
 
@@ -5369,14 +5362,9 @@ class MainWindow(QMainWindow):
 
         t = theme  # shorthand
 
-        # === Recolor logo ===
-        if self._logo_pixmap_original:
-            accent_color = QColor(t.accent)
-            tinted = _tint_pixmap(self._logo_pixmap_original, accent_color)
-
-            if self._sidebar_logo_small:
-                pix = tinted.scaled(28, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self._sidebar_logo_small.setPixmap(pix)
+        # === Recolor the mark ===
+        if self._sidebar_logo_small is not None:
+            self._sidebar_logo_small.setPixmap(_brand_glyph(t, 28))
 
         _set_role(self._sidebar_toggle_btn, "icon")
 
@@ -5406,11 +5394,13 @@ class MainWindow(QMainWindow):
         for combo in self.findChildren(QComboBox):
             _style_combobox_popup(combo, t)
 
-        # Recolor everything the OS draws for us, plus the tray badge.
+        # Recolor everything the OS draws for us: window chrome, the window
+        # and taskbar icon, the Dock icon (application-wide on macOS) and the
+        # tray.
         self._apply_window_chrome_theme(t)
         if self._title_bar is not None:
-            self._title_bar.set_icon_pixmap(self._themed_app_pixmap(t, 32))
-        self.setWindowIcon(QIcon(self._themed_app_pixmap(t, 64)))
+            self._title_bar.set_icon_pixmap(_brand_glyph(t, 18))
+        self._apply_app_icon(t)
         self._update_tray_icon_theme(t)
 
         # Vector nav icons are baked at a specific colour, so they have to be
@@ -6685,35 +6675,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, '_tray_status_action'):
             self._tray_status_action.setText(f"Status: {status}")
     
-    def _themed_app_pixmap(self, theme, size: int = 64) -> QPixmap:
-        """Return the FrameGuard mark tinted to the theme accent.
-
-        Prefers the real logo so the tray matches the app; falls back to a
-        drawn "FG" badge only when the asset is missing.
-        """
-        if self._logo_pixmap_original and not self._logo_pixmap_original.isNull():
-            tinted = _tint_pixmap(self._logo_pixmap_original, QColor(theme.accent))
-            return tinted.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-
-        pixmap = QPixmap(size, size)
-        pixmap.fill(QColor(0, 0, 0, 0))
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QBrush(QColor(theme.accent)))
-        painter.setPen(QPen(QColor(theme.accent_hover), 2))
-        painter.drawRoundedRect(QRect(2, 2, size - 4, size - 4), 14, 14)
-        painter.setFont(ui_font(int(size * 0.34), QFont.Bold))
-        painter.setPen(QColor("#FFFFFF"))
-        painter.drawText(QRect(0, 0, size, size), Qt.AlignCenter, "FG")
-        painter.end()
-        return pixmap
+    def _apply_app_icon(self, theme):
+        """Point the window (Windows taskbar) and application (macOS Dock)
+        icons at `theme`'s colourway."""
+        self.setWindowIcon(_themed_app_icon(theme))
+        _apply_application_icon(theme)
 
     def _update_tray_icon_theme(self, theme=None):
         """Recolor the system tray icon to match the active theme."""
         if not self._tray_icon:
             return
-        t = theme or get_theme()
-        self._tray_icon.setIcon(QIcon(self._themed_app_pixmap(t, 64)))
+        self._tray_icon.setIcon(_tray_icon_for(theme or get_theme()))
 
     def _apply_window_chrome_theme(self, theme):
         """Tint the OS-drawn window chrome to match the theme.
@@ -7176,6 +7148,71 @@ def _apply_macos_titlebar(widget, theme) -> bool:
         return False
 
 
+def _set_macos_dock_icon(image) -> bool:
+    """Set NSApp.applicationIconImage from a QImage at full resolution.
+
+    Returns False (and changes nothing) off Cocoa or if AppKit refuses it.
+    The Dock reverts to the bundle icon by itself when the app quits.
+    """
+    if sys.platform != "darwin" or QApplication.platformName() != "cocoa":
+        return False
+    if image is None or image.isNull():
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+        from PySide6.QtCore import QBuffer, QByteArray, QIODevice
+
+        data = QByteArray()
+        buffer = QBuffer(data)
+        buffer.open(QIODevice.WriteOnly)
+        if not image.save(buffer, "PNG"):
+            return False
+        buffer.close()
+        raw = bytes(data)
+
+        objc_path = ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib"
+        objc = ctypes.cdll.LoadLibrary(objc_path)
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+
+        def send(restype, *argtypes):
+            prototype = ctypes.CFUNCTYPE(
+                restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)
+            return prototype(("objc_msgSend", objc))
+
+        def sel(name: str):
+            return objc.sel_registerName(name.encode("ascii"))
+
+        # Owned (alloc/init) objects, released below, so nothing depends on
+        # an autorelease pool existing (there is none before app.exec()).
+        ns_data = send(ctypes.c_void_p)(objc.objc_getClass(b"NSData"), sel("alloc"))
+        ns_data = send(ctypes.c_void_p, ctypes.c_char_p, ctypes.c_ulong)(
+            ns_data, sel("initWithBytes:length:"), raw, len(raw))
+        if not ns_data:
+            return False
+        ns_image = send(ctypes.c_void_p)(objc.objc_getClass(b"NSImage"), sel("alloc"))
+        ns_image = send(ctypes.c_void_p, ctypes.c_void_p)(ns_image, sel("initWithData:"), ns_data)
+        send(None)(ns_data, sel("release"))
+        if not ns_image:
+            return False
+
+        class _NSSize(ctypes.Structure):
+            _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+        # Half the pixel size in points: AppKit keeps a 2x copy of the icon,
+        # so this maps the bitmap 1:1 instead of upscaling it to 2048 px.
+        points = image.width() / 2.0
+        send(None, _NSSize)(ns_image, sel("setSize:"), _NSSize(points, points))
+        ns_app = send(ctypes.c_void_p)(objc.objc_getClass(b"NSApplication"), sel("sharedApplication"))
+        send(None, ctypes.c_void_p)(ns_app, sel("setApplicationIconImage:"), ns_image)
+        send(None)(ns_image, sel("release"))  # NSApp keeps its own reference
+        return True
+    except (OSError, AttributeError, ValueError, TypeError):
+        return False
+
+
 # ============================================================================
 # SPLASH SCREEN (FL Studio-style loading animation)
 # ============================================================================
@@ -7235,7 +7272,6 @@ class SplashScreen(QWidget):
         self._intro = 0.0             # 0..1 entrance progress
 
         # Load the real mark once, then keep a theme-tinted copy alongside it.
-        self._logo_source = self._load_logo(112)
         self._logo = None
         self._retint_logo()
         # Pre-render the drop shadow. Stacking translucent rounded rects
@@ -7293,35 +7329,11 @@ class SplashScreen(QWidget):
             # A missing effects backend must not stop the app from starting.
             return None
 
-    @staticmethod
-    def _load_logo(size: int) -> Optional[QPixmap]:
-        from PySide6.QtGui import QImageReader
-
-        for candidate in (_LOGO_PATH, os.path.join(_ASSET_DIR, "icon_64.png")):
-            if candidate and os.path.isfile(candidate):
-                # Decode straight to the display size instead of inflating
-                # the 2048px master and then scaling it down.
-                reader = QImageReader(candidate)
-                source = reader.size()
-                if source.isValid() and source.width() > size * 2:
-                    reader.setScaledSize(source.scaled(
-                        size * 2, size * 2, Qt.KeepAspectRatio))
-                image = reader.read()
-                if not image.isNull():
-                    return QPixmap.fromImage(image).scaled(
-                        size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        return None
+    LOGO_SIZE = 96
 
     def _retint_logo(self):
-        """Recolour the mark to the active accent.
-
-        Without this the shield stayed hard blue in every theme, clashing with
-        the teal, amber and purple palettes.
-        """
-        if self._logo_source is None or self._logo_source.isNull():
-            self._logo = None
-            return
-        self._logo = _colorize_pixmap(self._logo_source, QColor(self._theme.accent))
+        """Redraw the mark in the active theme (vector, so always crisp)."""
+        self._logo = _brand_glyph(self._theme, self.LOGO_SIZE)
 
     def set_theme(self, theme):
         """Repaint in a different theme (accepts a name or a ThemeColors)."""
@@ -7430,7 +7442,7 @@ class SplashScreen(QWidget):
         p.setClipping(False)
 
         cx = card.center().x()
-        logo_cy = card.top() + 108
+        logo_cy = card.top() + 100
 
         # --- soft accent glow behind the mark ---
         glow = QRadialGradient(QPointF(cx, logo_cy), 92)
@@ -7459,7 +7471,8 @@ class SplashScreen(QWidget):
         # --- the real mark, scaling and fading in ---
         if self._logo is not None and not self._logo.isNull():
             scale = 0.86 + 0.14 * self._ease_out(self._intro)
-            size = self._logo.width() * scale
+            # Logical size: the pixmap carries Retina pixels.
+            size = self._logo.deviceIndependentSize().width() * scale
             p.setOpacity(self._intro)
             p.drawPixmap(QRectF(cx - size / 2, logo_cy - size / 2, size, size),
                          self._logo, QRectF(self._logo.rect()))
@@ -7473,12 +7486,14 @@ class SplashScreen(QWidget):
         # --- wordmark ---
         p.setPen(QColor(t.text_primary))
         p.setFont(ui_font(19, QFont.DemiBold))
-        p.drawText(QRectF(card.left(), logo_cy + 78, card.width(), 28),
+        # Title and subtitle sit clear of the ring (radius 74): the old
+        # offsets let the ring's lower edge touch the wordmark.
+        p.drawText(QRectF(card.left(), logo_cy + 90, card.width(), 26),
                    Qt.AlignCenter, "FrameGuard")
 
         p.setPen(QColor(t.text_tertiary))
         p.setFont(ui_font(11))
-        p.drawText(QRectF(card.left(), logo_cy + 102, card.width(), 18),
+        p.drawText(QRectF(card.left(), logo_cy + 116, card.width(), 18),
                    Qt.AlignCenter, f"Video QA for XR Deliverables  \u00b7  v{APP_VERSION}")
 
         # --- progress ---
@@ -7789,7 +7804,7 @@ def main(dev_mode: bool = False,
         QCoreApplication, QFileSystemWatcher, QSettings as QtQSettings,
         QtMsgType, qInstallMessageHandler,
     )
-    from PySide6.QtGui import QFileOpenEvent, QIcon
+    from PySide6.QtGui import QFileOpenEvent
     from PySide6.QtWidgets import QApplication, QComboBox
 
     probe = _StartupProbe(startup_preflight) if startup_preflight else None
@@ -7888,18 +7903,13 @@ def main(dev_mode: bool = False,
         if probe:
             probe.checkpoint("metadata_set")
 
-        icon_paths = [
-            os.path.join(os.path.dirname(sys.executable), "frameguard.ico")
-            if getattr(sys, "frozen", False) else "",
-            os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "frameguard.ico")
-            if getattr(sys, "frozen", False) else "",
-            os.path.join(os.path.dirname(__file__), "..", "assets", "frameguard.ico"),
-            os.path.join(os.path.dirname(__file__), "assets", "frameguard.ico"),
-        ]
-        for icon_path in icon_paths:
-            if os.path.exists(icon_path):
-                app.setWindowIcon(QIcon(icon_path))
-                break
+        # The Dock (macOS) and default window icon, in the startup theme
+        # straight away, so the icon does not flash the bundle colours first.
+        try:
+            _apply_application_icon(get_theme(startup_theme))
+        except Exception as exc:  # cosmetic; never block startup on it
+            if sys.stderr is not None:
+                sys.stderr.write(f"[icon] App icon not themed: {exc}\n")
         if probe:
             probe.checkpoint("icon_resolved")
 

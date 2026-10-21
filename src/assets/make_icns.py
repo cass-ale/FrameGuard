@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Generate assets/frameguard.icns from assets/frameguard_logo.png.
+"""Pack assets/frameguard.icns from the pre-rendered brand icons.
 
-Run as part of the macOS build. Writes a real .icns container directly rather
-than shelling out to iconutil, so the icon can also be regenerated on Windows
-or Linux when the artwork changes.
+Run as part of the macOS build (build_mac.sh step 5). The bitmaps come from
+branding/icon_mac_<N>.png, which tools_dev/make_brand_assets.py renders from
+the vector mark, with a heavier optical master at the small sizes. Packing
+them, rather than downscaling one large PNG, keeps 16 and 32 px crisp. No
+third-party imaging library is needed.
 
-    python assets/make_icns.py [--source PNG] [--out ICNS]
+    python assets/make_icns.py [--branding DIR] [--out ICNS]
 
 .icns layout: the 8-byte magic/length header 'icns' + total length, followed by
 one chunk per image, each being a 4-byte OSType, a 4-byte big-endian length
@@ -33,58 +35,53 @@ ICNS_TYPES = [
     (b"ic13", 256),   # 128x128@2x
     (b"ic14", 512),   # 256x256@2x
 ]
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 
-def build_icns(source: Path, out: Path) -> Path:
-    try:
-        from PIL import Image
-    except ImportError:
-        sys.exit(
-            "Pillow is required to generate the .icns icon.\n"
-            "    pip install Pillow"
-        )
+def _png_size(data: bytes) -> int:
+    if data[:8] != PNG_MAGIC:
+        raise ValueError("not a PNG")
+    width, height = struct.unpack(">II", data[16:24])
+    if width != height:
+        raise ValueError(f"not square ({width}x{height})")
+    return width
 
-    if not source.is_file():
-        sys.exit(f"Source artwork not found: {source}")
 
-    master = Image.open(source).convert("RGBA")
-    if master.width != master.height:
-        print(f"  WARNING: {source.name} is {master.width}x{master.height}, "
-              f"not square; macOS icons will be distorted.")
-
-    # Cache one resize per pixel size, then reuse it across the types that
-    # share that size.
-    rendered = {}
+def build_icns(branding: Path, out: Path) -> Path:
+    payloads = {}
     for _, size in ICNS_TYPES:
-        if size not in rendered:
-            img = master.resize((size, size), Image.LANCZOS)
-            from io import BytesIO
-            buf = BytesIO()
-            img.save(buf, format="PNG", optimize=True)
-            rendered[size] = buf.getvalue()
+        if size in payloads:
+            continue
+        src = branding / f"icon_mac_{size}.png"
+        if not src.is_file():
+            sys.exit(f"Missing {src}. Regenerate with: python tools_dev/make_brand_assets.py")
+        data = src.read_bytes()
+        try:
+            actual = _png_size(data)
+        except ValueError as exc:
+            sys.exit(f"{src.name}: {exc}")
+        if actual != size:
+            sys.exit(f"{src.name} is {actual}px, expected {size}px")
+        payloads[size] = data
 
-    chunks = b""
-    for ostype, size in ICNS_TYPES:
-        payload = rendered[size]
-        chunks += ostype + struct.pack(">I", len(payload) + 8) + payload
-
+    chunks = b"".join(ostype + struct.pack(">I", len(payloads[size]) + 8) + payloads[size]
+                      for ostype, size in ICNS_TYPES)
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "wb") as f:
-        f.write(b"icns" + struct.pack(">I", len(chunks) + 8) + chunks)
-
-    sizes = sorted({s for _, s in ICNS_TYPES})
+    tmp = out.with_suffix(out.suffix + ".part")
+    tmp.write_bytes(b"icns" + struct.pack(">I", len(chunks) + 8) + chunks)
+    tmp.replace(out)
     print(f"  Wrote {out} ({out.stat().st_size / 1024:.0f} KB, "
-          f"{len(ICNS_TYPES)} entries, sizes {sizes})")
+          f"{len(ICNS_TYPES)} entries, sizes {sorted(payloads)})")
     return out
 
 
 def main():
     here = Path(__file__).resolve().parent
     parser = argparse.ArgumentParser(description="Build the macOS .icns icon.")
-    parser.add_argument("--source", type=Path, default=here / "frameguard_logo.png")
+    parser.add_argument("--branding", type=Path, default=here.parent / "branding")
     parser.add_argument("--out", type=Path, default=here / "frameguard.icns")
     args = parser.parse_args()
-    build_icns(args.source, args.out)
+    build_icns(args.branding, args.out)
 
 
 if __name__ == "__main__":

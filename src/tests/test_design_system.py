@@ -233,34 +233,33 @@ class TestSplashTheme:
 
         assert blue != amber, "the logo did not recolour with the theme"
 
-    def test_tinting_preserves_the_silhouette(self, qapp):
-        """A flat fill would destroy the shield's internal detail, so the
-        colorize has to keep both the alpha mask and the shading."""
+    def test_mark_is_two_tone_in_the_theme_colours(self, qapp):
+        """The splash mark keeps the brand structure in every theme: stem in
+        the theme's text colour, tick in its accent (not one flat tint)."""
+        from PySide6.QtGui import QColor
         from frameguard.gui import SplashScreen
+        from frameguard.theme import get_theme
 
         splash = SplashScreen()
-        source = splash._logo_source.toImage()
-        tinted = splash._logo.toImage()
+        splash.set_theme("Monokai Pro")
+        image = splash._logo.toImage()
         splash.close()
+        theme = get_theme("Monokai Pro")
 
-        assert source.size() == tinted.size()
+        def near(c, ref, tol=40):
+            r = QColor(ref)
+            return (abs(c.red() - r.red()) + abs(c.green() - r.green())
+                    + abs(c.blue() - r.blue())) <= tol
 
-        opaque_source = opaque_tinted = 0
-        distinct_values = set()
-        for y in range(0, source.height(), 4):
-            for x in range(0, source.width(), 4):
-                if source.pixelColor(x, y).alpha() > 128:
-                    opaque_source += 1
-                tone = tinted.pixelColor(x, y)
-                if tone.alpha() > 128:
-                    opaque_tinted += 1
-                    distinct_values.add((tone.red(), tone.green(), tone.blue()))
-
-        # Silhouette retained...
-        assert abs(opaque_source - opaque_tinted) <= opaque_source * 0.05
-        # ...and it is not a single flat colour.
-        assert len(distinct_values) > 8, (
-            f"only {len(distinct_values)} distinct colours; detail was flattened")
+        stem = tick = 0
+        for y in range(0, image.height(), 2):
+            for x in range(0, image.width(), 2):
+                c = image.pixelColor(x, y)
+                if c.alpha() < 250:
+                    continue
+                stem += near(c, theme.text_primary)
+                tick += near(c, theme.accent)
+        assert stem > 40 and tick > 40, (stem, tick)
 
     def test_no_hardcoded_colours_in_the_splash(self):
         """Everything the splash paints must come from the theme."""
