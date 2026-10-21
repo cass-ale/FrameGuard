@@ -8324,10 +8324,19 @@ def _forward_to_running_instance(paths, timeout_ms: int = 1500) -> bool:
     if not socket.waitForConnected(timeout_ms):
         return False
     payload = (json.dumps({"paths": [os.path.abspath(p) for p in paths]}) + "\n").encode("utf-8")
-    socket.write(payload)
-    ok = socket.waitForBytesWritten(timeout_ms)
-    socket.disconnectFromServer()
-    return ok
+    if socket.write(payload) != len(payload):
+        socket.abort()
+        return False
+    # Windows writes small payloads straight into the pipe, leaving nothing
+    # pending, and waitForBytesWritten() then reports False although the
+    # running app already has the paths. Only wait when bytes are queued.
+    if socket.bytesToWrite() > 0 and not socket.waitForBytesWritten(timeout_ms):
+        socket.abort()
+        return False
+    socket.disconnectFromServer()  # flushes anything still buffered first
+    if socket.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+        socket.waitForDisconnected(timeout_ms)
+    return True
 
 
 class _SingleInstanceServer(QObject):

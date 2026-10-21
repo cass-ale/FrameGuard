@@ -474,6 +474,44 @@ class TestSingleInstance:
         finally:
             server.deleteLater()
 
+    def test_a_real_second_process_reports_success(self, qapp, tmp_path, monkeypatch):
+        """End to end, as Windows Explorer does it: a separate process
+        forwards a file and must report success (on Windows the pipe write
+        completes synchronously, which once made it report failure and start
+        a duplicate instance)."""
+        import uuid
+        from frameguard import gui
+        name = f"fg-xproc-{uuid.uuid4().hex[:12]}"
+        monkeypatch.setattr(gui, "_instance_server_name", lambda: name)
+        received = []
+
+        class Receiver:
+            def accept_paths(self, paths):
+                received.extend(paths)
+
+        server = gui._SingleInstanceServer(Receiver())
+        clip = tmp_path / "second launch.mov"
+        clip.write_bytes(b"\0")
+        code = (
+            "import os, sys; sys.path.insert(0, os.getcwd()); "
+            "from PySide6.QtCore import QCoreApplication; app = QCoreApplication([]); "
+            "from frameguard import gui; "
+            f"gui._instance_server_name = lambda: {name!r}; "
+            f"print('FORWARDED', gui._forward_to_running_instance([{str(clip)!r}], timeout_ms=5000))"
+        )
+        env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+        proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(SRC), env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            assert _wait_for(qapp, lambda: proc.poll() is not None and received, timeout_ms=30000)
+            out, err = proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            server.deleteLater()
+        assert "FORWARDED True" in out, out + err[-1500:]
+        assert received == [str(clip)]
+
     def test_no_running_instance_means_start_normally(self, qapp, monkeypatch):
         import uuid
         from frameguard import gui
