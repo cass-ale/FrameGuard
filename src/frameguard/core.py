@@ -3032,7 +3032,8 @@ def _report_video(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome,
     video_checks.report_video(
         result, plan.video_checks, plan.video, plan.video_fps(),
         decoded_frames=stats["frames"] if stats else 0, video_end=video_end,
-        black_events=_black_events(outcome.log_text, video_end),
+        black_events=(None if getattr(outcome.log_text, "evidence_dropped", 0)
+                      else _black_events(outcome.log_text, video_end)),
         analysis=analysis, analysis_error=analysis_error)
 
 

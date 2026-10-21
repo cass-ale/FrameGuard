@@ -35,19 +35,58 @@ _ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 256)
 _lock = threading.Lock()
 
 
+# Known-folder IDs (KnownFolders.h). Resolved through the shell rather than
+# %APPDATA% / ~\Desktop, which miss folders redirected to OneDrive or a share.
+_FOLDERID_ROAMING_APPDATA = "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}"
+_FOLDERID_PROGRAMS = "{A77F5D77-2E2B-44C3-A6A2-ABA601054A51}"
+_FOLDERID_DESKTOP = "{B4BFCC3A-DB2C-424C-B029-7FE99A87C641}"
+
+
+def _known_folder(folder_id: str) -> Optional[str]:
+    """SHGetKnownFolderPath, or None (off Windows, or the folder is absent)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        class GUID(ctypes.Structure):
+            _fields_ = [("a", ctypes.c_ulong), ("b", ctypes.c_ushort), ("c", ctypes.c_ushort),
+                        ("d", ctypes.c_ubyte * 8)]
+        guid = GUID()
+        if ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(folder_id), ctypes.byref(guid)) != 0:
+            return None
+        out = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
+                                                      ctypes.byref(out)) != 0:
+            return None
+        try:
+            return out.value
+        finally:
+            ctypes.windll.ole32.CoTaskMemFree(out)
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def shortcut_dirs() -> List[str]:
-    """Folders that hold the shortcuts the installer and the user create."""
-    appdata = os.environ.get("APPDATA", "")
-    programdata = os.environ.get("PROGRAMDATA", "")
-    home = os.path.expanduser("~")
+    """Per-user folders that hold FrameGuard's shortcuts: the pinned taskbar
+    and Start items, the user's Start menu (where the per-user installer puts
+    its shortcuts; it never writes the all-users ProgramData menu, which a
+    standard user cannot modify anyway) and the desktop."""
+    appdata = _known_folder(_FOLDERID_ROAMING_APPDATA) or os.environ.get("APPDATA", "")
+    pinned = os.path.join(appdata, r"Microsoft\Internet Explorer\Quick Launch\User Pinned") if appdata else ""
     dirs = [
-        os.path.join(appdata, r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar"),
-        os.path.join(appdata, r"Microsoft\Internet Explorer\Quick Launch\User Pinned\StartMenu"),
-        os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs"),
-        os.path.join(programdata, r"Microsoft\Windows\Start Menu\Programs"),
-        os.path.join(home, "Desktop"),
+        os.path.join(pinned, "TaskBar") if pinned else "",
+        os.path.join(pinned, "StartMenu") if pinned else "",
+        _known_folder(_FOLDERID_PROGRAMS) or (os.path.join(appdata, r"Microsoft\Windows\Start Menu\Programs") if appdata else ""),
+        _known_folder(_FOLDERID_DESKTOP) or os.path.join(os.path.expanduser("~"), "Desktop"),
     ]
-    return [d for d in dirs if d and os.path.isdir(d)]
+    seen, result = set(), []
+    for d in dirs:
+        key = os.path.normcase(d)
+        if d and key not in seen and os.path.isdir(d):
+            seen.add(key)
+            result.append(d)
+    return result
 
 
 def icon_cache_dir() -> str:
@@ -121,6 +160,51 @@ def _iter_shortcuts(dirs: Iterable[str]) -> Iterable[str]:
                     yield os.path.join(depth_root, name)
 
 
+def _is_frameguard_icon(icon_location: str, target_exe: str) -> bool:
+    """True when a shortcut still shows a FrameGuard icon we may replace: none
+    set (the exe's own), the exe, the installer's frameguard.ico, or one of
+    our cached theme icons. A user's own custom icon is never overwritten."""
+    if not icon_location:
+        return True
+    location = os.path.normcase(os.path.abspath(os.path.expandvars(icon_location)))
+    install_dir = os.path.normcase(os.path.dirname(os.path.abspath(target_exe)))
+    cache_dir = os.path.normcase(os.path.abspath(icon_cache_dir()))
+    if _same_file(location, target_exe):
+        return True
+    if os.path.dirname(location) == install_dir and os.path.basename(location) == "frameguard.ico":
+        return True
+    return os.path.dirname(location) == cache_dir and os.path.basename(location).startswith("frameguard-")
+
+
+_pending_icon: Optional[str] = None
+_worker: Optional[threading.Thread] = None
+
+
+def request_retheme(icon_path: str) -> None:
+    """Queue a re-theme for `icon_path`; the latest request wins.
+
+    One worker thread drains the queue, so rapid theme switches can never
+    finish out of order and leave the shortcuts on an earlier theme.
+    """
+    global _pending_icon, _worker
+    with _lock:
+        _pending_icon = icon_path
+        if _worker is not None and _worker.is_alive():
+            return
+        _worker = threading.Thread(target=_drain, name="fg-shortcut-icons", daemon=True)
+        _worker.start()
+
+
+def _drain() -> None:
+    global _pending_icon
+    while True:
+        with _lock:
+            icon_path, _pending_icon = _pending_icon, None
+        if icon_path is None:
+            return
+        retheme_shortcuts(icon_path)
+
+
 def retheme_shortcuts(icon_path: str, target_exe: Optional[str] = None,
                       dirs: Optional[Iterable[str]] = None) -> List[str]:
     """Point every shortcut that launches `target_exe` at `icon_path`.
@@ -133,13 +217,12 @@ def retheme_shortcuts(icon_path: str, target_exe: Optional[str] = None,
     target_exe = target_exe or (sys.executable if getattr(sys, "frozen", False) else None)
     if not target_exe or not icon_path or not os.path.isfile(icon_path):
         return []
-    with _lock:
-        try:
-            shortcuts = list(_iter_shortcuts(dirs if dirs is not None else shortcut_dirs()))
-            return _retarget_icons(shortcuts, target_exe, icon_path)
-        except Exception as exc:  # noqa: BLE001 - cosmetic; never break the app
-            log.warning("Could not re-theme shortcuts: %s", exc)
-            return []
+    try:
+        shortcuts = list(_iter_shortcuts(dirs if dirs is not None else shortcut_dirs()))
+        return _retarget_icons(shortcuts, target_exe, icon_path)
+    except Exception as exc:  # noqa: BLE001 - cosmetic; never break the app
+        log.warning("Could not re-theme shortcuts: %s", exc)
+        return []
 
 
 def _retarget_icons(shortcuts: List[str], target_exe: str, icon_path: str) -> List[str]:
@@ -148,17 +231,25 @@ def _retarget_icons(shortcuts: List[str], target_exe: str, icon_path: str) -> Li
     link = _ShellLink()
     try:
         for path in shortcuts:
-            if not link.load(path):
-                continue
-            target = link.target()
-            if not target or not _same_file(target, target_exe):
-                continue
-            current, index = link.icon_location()
-            if _same_file(current, icon_path) and index == 0:
-                continue
-            if link.set_icon_location(icon_path, 0) and link.save(path):
-                changed.append(path)
-                _notify_updated(path)
+            # One unreadable, foreign or corrupt shortcut must not stop the
+            # rest (a read-only all-users shortcut used to end the walk
+            # before the desktop was reached).
+            try:
+                if not link.load(path):
+                    continue
+                target = link.target()
+                if not target or not _same_file(target, target_exe):
+                    continue
+                current, index = link.icon_location()
+                if _same_file(current, icon_path) and index == 0:
+                    continue
+                if not _is_frameguard_icon(current, target_exe):
+                    continue
+                if link.set_icon_location(icon_path, 0) and link.save(path):
+                    changed.append(path)
+                    _notify_updated(path)
+            except OSError as exc:
+                log.debug("Skipped shortcut %s: %s", path, exc)
     finally:
         link.release()
     if changed:
@@ -225,7 +316,7 @@ class _ShellLink:
     def load(self, path: str) -> bool:
         ctypes = self._ctypes
         return self._call(self._file, self._LOAD, ctypes.HRESULT, ctypes.c_wchar_p, ctypes.c_uint)(
-            self._file, path, 2) == 0  # STGM_READWRITE
+            self._file, path, 0) == 0  # STGM_READ: Save(path) writes regardless
 
     def save(self, path: str) -> bool:
         ctypes = self._ctypes

@@ -187,6 +187,87 @@ class TestWindowsShortcutIcons:
         assert winshell.retheme_shortcuts(ico, target_exe=str(exe), dirs=[str(tmp_path)]) == []
 
 
+class TestWindowsShortcutSafety:
+    def test_user_custom_icons_are_kept(self, tmp_path, monkeypatch):
+        from frameguard import winshell
+
+        exe = tmp_path / "FrameGuard Desktop" / "FrameGuard.exe"
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
+        cache = Path(winshell.icon_cache_dir())
+        assert winshell._is_frameguard_icon("", str(exe))
+        assert winshell._is_frameguard_icon(str(exe), str(exe))
+        assert winshell._is_frameguard_icon(str(exe.parent / "frameguard.ico"), str(exe))
+        assert winshell._is_frameguard_icon(str(cache / "frameguard-sage.ico"), str(exe))
+        assert not winshell._is_frameguard_icon(r"C:\Windows\System32\imageres.dll", str(exe))
+        assert not winshell._is_frameguard_icon(str(tmp_path / "mine.ico"), str(exe))
+
+    def test_rapid_theme_switches_end_on_the_last_theme(self, monkeypatch):
+        import threading
+        from frameguard import winshell
+
+        applied, gate = [], threading.Event()
+
+        def slow_retheme(icon_path, *args, **kwargs):
+            gate.wait(2)
+            applied.append(icon_path)
+            return []
+
+        monkeypatch.setattr(winshell, "retheme_shortcuts", slow_retheme)
+        for name in ("a.ico", "b.ico", "c.ico", "d.ico"):
+            winshell.request_retheme(name)
+        gate.set()
+        winshell._worker.join(5)
+        assert applied[-1] == "d.ico"
+        assert len(applied) <= 2  # the first in flight, then only the latest
+
+    @pytest.mark.skipif(not __import__("sys").platform.startswith("win"), reason="needs the Windows shell")
+    def test_a_corrupt_or_foreign_shortcut_does_not_stop_the_walk(self, qapp, tmp_path):
+        import shutil
+        import subprocess
+        import sys
+        from frameguard import gui as G, winshell
+        from frameguard.theme import get_theme
+
+        exe = tmp_path / "FrameGuard.exe"
+        shutil.copy2(sys.executable, exe)
+        (tmp_path / "a_corrupt.lnk").write_bytes(b"not a shortcut")
+        ours = tmp_path / "z_ours.lnk"
+        script = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{ours}');"
+                  f"$s.TargetPath='{exe}';$s.Save()")
+        subprocess.run(["powershell", "-NoProfile", "-Command", script], check=True)
+        ico = winshell.write_theme_icon(G._themed_app_icon(get_theme("Carbon")), "Carbon",
+                                        directory=str(tmp_path / "icons"))
+        assert winshell.retheme_shortcuts(ico, target_exe=str(exe), dirs=[str(tmp_path)]) == [str(ours)]
+
+    def test_shortcut_folders_are_per_user_only(self, monkeypatch, tmp_path):
+        from frameguard import winshell
+
+        monkeypatch.setenv("PROGRAMDATA", str(tmp_path))
+        assert all(not d.lower().startswith(str(tmp_path).lower()) for d in winshell.shortcut_dirs())
+
+
+class TestNativeFrameGeometry:
+    def test_caption_is_kept_on_screen(self):
+        from frameguard.gui import _frame_fitted_geometry
+
+        available = QRect(0, 0, 1366, 728)          # 1366x768 minus the taskbar
+        caption, border = 31, 1
+        inner = QRect(100, 0, 1200, 800)             # client clamped to y=0 (0.9.0 save)
+        frame = inner.adjusted(-border, -caption, border, border)
+        fitted = _frame_fitted_geometry(inner, frame, available)
+        fitted_frame = fitted.adjusted(-border, -caption, border, border)
+        assert available.contains(fitted_frame), fitted_frame
+        assert fitted.top() == caption
+
+    def test_window_already_on_screen_is_untouched(self):
+        from frameguard.gui import _frame_fitted_geometry
+
+        available = QRect(0, 0, 2560, 1400)
+        inner = QRect(200, 140, 1200, 800)
+        frame = inner.adjusted(-1, -31, 1, 1)
+        assert _frame_fitted_geometry(inner, frame, available) == inner
+
+
 class TestWindowsNativeContracts:
     def test_window_rect_clamps_in_logical_pixels(self):
         from frameguard.gui import _clamp_window_rect

@@ -49,7 +49,6 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
-import threading
 import time
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
@@ -201,6 +200,23 @@ def _clamp_window_rect(rect: QRect, available: QRect) -> QRect:
     x = min(max(rect.x(), available.left()), available.right() - width + 1)
     y = min(max(rect.y(), available.top()), available.bottom() - height + 1)
     return QRect(x, y, width, height)
+
+
+def _frame_fitted_geometry(inner: QRect, frame: QRect, available: QRect) -> QRect:
+    """The client geometry that puts the whole native frame on `available`.
+
+    Qt saves and restores the client rectangle, which excludes the native
+    caption and borders. With the native frame (0.9.1 on Windows) a client
+    rectangle clamped to the top of the screen left the caption above it,
+    unreachable, so the window could not be dragged; on a short screen the
+    bottom edge also ran under the taskbar. Clamp the frame, then derive
+    the client rectangle from the frame margins.
+    """
+    left, top = inner.left() - frame.left(), inner.top() - frame.top()
+    right, bottom = frame.right() - inner.right(), frame.bottom() - inner.bottom()
+    fitted = _clamp_window_rect(frame, available)
+    return QRect(fitted.left() + left, fitted.top() + top,
+                 max(1, fitted.width() - left - right), max(1, fitted.height() - top - bottom))
 
 
 def _best_available_geometry(rect: QRect, screens=None) -> Optional[QRect]:
@@ -427,8 +443,7 @@ def _retheme_windows_shortcuts(icon: QIcon, theme_name: str) -> None:
     except OSError:
         return
     if path:
-        threading.Thread(target=winshell.retheme_shortcuts, args=(path,),
-                         name="fg-shortcut-icons", daemon=True).start()
+        winshell.request_retheme(path)
 
 
 def _tray_icon_for(theme) -> QIcon:
@@ -5652,6 +5667,20 @@ class MainWindow(QMainWindow):
         if settings.value(_SIDEBAR_COLLAPSED_KEY, False, type=bool) and not self._sidebar_collapsed:
             self._collapse_sidebar_immediately()
 
+    def _fit_frame_to_screen(self):
+        """Once the native frame exists, keep caption and borders on screen
+        (see _frame_fitted_geometry). Runs after the first show; a no-op for
+        maximized or full-screen windows and where frame == client."""
+        if self.isMaximized() or self.isFullScreen() or not self.isVisible():
+            return
+        frame, inner = self.frameGeometry(), self.geometry()
+        if frame == inner:
+            return
+        available = _best_available_geometry(frame) or _active_available_geometry()
+        fitted = _frame_fitted_geometry(inner, frame, available)
+        if fitted != inner:
+            self.setGeometry(fitted)
+
     def _save_window_state(self):
         """Persist only the restored geometry, never a maximized frame."""
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
@@ -6523,6 +6552,10 @@ class MainWindow(QMainWindow):
         # The native window only fully exists once shown; re-tint it so the
         # macOS title bar matches the theme from the first frame.
         self._apply_window_chrome_theme(get_theme())
+        if not getattr(self, "_frame_fitted", False):
+            self._frame_fitted = True
+            # Frame margins are only known once the platform window is up.
+            QTimer.singleShot(0, self._fit_frame_to_screen)
         for combo in self.findChildren(QComboBox):
             _install_combo_popup_fit(combo)
         if not getattr(self, "_initial_focus_set", False):

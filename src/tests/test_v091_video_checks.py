@@ -630,3 +630,15 @@ class TestStreamingAndCancel:
         monkeypatch.setattr(vc, "_release", release)
         assert _row(_scan(clean_clip), "Flash Risk")[1] == "PASS"
         assert removed == [[]]
+
+
+def test_black_frames_not_verified_when_ffmpeg_log_overflowed():
+    """Review: black-frame events come from FFmpeg's bounded log; a capture
+    that dropped evidence must not be judged as if complete."""
+    from frameguard import core, video_checks
+
+    result = core.QAResult("x.mp4")
+    config = video_checks.VideoCheckConfig.from_cfg(core.DEFAULT_CONFIG)
+    video_checks._report_black(result, config, None, 10.0, 30.0, video_checks.VideoSeries())
+    row = [c for c in result.checks if c[0] == video_checks.BLACK][0]
+    assert "overflowed" in row[2]

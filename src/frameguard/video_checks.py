@@ -1901,7 +1901,7 @@ def _add(result, name: str, status: str, detail: str, confidence: int = 100) -> 
 
 def report_video(result, config: VideoCheckConfig, video: dict, fps: float, *,
                  decoded_frames: int, video_end: float,
-                 black_events: Sequence[Tuple[float, float]],
+                 black_events: Optional[Sequence[Tuple[float, float]]],
                  analysis: Optional[VideoAnalysis],
                  analysis_error: Optional[str] = None) -> None:
     """Add every picture-check row to ``result`` (a core.QAResult).
@@ -1937,6 +1937,11 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
     """Black Frames row; returns the raw black runs for the freeze check."""
     if not config.black:
         result.add_skip(BLACK, "Switched off in the settings.")
+        return []
+    if events is None:
+        # blackdetect reports through FFmpeg's log; when the bounded capture
+        # dropped evidence, a partial list could invent or hide black runs.
+        result.add_not_verified(BLACK, "FFmpeg's log overflowed, so the black-frame events are incomplete.")
         return []
     findings = classify_black(events, duration, fps, config, series.times, series.yavg)
     if findings.segments:
