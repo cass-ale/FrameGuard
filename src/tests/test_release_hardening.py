@@ -930,3 +930,41 @@ class TestCrashHandling:
                      "threading.excepthook = _thread_excepthook",
                      "sys.unraisablehook = _unraisable_hook"):
             assert line in entry
+
+
+class TestDependabot:
+    """C-L4: Dependabot watches the Python pins as well as the actions."""
+
+    @staticmethod
+    def _config():
+        return (REPO_ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+
+    def test_pip_updates_are_weekly_and_grouped(self):
+        config = self._config()
+        pip = config[config.index('package-ecosystem: "pip"'):]
+        assert 'directory: "/src"' in pip
+        assert 'interval: "weekly"' in pip
+        assert re.search(r"groups:\n\s+python-dependencies:\n\s+patterns:\n\s+- \"\*\"", pip)
+
+    def test_action_updates_are_still_grouped(self):
+        config = self._config()
+        actions = config[config.index('package-ecosystem: "github-actions"'):
+                         config.index('package-ecosystem: "pip"')]
+        assert 'directory: "/"' in actions
+        assert re.search(r"groups:\n\s+github-actions:\n\s+patterns:\n\s+- \"\*\"", actions)
+
+    def test_pyside_floor_hold_is_respected(self):
+        config = self._config()
+        assert 'dependency-name: "PySide6*"' in config
+        assert 'dependency-name: "shiboken6"' in config
+        assert config.count('"version-update:semver-minor"') == 2
+
+    def test_constraints_file_is_parseable_as_plain_requirements(self):
+        """Dependabot only updates a .txt whose every line is a comment or a
+        requirement; a pip option line would silently stop pin updates."""
+        lines = (SRC / "constraints-3.12.txt").read_text(encoding="utf-8").splitlines()
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            assert re.fullmatch(r"[A-Za-z0-9_.\-]+==[0-9][A-Za-z0-9.]*", stripped), line

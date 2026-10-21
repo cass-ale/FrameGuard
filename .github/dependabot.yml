@@ -1,5 +1,6 @@
-# Keeps the SHA-pinned actions in release.yml current: Dependabot
-# understands SHA pins and preserves the trailing version comments.
+# Keeps the SHA-pinned actions in the workflows and the exact Python pins in
+# src/constraints-3.12.txt current. Dependabot understands SHA pins and
+# preserves the trailing version comments.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -13,3 +14,24 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # src/requirements*.txt and src/constraints-3.12.txt (every pin in the
+  # constraints file is a plain requirement line, so Dependabot updates it).
+  # One weekly pull request for everything; the full three-runner Tests
+  # workflow is the review gate.
+  - package-ecosystem: "pip"
+    directory: "/src"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
+    ignore:
+      # Held deliberately (see constraints-3.12.txt): PySide6 6.10 needs
+      # macOS 13 and 6.12 needs macOS 14.4, but FrameGuard supports macOS 12.
+      # Patch releases of 6.9 are still proposed.
+      - dependency-name: "PySide6*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: "shiboken6"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
