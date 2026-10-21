@@ -23,6 +23,8 @@ import unicodedata
 from pathlib import Path
 from typing import Optional, Dict, List
 
+from frameguard import audio_checks
+
 # Preset file format
 PRESET_FORMAT_VERSION = 2
 FG_EXTENSION = ".fg"
@@ -66,6 +68,8 @@ PRESET_CONFIG_KEYS = (
     "segment_enabled",
     "segment_count",
 )
+# Audio signal QC keys (loudness profile, per-check switches, thresholds).
+PRESET_CONFIG_KEYS = PRESET_CONFIG_KEYS + audio_checks.PRESET_KEYS
 
 # v1 presets (and anything exported by FrameGuard <= 0.5.1) used a different
 # spelling for a few keys. Map them onto the engine names on import.
@@ -136,7 +140,7 @@ def validate_preset_config(config: dict) -> dict:
             out[key] = coerced
     if problems or unknown:
         raise PresetValidationError(problems, unknown)
-    return out
+    return audio_checks.normalize_custom_profile(out)
 
 
 def normalize_preset_config(config: dict) -> dict:
@@ -158,7 +162,7 @@ def normalize_preset_config(config: dict) -> dict:
         coerced, problem = _coerce_preset_value(key, value)
         if not problem:
             out[key] = coerced
-    return out
+    return audio_checks.normalize_custom_profile(out)
 
 
 # Values are interpolated into FFmpeg filter graphs (e.g. silence_noise_db
@@ -182,13 +186,14 @@ _PRESET_VALUE_RANGES = {
     "true_peak_max_dbtp": (-20.0, 3.0),
     "segment_count": (1, 16),
 }
+_PRESET_VALUE_RANGES.update(audio_checks.VALUE_RANGES)
 _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers")
 # Only these are genuinely whole numbers. Everything else numeric accepts a
 # fraction even when its default happens to be written as an int.
 _INTEGER_PRESET_KEYS = frozenset({
     "target_width", "target_height", "min_audio_sample_rate", "segment_count",
     "max_decode_errors",
-})
+}) | audio_checks.INTEGER_KEYS
 
 
 def _enum_choices(key: str):
@@ -199,6 +204,7 @@ def _enum_choices(key: str):
         "required_projection": core.PROJECTION_CHOICES,
         "required_stereo_mode": core.STEREO_CHOICES,
         "loudness_mode": core.LOUDNESS_MODES,
+        **audio_checks.ENUM_CHOICES,
     }.get(key)
 
 

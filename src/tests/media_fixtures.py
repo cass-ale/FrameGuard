@@ -37,6 +37,14 @@ def ffmpeg(*args):
         raise RuntimeError(f"ffmpeg failed: {proc.stderr[-2000:]}")
 
 
+# Per-channel tone frequencies (Hz). The LFE gets 440 Hz, which AAC's LFE
+# low-pass removes, so that channel decodes silent as before.
+_DISTINCT_TONES = {
+    "stereo": (440, 554.37),
+    "5.1": (440, 554.37, 659.25, 440, 739.99, 830.61),
+}
+
+
 def make_clip(path, *, vcodec="h264", rate=30, duration=DURATION, size=SIZE,
               audio=("stereo",), video_filter=None, extra=(), video_source=None):
     """A testsrc2 clip with one 440 Hz sine track per entry in ``audio``.
@@ -55,13 +63,18 @@ def make_clip(path, *, vcodec="h264", rate=30, duration=DURATION, size=SIZE,
             args += ["-f", "lavfi", "-i", f"anullsrc=r=48000:cl={layout}:d={duration}"]
         elif kind == "8k":
             args += ["-f", "lavfi", "-i", f"sine=f=440:sample_rate=8000:d={duration}"]
+        elif kind in _DISTINCT_TONES:
+            # A different tone per channel: identical channels are dual mono,
+            # which the 0.9.1 Dual Mono check (rightly) flags.
+            tones = "|".join(f"0.125*sin(2*PI*{f}*t)" for f in _DISTINCT_TONES[kind])
+            args += ["-f", "lavfi", "-i", f"aevalsrc={tones}:s=48000:d={duration}"]
         else:
             args += ["-f", "lavfi", "-i", f"sine=f=440:sample_rate=48000:d={duration}"]
         label = f"a{n}"
         if kind == "stereo":
-            filters.append(f"[{n}:a]pan=stereo|c0=c0|c1=c0[{label}]")
+            filters.append(f"[{n}:a]aformat=channel_layouts=stereo[{label}]")
         elif kind == "5.1":
-            filters.append(f"[{n}:a]pan=5.1|c0=c0|c1=c0|c2=c0|c3=c0|c4=c0|c5=c0[{label}]")
+            filters.append(f"[{n}:a]aformat=channel_layouts=5.1[{label}]")
         elif kind == "dead-right":
             filters.append(f"[{n}:a]pan=stereo|c0=c0|c1=0*c0[{label}]")
         else:

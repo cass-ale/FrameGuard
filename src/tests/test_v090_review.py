@@ -144,7 +144,10 @@ class TestLoudnessIsReportedNotJudgedByDefault:
             result = _scan(clip, strict=strict)
             loud = _row(result, "Audio Loudness")
             assert loud[1] == "PASS", loud
-            assert "LUFS, true peak" in loud[2] and "not enforced" in loud[2], loud
+            assert "LUFS integrated" in loud[2] and "not enforced" in loud[2], loud
+            # 0.9.1: true peak is its own row (separate limit and remedy).
+            peak = _row(result, "Audio True Peak")
+            assert peak[1] == "PASS" and "dBTP" in peak[2] and "not enforced" in peak[2], peak
             assert result.status == "PASS", (strict, _problems(result))
         assert result.metadata["true_peak_dbtp"] > -1
 
