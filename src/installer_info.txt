@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.9.0
+FrameGuard Desktop v0.9.1
 Video QA for XR Deliverables
 
 
@@ -22,22 +22,24 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.9.0
+WHAT'S NEW IN v0.9.1
 
-  Stricter, more complete checks
-    - Truncated or corrupt files now fail instead of only warning.
-    - Every audio track is checked, plus loudness, dead channels, interlacing,
-      HDR, aspect ratio and 360 metadata.
-    - Frame rate and resolution must match your delivery spec.
-    - JSON and CSV data are saved next to every PDF report.
+  Broadcast-grade signal checks
+    - Loudness and true peak against EBU R 128, ATSC A/85, Netflix or
+      streaming targets, plus clipping, dropouts, phase, dual mono, DC offset
+      and hum.
+    - EBU R 103 signal levels and gamut, flash screening, interlace and
+      field-order detection, and better black and freeze detection.
+    - Container, codec profile, edit list, A/V offset, timecode, HDR and 360
+      (spatial video and audio) conformance.
 
-  New look
-    - A new FrameGuard icon. The taskbar and window icons follow your theme.
+  Stricter where it matters
+    - 29.97 fps no longer passes a 30 fps spec silently: it warns unless
+      you allow NTSC rate matching.
 
-  Easier to use
-    - Open video files with FrameGuard from Explorer's Open With menu.
-    - Settings are saved as you change them.
-    - Updates install silently and FrameGuard reopens afterwards.
+  Also in v0.9.0
+    - A new FrameGuard icon, stricter file-integrity verdicts, and JSON and
+      CSV data next to every PDF report.
 
 
 BEFORE YOU INSTALL

@@ -3291,7 +3291,7 @@ class SettingsPanel(QWidget):
             key="delivery_fps_tolerance",
             title="FPS Tolerance",
             control=self._wrap_slider_with_value(self.fps_tol_slider, self.fps_tol_value),
-            description="Default: 0.5 fps. Absorbs measurement jitter only: 29.97 and 30 fps are different rates unless \"Treat NTSC Rates as Integer\" is on.",
+            description="Default: 0.5 fps. Absorbs measurement jitter only: 29.97 against a 30 fps target (and 23.976 against 24) warns unless \"Treat NTSC Rates as Integer\" is on.",
             resetter=lambda: self._set_float_slider(self.fps_tol_slider, 0.1, 2.0, 0.1, float(self._defaults.get("fps_tolerance", 0.5)))
         )
 
@@ -3942,8 +3942,8 @@ class SettingsPanel(QWidget):
         ("delivery", "require_progressive", "bool", "Require Progressive",
          "Fail interlaced video", None),
         ("delivery", "allow_ntsc_rate_match", "bool", "Treat NTSC Rates as Integer",
-         "Accept 23.976 / 29.97 / 59.94 fps for a 24 / 30 / 60 fps spec (they are different "
-         "rates: a 29.97 file in a 30 fps timeline drifts 3.6 s per hour)", None),
+         "Pass 23.976 / 29.97 / 59.94 fps for a 24 / 30 / 60 fps spec. Off, they warn (fail in "
+         "Strict Mode): the rates differ and drift 3.6 s per hour in the wrong timeline", None),
         ("delivery", "require_square_pixels", "bool", "Require Square Pixels",
          "Fail anamorphic (non-1:1) pixel aspect ratios, as headsets and most players need", None),
         ("delivery", "require_faststart", "bool", "Require Fast Start",

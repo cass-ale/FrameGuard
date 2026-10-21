@@ -214,26 +214,30 @@ def _rate_clip(media, rate):
 
 class TestFrameRate:
     def test_ntsc_does_not_match_integer_rate(self, media):
-        check = _row(_scan(_rate_clip(media, "30000/1001")), "Frame Rate")
-        assert check[1] == "FAIL" and "NTSC" in check[2], check
+        # Never a clean pass; a confident warning by default, a failure under
+        # Strict Mode (camera 24p is 23.976 almost everywhere).
+        result = _scan(_rate_clip(media, "30000/1001"))
+        check = _row(result, "Frame Rate")
+        assert check[1] == "WARN" and "NTSC" in check[2] and check[3] >= 90, check
+        assert result.overall_status(strict=True) == "MISMATCH"
 
     def test_ntsc_allowance(self, media):
         check = _row(_scan(_rate_clip(media, "30000/1001"), allow_ntsc_rate_match=True), "Frame Rate")
         assert check[1] == "PASS" and "NTSC" in check[2], check
 
     def test_tolerance_never_bridges_ntsc(self, media):
-        assert _row(_scan(_rate_clip(media, "30000/1001"), fps_tolerance=2.0), "Frame Rate")[1] == "FAIL"
+        assert _row(_scan(_rate_clip(media, "30000/1001"), fps_tolerance=2.0), "Frame Rate")[1] == "WARN"
 
     def test_typed_ntsc_target_matches_exactly(self, media):
         check = _row(_scan(_rate_clip(media, "24000/1001"), target_fps=23.976), "Frame Rate")
         assert check[1] == "PASS" and check[3] == 100, check
-        assert _row(_scan(_rate_clip(media, "30"), target_fps=29.97), "Frame Rate")[1] == "FAIL"
+        assert _row(_scan(_rate_clip(media, "30"), target_fps=29.97), "Frame Rate")[1] == "WARN"
 
     def test_other_mismatches_and_multiples(self, media):
         assert _row(_scan(_rate_clip(media, "25"), target_fps=24.0), "Frame Rate")[1] == "FAIL"
         assert _row(_scan(_rate_clip(media, "60"), allow_fps_multiples=True), "Frame Rate")[1] == "PASS"
         ntsc_double = _rate_clip(media, "60000/1001")
-        assert _row(_scan(ntsc_double, allow_fps_multiples=True), "Frame Rate")[1] == "FAIL"
+        assert _row(_scan(ntsc_double, allow_fps_multiples=True), "Frame Rate")[1] == "WARN"
         assert _row(_scan(ntsc_double, allow_fps_multiples=True, allow_ntsc_rate_match=True),
                     "Frame Rate")[1] == "PASS"
 

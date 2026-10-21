@@ -10,7 +10,32 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.9.0] — New identity, stricter verdicts and a deeper app
+## [0.9.1] — Signal QC: audio, picture and conformance checks from the benchmark
+
+### Fixed
+- 29.97 fps no longer passes a 30 fps spec silently (and 23.976/59.94 likewise): an NTSC rate against its integer target now warns (fails in Strict Mode) unless "Treat NTSC Rates as Integer" is on. The FPS tolerance now only absorbs measurement jitter.
+- Audio shorter than the video by more than 2 frames warns, and by more than 0.5 s fails (Telestream FC-108 practice); audio up to 2 s long passes.
+- A rotated (portrait) file no longer fails both Resolution and Aspect Ratio for the same reason; a flat 180° or mirrored picture now warns.
+- Black frames: a dark scene is no longer called black (stricter black level, 98% of the picture, 0.3 s), and short isolated black flashes are now caught.
+- Freeze frames are found in long-GOP H.264/HEVC as well as ProRes; the old detector restarted at every I-frame and missed them.
+- On Apple Silicon, loudness of tracks with three or more channels was wrong (the bundled FFmpeg meter misreads multichannel audio). FrameGuard now self-tests the meter and uses FFmpeg's independent meter when needed; 4-channel ambisonic tracks are measured on the W channel.
+- The 8K preset is labelled as flat 8K UHD; 8K 360 (7680x3840) has its own preset.
+
+### Improved
+- Loudness targets: EBU R 128 (±0.5 LU file tolerance), ATSC A/85, Netflix (programme loudness), Streaming −14 and −16, or custom. True peak and clipping get their own rows. Enforcement stays "report only" by default, because camera originals rarely meet broadcast targets.
+- New audio checks: clipping, dropouts (line-up ident tones such as GLITS are recognised), phase, dual mono, DC offset and mains hum; per-channel silence at −70 dBFS.
+- New picture checks: EBU R 103 signal levels and RGB gamut (warn by default, fail for broadcast), BT.1702 flash screening (a warning, not a photosensitivity certificate), and interlace combing and field-order detection that ignores rolling credits.
+- New conformance checks: real container type vs extension, MP4/MOV structure (truncation, duplicate indexes, fast start), edit lists, A/V start offset (DPP ±5 ms warning; fails beyond 40 ms early or 60 ms late), timecode continuity, codec profile/level against resolution and frame rate, and track layout.
+- XR: Spherical Video V1 vs V2 and conflicting tags, per-eye 2:1 geometry, top-bottom vs side-by-side layout, no rotation on 360 files, and spatial audio (SA3D) matching the ambisonic channel count. New Quest 360 presets: 8K 360, 5760x5760 and 3840x3840 top-bottom.
+- Colour and HDR: untagged colour, a BT.601 matrix on HD, PQ on 8-bit, and PQ without mastering-display metadata or with MaxCLL 0 are flagged.
+- Settings has controls for every new check and rule, and the PDF lists the exact settings each verdict was made against.
+- Measured on the benchmark's 158-file known-answer corpus: defect types detected rose from 17 to 31 of 45 (macro recall 30% to 64%), and defective files given a clean PASS fell from 79 to 38, with no clean file failed.
+
+### Changed
+- Default black-frame level 0.10 → 0.02 and duration 0.5 → 0.3 s; freeze duration 2 → 1 s. freeze_detect_noise is retired (old presets still load).
+- Deep scans read the coded picture without auto-rotation (cheaper on rotated 4K, needed for interlace detection).
+
+## [0.9.0] — 2026-10-21 — New identity, stricter verdicts and a deeper app
 
 ### Fixed
 - A truncated or corrupt file now FAILS. Decode errors used to be advisory, so an incomplete copy could only ever be a warning; a new essential File Integrity check fails any file that decodes less than 98% of what its header declares or that has decoder errors.

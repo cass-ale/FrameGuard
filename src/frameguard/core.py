@@ -1337,10 +1337,14 @@ def _rate_text(fps: float) -> str:
 def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     """The frame rate must equal the target rate exactly, as a rational.
 
-    29.97 (30000/1001) passed a 30p spec because ``fps_tolerance`` (0.5)
-    bridged the 0.1% NTSC gap. NTSC and integer rates now match only with
-    ``allow_ntsc_rate_match``; ``fps_tolerance`` still absorbs measurement
-    jitter between other rates. 25p against a 24p spec fails (conforming
+    29.97 (30000/1001) passed a 30p spec silently because ``fps_tolerance``
+    (0.5) bridged the 0.1% NTSC gap. An NTSC rate against its integer
+    counterpart (or the reverse) is now a confident WARN — Strict Mode turns
+    it into a failure — and passes only with ``allow_ntsc_rate_match``. Not a
+    FAIL by default: camera "24p" is 23.976 almost everywhere and many specs
+    say 24 meaning it, so failing would turn whole shoots red; but the rates
+    really differ (3.6 s drift per hour), so it is never a clean pass.
+    ``fps_tolerance`` still absorbs measurement jitter between other rates. 25p against a 24p spec fails (conforming
     needs a speed change). Integer multiples (60p for a 30p spec) pass only
     with ``allow_fps_multiples``.
     """
@@ -1363,9 +1367,9 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
     tolerance = float(cfg["fps_tolerance"])
     allow_ntsc = bool(cfg.get("allow_ntsc_rate_match", False))
     relation = _rate_relation(fps, target, tolerance)
-    ntsc_fail = (f"{_rate_text(fps)} does not match the {typed:g} fps target: NTSC (x1000/1001) and integer "
-                 f"rates are different rates, and conforming needs a 0.1% speed change or pulldown. "
-                 f"Allow NTSC rate matching only if the spec treats them as equal.")
+    ntsc_fail = (f"{_rate_text(fps)} is the NTSC counterpart of the {typed:g} fps target, not the same rate: "
+                 f"they drift 3.6 s per hour, and conforming needs a 0.1% speed change or pulldown. "
+                 f"Set the target to the exact rate, or allow NTSC rate matching if the spec treats them as equal.")
     if relation == "exact":
         result.add_pass("Frame Rate", f"{_rate_text(fps)} (matches the {typed:g} fps target)")
         return
@@ -1374,7 +1378,7 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
             result.add_pass("Frame Rate", f"{_rate_text(fps)} is the NTSC counterpart of the {typed:g} fps "
                                           f"target (NTSC rate matching allowed by this spec)")
         else:
-            result.add_fail("Frame Rate", ntsc_fail)
+            result.add_warn("Frame Rate", ntsc_fail, confidence=90)
         return
     if relation == "tolerance":
         result.add_pass("Frame Rate", f"{fps:.3f} fps (target: {typed:g} ± {tolerance:g} fps)", confidence=90)
@@ -1387,7 +1391,7 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
             result.add_pass("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target "
                                           f"(integer multiples allowed by this spec)")
         elif not base_ok:
-            result.add_fail("Frame Rate", ntsc_fail)
+            result.add_warn("Frame Rate", ntsc_fail, confidence=90)
         else:
             result.add_fail("Frame Rate", f"{_rate_text(fps)} is {multiple}x the {typed:g} fps target; "
                                           f"integer multiples are not allowed by this spec.")
