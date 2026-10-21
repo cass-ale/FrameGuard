@@ -2930,9 +2930,10 @@ def _report_video(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome,
         analysis=analysis, analysis_error=analysis_error)
 
 
-def _silence_events(log_text: str, instance: str, end_time: float) -> List[Tuple[float, float]]:
+def _silence_events(log_text: str, instance: str, end_time: float,
+                    join_gap: float = 0.25) -> List[Tuple[float, float]]:
     text = _close_open_regions(_lines_with_context(log_text, instance), end_time)
-    events = _merge_event_intervals(_pair_detect_events(text, "silence"))
+    events = _merge_event_intervals(_pair_detect_events(text, "silence"), join_gap)
     return [(start, dur if dur > 0 else max(0.0, end_time - start)) for start, dur in events]
 
 
@@ -3022,7 +3023,8 @@ def _add_audio_row(result: QAResult, name: str, row) -> None:
 def _audio_evidence(log_text: str) -> "audio_checks.ScanEvidence":
     return audio_checks.ScanEvidence(
         log_text=log_text,
-        silence_events=lambda instance, end: _silence_events(log_text, instance, end),
+        silence_events=lambda instance, end, join_gap=0.25: _silence_events(
+            log_text, instance, end, join_gap),
         detect_events=lambda text, prefix: _merge_event_intervals(_pair_detect_events(text, prefix)))
 
 
