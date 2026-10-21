@@ -21,6 +21,7 @@ The check functions take the ``QAResult`` and the engine config; core.py
 calls them from ``_run_metadata_checks``.
 """
 
+import json
 import math
 import os
 import re
@@ -959,22 +960,108 @@ def check_edit_lists(structure: Structure, result, cfg: dict) -> None:
 # A/V Sync Offset (ESSENTIAL)
 # ---------------------------------------------------------------------------
 
-def _effective_audio_start(track: dict, video_start: float) -> Tuple[float, str]:
-    """(first presented audio time, note) with encoder priming removed.
+# Largest AAC encoder delay in common use: 2112 samples (Apple/QuickTime
+# AAC-LC; FFmpeg's encoder uses 1024). HE-AAC doubles it at the output rate.
+AAC_MAX_PRIMING_SAMPLES = 2112
 
-    MPEG-TS stamps the first AAC packet one frame (1024 samples) before the
-    decoded audio begins; the decoder discards that priming, so it is not
-    an offset.
+
+def _unsignalled_priming(track: dict) -> float:
+    """Seconds of AAC encoder priming the container does not signal (upper bound), else 0.
+
+    An MP4/MOV edit list (or a Matroska CodecDelay) tells the player to drop
+    the priming, and ffprobe then reports it as ``initial_padding`` with the
+    start time already at the first real sample. Without that signal (MPEG-TS
+    always; an MP4 written without an edit list) the decoder plays the
+    priming, so the sound starts 1024-2112 samples after the track does.
     """
     core = _core()
-    start = core._safe_float(track.get("start_time"), 0.0) or 0.0
+    if str(track.get("codec_name") or "").lower() != "aac":
+        return 0.0
+    if (core._safe_int(track.get("initial_padding"), 0) or 0) > 0:
+        return 0.0
     rate = core._safe_int(track.get("sample_rate"), 0) or 0
-    padding = core._safe_int(track.get("initial_padding"), 0) or 0
-    codec = str(track.get("codec_name") or "").lower()
-    priming = padding / rate if rate and padding else (1024 / rate if rate and codec == "aac" else 0.0)
-    if priming and start < video_start and abs((video_start - start) - priming) <= 0.0015:
-        return video_start, f" ({priming * 1000:.0f} ms encoder priming, discarded on decode)"
-    return start, ""
+    if rate <= 0:
+        return 0.0
+    he = "he" in str(track.get("profile") or "").lower()
+    return AAC_MAX_PRIMING_SAMPLES * (2 if he else 1) / rate
+
+
+def _judged_offset(raw: float, priming: float) -> float:
+    """The programme offset closest to zero that the unknown priming allows.
+
+    The sound begins between ``raw`` and ``raw + priming`` after the picture;
+    choosing the value nearest zero means only an offset that is certain
+    whatever encoder made the AAC can fail (FrameGuard's no-false-FAIL rule).
+    """
+    if priming <= 0 or raw >= 0:
+        return raw
+    return min(0.0, raw + priming)
+
+
+def _audio_offset(track: dict, video_start: float) -> Tuple[float, float, str]:
+    """(judged offset s, raw start difference s, note) of one audio track against the picture."""
+    core = _core()
+    start = core._safe_float(track.get("start_time"), 0.0) or 0.0
+    raw = start - video_start
+    priming = _unsignalled_priming(track)
+    judged = _judged_offset(raw, priming)
+    note = ""
+    if priming and abs(judged - raw) > 0.0005 and abs(judged) <= 0.0005:
+        note = f"; the track's {abs(raw) * 1000:.0f} ms early start is AAC encoder priming"
+    elif priming and abs(judged - raw) > 0.0005:
+        note = (f"; the track starts {abs(raw) * 1000:.0f} ms before the picture, but its AAC encoder "
+                f"priming (up to {priming * 1000:.0f} ms, not signalled by the container) plays first")
+    return judged, raw, note
+
+
+# Program-stream formats whose per-stream durations ffprobe can only estimate.
+_ESTIMATED_DURATION_FORMATS = ("mpegts", "mpeg")
+STREAM_END_WINDOW_S = 6.0
+
+
+def _estimated_durations(probe_data: dict) -> bool:
+    names = str(((probe_data or {}).get("format") or {}).get("format_name") or "").split(",")
+    return any(name.strip() in _ESTIMATED_DURATION_FORMATS for name in names)
+
+
+def measured_stream_ends(filepath: str, probe_data: dict, process_owner=None,
+                         cancel_event=None) -> Dict[int, float]:
+    """{stream index: end of its last packet (pts + duration)} for MPEG-TS/PS, else {}.
+
+    MPEG-TS carries no stream durations. ffprobe estimates them from the
+    last PES timestamp it finds near the end of the file, and an audio PES
+    holds several AAC frames, so a clean remux reads 0.1-0.3 s of audio
+    "missing" depending on where the last PES falls. Demuxing the last few
+    seconds and taking each stream's last packet end measures the real end
+    (about 30 ms for a 4K file). Any failure returns {} and the caller falls
+    back to ffprobe's durations.
+    """
+    if not _estimated_durations(probe_data):
+        return {}
+    core = _core()
+    fmt = (probe_data or {}).get("format") or {}
+    duration = core._safe_float(fmt.get("duration"))
+    start = core._safe_float(fmt.get("start_time"), 0.0) or 0.0
+    ffprobe = core.get_ffprobe_path()
+    if not ffprobe or not duration or duration <= 0:
+        return {}
+    seek = max(0.0, start + duration - STREAM_END_WINDOW_S)
+    cmd = [ffprobe, "-v", "error", "-of", "json", "-show_entries",
+           "packet=stream_index,pts_time,duration_time", "-read_intervals", f"{seek:.3f}%", filepath]
+    try:
+        proc = core._run_owned_subprocess(cmd, 60, process_owner, cancel_event)
+        packets = json.loads(proc.stdout).get("packets") or [] if proc is not None and proc.returncode == 0 else []
+    except (subprocess.TimeoutExpired, OSError, ValueError, TypeError, AttributeError):
+        return {}
+    ends: Dict[int, float] = {}
+    for packet in packets:
+        pts = core._safe_float(packet.get("pts_time"))
+        index = core._safe_int(packet.get("stream_index"))
+        if pts is None or index is None:
+            continue
+        end = pts + (core._safe_float(packet.get("duration_time"), 0.0) or 0.0)
+        ends[index] = max(ends.get(index, end), end)
+    return ends
 
 
 def stream_track_id(stream: dict) -> Optional[int]:
@@ -1003,6 +1090,17 @@ def _empty_edit_note(structure: Optional[Structure], stream: dict, kind: str) ->
     return f"; the {kind} edit list begins with {lead / structure.movie_timescale * 1000:.0f} ms of blank"
 
 
+def _no_edit_list_note(structure: Optional[Structure], video: dict, raw: float) -> str:
+    """Why a reordered video track starts late: no edit list to hide its B-frame delay."""
+    if structure is None or not structure.parsed or raw >= 0:
+        return ""
+    track = structure.track_by_id(stream_track_id(video) or -1)
+    if track is None or track.edits or not track.ctts:
+        return ""
+    return ("; the video track has B-frames but no edit list, so its first picture is presented "
+            "after its reorder delay")
+
+
 def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, result, cfg: dict) -> None:
     """Audio and video must start together: a container start offset is a sync error.
 
@@ -1016,9 +1114,11 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     broadcast chain end to end; a file that alone exceeds that budget
     cannot meet R37 (FAIL beyond ``av_offset_max_early_ms`` /
     ``av_offset_max_late_ms``). R37 is a chain budget, not a file
-    tolerance, which is why it bounds the FAIL and not the WARN. Sync inside
-    the essence (a lip-sync error baked into picture or sound) is not
-    measurable from metadata.
+    tolerance, which is why it bounds the FAIL and not the WARN. AAC whose
+    encoder priming is not signalled (MPEG-TS; MP4 without an edit list) is
+    judged at the most favourable priming (_judged_offset). Sync inside the
+    essence (a lip-sync error baked into picture or sound) is not measurable
+    from metadata.
     """
     core = _core()
     name = AV_SYNC_OFFSET
@@ -1034,17 +1134,18 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     entries, worst = [], 0.0
     for position, track in enumerate(tracks):
         label = core._track_label(position, track, len(tracks))
-        a_start, priming_note = _effective_audio_start(track, v_start)
-        offset = (a_start - v_start) * 1000
+        judged, raw, priming_note = _audio_offset(track, v_start)
+        offset = judged * 1000
         worst = offset if abs(offset) > abs(worst) else worst
         direction = "after" if offset > 0 else "before"
-        cause = _empty_edit_note(structure, video, "video") + _empty_edit_note(structure, track, "audio")
+        cause = (_empty_edit_note(structure, video, "video") + _empty_edit_note(structure, track, "audio")
+                 + _no_edit_list_note(structure, video, raw))
         if abs(offset) <= warn_ms:
             entries.append(("PASS", core._with_track(label, f"Audio and video start together ({offset:+.1f} ms"
                                                             f"{priming_note}; container timing only)")))
             continue
         limit = max_late if offset > 0 else max_early
-        text = (f"Audio starts {abs(offset):.0f} ms {direction} the picture{cause} "
+        text = (f"Sound starts {abs(offset):.0f} ms {direction} the picture{cause}{priming_note} "
                 f"(file limit ±{warn_ms:g} ms, DPP v5 §2.8")
         if abs(offset) <= limit:
             entries.append(("WARN", core._with_track(label, text + f"; within the {limit:g} ms EBU R37 "
@@ -1612,9 +1713,11 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
     if projection == "equirectangular":
         _equirect_geometry(video, stereo, v2, cfg, flag, hard, notes)
     if projection or enforced:
-        content = _content_layout_finding(video, stereo, grabber, duration)
+        content, content_note = _content_layout_finding(video, stereo, grabber, duration)
         if content:
             soft.append(content)
+        if content_note:
+            notes.append(content_note)
     return hard, soft, notes
 
 
@@ -1679,11 +1782,23 @@ class FrameGrabber:
 
     def __init__(self, path: str, process_owner=None, cancel_event=None):
         self.path, self.process_owner, self.cancel_event = path, process_owner, cancel_event
+        # Why the last grab produced nothing ("" when it worked or was cancelled).
+        self.problem = ""
 
     def gray(self, stream_index: int, at: float) -> Optional[List[float]]:
+        """The frame as grey bytes, or None with ``problem`` set; never raises.
+
+        A missing or unstartable FFmpeg must not turn an optional advisory
+        into an Internal Error: the caller reports the sub-check as not
+        verified and every other check stands.
+        """
         core = _core()
+        self.problem = ""
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return None
         ffmpeg = core.get_ffmpeg_path()
-        if not ffmpeg or (self.cancel_event is not None and self.cancel_event.is_set()):
+        if not ffmpeg:
+            self.problem = "FFmpeg was not found"
             return None
         width, height = LAYOUT_GRAB_SIZE
         # -noaccurate_seek returns the keyframe at or before ``at``: one
@@ -1699,15 +1814,20 @@ class FrameGrabber:
             core._register_owned_proc(proc, self.process_owner)
             data, _ = proc.communicate(timeout=60)
         except (OSError, ValueError) as exc:
-            raise RuntimeError(f"frame grab failed: {type(exc).__name__}: {exc}") from exc
+            self.problem = f"FFmpeg could not be started ({type(exc).__name__}: {exc})"
+            return None
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
+            self.problem = "the frame grab timed out"
             return None
         finally:
             if proc is not None:
                 core._unregister_owned_proc(proc, self.process_owner)
+        if self.cancel_event is not None and self.cancel_event.is_set():
+            return None
         if proc.returncode != 0 or len(data) != width * height:
+            self.problem = f"FFmpeg could not decode a frame (exit code {proc.returncode})"
             return None
         return [float(b) for b in data]
 
@@ -1766,7 +1886,7 @@ def stereo_layout_scores(pixels: List[float]) -> Optional[Tuple[float, float]]:
 
 
 def _content_layout_finding(video: dict, stereo: Optional[str], grabber: Optional[FrameGrabber],
-                            duration: Optional[float]) -> str:
+                            duration: Optional[float]) -> Tuple[str, str]:
     """A warning when a spherical picture tagged mono (or side-by-side) looks top-bottom.
 
     Gradient-domain NCC of the two half-frames over a small disparity search
@@ -1777,20 +1897,26 @@ def _content_layout_finding(video: dict, stereo: Optional[str], grabber: Optiona
     side-by-side claim would be unreliable. Thresholds are validated on
     synthetic content only, so this is advisory (confidence 60), never a
     failure, and costs one keyframe decode on spherical files only.
+
+    Returns (finding, note): a frame that cannot be grabbed is a note that
+    this one sub-check was not verified, never an error.
     """
     if grabber is None or "index" not in video or stereo == "top_bottom":
-        return ""
+        return "", ""
     at = duration / 2 if duration and duration > 1 else 0.0
     pixels = grabber.gray(int(video["index"]), at)
-    found = stereo_layout_scores(pixels) if pixels else None
+    if pixels is None:
+        reason = grabber.problem
+        return "", (f"picture layout content check not verified: {reason}" if reason else "")
+    found = stereo_layout_scores(pixels)
     if found is None:
-        return ""
+        return "", ""
     tb, sbs = found
     if tb < LAYOUT_MATCH or tb - sbs < LAYOUT_MARGIN:
-        return ""
+        return "", ""
     layout = (stereo or "mono").replace("_", "-")
     return (f"the picture looks top-bottom stereo (top and bottom halves match at {tb:.2f}, left/right "
-            f"{sbs:.2f}) but the metadata says {layout}; check the layout tag (content check, advisory)")
+            f"{sbs:.2f}) but the metadata says {layout}; check the layout tag (content check, advisory)"), ""
 
 
 # ---------------------------------------------------------------------------
