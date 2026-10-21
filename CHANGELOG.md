@@ -10,7 +10,44 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [0.8.3] — Menu-bar crash fix and sidebar polish
+## [0.9.0] — New identity, stricter verdicts and a deeper app
+
+### Fixed
+- A truncated or corrupt file now FAILS. Decode errors used to be advisory, so an incomplete copy could only ever be a warning; a new essential File Integrity check fails any file that decodes less than 98% of what its header declares or that has decoder errors.
+- Matroska (MKV) files have their audio/video durations compared again; a probe option had been discarding the tags the check needs.
+- Frame-level analysis is never skipped silently. Files with no duration in the header are still scanned, the 8 GB size limit that skipped most ProRes masters is gone, and anything that genuinely cannot be checked shows as "Not verified" so the file cannot read as a clean pass.
+- Damaged files get the same verdict on every Mac: the scan now always decodes in software, because hardware decoders hid errors and invented freezes.
+- Every audio track is checked, not just the first, including a silent second track or a dead channel.
+- Variable frame rate is measured from the actual frame timestamps instead of two header fields.
+- A file name containing "1080" or "vr" no longer switches your chosen delivery profile; FrameGuard only suggests a matching profile.
+- Frame rate and resolution must match the spec (4K no longer passes a 1080p spec, 25p no longer passes a 24p spec), with optional allowances for larger frames or integer frame-rate multiples.
+- Presets with out-of-range or unknown settings are rejected with a message naming every problem, instead of being silently loosened.
+- Scan progress updates and report-saved messages now run on the interface thread, removing a source of random crashes.
+- A slow folder search can no longer replace a newer selection, or refill the queue after Clear.
+- Unattended watch-folder errors are logged and notified instead of stacking dialogs on a hidden window.
+- Settings, window size and the sidebar state are saved as you change them, not only on a clean quit.
+- macOS: the Dock icon now follows the theme at full resolution (it showed the old icon, upscaled, whatever the theme).
+- Windows: in-app updates run silently instead of stopping at a confirmation box after FrameGuard has closed.
+
+### Improved
+- New Monogram identity: an F whose crossbar becomes the tick, drawn from vectors so it is sharp at every size. The Dock, taskbar, window and sidebar marks take the theme's colours; the macOS menu-bar icon is a template that fills its slot and adapts to light and dark menu bars like other professional apps.
+- New checks: interlaced content, bit depth and HDR transfer (SDR, PQ, HLG), XR projection and stereo metadata for 360 deliverables, aspect ratio, audio sample rate, dead channels, and EBU R128 loudness and true peak.
+- JSON and CSV data are saved next to every PDF report, and the PDF records the exact specification, thresholds and tool versions used.
+- The watch folder scans subfolders (camera-card layouts) and waits longer for copies to finish.
+- macOS has a full menu bar: About, Settings (Cmd+,), File, View, Window and Help, with the familiar shortcuts.
+- Open With: FrameGuard appears in Finder's and Explorer's Open With menus for video files and folders, without becoming the default app. On Windows a second launch hands its files to the running app.
+- Accessibility: summary badges and the file queue work from the keyboard and are named for screen readers, every slider and field has a name, and control outlines meet 3:1 contrast in all 15 themes.
+- Dialogs, file panels and title bars follow the app's light or dark theme.
+- The window's minimum size fits the layout, and narrow windows keep file names readable.
+
+### Changed
+- Bundled FFmpeg and MediaInfo are pinned to exact versions and verified against checksums committed in the repository.
+- Update checks verify GitHub's certificate with the operating system's own trust store.
+- The local-folder update fallback was removed; updates come only from GitHub Releases over HTTPS. Optional delta channels must use HTTPS and hash every file.
+- Hardware Acceleration, Segmented Scan and Segment Count were removed from Settings.
+- The installer now shows the repository's standard MIT licence text.
+
+## [0.8.3] — 2026-10-20 — Menu-bar crash fix and sidebar polish
 
 ### Fixed
 - macOS: clicking the FrameGuard icon in the menu bar no longer crashes the app. macOS 27 opens menu-bar menus without a mouse event, and Qt's menu-bar code asked that missing event for its click count, which aborted FrameGuard before any of its own code ran. The menu now opens normally.

@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.8.3
+FrameGuard Desktop v0.9.0
 Video QA for XR Deliverables
 
 
@@ -22,20 +22,22 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.8.3
+WHAT'S NEW IN v0.9.0
 
-  Fixes
-    - The sidebar's show/hide button is now a full square when you hover
-      over it.
-    - (macOS) Clicking the FrameGuard menu-bar icon no longer closes the app.
+  Stricter, more complete checks
+    - Truncated or corrupt files now fail instead of only warning.
+    - Every audio track is checked, plus loudness, dead channels, interlacing,
+      HDR, aspect ratio and 360 metadata.
+    - Frame rate and resolution must match your delivery spec.
+    - JSON and CSV data are saved next to every PDF report.
 
-  Also in v0.8.2
-    - Open With: open results in any installed video player, such as VLC,
-      MPC-HC or Windows Media Player Legacy, or any app through Choose
-      Another App.
-    - Quit always closes FrameGuard, even while a watch folder is active.
-    - PDF reports render file names in any language, keep each file's
-      checks together, and use easier-to-read status badges.
+  New look
+    - A new FrameGuard icon. The taskbar and window icons follow your theme.
+
+  Easier to use
+    - Open video files with FrameGuard from Explorer's Open With menu.
+    - Settings are saved as you change them.
+    - Updates install silently and FrameGuard reopens afterwards.
 
 
 BEFORE YOU INSTALL

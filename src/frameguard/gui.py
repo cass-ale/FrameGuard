@@ -357,7 +357,7 @@ def _preset_rejection_reason(filepath: str) -> str:
     except PresetValidationError as error:
         return str(error)
     except (OSError, ValueError) as error:
-        return f"Could not read the preset: {error}"
+        return f"Not a valid FrameGuard preset (could not read it: {error})"
     return "Not a valid FrameGuard preset file."
 
 
