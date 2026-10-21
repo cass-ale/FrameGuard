@@ -56,12 +56,12 @@ def _known_folder(folder_id: str) -> Optional[str]:
         if ctypes.windll.ole32.CLSIDFromString(ctypes.c_wchar_p(folder_id), ctypes.byref(guid)) != 0:
             return None
         out = ctypes.c_wchar_p()
-        if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
-                                                      ctypes.byref(out)) != 0:
-            return None
         try:
-            return out.value
+            hr = ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None,
+                                                            ctypes.byref(out))
+            return out.value if hr == 0 else None
         finally:
+            # The shell may allocate even when it fails; freeing NULL is a no-op.
             ctypes.windll.ole32.CoTaskMemFree(out)
     except (OSError, AttributeError, ValueError):
         return None
@@ -189,19 +189,22 @@ def request_retheme(icon_path: str) -> None:
     global _pending_icon, _worker
     with _lock:
         _pending_icon = icon_path
-        if _worker is not None and _worker.is_alive():
-            return
+        if _worker is not None:
+            return  # the running worker picks it up before it exits
         _worker = threading.Thread(target=_drain, name="fg-shortcut-icons", daemon=True)
         _worker.start()
 
 
 def _drain() -> None:
-    global _pending_icon
+    global _pending_icon, _worker
     while True:
         with _lock:
             icon_path, _pending_icon = _pending_icon, None
-        if icon_path is None:
-            return
+            if icon_path is None:
+                # Cleared under the same lock request_retheme takes, so a
+                # request can never land between "queue empty" and exit.
+                _worker = None
+                return
         retheme_shortcuts(icon_path)
 
 

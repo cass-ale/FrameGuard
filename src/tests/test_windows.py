@@ -215,8 +215,10 @@ class TestWindowsShortcutSafety:
         monkeypatch.setattr(winshell, "retheme_shortcuts", slow_retheme)
         for name in ("a.ico", "b.ico", "c.ico", "d.ico"):
             winshell.request_retheme(name)
+        worker = winshell._worker
         gate.set()
-        winshell._worker.join(5)
+        worker.join(5)
+        assert winshell._worker is None
         assert applied[-1] == "d.ico"
         assert len(applied) <= 2  # the first in flight, then only the latest
 

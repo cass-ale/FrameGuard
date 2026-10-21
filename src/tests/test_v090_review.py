@@ -76,7 +76,12 @@ class TestLosslessTrims:
         trimmed = media.get(f"trim_{vcodec}_{start}_{length}{ext}",
                             lambda p: stream_copy_trim(source, p + ext, start, length))
         fps = 30.0 if rate == "30" else 23.976
-        result = _scan(trimmed, target_fps=fps)
+        # The synthetic open-GOP source is saturated test-pattern graphics;
+        # depending on the platform's x265 build its ringing grazes the
+        # R 103 gamut limit (1.3% for 3 frames on the Windows FFmpeg build).
+        # That is a content property, not a trim artefact, so the picture
+        # levels are measured but not judged here.
+        result = _scan(trimmed, target_fps=fps, signal_levels_mode="report")
         integrity = _row(result, "File Integrity")
         assert integrity[1] == "PASS", integrity
         assert result.metadata.get("edit_list_hidden_frames", 0) > 0, result.metadata
