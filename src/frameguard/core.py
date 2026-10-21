@@ -21,7 +21,7 @@ from collections import Counter, deque
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Callable
 
-from frameguard import audio_checks, container_checks
+from frameguard import audio_checks, container_checks, video_checks
 
 # Live handles remain observable for diagnostics, but cancellation never reads
 # this global set. Every cancellable scan subprocess is registered explicitly
@@ -188,11 +188,15 @@ ESSENTIAL_CHECKS = {
     # container_checks.py: Codec Profile and Spatial Audio fail only on what
     # the spec sets; A/V Sync Offset fails beyond the EBU R37 chain budget.
     "Codec Profile", "Spatial Audio", "A/V Sync Offset",
+    # Like Audio Loudness: only FAILs when signal_levels_mode is "essential".
+    "Signal Levels",
 }
 
 ADVISORY_CHECKS = {
     "Frame Count", "Black Frames", "Freeze Frames",
     "Container Structure", "Edit List", "Timecode", "Track Layout",
+    # Content-dependent screening (see video_checks): warnings, never FAIL.
+    "Flash Risk", "Interlace Detection",
     # Raised when part of the analysis could not run.
     "Deep Scan",
 }
@@ -200,7 +204,8 @@ ADVISORY_CHECKS = {
 # The checks produced by the full-decode pass. When that pass cannot run,
 # every one of them is reported "Not verified" rather than left out.
 FRAME_LEVEL_CHECKS = (
-    "File Integrity", "Black Frames", "Freeze Frames", "Audio Silence",
+    "File Integrity", "Black Frames", "Freeze Frames", "Signal Levels",
+    "Flash Risk", "Interlace Detection", "Audio Silence",
     "Dead Channel", "Audio Loudness",
 )
 
@@ -233,7 +238,10 @@ CHECK_SEVERITY_WEIGHTS = {
     "Dead Channel": 40,
     "Deep Scan": 40,
     "Freeze Frames": 38,
+    "Signal Levels": 36,
     "Black Frames": 35,
+    "Interlace Detection": 34,
+    "Flash Risk": 32,
     "Audio Silence": 30,
     "Audio Codec": 25,
     "Audio Loudness": 25,
@@ -295,6 +303,7 @@ STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
 LOUDNESS_MODES = ("off", "report", "advisory", "essential")
 # "required" fails a file without a consistent SA3D ambisonic track.
 SPATIAL_AUDIO_CHOICES = ("any", "required")
+SIGNAL_LEVELS_MODES = video_checks.LEVELS_MODES
 
 DEFAULT_CONFIG = {
     # Picture geometry and timing. Resolution must match exactly unless
@@ -370,11 +379,27 @@ DEFAULT_CONFIG = {
     "deep_scan_max_stderr_lines": 5000,
     "deep_scan_max_stderr_chars": 512 * 1024,
 
-    # Deep scan thresholds
-    "black_detect_duration": 0.5,
-    "black_detect_pix_threshold": 0.10,
-    "freeze_detect_noise": 0.003,
-    "freeze_detect_duration": 2.0,
+    # Picture checks (video_checks.py). Black: a picture with at least
+    # black_detect_picture_threshold of its pixels at or below the level
+    # black_detect_pix_threshold (0.02 = Y <= 20 at 8-bit limited range) for
+    # black_detect_duration seconds; bursts from black_short_min_frames
+    # frames up to that are reported only when cut in hard (0 disables).
+    "black_frames_enabled": True,
+    "black_detect_duration": 0.3,
+    "black_detect_pix_threshold": 0.02,
+    "black_detect_picture_threshold": 0.98,
+    "black_short_min_frames": 3,
+    # Freeze: a held picture at least this long (EBU QC 0044B example: 25 frames).
+    "freeze_frames_enabled": True,
+    "freeze_detect_duration": 1.0,
+    # EBU R 103 v3.0 luma/RGB tolerance: off, report, advisory or essential
+    # (essential is for broadcast delivery specs; camera originals routinely
+    # exceed broadcast levels).
+    "signal_levels_mode": "advisory",
+    # ITU-R BT.1702-3 flash screening (warning only; not a certification).
+    "flash_check_enabled": True,
+    # idet combing in progressive video / field order vs metadata.
+    "interlace_check_enabled": True,
     "silence_noise_db": -50,
     "silence_duration": 2.0,
     # A channel (or a whole track) silent for at least this fraction of its
@@ -442,6 +467,8 @@ RETIRED_CONFIG_KEYS = frozenset({
     "use_mediaconch", "use_signalstats", "signalstats_sample_seconds",
     "signalstats_decimate_fps", "signalstats_num_samples",
     "quality_ymin_floor", "quality_ymax_ceil", "quality_satavg_min",
+    # 0.9.1: freezedetect was replaced by a frame-difference run detector.
+    "freeze_detect_noise",
 })
 
 
@@ -588,6 +615,9 @@ class QAResult:
             "File Integrity": "file is incomplete or damaged",
             "Black Frames": "unexpected black frames detected",
             "Freeze Frames": "video freezes detected",
+            "Signal Levels": "picture levels or colours are outside broadcast range",
+            "Flash Risk": "possible flashing (photosensitivity) risk",
+            "Interlace Detection": "interlacing or field-order problem in the picture",
             "Audio Silence": "long stretches of silence found",
             "Dead Channel": "an audio channel is silent",
             "Audio Loudness": "audio levels are outside the target range",
@@ -2474,6 +2504,9 @@ class _ScanPlan:
                  hidden_frames: int = 0):
         self.hidden_frames = max(0, int(hidden_frames or 0))
         self.video = _primary_video_stream(probe_data)
+        self.video_checks = video_checks.VideoCheckConfig.from_cfg(cfg)
+        # Set by run_deep_scan for the duration of the decode (temp files).
+        self.video_analysis: Optional["video_checks.VideoAnalysis"] = None
         self.audio = _audio_streams(probe_data)
         self.duration = _probed_duration(probe_data)
         self.loudness = (cfg.get("loudness_mode", "report") != "off") and bool(self.audio)
@@ -2526,7 +2559,7 @@ class _ScanPlan:
     def frame_check_names(self) -> List[str]:
         names = ["File Integrity"]
         if self.video:
-            names += ["Black Frames", "Freeze Frames"]
+            names += self.video_checks.enabled_names()
         if self.audio:
             names += ["Audio Silence", "Dead Channel"]
             if self.loudness:
@@ -2580,16 +2613,28 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     corrupt clip gave 16 errors and a phantom freeze on VideoToolbox, 175
     errors and no freeze in software), so the verdict depended on the machine
     and on which file happened to be scanned first.
+
+    The picture detectors come from ``plan.video_analysis`` (video_checks.py);
+    it may add a second output (the flash grid) after the null output.
     """
     chains, maps = [], []
+    extra_graphs: List[str] = []
+    extra_outputs: List[str] = []
     if plan.video is not None:
-        chains.append(
-            f"[0:{int(plan.video['index'])}]"
-            f"blackdetect@v=d={float(cfg['black_detect_duration'])}"
-            f":pix_th={float(cfg['black_detect_pix_threshold'])},"
-            f"freezedetect@v=n={float(cfg['freeze_detect_noise'])}"
-            f":d={float(cfg['freeze_detect_duration'])}[v]")
+        # --- video branch (video_checks.py) ---
+        video_analysis = plan.video_analysis
+        if video_analysis is not None:
+            chains.extend(video_analysis.filter_chains("v"))
+            for graph, label in video_analysis.extra_graphs():
+                extra_graphs += ["-filter_complex", graph]
+                if label:
+                    maps += ["-map", label]
+            extra_outputs = video_analysis.extra_outputs()
+        else:
+            chains.append(f"[0:{int(plan.video['index'])}]"
+                          f"{video_checks.black_filter(plan.video_checks)}[v]")
         maps += ["-map", "[v]"]
+        # --- end video branch ---
     meter = _multichannel_meter(ffmpeg, plan)
     plan.multichannel_meter = meter
     for i, track in enumerate(plan.audio):
@@ -2602,9 +2647,12 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     threads = max(1, int(cfg.get("filter_threads", 4) or 4))
     return ([ffmpeg, "-nostdin", "-hide_banner", "-nostats",
              "-loglevel", "level+verbose", "-progress", "pipe:1",
+             # Coded orientation: rotating a 4K picture costs more than the
+             # analysis, and interlace detection needs the coded lines.
+             "-noautorotate",
              "-i", filepath, "-filter_complex_threads", str(threads),
-             "-filter_complex", ";".join(chains)]
-            + maps + ["-f", "null", "-"])
+             "-filter_complex", ";".join(chains)] + extra_graphs
+            + maps + ["-f", "null", "-"] + extra_outputs)
 
 
 class _ScanOutcome:
@@ -2843,51 +2891,43 @@ def _report_file_integrity(result: QAResult, plan: _ScanPlan, outcome: _ScanOutc
     result.add_pass("File Integrity", summary + ".")
 
 
-def _report_black_frames(result: QAResult, events_text: str, duration: float) -> None:
-    black_events = _merge_event_intervals(_pair_detect_events(events_text, "black"))
-    # Trim the first and last second (legitimate fades) instead of discarding
-    # whole events, so an entirely black file still fails.
-    if duration > 3.0:
-        trimmed = []
-        for start, dur in black_events:
-            begin = max(start, 1.0)
-            finish = min(start + dur, duration - 1.0)
-            if finish - begin > 0:
-                trimmed.append((begin, finish - begin))
-        black_events = trimmed
-    if not black_events:
-        result.add_pass("Black Frames", "No black frame sequences detected.")
-        return
-    total_black = sum(d for _, d in black_events)
-    count = len(black_events)
-    positions = _format_event_list(black_events)
-    result.set_metadata("black_frame_sequences", count)
-    result.set_metadata("black_frame_total_seconds", round(total_black, 2))
-    result.set_metadata("black_frame_timestamps", positions)
-    if total_black > duration * 0.1:
-        if total_black < 4.0:
-            result.add_warn("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s (likely transitions/slates). At: {positions}", confidence=60)
-        else:
-            result.add_fail("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s. At: {positions}", confidence=90)
-    else:
-        result.add_warn("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s. At: {positions}", confidence=65)
+def _black_events(log_text: str, video_end: float) -> List[Tuple[float, float]]:
+    """(start, end) blackdetect runs, an open run closed at the decoded end."""
+    text = _close_open_regions(_lines_with_context(log_text, "blackdetect@v"), video_end)
+    return [(start, start + duration) for start, duration in _pair_detect_events(text, "black")]
 
 
-def _report_freeze_frames(result: QAResult, events_text: str, duration: float) -> None:
-    freeze_events = _merge_event_intervals(_pair_detect_events(events_text, "freeze"))
-    if not freeze_events:
-        result.add_pass("Freeze Frames", "No freeze events detected.")
-        return
-    total_freeze = sum(d for _, d in freeze_events)
-    count = len(freeze_events)
-    positions = _format_event_list(freeze_events)
-    result.set_metadata("freeze_frame_count", count)
-    result.set_metadata("freeze_frame_total_seconds", round(total_freeze, 2))
-    result.set_metadata("freeze_frame_timestamps", positions)
-    if total_freeze > duration * 0.1:
-        result.add_fail("Freeze Frames", f"{count} freeze event(s), total {total_freeze:.1f}s. At: {positions}")
-    else:
-        result.add_warn("Freeze Frames", f"{count} freeze event(s), total {total_freeze:.1f}s. At: {positions}")
+def _open_video_analysis(plan: _ScanPlan, cfg: dict):
+    """(analysis, error) for the picture checks; attaches it to ``plan``.
+
+    The analysis owns a private temporary directory; it is removed by
+    close() or, on any early exit, when the object is released. Without
+    temporary space the decode (integrity, black, audio) still runs and the
+    per-frame picture checks are reported not verified.
+    """
+    if plan.video is None or "index" not in plan.video:
+        return None, None
+    analysis = video_checks.VideoAnalysis(plan.video, cfg)
+    try:
+        analysis.open()
+    except OSError as exc:
+        return None, f"no temporary directory for the measurements ({exc.strerror or exc})."
+    plan.video_analysis = analysis
+    return analysis, None
+
+
+def _report_video(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome,
+                  analysis: Optional["video_checks.VideoAnalysis"],
+                  analysis_error: Optional[str] = None) -> None:
+    """Every picture-check row from the one decode (video_checks.py)."""
+    video_end = (_decoded_video_seconds(plan, outcome.accounting)
+                 or _stream_duration(plan.video) or plan.duration or 0.0)
+    stats = outcome.accounting.stream_stats.get(int(plan.video["index"]))
+    video_checks.report_video(
+        result, plan.video_checks, plan.video, plan.video_fps(),
+        decoded_frames=stats["frames"] if stats else 0, video_end=video_end,
+        black_events=_black_events(outcome.log_text, video_end),
+        analysis=analysis, analysis_error=analysis_error)
 
 
 def _silence_events(log_text: str, instance: str, end_time: float) -> List[Tuple[float, float]]:
@@ -3071,19 +3111,16 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
             _add_audio_row(result, name, rows[name])
 
 
-def _report_scan(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:
+def _report_scan(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict,
+                 analysis: Optional["video_checks.VideoAnalysis"] = None,
+                 analysis_error: Optional[str] = None) -> None:
     reason = _not_run_reason(outcome, plan)
     if reason:
         _mark_not_verified(result, plan.frame_check_names(), reason)
         return
     _report_file_integrity(result, plan, outcome, cfg)
     if plan.video is not None:
-        video_end = (_decoded_video_seconds(plan, outcome.accounting)
-                     or _stream_duration(plan.video) or plan.duration or 0.0)
-        _report_black_frames(result, _close_open_regions(
-            _lines_with_context(outcome.log_text, "blackdetect@v"), video_end), video_end)
-        _report_freeze_frames(result, _close_open_regions(
-            _lines_with_context(outcome.log_text, "freezedetect@v"), video_end), video_end)
+        _report_video(result, plan, outcome, analysis, analysis_error)
     if plan.audio:
         _report_audio(result, plan, outcome, cfg)
     else:
@@ -3138,6 +3175,7 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         result.set_metadata("duration_seconds", round(plan.duration, 2))
         result.set_metadata("duration_display", _format_duration(plan.duration))
 
+    analysis, analysis_error = _open_video_analysis(plan, cfg)
     cmd = _build_scan_command(ffmpeg_path, filepath, plan, cfg)
     if progress_callback:
         progress_callback("filter", 0, plan.duration or 0.0, "Integrity scan (software decode)")
@@ -3150,7 +3188,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     if progress_callback:
         end = plan.duration or outcome.last_out_time or 0.0
         progress_callback("filter", end, end, "Integrity scan (software decode)")
-    _report_scan(result, plan, outcome, cfg)
+    _report_scan(result, plan, outcome, cfg, analysis, analysis_error)
+    if analysis is not None:
+        analysis.close()
 
 
 

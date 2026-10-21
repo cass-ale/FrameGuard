@@ -82,6 +82,17 @@ PRESET_CONFIG_KEYS = (
     "allow_trim_edit_lists",
     "max_audio_tracks",
     "disabled_checks",
+    # Picture checks (video_checks.py, 0.9.1).
+    "black_frames_enabled",
+    "black_detect_duration",
+    "black_detect_pix_threshold",
+    "black_detect_picture_threshold",
+    "black_short_min_frames",
+    "freeze_frames_enabled",
+    "freeze_detect_duration",
+    "signal_levels_mode",
+    "flash_check_enabled",
+    "interlace_check_enabled",
     # Compatibility-only (see core.COMPAT_ONLY_CONFIG_KEYS): still accepted so
     # presets and saved settings written by 0.8.x round-trip unchanged.
     "use_hwaccel",
@@ -204,6 +215,13 @@ _PRESET_VALUE_RANGES = {
     "target_loudness_lufs": (-70.0, 0.0),
     "loudness_tolerance_lu": (0.0, 20.0),
     "true_peak_max_dbtp": (-20.0, 3.0),
+    # Picture checks. Black level is a fraction of the nominal range (0.02 =
+    # Y <= 20 at 8-bit limited); the picture share is a fraction of pixels.
+    "black_detect_duration": (0.04, 60.0),
+    "black_detect_pix_threshold": (0.0, 0.25),
+    "black_detect_picture_threshold": (0.5, 1.0),
+    "black_short_min_frames": (0, 100),
+    "freeze_detect_duration": (0.2, 600.0),
     "segment_count": (1, 16),
     "duration_mismatch_threshold": (0.0, 60.0),
     "av_short_tolerance_frames": (0, 1000),
@@ -227,7 +245,7 @@ _EMPTY_OK_LIST_KEYS = frozenset({"disabled_checks"})
 _INTEGER_PRESET_KEYS = frozenset({
     "target_width", "target_height", "min_audio_sample_rate", "segment_count",
     "max_decode_errors", "av_short_tolerance_frames", "max_frame_pixels",
-    "max_pixel_rate", "max_audio_tracks",
+    "max_pixel_rate", "max_audio_tracks", "black_short_min_frames",
 }) | audio_checks.INTEGER_KEYS
 
 
@@ -241,6 +259,7 @@ def _enum_choices(key: str):
         "loudness_mode": core.LOUDNESS_MODES,
         "spatial_audio": core.SPATIAL_AUDIO_CHOICES,
         **audio_checks.ENUM_CHOICES,
+        "signal_levels_mode": core.SIGNAL_LEVELS_MODES,
     }.get(key)
 
 

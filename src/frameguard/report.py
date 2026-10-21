@@ -1094,6 +1094,22 @@ def _conformance_spec_rows(c: dict) -> List[tuple]:
     if c.get("disabled_checks"):
         rows.append(("Checks switched off", ", ".join(c["disabled_checks"])))
     return rows
+def _black_freeze_spec(c: dict) -> str:
+    black = (f"black ≥{c.get('black_detect_duration')} s at ≤{c.get('black_detect_pix_threshold')} "
+             f"level on ≥{float(c.get('black_detect_picture_threshold') or 0) * 100:g}% of the picture"
+             if c.get("black_frames_enabled", True) else "black off")
+    freeze = (f"freeze ≥{c.get('freeze_detect_duration')} s"
+              if c.get("freeze_frames_enabled", True) else "freeze off")
+    return f"{black}; {freeze}"
+
+
+def _picture_signal_spec(c: dict) -> str:
+    mode = c.get("signal_levels_mode", "advisory")
+    levels = "EBU R 103 levels " + ("off" if mode == "off" else
+                                    "measured, not enforced" if mode == "report" else mode)
+    flash = "BT.1702 flash screening " + ("on" if c.get("flash_check_enabled", True) else "off")
+    interlace = "interlace detection " + ("on" if c.get("interlace_check_enabled", True) else "off")
+    return f"{levels}; {flash}; {interlace}"
 
 
 def spec_rows(config: dict) -> List[tuple]:
@@ -1119,8 +1135,8 @@ def spec_rows(config: dict) -> List[tuple]:
         ("Projection / stereo", f"{_fmt_choice(c.get('required_projection'))} / {_fmt_choice(c.get('required_stereo_mode'))}"),
         *_conformance_spec_rows(c),
         ("Decode errors allowed", str(c.get("max_decode_errors"))),
-        ("Black / freeze", f"≥{c.get('black_detect_duration')} s (pix {c.get('black_detect_pix_threshold')}) / "
-                           f"≥{c.get('freeze_detect_duration')} s (noise {c.get('freeze_detect_noise')})"),
+        ("Black / freeze", _black_freeze_spec(c)),
+        ("Picture signal", _picture_signal_spec(c)),
         ("Silence", f"≤{c.get('silence_noise_db')} dB for ≥{c.get('silence_duration')} s; "
                     f"dead at {float(c.get('dead_channel_ratio') or 0) * 100:g}%"),
         ("Loudness", _loudness_spec(c)),
