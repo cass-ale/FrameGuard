@@ -31,7 +31,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Improved
 - New Monogram identity: an F whose crossbar becomes the tick, drawn from vectors so it is sharp at every size. The Dock, taskbar, window and sidebar marks take the theme's colours; the macOS menu-bar icon is a template that fills its slot and adapts to light and dark menu bars like other professional apps.
-- New checks: interlaced content, bit depth and HDR transfer (SDR, PQ, HLG), XR projection and stereo metadata for 360 deliverables, aspect ratio, audio sample rate, dead channels, and EBU R128 loudness and true peak.
+- New checks: interlaced content, bit depth and HDR transfer (SDR, PQ, HLG), XR projection and stereo metadata for 360 deliverables, aspect ratio, audio sample rate, dead channels, and EBU R128 loudness and true peak (measured and reported by default; can warn or fail against a target).
+- Every stricter rule can be relaxed in Settings: allow larger resolution, allow frame-rate multiples, require progressive, minimum sample rate, loudness and allowed decode errors.
 - JSON and CSV data are saved next to every PDF report, and the PDF records the exact specification, thresholds and tool versions used.
 - The watch folder scans subfolders (camera-card layouts) and waits longer for copies to finish.
 - macOS has a full menu bar: About, Settings (Cmd+,), File, View, Window and Help, with the familiar shortcuts.

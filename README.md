@@ -148,9 +148,9 @@ a clean pass on the strength of a check that did not run.
 | Video | Bitrate | Essential | Passes within 10% under the minimum, warns at 10–25% under, fails beyond |
 | Audio | Audio Stream, Codec, Channels, Sample Rate | Essential | Checked on **every** audio track |
 | Audio | A/V Duration | Essential | Each track's end time against the video |
-| Audio | Audio Silence | Essential | Sustained silence per track; a track silent for 95% or more fails |
+| Audio | Audio Silence | Essential | Sustained silence per track; a primary track silent for 95% or more fails, an entirely blank extra track warns |
 | Audio | Dead Channel | Essential | A silent channel in stereo fails; in multichannel it warns (LFE is reported only) |
-| Audio | Audio Loudness | Advisory by default | EBU R128 integrated loudness and true peak (default −23 LUFS ± 2, TP ≤ −1 dBTP); can be made essential or turned off |
+| Audio | Audio Loudness | Reported by default | EBU R128 integrated loudness and true peak, measured on every track; set it to warn or fail outside the target (default −23 LUFS ± 2, true peak ≤ −1 dBTP), or off |
 | Frames | Black Frames, Freeze Frames | Advisory | Absolute timestamps; short fades are ignored |
 | Frames | Frame Count | Advisory | Frames against duration × frame rate |
 
@@ -296,7 +296,7 @@ codec list is rejected with a message naming every problem, never silently loose
 | `min_bit_depth`, `required_transfer` | `"any"` | Enforce bit depth and SDR / PQ / HLG |
 | `required_projection`, `required_stereo_mode` | `"any"` | Enforce XR metadata (set on the 5.7K 360 presets) |
 | `max_decode_errors` | `0` | Decoder errors allowed before File Integrity fails |
-| `loudness_mode` | `"advisory"` | `advisory`, `essential` or `off` |
+| `loudness_mode` | `"report"` | `report` (measure only), `advisory` (warn), `essential` (fail) or `off` |
 | `min_audio_sample_rate` | `44100` | Minimum sample rate for every track |
 
 See `PRESET_CONFIG_KEYS` in `src/frameguard/presets.py` for every accepted key and
@@ -368,8 +368,9 @@ those exact key names, and `tests/test_config_and_presets.py` keeps them in sync
 | Group | Controls |
 |-------|----------|
 | Delivery | Target resolution, frame rate, fps tolerance, minimum bitrate |
-| Audio | Audio required, silence duration threshold |
-| Verdicts | Strict mode: warnings count as failures |
+| Delivery rules | Allow larger resolution, allow frame-rate multiples, require progressive |
+| Audio | Audio required, silence duration, minimum sample rate, loudness (report, warn, fail or off) |
+| Verdicts | Strict mode (warnings count as failures), allowed decode errors |
 | Results | Clear results on each new scan |
 
 ---
