@@ -213,3 +213,23 @@ class TestSampledWindows:
         cfr = _row(result, "CFR Check")
         assert cfr[1] == "PASS" and "sampled 12 windows" in cfr[2], cfr
         assert result.metadata["irregular_frame_intervals"] == 0
+
+
+# ---------------------------------------------------------------------------
+# L5: rotated footage is an orientation mismatch, not "smaller"
+# ---------------------------------------------------------------------------
+
+class TestRotationWording:
+    def test_portrait_rotation_is_named(self, media):
+        source = media.get("clean.mp4", lambda p: make_clip(p + ".mp4", duration=3))
+
+        def build(path):
+            path += ".mp4"
+            ffmpeg("-display_rotation", "90", "-i", source, "-c", "copy", path)
+            return path
+        rotated = media.get("rot90", build)
+        check = _row(_scan(rotated), "Resolution")
+        assert check[1] == "FAIL"
+        assert check[2] == ("Portrait orientation (rotated 90°): 240x320 displayed vs "
+                            "320x240 landscape target."), check
+        assert "upscale" not in check[2]

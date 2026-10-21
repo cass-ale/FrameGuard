@@ -1026,6 +1026,25 @@ def _displayed_size(video: dict) -> Tuple[int, int, int]:
     return width, height, rotation
 
 
+def _orientation_name(width: int, height: int) -> str:
+    return "portrait" if height > width else "landscape" if width > height else "square"
+
+
+def _orientation_mismatch(width: int, height: int, tw: int, th: int, rotation: int) -> Optional[str]:
+    """A clear message when the picture is turned the other way from the target.
+
+    A portrait phone clip against a UHD spec used to read "smaller than the
+    target... would upscale", which sent operators looking for a scaling
+    problem instead of a rotation one.
+    """
+    actual, wanted = _orientation_name(width, height), _orientation_name(tw, th)
+    if "square" in (actual, wanted) or actual == wanted:
+        return None
+    turned = f" (rotated {abs(rotation)}°)" if abs(rotation) % 180 == 90 else ""
+    return (f"{actual.capitalize()} orientation{turned}: {width}x{height} displayed vs "
+            f"{tw}x{th} {wanted} target.")
+
+
 def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     """The displayed frame must equal the target exactly.
 
@@ -1051,8 +1070,11 @@ def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
     tw, th = int(cfg["target_width"]), int(cfg["target_height"])
     rot_note = f" (displayed after {abs(rotation)}° rotation)" if rotation else ""
 
+    orientation = _orientation_mismatch(width, height, tw, th, rotation)
     if (width, height) == (tw, th):
         result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}")
+    elif orientation:
+        result.add_fail("Resolution", orientation, confidence=95)
     elif width >= tw and height >= th and cfg.get("allow_larger_resolution", False):
         result.add_pass("Resolution", f"{width}x{height} exceeds the {tw}x{th} target "
                                       f"(larger frames allowed by this spec){rot_note}")
@@ -2532,12 +2554,23 @@ def _silence_events(log_text: str, instance: str, end_time: float) -> List[Tuple
     return [(start, dur if dur > 0 else max(0.0, end_time - start)) for start, dur in events]
 
 
-def _track_silence_entry(label: str, events, duration: float, cfg: dict) -> Tuple[str, str]:
+def _primary_track_position(tracks: List[dict]) -> int:
+    """The track a player picks: the first flagged default, else the first."""
+    for position, track in enumerate(tracks):
+        if (track.get("disposition") or {}).get("default"):
+            return position
+    return 0
+
+
+def _track_silence_entry(label: str, events, duration: float, cfg: dict,
+                         primary: bool = True, number: int = 1) -> Tuple[str, str]:
     """Status/detail for one track's silence, using the long-standing tiers.
 
-    New: a track silent for at least ``dead_channel_ratio`` of its length is
-    dead and fails whatever its length (the old >30 s condition let a
-    completely silent 20 s clip through as a warning).
+    A primary track silent for at least ``dead_channel_ratio`` of its length
+    carries no programme and fails whatever its length (the old >30 s
+    condition let a completely silent 20 s clip through as a warning). A
+    blank secondary track only warns: broadcast and archive layouts reserve
+    empty tracks on purpose.
     """
     if not events:
         return "PASS", _with_track(label, "No extended silence detected.")
@@ -2545,8 +2578,10 @@ def _track_silence_entry(label: str, events, duration: float, cfg: dict) -> Tupl
     positions = _format_event_list(events)
     count = len(events)
     if duration > 0 and total >= duration * float(cfg.get("dead_channel_ratio", 0.95)):
-        return "FAIL", _with_track(label, f"Silent for {total:.1f}s of {duration:.1f}s "
-                                          f"({total / duration * 100:.0f}%): track carries no audio.")
+        share = f"silent for {total:.1f}s of {duration:.1f}s ({total / duration * 100:.0f}%)"
+        if not primary:
+            return "WARN", f"Track {number} is silent - intentional blank track? ({share})"
+        return "FAIL", _with_track(label, f"{share[0].upper()}{share[1:]}: the main track carries no audio.")
     if total > duration * 0.5 and duration > 30:
         return "FAIL", _with_track(label, f"{count} silence region(s), total {total:.1f}s. Extended silence in deliverable. At: {positions}")
     if total < 1.0:
@@ -2647,12 +2682,14 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
     silence, dead, loudness = [], [], []
     measured = _parse_loudness(outcome.log_text) if plan.loudness else {}
     total = len(plan.audio)
+    primary = _primary_track_position(plan.audio)
     for position, track in enumerate(plan.audio):
         label = _track_label(position, track, total)
         duration = (_decoded_audio_seconds(track, outcome.accounting)
                     or plan.audio_expected_seconds(track) or 0.0)
         events = _silence_events(outcome.log_text, f"silencedetect@a{position}", duration)
-        status, detail = _track_silence_entry(label, events, duration, cfg)
+        status, detail = _track_silence_entry(label, events, duration, cfg,
+                                              primary=position == primary, number=position + 1)
         silence.append((status, detail))
         if position == 0 and events:
             result.set_metadata("silence_regions", len(events))
