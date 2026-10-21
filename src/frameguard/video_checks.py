@@ -230,6 +230,22 @@ class PictureInfo:
                    in ("", "unknown", "unspecified", "reserved"))
 
     @property
+    def gamut_matrices(self) -> Tuple[str, ...]:
+        """Matrices the RGB gamut is judged under: the signalled one, or, when
+        none is signalled, the size-based guess first and then the other
+        common SDR matrix.
+
+        Untagged files are often HD encoded with BT.601 coefficients (FFmpeg's
+        swscale default when nothing is signalled), so a gamut verdict under
+        the guessed BT.709 alone flagged 63-97 % of ordinary pictures. BT.2020
+        is not a candidate: it is always signalled in practice (HDR and wide
+        gamut deliveries require the tags).
+        """
+        if not self.matrix_assumed:
+            return (self.matrix,)
+        return (self.matrix,) + tuple(m for m in ("bt709", "bt601") if m != self.matrix)
+
+    @property
     def range_name(self) -> str:
         return "pc" if self.full_range else "tv"
 
@@ -304,7 +320,8 @@ def _print(key: str, path: str) -> str:
     return f"metadata=mode=print:key={key}:file={filter_path(path)}"
 
 
-def _rgb_mask_expressions(info: PictureInfo) -> Tuple[str, str, str, str]:
+def _rgb_mask_expressions(info: PictureInfo,
+                          matrix: Optional[str] = None) -> Tuple[str, str, str, str]:
     """lut2 expressions for the two packed gamut stages.
 
     Stage 1 pairs planes (Y, Y, U) with (V, U, V): R depends on (Y, Cr) and
@@ -313,9 +330,9 @@ def _rgb_mask_expressions(info: PictureInfo) -> Tuple[str, str, str, str]:
     error <= 0.23 % of nominal, far inside the 5 % tolerance). Stage 2 pairs
     W with Y for the G mask, G = Y - (W - 128). Masks are 255 where the
     component lies outside -5 % .. 105 %. Returns (red, blue, helper, green);
-    ``green`` takes x = W, y = Y.
+    ``green`` takes x = W, y = Y. ``matrix`` overrides ``info.matrix``.
     """
-    a, b, c, d = MATRICES[info.matrix]
+    a, b, c, d = MATRICES[matrix or info.matrix]
     if info.full_range:
         y_off, y_scale, c_scale = 0, 255.0, 255.0
     else:
@@ -392,8 +409,8 @@ class VideoAnalysis:
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
         self._cleanup = weakref.finalize(self, shutil.rmtree, self.directory, True)
-        names = ("mafd", "idet", "colmo", "rowmo", "luma", "band1", "band2",
-                 "gam_r", "gam_g", "gam_b", "yavg")
+        names = ("mafd", "idet", "colmo", "rowmo", "luma", "band1", "band2", "yavg") + tuple(
+            f"gam{k}_{c}" for k in range(len(self.info.gamut_matrices)) for c in "rgb")
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         self.paths["flash"] = os.path.join(self.directory, "flash.rgb")
         return self
@@ -486,8 +503,9 @@ class VideoAnalysis:
         info, c = self.info, self.config
         rng = info.range_name
         uses = []
+        matrices = info.gamut_matrices
         if c.levels:
-            uses += ["luma", "gamut1"]
+            uses += ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
         if c.black or c.levels:
             uses.append("mean")
         if self.flash_enabled:
@@ -500,22 +518,13 @@ class VideoAnalysis:
             f"split={len(uses)}{labels}"]
         if c.levels:
             m1, m2, m3 = _luma_mask_expressions(info)
-            red, blue, helper, green = _rgb_mask_expressions(info)
+            for k, matrix in enumerate(matrices):
+                chains += self._gamut_chains(k, matrix, reduce4)
             chains += [
                 f"[ar_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p,lutyuv=y='{m1}':u='{m2}':v='{m3}',"
                 f"{reduce4},signalstats,{_print('lavfi.signalstats.YAVG', self.paths['luma'])},"
                 f"{_print('lavfi.signalstats.UAVG', self.paths['band1'])},"
                 f"{_print('lavfi.signalstats.VAVG', self.paths['band2'])},nullsink",
-                "[ar_gamut1]split=3[g_src][g_alt][g_luma]",
-                "[g_src]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=1:format=yuv444p[g_a]",
-                "[g_alt]mergeplanes=map0s=0:map0p=2:map1s=0:map1p=1:map2s=0:map2p=2:format=yuv444p[g_b]",
-                f"[g_a][g_b]lut2=c0='{red}':c1='{blue}':c2='{helper}',"
-                "mergeplanes=map0s=0:map0p=0:map1s=0:map1p=2:map2s=0:map2p=1:format=yuv444p[g_rwb]",
-                "[g_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p[g_yyy]",
-                f"[g_rwb][g_yyy]lut2=c0='x':c1='{green}':c2='x',"
-                f"{reduce4},signalstats,{_print('lavfi.signalstats.YAVG', self.paths['gam_r'])},"
-                f"{_print('lavfi.signalstats.UAVG', self.paths['gam_g'])},"
-                f"{_print('lavfi.signalstats.VAVG', self.paths['gam_b'])},nullsink",
             ]
         if c.black or c.levels:
             # Without the flash output this branch is the graph's output.
@@ -536,6 +545,26 @@ class VideoAnalysis:
                 f"scale={cols}:{rows}:flags=area[vs_flash]")
         return chains
 
+    def _gamut_chains(self, k: int, matrix: str, reduce4: str) -> List[str]:
+        """R, G and B gamut masks of ``[ar_gamut<k>]`` under ``matrix``."""
+        red, blue, helper, green = _rgb_mask_expressions(self.info, matrix)
+        g = f"g{k}"
+        return [
+            f"[ar_gamut{k}]split=3[{g}_src][{g}_alt][{g}_luma]",
+            f"[{g}_src]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=1"
+            f":format=yuv444p[{g}_a]",
+            f"[{g}_alt]mergeplanes=map0s=0:map0p=2:map1s=0:map1p=1:map2s=0:map2p=2"
+            f":format=yuv444p[{g}_b]",
+            f"[{g}_a][{g}_b]lut2=c0='{red}':c1='{blue}':c2='{helper}',"
+            f"mergeplanes=map0s=0:map0p=0:map1s=0:map1p=2:map2s=0:map2p=1:format=yuv444p[{g}_rwb]",
+            f"[{g}_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0"
+            f":format=yuv444p[{g}_yyy]",
+            f"[{g}_rwb][{g}_yyy]lut2=c0='x':c1='{green}':c2='x',"
+            f"{reduce4},signalstats,{_print('lavfi.signalstats.YAVG', self.paths[f'gam{k}_r'])},"
+            f"{_print('lavfi.signalstats.UAVG', self.paths[f'gam{k}_g'])},"
+            f"{_print('lavfi.signalstats.VAVG', self.paths[f'gam{k}_b'])},nullsink",
+        ]
+
     def extra_outputs(self) -> List[str]:
         """Arguments for the raw flash-grid output (after the main output)."""
         if not self.flash_enabled:
@@ -555,13 +584,18 @@ class VideoAnalysis:
             series.col_motion = align_by_time(times, *read_metadata_series(self.paths["colmo"]))
             series.row_motion = align_by_time(times, *read_metadata_series(self.paths["rowmo"]))
         if self.needs_area_branch and self.config.levels:
-            fraction = {name: [_to_float(v) / 255.0 for v in read_metadata_series(self.paths[name])[1]]
-                        for name in ("luma", "band1", "band2", "gam_r", "gam_g", "gam_b")}
-            series.luma, series.band1, series.band2 = fraction["luma"], fraction["band1"], fraction["band2"]
-            # The largest single-component share: never above the union of
-            # R, G and B violations, so it can only under-report.
-            series.gam = [max(r, g, b) for r, g, b in
-                          zip(fraction["gam_r"], fraction["gam_g"], fraction["gam_b"])]
+            def fraction(name: str) -> List[float]:
+                return [_to_float(v) / 255.0 for v in read_metadata_series(self.paths[name])[1]]
+            series.luma, series.band1, series.band2 = fraction("luma"), fraction("band1"), fraction("band2")
+            for k, matrix in enumerate(self.info.gamut_matrices):
+                # The largest single-component share: never above the union
+                # of R, G and B violations, so it can only under-report.
+                series.gam_by_matrix[matrix] = [
+                    max(r, g, b) for r, g, b in
+                    zip(fraction(f"gam{k}_r"), fraction(f"gam{k}_g"), fraction(f"gam{k}_b"))]
+            # A pixel share counts only if it is out of gamut under every
+            # candidate matrix (one candidate when the matrix is signalled).
+            series.gam = [min(values) for values in zip(*series.gam_by_matrix.values())]
         if self.needs_area_branch and (self.config.black or self.config.levels):
             series.yavg = [_to_float(v) for v in read_metadata_series(self.paths["yavg"])[1]]
         if self.flash_enabled:
@@ -639,7 +673,8 @@ class VideoSeries:
     col_motion: List[Optional[float]] = field(default_factory=list)
     row_motion: List[Optional[float]] = field(default_factory=list)
     luma: List[float] = field(default_factory=list)   # tv: outside R 103; pc: extremes used
-    gam: List[float] = field(default_factory=list)
+    gam: List[float] = field(default_factory=list)       # min over candidate matrices
+    gam_by_matrix: Dict[str, List[float]] = field(default_factory=dict)
     band1: List[float] = field(default_factory=list)
     band2: List[float] = field(default_factory=list)
     yavg: List[float] = field(default_factory=list)
@@ -662,6 +697,7 @@ class VideoSeries:
             values = getattr(self, name)
             if values:
                 setattr(self, name, values[:common])
+        self.gam_by_matrix = {m: v[:common] for m, v in self.gam_by_matrix.items()}
 
     @property
     def frames(self) -> int:
@@ -978,6 +1014,10 @@ class LevelsFindings:
     max_luma: float
     max_gamut: float
     range_hint: Optional[str] = None
+    # Unsignalled matrix: the candidates judged, and whether the first
+    # (size-based) guess alone would have reported a gamut excursion.
+    gamut_matrices: Tuple[str, ...] = ()
+    guess_alone_flags: bool = False
 
 
 def _area_events(fractions: Sequence[float], times: Sequence[float],
@@ -1031,7 +1071,8 @@ def range_plausibility(series: VideoSeries, full_range: bool) -> Optional[str]:
     return None
 
 
-def assess_levels(series: VideoSeries, fps: float, full_range: bool) -> LevelsFindings:
+def assess_levels(series: VideoSeries, fps: float, full_range: bool,
+                  gamut_matrices: Sequence[str] = ()) -> LevelsFindings:
     """EBU R 103 v3.0 luma and RGB-gamut tolerance on the averaged copy.
 
     A frame violates when more than 1 % of its picture lies outside the
@@ -1039,17 +1080,23 @@ def assess_levels(series: VideoSeries, fps: float, full_range: bool) -> LevelsFi
     needs at least R103_MIN_FRAMES consecutive violating frames, so a single
     corrupt or transitional frame does not count. Full-range pictures cannot
     leave the luma range (0-255 is the nominal range), so only gamut applies.
+    With more than one candidate matrix (unsignalled), ``series.gam`` already
+    holds the per-frame minimum over the candidates.
     """
     period = _frame_period(fps, series.times)
     count = series.frames
     luma_fraction = (list(series.luma) if not full_range and series.luma else [0.0] * count)
     gamut_fraction = list(series.gam) if series.gam else [0.0] * count
+    candidates = tuple(gamut_matrices) if len(gamut_matrices) > 1 else ()
+    guess = series.gam_by_matrix.get(candidates[0], []) if candidates else []
     return LevelsFindings(
         luma=_area_events(luma_fraction, series.times, period),
         gamut=_area_events(gamut_fraction, series.times, period),
         max_luma=max(luma_fraction or [0.0]),
         max_gamut=max(gamut_fraction or [0.0]),
         range_hint=range_plausibility(series, full_range),
+        gamut_matrices=candidates,
+        guess_alone_flags=bool(guess and _area_events(guess, series.times, period)),
     )
 
 
@@ -1060,17 +1107,31 @@ def _level_event_text(kind: str, events: Sequence[LevelEvent]) -> str:
     return f"{kind} outside the R 103 range on >1% of the picture: {shown}{more}"
 
 
-def levels_entry(findings: LevelsFindings, mode: str, full_range: bool,
-                 assumed_matrix: Optional[str] = None) -> Tuple[str, str, int]:
-    """(status, detail, confidence) for the Signal Levels row.
+def _matrix_label(matrix: str) -> str:
+    return matrix.upper().replace("BT", "BT.")
 
-    ``assumed_matrix`` names the Y'CbCr matrix guessed for an untagged file:
-    the gamut result depends on it, so confidence stays below 70.
-    """
+
+def _matrix_note(findings: LevelsFindings) -> str:
+    """One sentence on an unsignalled matrix ('' when it is signalled)."""
+    if not findings.gamut_matrices:
+        return ""
+    names = " and ".join(_matrix_label(m) for m in findings.gamut_matrices)
+    if findings.gamut:
+        return (f" The colour matrix is not signalled; the gamut excursion holds under "
+                f"{names}.")
+    if findings.guess_alone_flags:
+        return (f" The colour matrix is not signalled; gamut was judged under {names} "
+                f"and is within R 103 under at least one.")
+    return f" The colour matrix is not signalled; gamut was judged under {names}."
+
+
+def levels_entry(findings: LevelsFindings, mode: str, full_range: bool) -> Tuple[str, str, int]:
+    """(status, detail, confidence) for the Signal Levels row."""
     luma_part = ("luma n/a (full range)" if full_range
                  else f"luma max {findings.max_luma * 100:.2f}%")
     measured = (f"Largest share outside EBU R 103 (limit 1% of the picture): {luma_part}, "
                 f"RGB gamut max {findings.max_gamut * 100:.2f}%")
+    note = _matrix_note(findings)
     problems = []
     if findings.luma:
         problems.append(_level_event_text("Luma", findings.luma))
@@ -1079,18 +1140,14 @@ def levels_entry(findings: LevelsFindings, mode: str, full_range: bool,
     if findings.range_hint:
         problems.append("Range: " + findings.range_hint)
     if not problems:
-        return "PASS", measured + ".", 100
-    detail = ". ".join(problems) + f". ({measured}.)"
-    if assumed_matrix and findings.gamut:
-        detail += (f" The colour matrix is not signalled; {assumed_matrix.upper().replace('BT', 'BT.')}"
-                   f" was assumed from the picture size.")
+        return "PASS", measured + "." + note, 100
+    detail = ". ".join(problems) + f". ({measured}.)" + note
     if mode == "report":
         return "PASS", "Not enforced: " + detail, 100
     peak = max([e.peak for e in findings.luma + findings.gamut] or [0.0])
     # Near the 1 % limit the result depends on the averaging approximation
     # of the R 103 filter: keep confidence below 70 there.
-    confident = (peak >= 2 * R103_AREA or bool(findings.range_hint and peak >= R103_AREA)) \
-        and not (assumed_matrix and findings.gamut and not findings.luma)
+    confident = peak >= 2 * R103_AREA or bool(findings.range_hint and peak >= R103_AREA)
     if mode == "essential":
         return "FAIL", detail, 85 if confident else 60
     return "WARN", detail, 80 if confident else 60
@@ -1473,13 +1530,13 @@ def _report_levels(result, config, series, analysis, fps, decoded, reason) -> No
         result.add_not_verified(LEVELS, reason)
         return
     full = analysis.info.full_range if analysis is not None else False
-    findings = assess_levels(series, fps, full)
+    matrices = analysis.info.gamut_matrices if analysis is not None else ()
+    findings = assess_levels(series, fps, full, matrices)
     result.set_metadata("levels_max_luma_pct", round(findings.max_luma * 100, 3))
     result.set_metadata("levels_max_gamut_pct", round(findings.max_gamut * 100, 3))
     if findings.range_hint:
         result.set_metadata("range_mismatch_suspected", True)
-    assumed = analysis.info.matrix if analysis is not None and analysis.info.matrix_assumed else None
-    _add(result, LEVELS, *levels_entry(findings, config.levels_mode, full, assumed))
+    _add(result, LEVELS, *levels_entry(findings, config.levels_mode, full))
 
 
 def _report_flash(result, config, series, analysis, fps, decoded, reason) -> None:
