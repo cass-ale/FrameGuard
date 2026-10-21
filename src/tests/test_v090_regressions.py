@@ -591,3 +591,26 @@ class TestReviewFollowUps:
         cfg = panel.get_config_overrides()
         assert cfg["loudness_mode"] == panel._defaults["loudness_mode"]
         assert cfg["allow_fps_multiples"] is bool(panel._defaults["allow_fps_multiples"])
+
+
+def test_0_9_1_checks_have_settings_controls(qapp):
+    """Every 0.9.1 check can be switched or tuned from Settings and the value
+    reaches the engine config."""
+    from frameguard.gui import SettingsPanel
+    panel = SettingsPanel()
+    cfg = panel.get_config_overrides()
+    for key in ("loudness_profile", "audio_clipping_check", "audio_dropout_check",
+                "audio_phase_check", "audio_dual_mono_check", "audio_dc_offset_check",
+                "audio_hum_check", "black_frames_enabled", "freeze_frames_enabled",
+                "signal_levels_mode", "flash_check_enabled", "interlace_check_enabled",
+                "allow_ntsc_rate_match", "require_square_pixels", "require_faststart",
+                "warn_untagged_color", "spatial_audio"):
+        assert key in cfg, key
+    panel._apply_preset_config({**cfg, "loudness_profile": "atsc_a85", "signal_levels_mode": "essential",
+                                "audio_hum_check": False, "allow_ntsc_rate_match": True})
+    after = panel.get_config_overrides()
+    assert after["loudness_profile"] == "atsc_a85"
+    assert after["signal_levels_mode"] == "essential"
+    assert after["audio_hum_check"] is False and after["allow_ntsc_rate_match"] is True
+    tolerance_help = [w for w in panel.findChildren(type(panel._rule_controls["allow_ntsc_rate_match"]))]
+    assert tolerance_help

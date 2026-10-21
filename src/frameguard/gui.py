@@ -695,9 +695,17 @@ def open_in_player(path: str) -> str:
 _UI_BACKED_CONFIG_KEYS = frozenset({
     "target_width", "target_height", "target_fps", "fps_tolerance",
     "min_bitrate_mbps", "audio_required", "silence_duration",
-    # The 0.9.0 strictness rules (see SettingsPanel._RULE_CONTROLS).
+    # The 0.9.0 strictness rules and the 0.9.1 checks (see
+    # SettingsPanel._RULE_CONTROLS).
     "allow_larger_resolution", "allow_fps_multiples", "require_progressive",
     "min_audio_sample_rate", "loudness_mode", "max_decode_errors",
+    "allow_ntsc_rate_match", "require_square_pixels", "require_faststart",
+    "warn_untagged_color", "spatial_audio",
+    "loudness_profile", "audio_clipping_check", "audio_dropout_check",
+    "audio_phase_check", "audio_dual_mono_check", "audio_dc_offset_check",
+    "audio_hum_check",
+    "black_frames_enabled", "freeze_frames_enabled", "signal_levels_mode",
+    "flash_check_enabled", "interlace_check_enabled",
 })
 
 # Upper bound on results kept in memory / rendered in the table.
@@ -3283,7 +3291,7 @@ class SettingsPanel(QWidget):
             key="delivery_fps_tolerance",
             title="FPS Tolerance",
             control=self._wrap_slider_with_value(self.fps_tol_slider, self.fps_tol_value),
-            description="Default: 0.5 fps. Accommodates NTSC drop-frame rates (29.97 counts as 30fps, 59.94 counts as 60fps). Captures report either exact or NTSC-equivalent frame rates.",
+            description="Default: 0.5 fps. Absorbs measurement jitter only: 29.97 and 30 fps are different rates unless \"Treat NTSC Rates as Integer\" is on.",
             resetter=lambda: self._set_float_slider(self.fps_tol_slider, 0.1, 2.0, 0.1, float(self._defaults.get("fps_tolerance", 0.5)))
         )
 
@@ -3337,6 +3345,11 @@ class SettingsPanel(QWidget):
 
         self._add_rule_controls(audio_layout, "audio")
         self._main_layout.addWidget(audio_box)
+
+        # --- Picture checks (0.9.1) ---
+        picture_box = self._make_group("Picture Checks")
+        self._add_rule_controls(picture_box.layout(), "picture")
+        self._main_layout.addWidget(picture_box)
 
         # --- Deep Scan ---
         scan_box = self._make_group("Verdicts")
@@ -3459,12 +3472,12 @@ class SettingsPanel(QWidget):
         
         # Mark advanced-only groups (hidden in simple mode).
         # Simple mode shows: Delivery Profile, Results, Appearance, Presets.
-        # Advanced mode adds: Audio Requirements, Deep Scan.
+        # Advanced mode adds: Audio Requirements, Picture Checks, Verdicts.
         #
         # Held by reference, not by position in _group_boxes: the old
         # index-based lookup silently pointed at the wrong groups as soon as
         # another _make_group() call was inserted anywhere above.
-        self._advanced_groups = [audio_box, scan_box]
+        self._advanced_groups = [audio_box, picture_box, scan_box]
 
         # Apply simple mode on startup (hide advanced groups)
         for group in self._advanced_groups:
@@ -3928,14 +3941,61 @@ class SettingsPanel(QWidget):
          "Accept integer multiples of the target frame rate, such as 60 fps for a 30 fps spec", None),
         ("delivery", "require_progressive", "bool", "Require Progressive",
          "Fail interlaced video", None),
+        ("delivery", "allow_ntsc_rate_match", "bool", "Treat NTSC Rates as Integer",
+         "Accept 23.976 / 29.97 / 59.94 fps for a 24 / 30 / 60 fps spec (they are different "
+         "rates: a 29.97 file in a 30 fps timeline drifts 3.6 s per hour)", None),
+        ("delivery", "require_square_pixels", "bool", "Require Square Pixels",
+         "Fail anamorphic (non-1:1) pixel aspect ratios, as headsets and most players need", None),
+        ("delivery", "require_faststart", "bool", "Require Fast Start",
+         "Warn when the MP4/MOV index is at the end of the file (it must come first to "
+         "start playing while streaming)", None),
+        ("delivery", "spatial_audio", "choice", "Spatial Audio",
+         "Require an ambisonic track with valid spatial (SA3D) metadata for 360 deliverables",
+         (("any", "Not required"), ("required", "Required"))),
+        ("delivery", "warn_untagged_color", "bool", "Warn on Untagged Colour",
+         "Warn when a file carries no colour primaries, transfer or matrix tags, so players "
+         "have to guess", None),
         ("audio", "min_audio_sample_rate", "choice", "Min Sample Rate",
          "Lowest sample rate accepted on every audio track",
          ((32000, "32 kHz"), (44100, "44.1 kHz"), (48000, "48 kHz"), (96000, "96 kHz"))),
-        ("audio", "loudness_mode", "choice", "Loudness",
-         "EBU R128 integrated loudness and true peak. Report only measures; the other "
-         "options compare against the target (-23 LUFS, true peak -1 dBTP by default)",
+        ("audio", "loudness_profile", "choice", "Loudness Target",
+         "The delivery standard loudness, true peak and (for broadcast targets) the 48 kHz "
+         "sample rate are judged against",
+         (("ebu_r128", "EBU R 128 (-23 LUFS ±0.5, -1 dBTP, 48 kHz)"),
+          ("atsc_a85", "ATSC A/85 (-24 ±2, -2 dBTP, 48 kHz)"),
+          ("netflix", "Netflix (-27, programme loudness, -2 dBTP, 48 kHz)"),
+          ("streaming", "Streaming -14 (±1, -1 dBTP)"),
+          ("streaming_16", "Streaming -16 (±1, -1 dBTP)"),
+          ("custom", "Custom (preset values)"))),
+        ("audio", "loudness_mode", "choice", "Loudness Enforcement",
+         "Report only measures loudness, true peak and clipping without judging them (camera "
+         "originals rarely meet broadcast targets). Warn or Fail compare them, and the broadcast "
+         "sample rate, against the Loudness Target",
          (("report", "Report only"), ("advisory", "Warn outside target"),
           ("essential", "Fail outside target"), ("off", "Off"))),
+        ("audio", "audio_clipping_check", "bool", "Clipping",
+         "Count runs of three or more samples at full scale (judged per Loudness Enforcement)", None),
+        ("audio", "audio_dropout_check", "bool", "Dropouts",
+         "Warn on short drops to digital silence (5 ms to 2 s) inside active audio", None),
+        ("audio", "audio_phase_check", "bool", "Phase",
+         "Warn when left and right are out of phase for a second or more", None),
+        ("audio", "audio_dual_mono_check", "bool", "Dual Mono",
+         "Warn when a stereo track carries the same signal on both channels", None),
+        ("audio", "audio_dc_offset_check", "bool", "DC Offset", "Warn on a DC offset above -50 dBFS", None),
+        ("audio", "audio_hum_check", "bool", "Hum", "Warn on a steady 50 / 60 Hz mains hum", None),
+        ("picture", "black_frames_enabled", "bool", "Black Frames",
+         "Find black sections (0.3 s or longer) and isolated short black flashes", None),
+        ("picture", "freeze_frames_enabled", "bool", "Freeze Frames",
+         "Find held pictures of a second or longer, including in long-GOP encodes", None),
+        ("picture", "signal_levels_mode", "choice", "Signal Levels (EBU R 103)",
+         "Luma outside 5-246 or RGB outside -5…105% on more than 1% of the picture. "
+         "Broadcast deliveries usually fail on it; other targets only need a warning",
+         (("advisory", "Warn"), ("essential", "Fail"), ("report", "Report only"), ("off", "Off"))),
+        ("picture", "flash_check_enabled", "bool", "Flash Risk (BT.1702)",
+         "Warn on more than three large flashes in a second. A screening aid, not a "
+         "photosensitivity certificate (that needs a Harding FPA test)", None),
+        ("picture", "interlace_check_enabled", "bool", "Interlace Detection",
+         "Warn on combing in video declared progressive and on a wrong field order", None),
         ("verdicts", "max_decode_errors", "int", "Allowed Decode Errors",
          "Decoder errors tolerated before File Integrity fails (0 = none)", (0, 1_000_000)),
     )
@@ -5820,7 +5880,7 @@ class MainWindow(QMainWindow):
                         break
             elif not str(combo.currentData() or "").startswith("imported:"):
                 # Don't yank the user out of an imported preset just because it
-                # doesn't correspond to one of the nine built-ins.
+                # doesn't correspond to one of the built-ins.
                 combo.setCurrentIndex(0)  # "Custom (config defaults)" is first item
         finally:
             combo.blockSignals(was_blocked)
