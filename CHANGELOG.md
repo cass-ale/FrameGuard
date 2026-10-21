@@ -38,6 +38,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 - Default black-frame level 0.10 → 0.02 and duration 0.5 → 0.3 s; freeze duration 2 → 1 s. freeze_detect_noise is retired (old presets still load).
 - Deep scans read the coded picture without auto-rotation (cheaper on rotated 4K, needed for interlace detection).
+- Loudness checks set to "Warn" or "Fail outside target" now judge against a delivery profile, EBU R 128 by default (−23 LUFS ±0.5 LU, true peak −1 dBTP, 48 kHz audio required), instead of 0.9.0's −23 LUFS ±2 LU; choose ATSC A/85, Netflix, Streaming −14/−16 or Custom in Settings. Clipping is graded the same way, and "Report only" (the default) still judges nothing.
+- A/V Sync Offset flags audio and video that start at different times in the container: a warning beyond ±5 ms (DPP file tolerance), a failure beyond EBU R37's 40 ms sound-early / 60 ms sound-late budget. This catches MP4/MOV files with B-frame video written without an edit list, whose first picture really is presented after the sound; AAC whose encoder priming is not signalled is judged at the most favourable priming, so such files usually warn. FFmpeg-written MPEG-TS and camera originals are unaffected.
+- On Apple Silicon, loudness of tracks with 7 or more channels is shown as not verified when a loudness target is enforced (the bundled meter misreads them and the fallback meter handles up to six channels); true peak is still measured. Intel Macs and Windows measure them normally.
+- Deep scans write their filter graphs and detector events to the scan's private temporary folder (removed afterwards), so files with many audio tracks scan on Windows and very long programmes keep every event.
 
 ## [0.9.0] — 2026-10-21 — New identity, stricter verdicts and a deeper app
 
