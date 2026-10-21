@@ -6,3 +6,7 @@
 # convert them to CRLF, which breaks the shebang on macOS/Linux — and
 # fails the line-ending tests on Windows CI.
 *.sh text eol=lf
+
+# Generated SVG brand masters: keep LF so the --check comparison is identical
+# on every checkout.
+*.svg text eol=lf

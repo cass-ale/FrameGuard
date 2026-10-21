@@ -161,7 +161,9 @@ class TestThemedAppIcon:
         rows = {parts[1]: parts for parts in (line.split() for line in completed.stdout.splitlines())
                 if parts and parts[0] == "ICON"}
         from PySide6.QtGui import QColor
-        assert int(rows["Blue_Hour"][2]) >= 1024 and int(rows["Clean_Light"][2]) >= 1024
+        # AppKit keeps its own copy at the screen's scale: 1024 px on Retina,
+        # 512 px on a 1x display (CI). Qt alone handed it 32 px.
+        assert int(rows["Blue_Hour"][2]) >= 512 and int(rows["Clean_Light"][2]) >= 512
         assert QColor(rows["Blue_Hour"][3]).lightness() < 80
         assert QColor(rows["Clean_Light"][3]).lightness() > 200
 
@@ -458,8 +460,17 @@ class TestSingleInstance:
             assert server.is_listening()
             clip = tmp_path / "take one.mov"
             clip.write_bytes(b"\0")
-            assert gui._forward_to_running_instance([str(clip)]) is True
-            assert _wait_for(qapp, lambda: received == [str(clip)])
+            # The second launch is another process; run the client off the GUI
+            # thread so this event loop can accept and read (Windows pipes
+            # have no buffer, so a same-thread write would never complete).
+            import threading
+            outcome = {}
+            client = threading.Thread(target=lambda: outcome.update(
+                ok=gui._forward_to_running_instance([str(clip)], timeout_ms=5000)))
+            client.start()
+            assert _wait_for(qapp, lambda: received == [str(clip)] and not client.is_alive())
+            client.join(5)
+            assert outcome.get("ok") is True
         finally:
             server.deleteLater()
 

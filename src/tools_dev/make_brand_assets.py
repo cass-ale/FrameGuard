@@ -150,6 +150,8 @@ def _same_image(a: QImage, b: QImage) -> bool:
 
 def _same_svg(a: bytes, b: bytes) -> bool:
     import re
+    # A Windows checkout may convert line endings (core.autocrlf).
+    a, b = a.replace(b"\r\n", b"\n"), b.replace(b"\r\n", b"\n")
     num = re.compile(rb"-?\d+(?:\.\d+)?")
     if num.sub(b"#", a) != num.sub(b"#", b):
         return False

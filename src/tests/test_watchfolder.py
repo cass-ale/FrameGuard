@@ -83,21 +83,14 @@ class TestFileFiltering:
 
 
 class TestExclusiveOpenProbe:
-    def test_reports_available_when_host_operations_succeed(self, monkeypatch):
-        if os.name == "nt":
-            calls = []
-            monkeypatch.setattr(W.os, "open", lambda _path, _flags: 41)
-            monkeypatch.setattr(
-                W.os, "close", lambda handle: calls.append(("close", handle)))
-            monkeypatch.setattr(
-                W.os, "rename",
-                lambda src, dst: calls.append(("rename", src, dst)))
+    # Windows uses a real share-mode-0 CreateFileW (0.9.0), so it is exercised
+    # against real files there; POSIX only proves the file is readable.
 
-            assert _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
-            assert calls == [
-                ("close", 41),
-                ("rename", "clip.mp4", "clip.mp4"),
-            ]
+    def test_reports_available_when_host_operations_succeed(self, monkeypatch, tmp_path):
+        if os.name == "nt":
+            clip = tmp_path / "clip.mp4"
+            clip.write_bytes(b"\0" * 64)
+            assert _REAL_CAN_OPEN_EXCLUSIVELY(str(clip))
         else:
             opened = mock_open()
             monkeypatch.setattr("builtins.open", opened)
@@ -105,26 +98,24 @@ class TestExclusiveOpenProbe:
             assert _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
             opened.assert_called_once_with("clip.mp4", "rb")
 
-    def test_reports_locked_when_host_refuses_access(self, monkeypatch):
+    def test_reports_locked_when_host_refuses_access(self, monkeypatch, tmp_path):
+        if os.name == "nt":
+            clip = tmp_path / "clip.mp4"
+            clip.write_bytes(b"\0" * 64)
+            with open(clip, "rb"):  # another handle: an exclusive open must fail
+                assert not _REAL_CAN_OPEN_EXCLUSIVELY(str(clip))
+            assert _REAL_CAN_OPEN_EXCLUSIVELY(str(clip))
+            return
+
         def refuse(*_args, **_kwargs):
             raise PermissionError("simulated sharing violation")
 
-        if os.name == "nt":
-            monkeypatch.setattr(W.os, "open", lambda _path, _flags: 41)
-            monkeypatch.setattr(W.os, "close", lambda _handle: None)
-            monkeypatch.setattr(W.os, "rename", refuse)
-        else:
-            monkeypatch.setattr("builtins.open", refuse)
-
+        monkeypatch.setattr("builtins.open", refuse)
         assert not _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
 
     @pytest.mark.skipif(os.name != "nt", reason="Windows sharing semantics")
-    def test_windows_open_denial_reports_locked(self, monkeypatch):
-        def refuse_open(*_args, **_kwargs):
-            raise PermissionError("simulated open denial")
-
-        monkeypatch.setattr(W.os, "open", refuse_open)
-        assert not _REAL_CAN_OPEN_EXCLUSIVELY("clip.mp4")
+    def test_windows_missing_file_reports_unavailable(self, tmp_path):
+        assert not _REAL_CAN_OPEN_EXCLUSIVELY(str(tmp_path / "missing.mp4"))
 
 
 class TestManualCompleteness:
