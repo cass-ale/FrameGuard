@@ -88,8 +88,12 @@ class TestExclusiveOpenProbe:
 
     def test_reports_available_when_host_operations_succeed(self, monkeypatch, tmp_path):
         if os.name == "nt":
+            import time
             clip = tmp_path / "clip.mp4"
             clip.write_bytes(b"\0" * 64)
+            deadline = time.monotonic() + 3.0  # antivirus may hold a new file briefly
+            while not _REAL_CAN_OPEN_EXCLUSIVELY(str(clip)) and time.monotonic() < deadline:
+                time.sleep(0.1)
             assert _REAL_CAN_OPEN_EXCLUSIVELY(str(clip))
         else:
             opened = mock_open()
@@ -104,6 +108,12 @@ class TestExclusiveOpenProbe:
             clip.write_bytes(b"\0" * 64)
             with open(clip, "rb"):  # another handle: an exclusive open must fail
                 assert not _REAL_CAN_OPEN_EXCLUSIVELY(str(clip))
+            # Released again. Antivirus may scan the file for a moment after
+            # the handle closes, so allow a short retry window.
+            import time
+            deadline = time.monotonic() + 3.0
+            while not _REAL_CAN_OPEN_EXCLUSIVELY(str(clip)) and time.monotonic() < deadline:
+                time.sleep(0.1)
             assert _REAL_CAN_OPEN_EXCLUSIVELY(str(clip))
             return
 
