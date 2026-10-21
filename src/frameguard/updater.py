@@ -56,6 +56,14 @@ _LOCAL_COPY_POLL_SECONDS = 0.05
 _LOCAL_COPY_STOP_SECONDS = 1.0
 _MIN_FREE_SPACE_BYTES = 64 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# Inno Setup arguments for the in-app Windows update. FrameGuard has already
+# quit when Setup runs, so nothing may wait for a click: /SILENT shows only
+# progress, /SUPPRESSMSGBOXES answers any SuppressibleMsgBox with its default
+# (installer.iss also skips its prompts when WizardSilent), /NORESTART stops
+# a suppressed "restart now?" from rebooting the machine, and
+# /RESTARTAPPLICATIONS tells installer.iss to relaunch FrameGuard afterwards.
+WINDOWS_INSTALLER_ARGS = (
+    "/SILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/RESTARTAPPLICATIONS")
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
@@ -1183,7 +1191,7 @@ class UpdateManager(QObject):
 
             self._emit(self.status_changed, "Launching installer...")
             subprocess.Popen(
-                [dest, "/SILENT", "/RESTARTAPPLICATIONS"],
+                [dest, *WINDOWS_INSTALLER_ARGS],
                 creationflags=(subprocess.DETACHED_PROCESS
                                if sys.platform == "win32" else 0),
             )

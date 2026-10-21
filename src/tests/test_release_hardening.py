@@ -188,3 +188,147 @@ class TestPinnedBuildTools:
             "download_tools.py", "--platform", "windows", "--dest", str(dest)])
         assert m.main() == 1
         assert not dest.exists() or list(dest.iterdir()) == []
+
+
+def _pascal_calls(source: str, name: str):
+    """Top-level argument lists of every `name(...)` call in Pascal source.
+
+    Understands single-quoted strings (with '' escapes) so commas and
+    parentheses inside message text do not split arguments.
+    """
+    calls = []
+    for match in re.finditer(rf"\b{name}\s*\(", source):
+        index = match.end()
+        depth, args, current, in_string = 1, [], [], False
+        while depth:
+            char = source[index]
+            if in_string:
+                current.append(char)
+                if char == "'":
+                    in_string = False
+            elif char == "'":
+                in_string = True
+                current.append(char)
+            elif char == "(":
+                depth += 1
+                current.append(char)
+            elif char == ")":
+                depth -= 1
+                if depth:
+                    current.append(char)
+            elif char == "," and depth == 1:
+                args.append("".join(current).strip())
+                current = []
+            else:
+                current.append(char)
+            index += 1
+        args.append("".join(current).strip())
+        calls.append((match.start(), args))
+    return calls
+
+
+class TestSilentWindowsUpdate:
+    """C-M1: the in-app Windows update never stops at a message box after
+    FrameGuard has quit."""
+
+    @staticmethod
+    def _iss():
+        return (SRC / "installer.iss").read_text(encoding="utf-8-sig")
+
+    @staticmethod
+    def _code_section(iss):
+        return iss[iss.index("[Code]"):]
+
+    def test_updater_launches_setup_silently_without_message_boxes(
+            self, qapp, monkeypatch, tmp_path):
+        from frameguard import updater as U
+
+        body = b"installer"
+        stage = tmp_path / "stage"
+        launched = []
+
+        class _Response:
+            status = 200
+            headers = {"Content-Length": str(len(body))}
+
+            def __init__(self):
+                import io
+                self._io = io.BytesIO(body)
+
+            def read(self, size=-1):
+                return self._io.read(size)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        monkeypatch.setattr(U.tempfile, "mkdtemp", lambda **_k: str(stage))
+        monkeypatch.setattr(U.sys, "platform", "win32")
+        monkeypatch.setattr(U.subprocess, "DETACHED_PROCESS", 0x8, raising=False)
+        monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_k: _Response())
+        monkeypatch.setattr(
+            U.subprocess, "Popen",
+            lambda command, **kwargs: launched.append((command, kwargs)))
+        manager = U.UpdateManager()
+        info = U.UpdateInfo(
+            version="9.9.9",
+            installer_path="https://example.test/FrameGuardInstaller.exe",
+            sha256=hashlib.sha256(body).hexdigest(), size_bytes=len(body),
+            asset_name="FrameGuardInstaller.exe")
+
+        manager._do_apply(info)
+
+        assert len(launched) == 1
+        command, kwargs = launched[0]
+        assert command == [str(stage / "FrameGuardInstaller.exe"), "/SILENT",
+                           "/SUPPRESSMSGBOXES", "/NORESTART",
+                           "/RESTARTAPPLICATIONS"]
+        assert kwargs["creationflags"] == 0x8
+
+    def test_relaunch_check_matches_the_updater_arguments(self):
+        from frameguard.updater import WINDOWS_INSTALLER_ARGS
+
+        code = self._code_section(self._iss())
+        assert "WizardSilent and" in code
+        assert "Pos('/RESTARTAPPLICATIONS', Uppercase(GetCmdTail))" in code
+        assert "/RESTARTAPPLICATIONS" in WINDOWS_INSTALLER_ARGS
+        assert {"/SILENT", "/SUPPRESSMSGBOXES"} <= set(WINDOWS_INSTALLER_ARGS)
+
+    def test_every_installer_message_box_is_suppressible_with_a_default(self):
+        code = self._code_section(self._iss())
+        bare = [m.start() for m in re.finditer(r"(?<!Suppressible)\bMsgBox\s*\(", code)]
+        assert bare == [], "MsgBox ignores /SUPPRESSMSGBOXES; use SuppressibleMsgBox"
+        calls = _pascal_calls(code, "SuppressibleMsgBox")
+        assert len(calls) >= 4
+        for _offset, args in calls:
+            assert len(args) == 4, args
+            assert args[1].startswith("mb"), args
+            assert re.fullmatch(r"ID[A-Z]+", args[3]), args
+
+    def test_upgrade_and_repair_prompts_are_skipped_when_silent(self):
+        code = self._code_section(self._iss())
+        init = code[code.index("function InitializeSetup"):
+                    code.index("procedure CurStepChanged")]
+        guard = init.index("(not WizardSilent) and")
+        registry = init.index("RegQueryStringValue(HKEY_CURRENT_USER")
+        repair = init.index("is already installed.")
+        upgrade = init.index("will be updated from v")
+        assert guard < registry < repair < upgrade
+        # The repair question defaults to Yes so an unattended same-version
+        # install still repairs instead of silently aborting.
+        repair_call = next(args for offset, args in
+                           _pascal_calls(init, "SuppressibleMsgBox")
+                           if "is already installed." in args[0])
+        assert repair_call[3] == "IDYES"
+
+    def test_post_install_and_uninstall_prompts_are_skipped_when_silent(self):
+        code = self._code_section(self._iss())
+        post = code[code.index("procedure CurStepChanged"):
+                    code.index("procedure CurUninstallStepChanged")]
+        assert "(not WizardSilent) and (not FileExists(FFmpegPath))" in post
+        uninstall = code[code.index("procedure CurUninstallStepChanged"):]
+        assert "(not UninstallSilent) and DirExists(ExportPath)" in uninstall
+        delete_call = _pascal_calls(uninstall, "SuppressibleMsgBox")[0][1]
+        assert delete_call[3] == "IDNO", "a suppressed prompt must keep reports"
