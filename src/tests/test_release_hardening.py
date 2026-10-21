@@ -458,3 +458,117 @@ class TestReleaseNotes:
             in workflow
         assert 'data.get("changelog"' not in workflow
         assert "path: release-notes.md" in workflow
+
+
+class TestOsNativeTls:
+    """C-M3: update traffic is verified by the operating system (truststore),
+    never by loading keychain certificates as roots."""
+
+    @staticmethod
+    def _assert_verifying(context):
+        import ssl
+        assert isinstance(context, ssl.SSLContext)
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+
+    def test_truststore_context_is_used_when_available(self):
+        truststore = pytest.importorskip("truststore")
+        from frameguard import updater as U
+
+        context = U.https_context()
+        assert isinstance(context, truststore.SSLContext)
+        self._assert_verifying(context)
+
+    def test_updatesource_uses_the_same_os_native_context(self):
+        truststore = pytest.importorskip("truststore")
+        from frameguard import updatesource
+
+        assert isinstance(updatesource._https_context(), truststore.SSLContext)
+
+    def test_missing_truststore_falls_back_to_a_verifying_default(
+            self, monkeypatch):
+        import sys
+        from frameguard import updater as U
+
+        monkeypatch.setitem(sys.modules, "truststore", None)  # ImportError
+        context = U.https_context()
+        assert type(context).__module__ == "ssl"
+        self._assert_verifying(context)
+
+    def test_unusable_truststore_falls_back_to_a_verifying_default(
+            self, monkeypatch):
+        import sys
+        import types
+        from frameguard import updater as U
+
+        broken = types.ModuleType("truststore")
+
+        def _fail(*_a, **_k):
+            raise OSError("Security framework unavailable")
+        broken.SSLContext = _fail
+        monkeypatch.setitem(sys.modules, "truststore", broken)
+        context = U.https_context()
+        assert type(context).__module__ == "ssl"
+        self._assert_verifying(context)
+
+    def test_truststore_backend_failing_at_import_falls_back(self, monkeypatch):
+        import builtins
+        import sys
+        from frameguard import updater as U
+
+        real_import = builtins.__import__
+
+        def _import(name, *args, **kwargs):
+            if name == "truststore":
+                raise OSError("Security framework failed to load")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.delitem(sys.modules, "truststore", raising=False)
+        monkeypatch.setattr(builtins, "__import__", _import)
+        context = U.https_context()
+        assert type(context).__module__ == "ssl"
+        self._assert_verifying(context)
+
+    @pytest.mark.parametrize("truststore_available", [True, False])
+    def test_keychain_certificates_are_never_added_as_roots(
+            self, monkeypatch, truststore_available):
+        """A certificate an administrator marked never-trust (or merely
+        imported) in System.keychain must not become a trusted root: no
+        keychain is read and no certificate data is loaded, on any path."""
+        import ssl
+        import sys
+        from frameguard import updater as U
+
+        if not truststore_available:
+            monkeypatch.setitem(sys.modules, "truststore", None)
+        monkeypatch.setattr(U.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            U.subprocess, "run",
+            mock.Mock(side_effect=AssertionError("keychain was read")))
+        loaded = []
+        original = ssl.SSLContext.load_verify_locations
+
+        def _record(self, cafile=None, capath=None, cadata=None):
+            loaded.append((cafile, capath, cadata))
+            return original(self, cafile=cafile, capath=capath, cadata=cadata)
+
+        monkeypatch.setattr(ssl.SSLContext, "load_verify_locations", _record)
+        U.https_context()
+        assert all(cadata is None for _cafile, _capath, cadata in loaded)
+        assert all(capath is None for _cafile, capath, _cadata in loaded)
+        assert all(cafile is None or "certifi" in cafile
+                   for cafile, _capath, _cadata in loaded)
+
+    def test_keychain_trust_fallback_is_gone(self):
+        source = (SRC / "frameguard" / "updater.py").read_text(encoding="utf-8")
+        for marker in ("System.keychain", "find-certificate",
+                       "include_admin", "cadata="):
+            assert marker not in source, marker
+        delta = (SRC / "frameguard" / "updatesource.py").read_text(encoding="utf-8")
+        assert "include_admin" not in delta
+
+    def test_truststore_is_a_pinned_runtime_dependency(self):
+        requirements = (SRC / "requirements.txt").read_text(encoding="utf-8")
+        constraints = (SRC / "constraints-3.12.txt").read_text(encoding="utf-8")
+        assert re.search(r"^truststore>=0\.10\.5,<1\.0$", requirements, re.M)
+        assert re.search(r"^truststore==0\.10\.5$", constraints, re.M)

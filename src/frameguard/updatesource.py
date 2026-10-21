@@ -38,7 +38,7 @@ from typing import Optional
 def _https_context():
     """Trust what the OS trusts (see frameguard.updater.https_context)."""
     from frameguard.updater import https_context
-    return https_context(include_admin=True)
+    return https_context()
 
 from frameguard import manifest as M
 

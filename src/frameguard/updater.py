@@ -106,90 +106,23 @@ _LOCAL_COPY_WORKER_TARGET = _copy_local_installer_worker
 # ---------------------------------------------------------------------------
 # HTTPS trust
 # ---------------------------------------------------------------------------
-# The frozen macOS app bundles python.org's OpenSSL, whose CA search path is
-# /Library/Frameworks/Python.framework/Versions/3.12/etc/openssl/cert.pem. That
-# file exists only on Macs with python.org Python *and* its "Install
-# Certificates" step, so on a normal Mac every HTTPS request failed
-# verification. check_github_for_update() swallowed the error and the app
-# reported "Up to date" forever. macOS trust lives in the system keychains, so
-# load their roots (plus any certificate an administrator installed, e.g. a
-# corporate TLS-inspection root) into the context explicitly. Windows already
-# reads the system certificate store through ssl.create_default_context().
-_ROOT_KEYCHAIN = "/System/Library/Keychains/SystemRootCertificates.keychain"
-_ADMIN_KEYCHAIN = "/Library/Keychains/System.keychain"
-_KEYCHAINS = (_ROOT_KEYCHAIN,)
-_macos_pem_cache: Optional[List[str]] = None
-_macos_admin_pem_cache: Optional[List[str]] = None
-_macos_pem_lock = threading.Lock()
+# Certificate verification is delegated to the operating system through
+# `truststore`: Security.framework on macOS (which honours keychain trust
+# settings, including roots an administrator trusted for a corporate proxy
+# and certificates explicitly marked never-trust) and CryptoAPI on Windows.
+#
+# The frozen macOS app bundles python.org's OpenSSL, whose CA file does not
+# exist on a normal Mac, so plain OpenSSL verification fails there. Earlier
+# releases worked around that by loading every certificate in the System
+# keychain as a trusted root, which also trusted certificates that were only
+# imported, or explicitly distrusted. That workaround is gone and keychain
+# certificates are never loaded as roots. Without truststore the context
+# falls back to OpenSSL's default store, plus certifi's bundle if installed;
+# either way it requires a valid chain and a matching hostname.
 
 
-def _macos_keychain_certificates(include_admin: bool = False) -> List[str]:
-    """PEM certificates from the macOS keychains (cached per process).
-
-    Apple's root store by default. ``include_admin`` adds certificates an
-    administrator installed in the System keychain; that keychain can also
-    hold certificates that were imported but never marked trusted, so it is
-    only consulted after verification against Apple's roots has failed
-    (e.g. behind a corporate TLS-inspection proxy).
-    """
-    global _macos_pem_cache, _macos_admin_pem_cache
-    with _macos_pem_lock:
-        cached = _macos_admin_pem_cache if include_admin else _macos_pem_cache
-        if cached is not None:
-            return cached
-        certificates: List[str] = []
-        failed = False
-        security = "/usr/bin/security"
-        keychains = (_ROOT_KEYCHAIN, _ADMIN_KEYCHAIN) if include_admin else (_ROOT_KEYCHAIN,)
-        if os.path.exists(security):
-            for keychain in keychains:
-                if not os.path.exists(keychain):
-                    continue
-                try:
-                    completed = subprocess.run(
-                        [security, "find-certificate", "-a", "-p", keychain],
-                        capture_output=True, text=True, timeout=15, check=False)
-                except Exception:
-                    # Never let trust-store discovery break an update check;
-                    # the default context still applies. Retry next time.
-                    failed = True
-                    continue
-                for block in completed.stdout.split("-----END CERTIFICATE-----"):
-                    start = block.find("-----BEGIN CERTIFICATE-----")
-                    if start >= 0:
-                        certificates.append(
-                            block[start:] + "-----END CERTIFICATE-----\n")
-        if certificates or not failed:
-            if include_admin:
-                _macos_admin_pem_cache = certificates
-            else:
-                _macos_pem_cache = certificates
-        return certificates
-
-
-def _is_certificate_failure(error: BaseException) -> bool:
-    reason = getattr(error, "reason", error)
-    return isinstance(reason, ssl.SSLCertVerificationError) or isinstance(
-        error, ssl.SSLCertVerificationError)
-
-
-def _urlopen_verified(request, timeout: float):
-    """urlopen with OS trust; on macOS retry once with admin-installed roots."""
-    import urllib.request
-
-    try:
-        return urllib.request.urlopen(
-            request, timeout=timeout, context=https_context())
-    except Exception as error:
-        if sys.platform != "darwin" or not _is_certificate_failure(error):
-            raise
-        return urllib.request.urlopen(
-            request, timeout=timeout,
-            context=https_context(include_admin=True))
-
-
-def https_context(include_admin: bool = False) -> ssl.SSLContext:
-    """A verifying TLS context that trusts what the operating system trusts."""
+def _fallback_https_context() -> ssl.SSLContext:
+    """OpenSSL default verification, extended with certifi when present."""
     try:
         context = ssl.create_default_context()
     except Exception:
@@ -200,14 +133,36 @@ def https_context(include_admin: bool = False) -> ssl.SSLContext:
             context.set_default_verify_paths()
         except Exception:
             pass
-    if sys.platform == "darwin":
-        for pem in _macos_keychain_certificates(include_admin):
-            try:
-                context.load_verify_locations(cadata=pem)
-            except (ssl.SSLError, ValueError):
-                # One unparsable keychain item must not discard the rest.
-                continue
+    try:
+        import certifi
+        context.load_verify_locations(cafile=certifi.where())
+    except Exception:
+        pass  # certifi is optional; the default store still applies
     return context
+
+
+def https_context() -> ssl.SSLContext:
+    """A verifying TLS client context that trusts what the OS trusts."""
+    try:
+        import truststore
+    except Exception:
+        # Not installed, or its OS backend failed to load at import time
+        # (truststore loads Security.framework / crypt32 when imported).
+        truststore = None
+    if truststore is not None:
+        try:
+            return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        except Exception:
+            pass  # e.g. the OS trust API is unavailable; verify with OpenSSL
+    return _fallback_https_context()
+
+
+def _urlopen_verified(request, timeout: float):
+    """urlopen with OS-native certificate verification."""
+    import urllib.request
+
+    return urllib.request.urlopen(
+        request, timeout=timeout, context=https_context())
 
 
 class UpdateCheckError(RuntimeError):

@@ -225,21 +225,8 @@ class TestUpdaterTrustAndFailures:
         assert context.verify_mode == ssl.CERT_REQUIRED
         assert context.check_hostname is True
 
-    @pytest.mark.skipif(sys.platform != "darwin", reason="macOS keychain only")
-    def test_macos_context_loads_system_keychain_roots(self):
-        from frameguard import updater as U
-        U._macos_pem_cache = None
-        assert U._macos_keychain_certificates(), "no roots read from the system keychains"
-        assert U.https_context().cert_store_stats()["x509_ca"] > 0
-
-    def test_keychain_discovery_failure_never_breaks_a_check(self, monkeypatch):
-        from frameguard import updater as U
-        monkeypatch.setattr(U, "_macos_pem_cache", None)
-        monkeypatch.setattr(U.os.path, "exists", lambda _p: True)
-        monkeypatch.setattr(U.subprocess, "run",
-                            mock.Mock(side_effect=TypeError("patched Popen")))
-        assert U._macos_keychain_certificates() == []
-        assert U._macos_pem_cache is None   # retried next time, not cached
+    # OS-native trust (truststore) replaced the keychain-loading context;
+    # see TestOsNativeTls in test_release_hardening.py.
 
     def test_unreachable_github_reports_failure_not_up_to_date(self, qapp, monkeypatch):
         from frameguard import updater as U
