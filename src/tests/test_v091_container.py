@@ -6,6 +6,7 @@ file runs well under a minute.
 """
 
 import struct
+from pathlib import Path
 
 import pytest
 
@@ -241,7 +242,7 @@ class TestTimecode:
         first = _mpeg2(tmp_path / "a.m2v", "01:00:00:00")
         second = _mpeg2(tmp_path / "b.m2v", "05:00:00:00")
         listing = tmp_path / "list.txt"
-        listing.write_text(f"file '{first}'\nfile '{second}'\n")
+        listing.write_text("".join(f"file '{Path(p).as_posix()}'\n" for p in (first, second)))
         mov = tmp_path / "jump.mov"
         ffmpeg("-f", "concat", "-safe", "0", "-i", str(listing), "-c", "copy", str(mov))
         check = _row(_scan(mov, audio_required=False), "Timecode")
