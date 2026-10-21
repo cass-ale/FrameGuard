@@ -25,6 +25,7 @@ import math
 import os
 import re
 import struct
+import subprocess
 from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import Dict, List, Optional, Tuple
@@ -1578,7 +1579,8 @@ def _bounds(video: dict, v2: Optional[dict]) -> Tuple[float, float, float, float
 
 
 def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optional[str],
-                         structure: Optional[Structure], cfg: dict) -> Tuple[List[str], List[str], List[str]]:
+                         structure: Optional[Structure], cfg: dict, grabber: Optional["FrameGrabber"] = None,
+                         duration: Optional[float] = None) -> Tuple[List[str], List[str], List[str]]:
     """(failures, warnings, notes) beyond what the spec's projection/stereo fields enforce.
 
     Failures arise only when the spec requires a projection (an XR delivery
@@ -1613,6 +1615,10 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
         notes.append(f"initial view yaw {yaw:g}°, pitch {pitch:g}°, roll {roll:g}°")
     if projection == "equirectangular":
         _equirect_geometry(video, stereo, v2, cfg, flag, hard, notes)
+    if projection or enforced:
+        content = _content_layout_finding(video, stereo, grabber, duration)
+        if content:
+            soft.append(content)
     return hard, soft, notes
 
 
@@ -1654,6 +1660,141 @@ def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], c
                  f"each eye is {ratio:.2f}:1, a {cover} equirect is {expected:.2f}:1")
     if layout == "side_by_side" and span_h >= 359.9:
         flag("360° stereo is tagged side-by-side; Meta Quest and YouTube take 360° stereo only as top-bottom")
+
+
+# ---------------------------------------------------------------------------
+# Stereo layout from the picture (advisory, content-dependent)
+# ---------------------------------------------------------------------------
+
+LAYOUT_GRAB_SIZE = (384, 192)
+LAYOUT_SHIFT = 8          # horizontal disparity searched, in grab pixels
+LAYOUT_MATCH = 0.9        # top and bottom halves this alike are two views of one scene
+LAYOUT_MARGIN = 0.15      # ...and clearly more alike than the left/right halves
+LAYOUT_MIN_DETAIL = 2.0   # gradient RMS below this is a flat frame: no evidence
+
+
+class FrameGrabber:
+    """Decodes a downscaled grey frame on demand, at most a few per file.
+
+    Used only for files that declare spherical video (or face an XR spec),
+    so flat deliverables pay nothing. Registered with the scan owner like
+    every other subprocess so Cancel stops it.
+    """
+
+    def __init__(self, path: str, process_owner=None, cancel_event=None):
+        self.path, self.process_owner, self.cancel_event = path, process_owner, cancel_event
+
+    def gray(self, stream_index: int, at: float) -> Optional[List[float]]:
+        core = _core()
+        ffmpeg = core.get_ffmpeg_path()
+        if not ffmpeg or (self.cancel_event is not None and self.cancel_event.is_set()):
+            return None
+        width, height = LAYOUT_GRAB_SIZE
+        # -noaccurate_seek returns the keyframe at or before ``at``: one
+        # frame is decoded instead of a GOP's worth.
+        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-v", "error", "-noaccurate_seek", "-ss", f"{max(0.0, at):.3f}",
+               "-i", self.path, "-map", f"0:{stream_index}", "-frames:v", "1", "-an", "-sn", "-dn",
+               "-vf", f"scale={width}:{height}:flags=area,format=gray", "-f", "rawvideo", "-"]
+        kwargs = {k: v for k, v in core._subprocess_kwargs().items() if k not in ("encoding", "errors")}
+        proc = None
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=core._get_clean_env(), **kwargs)
+            core._register_owned_proc(proc, self.process_owner)
+            data, _ = proc.communicate(timeout=60)
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"frame grab failed: {type(exc).__name__}: {exc}") from exc
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            return None
+        finally:
+            if proc is not None:
+                core._unregister_owned_proc(proc, self.process_owner)
+        if proc.returncode != 0 or len(data) != width * height:
+            return None
+        return [float(b) for b in data]
+
+
+def _gradient(pixels: List[float], width: int, height: int) -> List[float]:
+    """|dx| + |dy| removes smooth ramps that make unrelated halves correlate."""
+    out = [0.0] * (width * height)
+    for y in range(1, height):
+        row, above = y * width, (y - 1) * width
+        for x in range(1, width):
+            i = row + x
+            out[i] = abs(pixels[i] - pixels[i - 1]) + abs(pixels[i] - pixels[above + x])
+    return out
+
+
+def _ncc(a: List[float], b: List[float]) -> float:
+    n = len(a)
+    if n == 0:
+        return 0.0
+    ma, mb = sum(a) / n, sum(b) / n
+    da = [v - ma for v in a]
+    db = [v - mb for v in b]
+    den = math.sqrt(sum(v * v for v in da) * sum(v * v for v in db))
+    return sum(x * y for x, y in zip(da, db)) / den if den else 0.0
+
+
+def _half_similarity(grad: List[float], width: int, height: int, split: str) -> float:
+    """Best NCC between the two halves over +-LAYOUT_SHIFT px of horizontal disparity."""
+    if split == "top_bottom":
+        rows = height // 2
+        first = [grad[y * width:(y + 1) * width] for y in range(rows)]
+        second = [grad[(y + rows) * width:(y + rows + 1) * width] for y in range(rows)]
+        cols = width
+    else:
+        cols = width // 2
+        first = [grad[y * width:y * width + cols] for y in range(height)]
+        second = [grad[y * width + cols:y * width + 2 * cols] for y in range(height)]
+    best = -1.0
+    for shift in range(-LAYOUT_SHIFT, LAYOUT_SHIFT + 1, 2):
+        lo, hi = max(0, shift), cols + min(0, shift)
+        a = [v for row in first for v in row[lo:hi]]
+        b = [v for row in second for v in row[lo - shift:hi - shift]]
+        best = max(best, _ncc(a, b))
+    return best
+
+
+def stereo_layout_scores(pixels: List[float]) -> Optional[Tuple[float, float]]:
+    """(top/bottom similarity, left/right similarity) of one grey frame, or None if flat."""
+    width, height = LAYOUT_GRAB_SIZE
+    grad = _gradient(pixels, width, height)
+    rms = math.sqrt(sum(v * v for v in grad) / len(grad))
+    if rms < LAYOUT_MIN_DETAIL:
+        return None
+    return (_half_similarity(grad, width, height, "top_bottom"),
+            _half_similarity(grad, width, height, "side_by_side"))
+
+
+def _content_layout_finding(video: dict, stereo: Optional[str], grabber: Optional[FrameGrabber],
+                            duration: Optional[float]) -> str:
+    """A warning when a spherical picture tagged mono (or side-by-side) looks top-bottom.
+
+    Gradient-domain NCC of the two half-frames over a small disparity search
+    (container benchmark prototype). Measured on synthetic stitches: true
+    top-bottom 0.95-0.97, mono equirect 0.06-0.80. Only the top-bottom claim
+    is made, the Quest-critical mislabel: a mono picture whose left and right
+    halves look alike is common (horizontally periodic scenes), so a
+    side-by-side claim would be unreliable. Thresholds are validated on
+    synthetic content only, so this is advisory (confidence 60), never a
+    failure, and costs one keyframe decode on spherical files only.
+    """
+    if grabber is None or "index" not in video or stereo == "top_bottom":
+        return ""
+    at = duration / 2 if duration and duration > 1 else 0.0
+    pixels = grabber.gray(int(video["index"]), at)
+    found = stereo_layout_scores(pixels) if pixels else None
+    if found is None:
+        return ""
+    tb, sbs = found
+    if tb < LAYOUT_MATCH or tb - sbs < LAYOUT_MARGIN:
+        return ""
+    layout = (stereo or "mono").replace("_", "-")
+    return (f"the picture looks top-bottom stereo (top and bottom halves match at {tb:.2f}, left/right "
+            f"{sbs:.2f}) but the metadata says {layout}; check the layout tag (content check, advisory)")
 
 
 # ---------------------------------------------------------------------------

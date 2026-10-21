@@ -125,6 +125,34 @@ class TestEquirectGeometry:
         assert allowed[1] == "PASS", allowed
 
 
+class TestContentLayout:
+    """Advisory pixel check: a top-bottom picture tagged mono (the Quest-critical mislabel)."""
+
+    def _stacked(self, media):
+        def build(path):
+            # Two 320x80 views stacked: a 2:1 frame, so only the content is wrong.
+            make_clip(path, duration=3, size="320x80", video_filter="split[t][b];[t][b]vstack")
+            return path
+        return media.get("stacked.mp4", build)
+
+    def test_top_bottom_picture_tagged_mono_warns(self, media, tmp_path):
+        path = add_to_sample_entry(_copy(self._stacked(media), tmp_path / "tbmono.mp4"), b"vide", st3d(0), sv3d())
+        check = _row(_scan(path, **XR_SPEC), "XR Metadata")
+        assert check[1] == "WARN" and "looks top-bottom" in check[2] and check[3] < 70, check
+
+    def test_correct_tags_and_mono_pictures_are_quiet(self, media, tmp_path):
+        tagged = add_to_sample_entry(_copy(self._stacked(media), tmp_path / "tbok.mp4"), b"vide", st3d(1), sv3d())
+        assert "looks top-bottom" not in _row(_scan(tagged, **XR_SPEC), "XR Metadata")[2]
+        mono = _v2(media, tmp_path, "mono_content.mp4")
+        assert "looks top-bottom" not in _row(_scan(mono, **XR_SPEC), "XR Metadata")[2]
+
+    def test_flat_pictures_are_not_grabbed(self, media, monkeypatch):
+        def fail(*args, **kwargs):
+            raise AssertionError("no frame grab for a flat file")
+        monkeypatch.setattr(cc.FrameGrabber, "gray", fail)
+        assert _row(_scan(self._stacked(media)), "XR Metadata")[1] == "PASS"
+
+
 # ---------------------------------------------------------------------------
 # Spatial Audio
 # ---------------------------------------------------------------------------

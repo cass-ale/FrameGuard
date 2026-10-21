@@ -1220,10 +1220,16 @@ def check_aspect_ratio(probe_data: dict, result: QAResult, cfg: dict):
     if video is None:
         result.add_skip("Aspect Ratio", "No video stream found.")
         return
-    width, height, _ = _displayed_size(video)
+    width, height, rotation = _displayed_size(video)
     tw, th = int(cfg["target_width"]), int(cfg["target_height"])
     if not width or not height or not tw or not th:
         result.add_not_verified("Aspect Ratio", "frame size is unknown.")
+        return
+    if _orientation_mismatch(width, height, tw, th, rotation):
+        # Resolution already fails a picture turned the other way; judging
+        # its shape again would report one cause twice.
+        result.add_skip("Aspect Ratio", f"Not judged separately: the picture is {_orientation_name(width, height)} "
+                                        f"and the target {_orientation_name(tw, th)} (see Resolution).")
         return
     sar = _ratio(video.get("sample_aspect_ratio")) or 1.0
     if abs(_stream_rotation_degrees(video)) % 180 == 90:
@@ -1644,7 +1650,8 @@ def _xr_metadata(video: dict, first_frame: dict) -> Tuple[Optional[str], Optiona
 
 def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
                       first_frame: Optional[dict] = None,
-                      structure: Optional["container_checks.Structure"] = None):
+                      structure: Optional["container_checks.Structure"] = None,
+                      grabber: Optional["container_checks.FrameGrabber"] = None):
     """Require the spherical / stereo-3D signalling a 360 or VR spec declares.
 
     A 360 file without spherical metadata plays flat on every headset and
@@ -1652,6 +1659,8 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
     ``structure`` (the box reader's view) adds what ffprobe merges away:
     V1-only or conflicting V1/V2 metadata, per-eye geometry, display
     rotation on a spherical picture (container_checks.xr_metadata_findings).
+    ``grabber`` lets a spherical file's picture be compared with its stereo
+    tag (advisory content check, two downscaled frames).
     """
     video = _primary_video_stream(probe_data)
     if video is None:
@@ -1675,14 +1684,16 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
     if want_stereo != "any" and actual_stereo != want_stereo:
         problems.append(f"spec requires stereo layout {want_stereo}, file declares {actual_stereo}")
 
-    hard, soft, notes = container_checks.xr_metadata_findings(video, projection, stereo, structure, cfg)
+    hard, soft, notes = container_checks.xr_metadata_findings(
+        video, projection, stereo, structure, cfg, grabber, _stream_duration(video) or _probed_duration(probe_data))
     problems += hard
     note = f" ({'; '.join(notes)})" if notes else ""
     if problems:
         result.add_fail("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(problems + soft) + "." + note)
     elif soft:
+        content_only = all("content check" in text for text in soft)
         result.add_warn("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(soft) + "." + note,
-                        confidence=80)
+                        confidence=60 if content_only else 80)
     else:
         enforced = want_projection != "any" or want_stereo != "any"
         result.add_pass("XR Metadata", f"{found[0].upper()}{found[1:]}"
@@ -3194,7 +3205,8 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
     # Box-level view of MP4/MOV files for the container/XR/conformance checks
     # (container_checks.py); bounded and never raises.
     structure = container_checks.read_structure(filepath)
-    check_xr_metadata(probe_data, result, cfg, first_frame, structure)
+    check_xr_metadata(probe_data, result, cfg, first_frame, structure,
+                      container_checks.FrameGrabber(filepath, process_owner, cancel_event))
     check_bitrate(probe_data, result, cfg)
     check_audio(probe_data, result, cfg)
     check_av_duration_mismatch(probe_data, result, cfg)
