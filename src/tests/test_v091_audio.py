@@ -6,11 +6,13 @@ exactly with ``aevalsrc`` into 24-bit PCM MOV so the decoded samples are the
 generated ones (no lossy codec in the way).
 """
 
+import subprocess
+
 import pytest
 
 from frameguard import audio_checks, core, presets
 from frameguard.core import DEFAULT_CONFIG, run_qa_checks
-from media_fixtures import MediaLibrary, ffmpeg, needs_ffmpeg
+from media_fixtures import MediaLibrary, ffmpeg, inject_spherical, needs_ffmpeg
 
 SECONDS = 4
 MINUS_23_DBFS = 0.0707946  # 1 kHz at this amplitude in L and R reads -23.0 LUFS (Tech 3341 #1)
@@ -37,8 +39,19 @@ def _row(result, name):
     raise AssertionError(f"{name} missing: {[c[:2] for c in result.checks]}")
 
 
+GRAPH_OPTIONS = ("-filter_complex", core.GRAPH_FILE_OPTION, core.LEGACY_GRAPH_FILE_OPTION)
+
+
 def _graph(command):
-    return command[command.index("-filter_complex") + 1]
+    """Every filter graph of a scan command, inline or from its file, joined."""
+    graphs = []
+    for option, value in zip(command, command[1:]):
+        if option == "-filter_complex":
+            graphs.append(value)
+        elif option in GRAPH_OPTIONS:
+            with open(value, encoding="utf-8") as handle:
+                graphs.append(handle.read())
+    return ";".join(graphs)
 
 
 def make_audio(path, exprs, *, layout="stereo", rate=48000, seconds=SECONDS):
@@ -152,9 +165,10 @@ class TestLoudnessRules:
         row = audio_checks.loudness_row({"integrated": -70.0}, _ctx(), _cfg(loudness_mode="essential"))
         assert row[0] == "SKIP"
 
-    def test_four_channel_track_never_fails_loudness(self):
+    def test_ambisonic_track_never_fails_loudness(self):
         ctx = audio_checks.TrackContext(position=0, track={"channels": 4, "channel_layout": "4.0"},
-                                        names=["FL", "FR", "FC", "BC"], label="", duration=60.0)
+                                        names=["FL", "FR", "FC", "BC"], label="", duration=60.0,
+                                        ambisonic=True)
         row = audio_checks.loudness_row({"integrated": -10.0}, ctx, _cfg(loudness_mode="essential"))
         assert row[0] == "WARN" and row[2] < 70 and "W-channel loudness" in row[1]
 
@@ -212,9 +226,11 @@ class TestLoudnessOnFiles:
 
     def test_first_order_ambisonics_is_measured_on_w(self, media):
         """BS.1770 weighting must never be applied to B-format: W alone,
-        here a -23 dBFS 1 kHz tone, reads -26.0 LUFS as a mono programme."""
-        clip = media.get("foa_w", lambda p: make_audio(
-            p, [tone(1000, MINUS_23_DBFS), NOISE, "0", NOISE.replace("0.1", "0.05")], layout="4.0"))
+        here a -23 dBFS 1 kHz tone, reads -26.0 LUFS as a mono programme.
+        A 4-channel track on spherical video with no layout signalled
+        (AAC/FFmpeg's default "4.0") is first-order ambisonics."""
+        clip = media.get("foa_w", lambda p: inject_spherical(make_audio(
+            p, [tone(1000, MINUS_23_DBFS), NOISE, "0", NOISE.replace("0.1", "0.05")], layout="4.0")))
         result = _scan(clip, loudness_mode="essential")
         assert abs(result.metadata["integrated_loudness_lufs"] + 26.0) <= 0.15, result.metadata
         row = _row(result, "Audio Loudness")
@@ -225,6 +241,8 @@ class TestLoudnessOnFiles:
         tracks = [{"codec_type": "audio", "index": 1, "channels": 6, "channel_layout": "5.1"},
                   {"codec_type": "audio", "index": 2, "channels": 8, "channel_layout": "7.1"}]
         plan = core._ScanPlan({"streams": tracks}, _cfg())
+        plan.multichannel_meter = core._multichannel_meter("ffmpeg", plan)
+        assert plan.multichannel_meter == audio_checks.METER_LOUDNORM
         graph = _graph(core._build_scan_command("ffmpeg", "x.mov", plan, _cfg()))
         assert "loudnorm@a0" in graph and "ebur128@a0" not in graph
         # Beyond loudnorm's six channels only the (exact) true peak is kept.
@@ -379,14 +397,23 @@ class TestPhaseAndDualMono:
         assert _row(result, "Audio Phase")[1] == "PASS"
         assert _row(result, "Dual Mono")[1] == "PASS"
 
-    def test_four_channel_tracks_are_never_paired(self, media):
+    FOA = [NOISE, NOISE.replace("0.1", "-0.07"), "0", "0"]
+
+    def test_ambisonic_tracks_are_never_paired(self, media):
         """W and Y of first-order ambisonics correlate negatively for a
         source on the right; pairing them would be a false alarm."""
-        clip = media.get("foa", lambda p: make_audio(
-            p, [NOISE, NOISE.replace("0.1", "-0.07"), "0", "0"], layout="4.0"))
+        clip = media.get("foa", lambda p: inject_spherical(make_audio(p, self.FOA, layout="4.0")))
         result = _scan(clip)
+        assert result.metadata["ambisonic_audio_tracks"] == [1]
         assert _row(result, "Audio Phase")[1] == "SKIP"
         assert _row(result, "Dual Mono")[1] == "SKIP"
+
+    def test_four_channel_track_on_flat_video_is_discrete(self, media):
+        """Camera and field-recorder 4.0/quad: FL/FR is a real stereo pair."""
+        clip = media.get("quad_flat", lambda p: make_audio(p, self.FOA, layout="4.0"))
+        result = _scan(clip)
+        assert result.metadata["ambisonic_audio_tracks"] == []
+        assert "FL/FR" in _row(result, "Audio Phase")[2]
 
 
 @needs_ffmpeg
@@ -461,12 +488,23 @@ class TestWiring:
         plan = core._ScanPlan({"streams": [track]}, _cfg())
         graph = _graph(core._build_scan_command("ffmpeg", "x.mov", plan, _cfg()))
         assert "silencedetect@a0d3" not in graph and "silencedetect@a0d2" in graph
-        assert "*c3" not in graph.split("[a0h]")[1].split(";")[0]
+        hum_mix = next(chain for chain in graph.split(";") if chain.startswith("[a0h]"))
+        assert "*c3" not in hum_mix and "*c2" in hum_mix
 
     def test_audio_records_survive_the_bounded_capture(self):
         assert core._stderr_evidence_categories("[astats@a0s @ 0x1] [info] Peak level dB: -1.0") == ("audio",)
-        assert "audio" in core._stderr_evidence_categories("[aphasemeter@a0p0 @ 0x2] out_phase_start: 1")
+        assert core._stderr_evidence_categories("[astats@a0p1 @ 0x1] [info] RMS level dB: -9") == ("audio",)
         assert core._stderr_evidence_categories("Input Integrated:    -23.1 LUFS") == ("audio",)
+
+    @pytest.mark.parametrize("line", [
+        "[aphasemeter@a0p0 @ 0x2] [info] out_phase_start: 1",
+        "[silencedetect@a3d12 @ 0x2] [info] silence_start: 1.5",
+        "[silencedetect@a0 @ 0x2] [info] silence_end: 2 | silence_duration: 0.5",
+        "[astats@a0h60c @ 0x2] [info] RMS level dB: -70"])
+    def test_file_routed_detectors_are_not_log_evidence(self, line):
+        """Read from the measurement files; thousands of dropout lines must
+        not crowd the summaries out of the bounded capture (review B1)."""
+        assert core._stderr_evidence_categories(line) == ()
 
     def test_classification_weights_and_defaults(self):
         for name in audio_checks.ESSENTIAL_CHECKS | audio_checks.ADVISORY_CHECKS:
@@ -474,3 +512,194 @@ class TestWiring:
             assert (name in core.ESSENTIAL_CHECKS) != (name in core.ADVISORY_CHECKS)
         for key in audio_checks.DEFAULT_CONFIG:
             assert key in DEFAULT_CONFIG and key in presets.PRESET_CONFIG_KEYS
+
+
+# ---------------------------------------------------------------------------
+# Release review 0.9.1: B1 (capture overflow), B2 (command length), meter
+# self-test, ambisonic detection
+# ---------------------------------------------------------------------------
+
+def _gated_tracks(path, tracks=3, seconds=20):
+    """Noise tracks with a 20 ms digital-zero gap every 250 ms (a chatty
+    dropout detector); track 1 is silent from 8 to 12 s. A scaled-down
+    copy of the reviewer's 6-minute, 16-track repro."""
+    path = str(path) + ".mov"
+    args = ["-f", "lavfi", "-i", f"testsrc2=s=96x64:r=10:d={seconds}"]
+    for k in range(tracks):
+        expr = f"if(lt(mod(t,0.25),0.02),0,0.1*(random({k})-0.5))"
+        if k == 0:
+            expr = f"if(between(t,8,12),0,{expr})"
+        args += ["-f", "lavfi", "-i", f"aevalsrc=exprs='{expr}':s=48000:d={seconds}"]
+    args += ["-map", "0:v"] + [a for k in range(tracks) for a in ("-map", f"{k + 1}:a")]
+    ffmpeg(*args, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+           "-c:a", "pcm_s24le", "-t", str(seconds), path)
+    return path
+
+
+@needs_ffmpeg
+class TestCaptureOverflow:
+    """B1: dropped detector lines must never become a phantom silence."""
+
+    def test_chatty_dropouts_leave_silence_and_summaries_intact(self, media):
+        # 0.9.1-rc logged 480 dropout lines here; with room for 200 the
+        # capture dropped the silence end and the summaries.
+        clip = media.get("gated", _gated_tracks)
+        result = _scan(clip, deep_scan_max_event_lines=200)
+        silence = _row(result, "Audio Silence")
+        assert silence[1] == "WARN" and "total 4.0s" in silence[2], silence
+        assert result.status != "MISMATCH"
+        assert _row(result, "Audio Loudness")[1] == "PASS"
+        assert _row(result, "Audio Clipping")[1] == "PASS"
+        dropouts = _row(result, "Audio Dropouts")
+        assert dropouts[1] == "WARN" and "Track 2" in dropouts[2] and "79 dropout(s)" in dropouts[2], dropouts
+        assert "deep_scan_evidence_dropped" not in result.metadata
+
+    def test_overflowing_summaries_are_not_verified(self, media):
+        clip = media.get("gated", _gated_tracks)
+        result = _scan(clip, deep_scan_max_event_lines=5)
+        assert result.metadata["deep_scan_evidence_dropped"] > 0
+        for name in ("Audio Loudness", "Audio True Peak", "Audio Clipping", "DC Offset"):
+            row = _row(result, name)
+            assert row[1] == "WARN" and core.NOT_VERIFIED_PREFIX in row[2], row
+        # Silence comes from the measurement files and is still judged.
+        silence = _row(result, "Audio Silence")
+        assert silence[1] == "WARN" and "total 4.0s" in silence[2], silence
+
+    def test_missing_measurement_files_are_not_verified(self, media, monkeypatch):
+        clip = media.get("gated", _gated_tracks)
+        monkeypatch.setattr(core.tempfile, "mkdtemp", lambda prefix="": (_ for _ in ()).throw(OSError("full")))
+        result = _scan(clip)
+        for name in ("Audio Silence", "Dead Channel", "Audio Dropouts"):
+            row = _row(result, name)
+            assert row[1] == "WARN" and core.NOT_VERIFIED_PREFIX in row[2], row
+        assert _row(result, "Audio Loudness")[1] == "PASS"
+
+
+def _probe(tracks):
+    streams = [{"index": 0, "codec_type": "video", "codec_name": "h264", "width": 3840,
+                "height": 2160, "avg_frame_rate": "30/1", "r_frame_rate": "30/1",
+                "pix_fmt": "yuv420p"}]
+    for i, (channels, layout) in enumerate(tracks, 1):
+        streams.append({"index": i, "codec_type": "audio", "codec_name": "pcm_s24le",
+                        "channels": channels, "channel_layout": layout, "sample_rate": "48000"})
+    return {"streams": streams, "format": {"duration": "3600"}}
+
+
+class TestCommandLength:
+    """B2: Windows caps a command line at 32,767 characters."""
+
+    def test_many_track_command_is_short(self, tmp_path):
+        cfg = _cfg()
+        plan = core._ScanPlan(_probe([(1, "mono")] * 16 + [(16, "")] * 4), cfg)
+        analysis, error = core._open_video_analysis(plan, cfg)
+        plan.graph_dir = str(tmp_path)
+        plan.audio_files = audio_checks.MeasurementFiles(str(tmp_path))
+        plan.multichannel_meter = audio_checks.METER_LOUDNORM
+        command = core._build_scan_command(r"C:\Program Files\FrameGuard\ffmpeg.exe",
+                                           r"D:\Media\Some Project\clip.mov", plan, cfg)
+        try:
+            line = subprocess.list2cmdline(command)
+            assert len(line) < 8000, len(line)
+            assert core.GRAPH_FILE_OPTION in command and "-filter_complex" not in command
+            graph = _graph(command)
+            assert len(graph) > 32767  # inline, this would not start on Windows
+            for i in range(20):
+                assert f"[a{i}]" in graph
+        finally:
+            if analysis is not None:
+                analysis.close()
+
+    @pytest.mark.parametrize("banner,option", [
+        ("ffmpeg version 9.0.2-https://www.martin-riedl.de Copyright", "-/filter_complex"),
+        ("ffmpeg version 7.0 Copyright", "-/filter_complex"),
+        ("ffmpeg version n6.1.1 Copyright", "-filter_complex_script"),
+        ("ffmpeg version N-118000-g1234567 Copyright", "-/filter_complex"),
+        (None, "-/filter_complex")])
+    def test_graph_file_option_follows_the_ffmpeg_version(self, banner, option):
+        assert core._graph_file_option(banner) == option
+
+    @needs_ffmpeg
+    def test_real_many_track_scan_reports_every_row(self, media, monkeypatch):
+        def build(path):
+            path = str(path) + ".mov"
+            args = ["-f", "lavfi", "-i", "testsrc2=s=96x64:r=10:d=3"]
+            for k in range(8):
+                args += ["-f", "lavfi", "-i", f"aevalsrc=exprs='0.1*sin(2*PI*{300 + 50 * k}*t)':s=48000:d=3"]
+            tones = "|".join(f"0.05*sin(2*PI*{200 + 40 * c}*t)" for c in range(16))
+            args += ["-f", "lavfi", "-i", f"aevalsrc=exprs='{tones}':s=48000:d=3"]
+            args += ["-map", "0:v"] + [a for k in range(9) for a in ("-map", f"{k + 1}:a")]
+            ffmpeg(*args, "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                   "-c:a", "pcm_s24le", "-t", "3", path)
+            return path
+        clip = media.get("tracks9", build)
+        commands = []
+        real = core._run_scan_process
+        monkeypatch.setattr(core, "_run_scan_process",
+                            lambda cmd, *a, **k: commands.append(cmd) or real(cmd, *a, **k))
+        result = _scan(clip, loudness_mode="report")
+        assert core.GRAPH_FILE_OPTION in commands[0]
+        for name in ("File Integrity", "Audio Silence", "Dead Channel", "Audio Loudness",
+                     "Audio True Peak", "Audio Clipping", "Audio Dropouts", "Audio Phase",
+                     "Dual Mono", "DC Offset", "Audio Hum"):
+            row = _row(result, name)
+            assert core.NOT_VERIFIED_PREFIX not in row[2], row
+        assert "Track 9" in _row(result, "Audio Hum")[2]
+
+
+class _Owner:
+    def __init__(self):
+        self.registered = []
+
+    def register_proc(self, proc):
+        self.registered.append(proc)
+
+    def unregister_proc(self, proc):
+        pass
+
+
+class TestMeterSelfTest:
+    def test_a_failed_run_is_not_cached(self, monkeypatch):
+        monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
+
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired("ffmpeg", 30)
+        monkeypatch.setattr(core, "_run_owned_subprocess", timeout)
+        assert core._ebur128_multichannel_ok("ffmpeg") is False
+        assert core._EBUR128_MULTICHANNEL_OK == {}
+
+    @needs_ffmpeg
+    def test_the_run_belongs_to_the_scan_and_is_cached(self, monkeypatch):
+        monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
+        owner = _Owner()
+        ffmpeg_path = core.get_ffmpeg_path()
+        verdict = core._ebur128_multichannel_ok(ffmpeg_path, owner)
+        assert verdict in (True, False) and len(owner.registered) == 1
+        assert core._EBUR128_MULTICHANNEL_OK == {ffmpeg_path: verdict}
+
+    def test_cancel_before_the_run_returns_none(self, monkeypatch):
+        import threading
+        monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
+        cancel = threading.Event()
+        cancel.set()
+        assert core._ebur128_multichannel_ok("ffmpeg", None, cancel) is None
+        assert core._EBUR128_MULTICHANNEL_OK == {}
+
+
+class TestAmbisonicDetection:
+    """Review: 4 channels are ambisonic only when the file says so."""
+
+    @pytest.mark.parametrize("channels,layout,sa3d,spherical,expected", [
+        (4, "4.0", None, False, False),            # camera / field recorder
+        (4, "quad", None, True, False),            # a named loudspeaker layout
+        (4, "4.0", None, True, True),              # AAC FOA decodes as 4.0
+        (4, "", None, True, True),
+        (4, "4.0", {"ambisonic_type": 0}, False, True),
+        (4, "4.0", {"error": "short box"}, False, False),
+        (9, "9 channels", None, True, True),
+        (16, "hexadecagonal", None, False, False),
+        (16, "hexadecagonal", None, True, True),
+        (4, "ambisonic 1", None, False, True),
+        (6, "5.1", None, True, False)])
+    def test_rule(self, channels, layout, sa3d, spherical, expected):
+        track = {"channels": channels, "channel_layout": layout}
+        assert (audio_checks.ambisonic_positions([track], [sa3d], spherical) == [0]) is expected
