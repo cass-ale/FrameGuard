@@ -3656,7 +3656,7 @@ class SettingsPanel(QWidget):
             if info.is_newer:
                 QMessageBox.information(
                     self, "Update Available",
-                    f"v{info.version} is available (you have v{APP_VERSION}).\n\n{info.changelog[:200]}")
+                    f"v{info.version} is available (you have v{APP_VERSION}).\n\n{info.changelog}")
             else:
                 QMessageBox.information(
                     self, "Up to Date", f"You're running the latest version (v{APP_VERSION}).")

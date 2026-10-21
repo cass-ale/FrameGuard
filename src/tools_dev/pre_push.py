@@ -268,8 +268,9 @@ def classify_path(path: str) -> set[str]:
             "constraints-3.12.txt", "diagnostic.bat", "diagnostic.sh",
             "download_tools.py", "entitlements.plist", "frameguard.spec",
             "installer.iss", "installer_info.txt", "publish_release.py",
-            "pytest.ini", "requirements-dev.txt", "requirements.txt",
-            "validate_version.py", "version.json", "write_build_stamp.py",
+            "pytest.ini", "release_notes.py", "requirements-dev.txt",
+            "requirements.txt", "validate_version.py", "version.json",
+            "write_build_stamp.py",
         }
         if name in packaging_names:
             return {"workflow_packaging"}
@@ -358,10 +359,10 @@ def build_stages(profile: str, classification: dict, changed_paths: Iterable[str
         Stage("compile-lint-diff", (
             (py, "-m", "compileall", "-q", "frameguard", "main.py",
              "validate_version.py", "write_build_stamp.py", "publish_release.py",
-             "download_tools.py", "tools_dev"),
+             "download_tools.py", "release_notes.py", "tools_dev"),
             (py, "-m", "pyflakes", "frameguard", "main.py", "validate_version.py",
              "write_build_stamp.py", "publish_release.py", "download_tools.py",
-             "tools_dev"),
+             "release_notes.py", "tools_dev"),
             ("git", "diff", "--check", "HEAD", "--"),
         ), stage_timeout),
     ]

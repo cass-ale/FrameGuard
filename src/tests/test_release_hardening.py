@@ -7,7 +7,6 @@ build-time and release-pipeline contracts that have no other home.
 
 import hashlib
 import importlib.util
-import os
 import re
 from pathlib import Path
 from unittest import mock
@@ -332,3 +331,130 @@ class TestSilentWindowsUpdate:
         assert "(not UninstallSilent) and DirExists(ExportPath)" in uninstall
         delete_call = _pascal_calls(uninstall, "SuppressibleMsgBox")[0][1]
         assert delete_call[3] == "IDNO", "a suppressed prompt must keep reports"
+
+
+def _load_release_notes():
+    spec = importlib.util.spec_from_file_location(
+        "fg_release_notes", str(SRC / "release_notes.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_SAMPLE_CHANGELOG = (
+    "v2.1.0 - Faster scans\n\nFIXED\n- Scans start sooner.\n- Reports open.\n\n"
+    "v2.0.1 - Patch\n\nFIXED\n- Old fix.\n\n"
+    "v2.0.0 - Big release\n\nCHANGED\n- Everything.\n"
+)
+
+
+class TestReleaseNotes:
+    """C-M2: the release body carries only this version's changes, and the
+    update prompt shows those changes rather than download boilerplate."""
+
+    def test_entry_is_exactly_the_requested_version(self):
+        rn = _load_release_notes()
+        assert rn.changelog_entry(_SAMPLE_CHANGELOG, "2.0.1") == (
+            "v2.0.1 - Patch\n\nFIXED\n- Old fix.")
+        assert rn.changelog_entry(_SAMPLE_CHANGELOG, "2.1.0").endswith(
+            "- Reports open.")
+        assert rn.changelog_entry(_SAMPLE_CHANGELOG, "2.0.0") == (
+            "v2.0.0 - Big release\n\nCHANGED\n- Everything.")
+
+    def test_missing_entry_fails_instead_of_publishing_old_notes(self):
+        rn = _load_release_notes()
+        with pytest.raises(rn.ReleaseNotesError, match="v3.0.0"):
+            rn.changelog_entry(_SAMPLE_CHANGELOG, "3.0.0")
+        with pytest.raises(rn.ReleaseNotesError):
+            rn.render({"version": "2.1.0", "changelog": "v2.1.0 - x\n```\n"})
+
+    def test_real_release_body_contains_only_the_current_entry(self):
+        import json
+
+        rn = _load_release_notes()
+        data = json.loads((SRC / "version.json").read_text(encoding="utf-8"))
+        notes = rn.render(data)
+        headers = re.findall(r"^v\d+\.\d+\.\d+ - ", notes, re.MULTILINE)
+        assert headers == [f"v{data['version']} - "]
+        assert notes.count("## Changes") == 1
+        assert rn.changelog_entry(data["changelog"], data["version"]) in notes
+        assert len(notes) < len(data["changelog"]) + 2000
+
+    def test_update_prompt_shows_the_changes_from_a_real_release_body(self):
+        import json
+        from frameguard import updater as U
+
+        rn = _load_release_notes()
+        data = json.loads((SRC / "version.json").read_text(encoding="utf-8"))
+        entry = rn.changelog_entry(data["changelog"], data["version"])
+        summary = U.release_notes_summary(rn.render(data))
+
+        first_lines = [line for line in entry.splitlines() if line.strip()][:2]
+        assert summary.startswith(first_lines[0])
+        assert first_lines[1] in summary
+        assert len(summary) <= U.MAX_CHANGELOG_CHARS
+        for boilerplate in ("|", "SmartScreen", "SHA256SUMS", "```",
+                            "Published by", "MIT License"):
+            assert boilerplate not in summary
+
+    def test_short_body_is_shown_whole_and_long_body_cuts_at_a_line(self):
+        from frameguard import updater as U
+
+        rn = _load_release_notes()
+        body = rn.render({"version": "2.1.0", "changelog": _SAMPLE_CHANGELOG})
+        assert U.release_notes_summary(body) == (
+            "v2.1.0 - Faster scans\n\nFIXED\n- Scans start sooner.\n- Reports open.")
+        cut = U.release_notes_summary(body, limit=40)
+        assert cut == "v2.1.0 - Faster scans\n\nFIXED\u2026"
+
+    def test_body_without_a_changes_heading_drops_tables_and_boilerplate(self):
+        from frameguard import updater as U
+
+        body = ("**Published by someone**\n\n## Download\n\n| A | B |\n|---|---|\n"
+                "| x | y |\n\nFixed the crash on launch.\n")
+        assert U.release_notes_summary(body) == "Fixed the crash on launch."
+        assert U.release_notes_summary(None) == ""
+
+    def test_github_check_offers_the_summary_not_the_raw_body(self, monkeypatch):
+        import io
+        import json
+        from frameguard import updater as U
+
+        rn = _load_release_notes()
+        body = rn.render({"version": "9.9.9", "changelog":
+                          "v9.9.9 - New\n\nFIXED\n- The thing.\n"})
+        digest = hashlib.sha256(b"installer").hexdigest()
+        payload = {
+            "tag_name": "v9.9.9", "body": body, "draft": False,
+            "prerelease": False,
+            "assets": [{
+                "name": "FrameGuardInstaller.exe",
+                "browser_download_url": "https://example.test/FrameGuardInstaller.exe",
+                "size": 9, "digest": f"sha256:{digest}"}],
+        }
+
+        class _Response(io.BytesIO):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        monkeypatch.setattr(U.sys, "platform", "win32")
+        monkeypatch.setattr(U, "get_current_version", lambda: "1.0.0")
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda *_a, **_k: _Response(json.dumps(payload).encode()))
+        info = U.check_github_for_update()
+        assert info is not None
+        assert info.changelog == "v9.9.9 - New\n\nFIXED\n- The thing."
+
+    def test_release_workflow_publishes_only_the_rendered_entry(self):
+        workflow = (REPO_ROOT / ".github" / "workflows" / "release.yml").read_text(
+            encoding="utf-8")
+        assert 'python release_notes.py --output "$GITHUB_WORKSPACE/release-notes.md"' \
+            in workflow
+        assert 'data.get("changelog"' not in workflow
+        assert "path: release-notes.md" in workflow

@@ -326,6 +326,7 @@ class UpdateInfo:
     """Information about an available update."""
     version: str
     installer_path: str
+    # Display-ready and bounded (see release_notes_summary).
     changelog: str = ""
     file_size_mb: float = 0.0
     is_newer: bool = False
@@ -467,6 +468,87 @@ def _checksum_from_release(assets, filename: str) -> str:
     return matches[0] if len(matches) == 1 else ""
 
 
+# The update prompt shows what changed, not the release page's download
+# instructions. Release bodies come from release_notes.py: boilerplate, then
+# "## Changes" with this version's changelog entry in a fenced block.
+MAX_CHANGELOG_CHARS = 600
+_CHANGES_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*changes\s*#*\s*$",
+                                 re.IGNORECASE | re.MULTILINE)
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s")
+_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+
+
+def _changes_section(text: str) -> Optional[str]:
+    """Text under the "Changes" heading, up to the next heading."""
+    match = _CHANGES_HEADING_RE.search(text)
+    if match is None:
+        return None
+    lines = []
+    in_fence = False
+    fenced: List[str] = []
+    saw_fence = False
+    for line in text[match.end():].split("\n"):
+        if _FENCE_RE.match(line):
+            if in_fence:
+                in_fence = False
+                continue
+            in_fence = saw_fence = True
+            continue
+        if in_fence:
+            fenced.append(line)
+            continue
+        if _HEADING_RE.match(line):
+            break
+        lines.append(line)
+    # The release template fences the changelog and puts a footer after it;
+    # when a fence is present its contents ARE the changes.
+    return "\n".join(fenced if saw_fence else lines)
+
+
+def _strip_release_boilerplate(text: str) -> str:
+    """Fallback for bodies without a Changes heading: drop markdown tables,
+    headings, fences and bold-only lines, keeping the prose."""
+    kept = []
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if (stripped.startswith("|") or _HEADING_RE.match(line)
+                or _FENCE_RE.match(line)
+                or re.fullmatch(r"\*\*[^*]+\*\*", stripped)):
+            continue
+        kept.append(line.rstrip())
+    return "\n".join(kept)
+
+
+def release_notes_summary(body, limit: int = MAX_CHANGELOG_CHARS) -> str:
+    """Display-ready "what changed" text from a GitHub release body.
+
+    Prefers the section under "## Changes"; otherwise strips tables and
+    boilerplate. Blank-line runs collapse, and the result is cut at a line
+    (or word) boundary within ``limit`` characters with a trailing ellipsis.
+    """
+    if not isinstance(body, str) or limit <= 0:
+        return ""
+    text = body.replace("\r\n", "\n").replace("\r", "\n")
+    section = _changes_section(text)
+    if section is None or not section.strip():
+        section = _strip_release_boilerplate(text)
+    lines: List[str] = []
+    for line in section.strip().split("\n"):
+        line = line.rstrip()
+        if not line and (not lines or not lines[-1]):
+            continue
+        lines.append(line)
+    summary = "\n".join(lines).strip()
+    if len(summary) <= limit:
+        return summary
+    cut = summary.rfind("\n", 0, limit)
+    if cut <= 0:
+        cut = summary.rfind(" ", 0, limit)
+    if cut <= 0:
+        cut = limit - 1
+    return summary[:cut].rstrip() + "\u2026"
+
+
 def check_github_for_update() -> Optional["UpdateInfo"]:
     """Check GitHub Releases for one integrity-verifiable stable installer.
 
@@ -527,13 +609,10 @@ def check_github_for_update() -> Optional["UpdateInfo"]:
         if not digest:
             return None
 
-        body = data.get("body", "")
-        if not isinstance(body, str):
-            body = ""
         return UpdateInfo(
             version=tag,
             installer_path=installer_url,
-            changelog=body[:500],
+            changelog=release_notes_summary(data.get("body", "")),
             file_size_mb=round(size / (1024 * 1024), 1),
             is_newer=_is_newer(tag, get_current_version()),
             source_path="GitHub Releases",

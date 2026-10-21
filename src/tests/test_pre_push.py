@@ -721,5 +721,6 @@ def test_every_tracked_release_file_is_classified():
         ("assets/screenshots/scan.gif", {"documentation"}),
         ("src/LICENSE", {"documentation", "workflow_packaging"}),
         ("src/.gitignore", {"repository_config"}),
+        ("src/release_notes.py", {"workflow_packaging"}),
     ]:
         assert pre_push.classify_path(path) == expected, path
