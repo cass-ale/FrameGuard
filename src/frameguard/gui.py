@@ -695,6 +695,9 @@ def open_in_player(path: str) -> str:
 _UI_BACKED_CONFIG_KEYS = frozenset({
     "target_width", "target_height", "target_fps", "fps_tolerance",
     "min_bitrate_mbps", "audio_required", "silence_duration",
+    # The 0.9.0 strictness rules (see SettingsPanel._RULE_CONTROLS).
+    "allow_larger_resolution", "allow_fps_multiples", "require_progressive",
+    "min_audio_sample_rate", "loudness_mode", "max_decode_errors",
 })
 
 # Upper bound on results kept in memory / rendered in the table.
@@ -3299,6 +3302,8 @@ class SettingsPanel(QWidget):
             resetter=lambda: self._set_int_slider(self.min_bitrate_slider, int(self._defaults.get("min_bitrate_mbps", 20)))
         )
 
+        self._rule_controls = {}
+        self._add_rule_controls(delivery_layout, "delivery")
         self._main_layout.addWidget(delivery_box)
 
         # --- Audio Requirements ---
@@ -3330,6 +3335,7 @@ class SettingsPanel(QWidget):
         )
 
 
+        self._add_rule_controls(audio_layout, "audio")
         self._main_layout.addWidget(audio_box)
 
         # --- Deep Scan ---
@@ -3349,6 +3355,7 @@ class SettingsPanel(QWidget):
             description="Treat any warning as a failure",
             resetter=lambda: self.strict_cb.setChecked(False)
         )
+        self._add_rule_controls(scan_layout, "verdicts")
 
         self._main_layout.addWidget(scan_box)
 
@@ -3744,6 +3751,10 @@ class SettingsPanel(QWidget):
         if "silence_duration" in config:
             self._set_float_slider(self.silence_slider, 1.0, 30.0, 0.5, float(config["silence_duration"]))
 
+        for key in self._rule_controls:
+            if key in config:
+                self._set_rule_value(key, config[key])
+
 
 
     
@@ -3847,6 +3858,8 @@ class SettingsPanel(QWidget):
         # Audio
         d["audio_required"] = bool(self.audio_required_cb.isChecked())
         d["silence_duration"] = self._get_float_slider(self.silence_slider, 0.5)
+        for key in self._rule_controls:
+            d[key] = self._rule_value(key)
 
         # Deep scan
 
@@ -3903,9 +3916,76 @@ class SettingsPanel(QWidget):
     def is_strict_mode(self) -> bool:
         return bool(self.strict_cb.isChecked())
 
+    # The rules 0.9.0 made strict, each with its escape hatch, so nobody has
+    # to hand-edit a preset file to relax them: (group, key, kind, title,
+    # description, choices). Choices are (value, label) pairs.
+    _RULE_CONTROLS = (
+        ("delivery", "allow_larger_resolution", "bool", "Allow Larger Resolution",
+         "Accept files larger than the target size (otherwise the size must match exactly)", None),
+        ("delivery", "allow_fps_multiples", "bool", "Allow Frame-Rate Multiples",
+         "Accept integer multiples of the target frame rate, such as 60 fps for a 30 fps spec", None),
+        ("delivery", "require_progressive", "bool", "Require Progressive",
+         "Fail interlaced video", None),
+        ("audio", "min_audio_sample_rate", "choice", "Min Sample Rate",
+         "Lowest sample rate accepted on every audio track",
+         ((32000, "32 kHz"), (44100, "44.1 kHz"), (48000, "48 kHz"), (96000, "96 kHz"))),
+        ("audio", "loudness_mode", "choice", "Loudness",
+         "EBU R128 integrated loudness and true peak. Report only measures; the other "
+         "options compare against the target (-23 LUFS, true peak -1 dBTP by default)",
+         (("report", "Report only"), ("advisory", "Warn outside target"),
+          ("essential", "Fail outside target"), ("off", "Off"))),
+        ("verdicts", "max_decode_errors", "int", "Allowed Decode Errors",
+         "Decoder errors tolerated before File Integrity fails (0 = none)", (0, 1000)),
+    )
+
+    def _add_rule_controls(self, layout, group: str):
+        for row_group, key, kind, title, description, choices in self._RULE_CONTROLS:
+            if row_group != group:
+                continue
+            if kind == "bool":
+                control = QCheckBox()
+            elif kind == "choice":
+                control = QComboBox()
+                for value, label in choices:
+                    control.addItem(label, value)
+            else:
+                control = QSpinBox()
+                control.setRange(*choices)
+            control.setAccessibleName(title)
+            self._rule_controls[key] = control
+            self._add_setting(layout, key=f"rule_{key}", title=title, control=control,
+                              description=description,
+                              resetter=lambda k=key: self._set_rule_value(k, self._defaults.get(k)))
+            self._set_rule_value(key, self._defaults.get(key))
+
+    def _set_rule_value(self, key: str, value):
+        control = self._rule_controls.get(key)
+        if control is None or value is None:
+            return
+        if isinstance(control, QCheckBox):
+            control.setChecked(bool(value))
+        elif isinstance(control, QComboBox):
+            index = control.findData(value)
+            if index < 0 and isinstance(value, (int, float)):
+                index = control.findData(int(value))
+            if index >= 0:
+                control.setCurrentIndex(index)
+        else:
+            control.setValue(int(value))
+
+    def _rule_value(self, key: str):
+        control = self._rule_controls[key]
+        if isinstance(control, QCheckBox):
+            return bool(control.isChecked())
+        if isinstance(control, QComboBox):
+            return control.currentData()
+        return int(control.value())
+
     def _reset_to_defaults(self):
         # Delivery
         self._reset_resolution()
+        for key in self._rule_controls:
+            self._set_rule_value(key, self._defaults.get(key))
 
         self._set_combo_by_text(self.fps_combo, _fps_text(self._defaults.get("target_fps", 30.0)))
         self._set_float_slider(
@@ -7242,6 +7322,17 @@ class MainWindow(QMainWindow):
         if getattr(self, "_services_stopped", False):
             return
         self._services_stopped = True
+        # Stop accepting handoffs first: a launch during the (up to ~16 s)
+        # shutdown would otherwise give its files to an app that is exiting.
+        server = getattr(QApplication.instance(), "_fg_instance_server", None)
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+        timer = getattr(self, "_autosave_timer", None)
+        if timer is not None:
+            timer.stop()
         for step in (self.settings_panel.save_settings,
                      self.watch_panel.save_watch_settings,
                      self._save_window_state):
@@ -7268,8 +7359,32 @@ class MainWindow(QMainWindow):
         if self._tray_icon:
             self._defer(self._tray_icon.hide)
 
+    def _confirm_close_during_scan(self) -> bool:
+        """Ask before a window close (red button, Cmd/Ctrl+W) cancels a scan.
+
+        An explicit Quit (Cmd+Q, the tray or Dock menu) is not asked: it sets
+        _force_quit first. Offscreen (tests, automation) never prompts.
+        """
+        running = bool(self._worker_thread and self._worker_thread.isRunning())
+        if (not running or getattr(self, "_close_confirmed", False)
+                or QApplication.platformName() == "offscreen"):
+            return True
+        answer = QMessageBox.question(
+            self, "Scan in progress",
+            "A scan is still running. Close FrameGuard and cancel it?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        # Once confirmed, the shutdown's own close() retries must not ask again.
+        self._close_confirmed = answer == QMessageBox.Yes
+        return self._close_confirmed
+
     def closeEvent(self, event):
         """Override close: minimize to tray if watch folder is active."""
+        watching_to_tray = (hasattr(self, '_watch_monitor') and self._watch_monitor.is_active
+                            and self._tray_icon is not None)
+        if (not getattr(self, '_force_quit', False) and not watching_to_tray
+                and not self._confirm_close_during_scan()):
+            event.ignore()
+            return
         if not getattr(self, '_force_quit', False):
             # If watch folder is actively monitoring, minimize to tray instead
             if (hasattr(self, '_watch_monitor') and self._watch_monitor.is_active
@@ -8228,6 +8343,10 @@ class _SingleInstanceServer(QObject):
 
     def is_listening(self) -> bool:
         return self._server.isListening()
+
+    def close(self):
+        """Stop listening, so later launches start their own instance."""
+        self._server.close()
 
     def _on_connection(self):
         while self._server.hasPendingConnections():

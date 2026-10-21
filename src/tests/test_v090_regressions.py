@@ -227,6 +227,18 @@ def test_installer_shows_the_same_licence_as_the_repository():
 # App-shell audit fixes
 # ---------------------------------------------------------------------------
 
+def _wait_for(qapp, predicate, timeout_ms=6000):
+    """Pump events until predicate() is true (CI runners can be slow)."""
+    import time
+    end = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < end:
+        qapp.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
 def _pump(qapp, ms):
     import time
     end = time.monotonic() + ms / 1000.0
@@ -261,8 +273,7 @@ class TestWorkerSignalsStayOnTheGuiThread:
         clip = tmp_path / "clip.mov"
         clip.write_bytes(b"\0" * 16)
         window._on_scan_requested([str(clip)], "custom", True, False)
-        _pump(qapp, 800)
-        assert len(threads) >= 21
+        assert _wait_for(qapp, lambda: len(threads) >= 21)
         assert all(t is qapp.thread() for t in threads)
 
     def test_no_lambda_slots_on_background_signals(self):
@@ -291,12 +302,14 @@ class TestFolderSearchRace:
         panel = window.scan_panel
         panel._discover_files_async([str(slow)])
         panel._discover_files_async([str(fast)])
-        _pump(qapp, 1200)
+        assert _wait_for(qapp, lambda: not panel._discovery_runners)
+        _pump(qapp, 100)
         assert panel._files == [str(fast / "new_take.mov")]
 
         panel._discover_files_async([str(slow)])
         panel._on_files_dropped([])  # Clear while the search runs
-        _pump(qapp, 1200)
+        assert _wait_for(qapp, lambda: not panel._discovery_runners)
+        _pump(qapp, 100)
         assert panel._files == []
 
 
@@ -318,16 +331,14 @@ class TestAutosave:
         from frameguard import gui
         target = not window.settings_panel.strict_cb.isChecked()
         window.settings_panel.strict_cb.setChecked(target)
-        _pump(qapp, gui._AUTOSAVE_DELAY_MS + 400)
-        stored = gui.QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value("scan/strict", type=bool)
-        assert stored is target
+        assert _wait_for(qapp, lambda: gui.QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value(
+            "scan/strict", not target, type=bool) is target)
 
     def test_sidebar_collapse_survives_a_restart(self, window, qapp):
         from frameguard import gui
         window._toggle_sidebar()
-        _pump(qapp, 400 + gui._AUTOSAVE_DELAY_MS)
-        assert gui.QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value(
-            gui._SIDEBAR_COLLAPSED_KEY, type=bool) is True
+        assert _wait_for(qapp, lambda: gui.QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value(
+            gui._SIDEBAR_COLLAPSED_KEY, False, type=bool) is True)
         second = gui.MainWindow()
         try:
             assert second._sidebar_collapsed and not second._sidebar.isVisible()
@@ -448,8 +459,7 @@ class TestSingleInstance:
             clip = tmp_path / "take one.mov"
             clip.write_bytes(b"\0")
             assert gui._forward_to_running_instance([str(clip)]) is True
-            _pump(qapp, 500)
-            assert received == [str(clip)]
+            assert _wait_for(qapp, lambda: received == [str(clip)])
         finally:
             server.deleteLater()
 
@@ -489,3 +499,54 @@ def test_checks_matrix_puts_problem_columns_first(qapp):
     ranks = [worst[name] for name in panel._columns]
     assert ranks == sorted(ranks), ranks
     assert ranks and ranks[0] == 0
+
+
+class TestReviewFollowUps:
+    def test_strictness_rules_have_settings_controls(self, window):
+        """Every 0.9 strict rule can be relaxed from Settings, not only by
+        hand-editing a preset, and round-trips through the config."""
+        panel = window.settings_panel
+        cfg = panel.get_config_overrides()
+        for key in ("allow_larger_resolution", "allow_fps_multiples", "require_progressive",
+                    "min_audio_sample_rate", "loudness_mode", "max_decode_errors"):
+            assert key in cfg, key
+        panel._apply_preset_config({**cfg, "allow_larger_resolution": True,
+                                    "loudness_mode": "off", "max_decode_errors": 5,
+                                    "min_audio_sample_rate": 48000})
+        after = panel.get_config_overrides()
+        assert after["allow_larger_resolution"] is True
+        assert after["loudness_mode"] == "off"
+        assert after["max_decode_errors"] == 5
+        assert after["min_audio_sample_rate"] == 48000
+        assert "loudness_mode" not in panel._preset_extras
+        for control in panel._rule_controls.values():
+            assert control.accessibleName()
+
+    def test_shutdown_stops_the_single_instance_server_first(self, window, monkeypatch, qapp):
+        closed = []
+
+        class Server:
+            def close(self):
+                closed.append(True)
+
+        monkeypatch.setattr(qapp, "_fg_instance_server", Server(), raising=False)
+        window._shutdown_services()
+        assert closed == [True]
+        window._services_stopped = False
+
+    def test_closing_during_a_scan_asks_first(self, window, monkeypatch, qapp):
+        from frameguard import gui
+        asked = []
+        monkeypatch.setattr(gui.QApplication, "platformName", staticmethod(lambda: "cocoa"))
+        monkeypatch.setattr(gui.QMessageBox, "question",
+                            lambda *a, **k: (asked.append(a), gui.QMessageBox.No)[1])
+
+        class Thread:
+            def isRunning(self):
+                return True
+
+        monkeypatch.setattr(window, "_worker_thread", Thread())
+        assert window._confirm_close_during_scan() is False
+        assert len(asked) == 1
+        monkeypatch.setattr(window, "_worker_thread", None)
+        assert window._confirm_close_during_scan() is True
