@@ -254,7 +254,10 @@ PROJECTION_CHOICES = (
     "half_equirectangular", "tiled_equirectangular", "rectilinear",
 )
 STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
-LOUDNESS_MODES = ("off", "advisory", "essential")
+# "report" measures and shows loudness without judging it: camera originals
+# and phone recordings routinely sit far from broadcast targets (-23 LUFS,
+# -1 dBTP) and must not be flagged unless the spec asks for it.
+LOUDNESS_MODES = ("off", "report", "advisory", "essential")
 
 DEFAULT_CONFIG = {
     # Picture geometry and timing. Resolution must match exactly unless
@@ -315,8 +318,9 @@ DEFAULT_CONFIG = {
     # length is dead.
     "dead_channel_ratio": 0.95,
 
-    # Loudness (EBU R128). "off" skips ebur128 entirely.
-    "loudness_mode": "advisory",
+    # Loudness (EBU R128): "off" skips ebur128 entirely, "report" measures
+    # without enforcing, "advisory" warns and "essential" fails off-target.
+    "loudness_mode": "report",
     "target_loudness_lufs": -23.0,
     "loudness_tolerance_lu": 2.0,
     "true_peak_max_dbtp": -1.0,
@@ -452,20 +456,25 @@ class QAResult:
         with self._lock:
             self.checks.append((check_name, "SKIP", detail, confidence))
 
-    def add_not_verified(self, check_name: str, reason: str):
-        """Record an analysis that should have run but could not.
+    def add_not_verified(self, check_name: str, reason: str, by_choice: bool = False):
+        """Record an analysis that did not run.
 
         SKIP is ignored by the verdict, so an unrun integrity scan used to read
         exactly like a clean one. "Not verified" is a WARN with an explicit
         label: the file can never come out a clean PASS on unverified ground.
+
+        ``by_choice`` marks analysis the operator chose not to run (a quick
+        scan). Strict Mode escalates genuine failures to analyse, but not a
+        choice: otherwise every quick + strict scan was a FAIL.
         """
         with self._lock:
             detail = f"{NOT_VERIFIED_PREFIX}{reason}"
             self.checks.append((check_name, "WARN", detail, 100))
             self.warnings.append(f"{check_name}: {detail}")
-            self.metadata.setdefault("not_verified", [])
-            if check_name not in self.metadata["not_verified"]:
-                self.metadata["not_verified"].append(check_name)
+            key = "not_run_by_choice" if by_choice else "not_verified"
+            self.metadata.setdefault(key, [])
+            if check_name not in self.metadata[key]:
+                self.metadata[key].append(check_name)
 
     def set_metadata(self, key, value):
         with self._lock:
@@ -507,24 +516,28 @@ class QAResult:
         for check_name, status, *_ in self.checks:
             if status == "FAIL":
                 issues.append(_PLAIN.get(check_name, check_name.lower() + " issue"))
+        if issues:
+            if len(issues) == 1:
+                return issues[0][0].upper() + issues[0][1:] + "."
+            return ", ".join(i.capitalize() for i in issues) + "."
 
-        if not issues:
-            warn_names = []
-            for check_name, status, detail, *_ in self.checks:
-                if status != "WARN":
-                    continue
-                if str(detail).startswith(NOT_VERIFIED_PREFIX):
-                    warn_names.append(f"{check_name.lower()} not verified")
-                else:
-                    warn_names.append(_PLAIN.get(check_name, check_name.lower() + " concern"))
-            if warn_names:
-                unique = list(dict.fromkeys(warn_names))
-                return "Heads up: " + ", ".join(unique) + "."
+        notes = []
+        for check_name, status, detail, *_ in self.checks:
+            if status != "WARN":
+                continue
+            if str(detail).startswith(NOT_VERIFIED_PREFIX):
+                notes.append(f"{check_name.lower()} not verified")
+            else:
+                notes.append(_PLAIN.get(check_name, check_name.lower() + " concern"))
+        notes = list(dict.fromkeys(notes))
+        if not notes:
             return "Passed with minor notes."
-
-        if len(issues) == 1:
-            return issues[0][0].upper() + issues[0][1:] + "."
-        return ", ".join(i.capitalize() for i in issues) + "."
+        # The wording follows the final verdict: under Strict Mode warnings
+        # are failures, and "Heads up" on a FAIL row contradicted it.
+        verdict = self.status or self.overall_status()
+        if verdict == "MISMATCH":
+            return "Failed in Strict Mode: " + ", ".join(notes) + "."
+        return "Heads up: " + ", ".join(notes) + "."
 
     def overall_status(self, strict: bool = False) -> str:
         """Return the file's overall verdict.
@@ -545,6 +558,7 @@ class QAResult:
         """
         strict = strict or bool(getattr(self, "strict", False))
         flagged = False
+        by_choice = set(self.metadata.get("not_run_by_choice") or ())
 
         for check_tuple in self.checks:
             name, status = check_tuple[0], check_tuple[1]
@@ -559,7 +573,9 @@ class QAResult:
             if name in ESSENTIAL_CHECKS and status == "FAIL" and confidence >= 70:
                 return "MISMATCH"
 
-            if strict:
+            chosen = (status == "WARN" and name in by_choice
+                      and str(check_tuple[2]).startswith(NOT_VERIFIED_PREFIX))
+            if strict and not chosen:
                 return "MISMATCH"
 
             flagged = True
@@ -2130,7 +2146,7 @@ class _ScanPlan:
         self.video = _primary_video_stream(probe_data)
         self.audio = _audio_streams(probe_data)
         self.duration = _probed_duration(probe_data)
-        self.loudness = (cfg.get("loudness_mode", "advisory") != "off") and bool(self.audio)
+        self.loudness = (cfg.get("loudness_mode", "report") != "off") and bool(self.audio)
         self.variable_rate = variable_rate
 
     def video_frames_unreliable(self) -> bool:
@@ -2596,14 +2612,22 @@ def _parse_loudness(log_text: str) -> Dict[int, dict]:
 
 
 def _loudness_entry(label: str, measured: Optional[dict], cfg: dict) -> Tuple[str, str]:
+    """One track's loudness row for the configured ``loudness_mode``."""
+    mode = cfg.get("loudness_mode", "report")
     if not measured or "integrated" not in measured:
+        if mode == "report":
+            return "SKIP", _with_track(label, "Loudness summary not reported by FFmpeg.")
         return "WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}loudness summary not reported by FFmpeg.")
-    essential = cfg.get("loudness_mode") == "essential"
+    integrated = measured["integrated"]
+    peak = measured.get("true_peak")
+    peak_text = f"{peak:.1f} dBTP" if peak is not None and math.isfinite(peak) else "-inf dBTP"
+    loudness_text = ("no measurable loudness (silent)" if integrated <= -69.9
+                     else f"{integrated:.1f} LUFS")
+    if mode == "report":
+        return "PASS", _with_track(label, f"{loudness_text}, true peak {peak_text}; not enforced")
     target = float(cfg["target_loudness_lufs"])
     tolerance = float(cfg["loudness_tolerance_lu"])
     peak_max = float(cfg["true_peak_max_dbtp"])
-    integrated = measured["integrated"]
-    peak = measured.get("true_peak")
     issues = []
     if integrated <= -69.9:
         issues.append("no measurable programme loudness (silent)")
@@ -2611,11 +2635,11 @@ def _loudness_entry(label: str, measured: Optional[dict], cfg: dict) -> Tuple[st
         issues.append(f"integrated {integrated:.1f} LUFS is outside {target:g} ± {tolerance:g} LUFS")
     if peak is not None and peak > peak_max:
         issues.append(f"true peak {peak:.1f} dBTP exceeds {peak_max:g} dBTP")
-    peak_text = f"{peak:.1f} dBTP" if peak is not None and math.isfinite(peak) else "-inf dBTP"
-    text = f"I {integrated:.1f} LUFS (target {target:g} ± {tolerance:g}), true peak {peak_text} (max {peak_max:g})"
+    text = (f"{loudness_text}, true peak {peak_text} "
+            f"(target {target:g} ± {tolerance:g} LUFS, max {peak_max:g} dBTP)")
     if not issues:
         return "PASS", _with_track(label, text)
-    status = "FAIL" if essential else "WARN"
+    status = "FAIL" if mode == "essential" else "WARN"
     return status, _with_track(label, f"{text}: " + "; ".join(issues))
 
 
@@ -2703,8 +2727,8 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
                      variable_rate=bool(result.metadata.get("vfr_detected")),
                      hidden_frames=result.metadata.get("edit_list_hidden_frames", 0))
     if quick:
-        _mark_not_verified(result, plan.frame_check_names(),
-                           "quick scan — the file was not decoded.")
+        for name in plan.frame_check_names():
+            result.add_not_verified(name, "quick scan — the file was not decoded.", by_choice=True)
         return
     if probe_data is None:
         _mark_not_verified(result, plan.frame_check_names(), "the file could not be probed.")

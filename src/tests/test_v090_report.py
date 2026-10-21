@@ -36,7 +36,7 @@ class TestReportAuditTrail:
         assert rows["Resolution"] == "3840x2160 exactly"
         assert rows["Projection / stereo"] == "equirectangular / not enforced"
         assert rows["Decode errors allowed"] == "0"
-        assert "advisory" in rows["Loudness"]
+        assert rows["Loudness"] == "measured and reported, not enforced"  # default "report"
 
     def test_pdf_and_exports_render_with_and_without_audit_data(self, tmp_path):
         from conftest import make_result

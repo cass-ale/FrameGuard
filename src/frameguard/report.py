@@ -1044,6 +1044,16 @@ def _fmt_choice(value) -> str:
     return "not enforced" if value in (None, "any") else str(value)
 
 
+def _loudness_spec(c: dict) -> str:
+    mode = c.get("loudness_mode", "report")
+    if mode == "off":
+        return "not measured"
+    if mode == "report":
+        return "measured and reported, not enforced"
+    return (f"{mode}: {c.get('target_loudness_lufs')} ± {c.get('loudness_tolerance_lu')} LUFS, "
+            f"TP ≤ {c.get('true_peak_max_dbtp')} dBTP")
+
+
 def spec_rows(config: dict) -> List[tuple]:
     """(label, value) pairs summarising the effective spec for the PDF."""
     if not config:
@@ -1070,9 +1080,7 @@ def spec_rows(config: dict) -> List[tuple]:
                            f"≥{c.get('freeze_detect_duration')} s (noise {c.get('freeze_detect_noise')})"),
         ("Silence", f"≤{c.get('silence_noise_db')} dB for ≥{c.get('silence_duration')} s; "
                     f"dead at {float(c.get('dead_channel_ratio') or 0) * 100:g}%"),
-        ("Loudness", "not measured" if c.get("loudness_mode") == "off" else
-                     f"{c.get('loudness_mode')}: {c.get('target_loudness_lufs')} ± "
-                     f"{c.get('loudness_tolerance_lu')} LUFS, TP ≤ {c.get('true_peak_max_dbtp')} dBTP"),
+        ("Loudness", _loudness_spec(c)),
     ]
     return [(label, value) for label, value in rows if value not in (None, "")]
 

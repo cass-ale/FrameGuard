@@ -117,6 +117,83 @@ class TestLosslessTrims:
 
 
 # ---------------------------------------------------------------------------
+# H2: loudness, strict mode and the summary line
+# ---------------------------------------------------------------------------
+
+def _hot_clip(path):
+    """Camera-original loudness: about -3.6 LUFS with a true peak above 0 dBTP."""
+    path += ".mp4"
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=4",
+           "-f", "lavfi", "-i", "sine=f=1000:sample_rate=48000:d=4,volume=8",
+           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+           "-c:a", "aac", path)
+    return path
+
+
+class TestLoudnessIsReportedNotJudgedByDefault:
+    """Every Canon original tripped -23 LUFS / -1 dBTP and Strict Mode turned
+    that into FAIL (review H2)."""
+
+    def test_default_is_report(self):
+        assert DEFAULT_CONFIG["loudness_mode"] == "report"
+        assert core.LOUDNESS_MODES == ("off", "report", "advisory", "essential")
+
+    def test_hot_original_passes_by_default_even_in_strict_mode(self, media):
+        clip = media.get("hot", _hot_clip)
+        for strict in (False, True):
+            result = _scan(clip, strict=strict)
+            loud = _row(result, "Audio Loudness")
+            assert loud[1] == "PASS", loud
+            assert "LUFS, true peak" in loud[2] and "not enforced" in loud[2], loud
+            assert result.status == "PASS", (strict, _problems(result))
+        assert result.metadata["true_peak_dbtp"] > -1
+
+    def test_advisory_warns_and_essential_fails(self, media):
+        clip = media.get("hot", _hot_clip)
+        assert _row(_scan(clip, loudness_mode="advisory"), "Audio Loudness")[1] == "WARN"
+        essential = _scan(clip, loudness_mode="essential")
+        assert _row(essential, "Audio Loudness")[1] == "FAIL"
+        assert essential.status == "MISMATCH"
+
+    def test_off_skips_ebur128(self, media):
+        clip = media.get("hot", _hot_clip)
+        result = _scan(clip, loudness_mode="off")
+        assert _row(result, "Audio Loudness")[1] == "SKIP"
+        assert "integrated_loudness_lufs" not in result.metadata
+
+
+class TestStrictMode:
+    def test_quick_scan_is_not_a_strict_failure(self, media):
+        """Quick scans skip frame analysis by choice; under Strict every file
+        used to become a FAIL."""
+        clip = media.get("clean.mp4", lambda p: make_clip(p + ".mp4", duration=3))
+        result = _scan(clip, strict=True, quick=True)
+        assert _row(result, "File Integrity")[2].startswith(core.NOT_VERIFIED_PREFIX)
+        assert result.status == "PASS_WITH_WARNINGS", _problems(result)
+        assert result.plain_summary().startswith("Heads up:")
+
+    def test_analysis_that_genuinely_failed_still_escalates(self, media, monkeypatch):
+        clip = media.get("clean.mp4", lambda p: make_clip(p + ".mp4", duration=3))
+        monkeypatch.setattr(core, "_build_scan_command",
+                            lambda ffmpeg_path, filepath, plan, cfg:
+                            [ffmpeg_path, "-loglevel", "level+verbose", "-i", filepath,
+                             "-filter_complex", "nosuchfilter", "-f", "null", "-"])
+        assert _scan(clip).status == "PASS_WITH_WARNINGS"
+        strict = _scan(clip, strict=True)
+        assert strict.status == "MISMATCH"
+        assert strict.plain_summary().startswith("Failed in Strict Mode:"), strict.plain_summary()
+
+    def test_strict_warning_summary_follows_the_verdict(self, media):
+        clip = media.get("hot", _hot_clip)
+        strict = _scan(clip, strict=True, loudness_mode="advisory")
+        assert strict.status == "MISMATCH"
+        summary = strict.plain_summary()
+        assert summary.startswith("Failed in Strict Mode:") and "Heads up" not in summary
+        relaxed = _scan(clip, loudness_mode="advisory")
+        assert relaxed.plain_summary().startswith("Heads up:")
+
+
+# ---------------------------------------------------------------------------
 # L3: sampled VFR windows on MPEG-TS with B-frames
 # ---------------------------------------------------------------------------
 

@@ -380,7 +380,8 @@ class TestXRMetadata:
 # ---------------------------------------------------------------------------
 
 class TestLoudness:
-    """D3: ebur128 ran and its result was discarded."""
+    """D3: ebur128 ran and its result was discarded. Enforcement is opt-in
+    (review H2); the defaults are covered in test_v090_review.py."""
 
     def test_measured_loudness_is_checked(self, media):
         clip = media.get("clean_h264.mp4", lambda p: make_clip(p))
