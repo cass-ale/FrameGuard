@@ -105,6 +105,9 @@ USE_CUSTOM_CHROME = sys.platform == "win32"
 _THEME_KEY = "appearance/theme"
 _LEGACY_THEME_KEY = "theme"
 _WINDOW_GEOMETRY_KEY = "window/normal_geometry"
+_SIDEBAR_COLLAPSED_KEY = "window/sidebar_collapsed"
+MIN_WINDOW_W, MIN_WINDOW_H = 760, 520
+_AUTOSAVE_DELAY_MS = 600
 _RESULTS_SPLITTER_KEY = "window/results_splitter"
 _DEFAULT_DARK_THEME = "Blue Hour"
 _DEFAULT_LIGHT_THEME = "Clean Light"
@@ -1004,15 +1007,37 @@ class _QueueList(QListWidget):
     """
 
     pressed_anywhere = Signal()
+    remove_requested = Signal(int)  # row
 
     def mousePressEvent(self, event: QMouseEvent):
         if event.button() == Qt.LeftButton:
             self.pressed_anywhere.emit()
         event.accept()
 
+    def keyPressEvent(self, event):
+        """Keyboard review: arrows move, Delete/Backspace removes a file."""
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and self.currentRow() >= 0:
+            self.remove_requested.emit(self.currentRow())
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.pos())
+        if item is None:
+            return
+        from PySide6.QtWidgets import QMenu
+        menu = QMenu(self)
+        remove = menu.addAction("Remove from Queue")
+        row = self.row(item)
+        if menu.exec(event.globalPos()) is remove:
+            self.remove_requested.emit(row)
+
 
 class DropZone(QFrame):
     """Drag-and-drop zone for video files and folders. Clickable to browse."""
+
+    file_remove_requested = Signal(int)  # queue row
     files_dropped = Signal(list)
     preset_dropped = Signal(str)  # Emits path to .fg preset file
     browse_requested = Signal()
@@ -1086,8 +1111,13 @@ class DropZone(QFrame):
         # restores "click anywhere to browse".
         self._file_list.setAcceptDrops(False)
         self._file_list.setDragDropMode(QAbstractItemView.NoDragDrop)
-        self._file_list.setFocusPolicy(Qt.NoFocus)
-        self._file_list.setSelectionMode(QAbstractItemView.NoSelection)
+        # Focusable so the queue can be reviewed (and trimmed) by keyboard.
+        self._file_list.setFocusPolicy(Qt.StrongFocus)
+        self._file_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._file_list.setAccessibleName("Queued files")
+        self._file_list.setAccessibleDescription(
+            "Use the arrow keys to review; press Delete to remove the selected file.")
+        self._file_list.remove_requested.connect(self.file_remove_requested)
         self._file_list.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self._file_list.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
         self._file_list.pressed_anywhere.connect(self.browse_requested)
@@ -1422,6 +1452,10 @@ class ScanPanel(QWidget):
         # delivery — files would silently never load. Same pattern as
         # MainWindow._export_runners.
         self._discovery_runners = []
+        # Bumped by every new selection or clear; a folder search reports
+        # its generation so a slow, superseded search cannot overwrite the
+        # newer queue (or refill a cleared one).
+        self._discovery_generation = 0
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
@@ -1454,6 +1488,7 @@ class ScanPanel(QWidget):
         # window instead of scrolling inside a fixed 120px box.
         self.drop_zone = DropZone()
         self.drop_zone.files_dropped.connect(self._on_files_dropped)
+        self.drop_zone.file_remove_requested.connect(self._remove_queued_file)
         self.drop_zone.browse_requested.connect(self._browse_combined)
         layout.addWidget(self.drop_zone, 1)
 
@@ -1720,6 +1755,7 @@ class ScanPanel(QWidget):
                 "Video Files (*.mp4 *.mov *.mkv *.mxf *.avi *.ts *.webm);;All Files (*)"
             )
             if files:
+                self._invalidate_discovery()
                 self._set_files(files)
         elif clicked == folder_btn:
             folder = QFileDialog.getExistingDirectory(self, "Select Folder")
@@ -1734,6 +1770,7 @@ class ScanPanel(QWidget):
         thread pool: the old sync os.listdir blocked the event loop and
         Windows flagged the app "Not Responding".
         """
+        generation = self._invalidate_discovery()
         try:
             from frameguard.core import discover_video_files as _discover
             # Fast path: single existing files need no thread hop.
@@ -1751,7 +1788,7 @@ class ScanPanel(QWidget):
         self.file_count_label.setText("Looking for video files\u2026")
         self._style_file_count("muted")
         self.scan_btn.setEnabled(False)
-        runner = _FileDiscoveryRunner(list(paths))
+        runner = _FileDiscoveryRunner(list(paths), generation)
         self._discovery_runners.append(runner)
         runner.signals.finished.connect(self._on_discovery_finished)
         runner.signals.error.connect(self._on_discovery_error)
@@ -1765,11 +1802,33 @@ class ScanPanel(QWidget):
         except ValueError:
             pass
 
-    def _on_discovery_error(self, error):
+    def _remove_queued_file(self, row: int):
+        if not 0 <= row < len(self._files):
+            return
+        remaining = self._files[:row] + self._files[row + 1:]
+        if not remaining:
+            self._on_files_dropped([])
+            self.drop_zone.show_empty_state()
+            return
+        self._invalidate_discovery()
+        self._set_files(remaining)
+        lst = self.drop_zone._file_list
+        lst.setCurrentRow(min(row, lst.count() - 1))
+
+    def _invalidate_discovery(self) -> int:
+        """Supersede any folder search still running; returns the new generation."""
+        self._discovery_generation += 1
+        return self._discovery_generation
+
+    def _on_discovery_error(self, generation, error):
+        if generation != self._discovery_generation:
+            return  # a newer selection or a clear replaced this search
         self.file_count_label.setText(f"Could not inspect selection: {error}")
         self.scan_btn.setEnabled(False)
 
-    def _on_discovery_finished(self, files):
+    def _on_discovery_finished(self, generation, files):
+        if generation != self._discovery_generation:
+            return  # a newer selection or a clear replaced this search
         if files:
             self._set_files(files)
         else:
@@ -1779,6 +1838,7 @@ class ScanPanel(QWidget):
 
     def _on_files_dropped(self, paths):
         if not paths:
+            self._invalidate_discovery()
             self._files = []
             self.file_count_label.setText("No files selected")
             self._style_file_count("muted")
@@ -2177,8 +2237,15 @@ class ResultsPanel(QWidget):
         header.setSectionResizeMode(0, QHeaderView.Fixed)
         for col in (1, 3, 4, 5):
             header.setSectionResizeMode(col, QHeaderView.Fixed)
+        # Filename takes the remaining width; Summary is sized by
+        # _rebalance_name_columns (user-resizable). When both stretched, a
+        # narrow window squeezed Filename to ~50px ("PR…ov") and the
+        # middle elision could no longer keep the clip ID visible.
         header.setSectionResizeMode(2, QHeaderView.Stretch)    # filename
-        header.setSectionResizeMode(6, QHeaderView.Stretch)    # summary
+        header.setSectionResizeMode(6, QHeaderView.Interactive)  # summary
+        header.setStretchLastSection(False)
+        self._summary_width_user = None
+        header.sectionResized.connect(self._on_header_section_resized)
         self._autosize_metadata_columns()
         # Header text sits on the same column as the cell text below it. All
         # headers were centred, so "Filename" and "Summary" floated over the
@@ -2221,6 +2288,7 @@ class ResultsPanel(QWidget):
         # Detail panel
         self.detail_panel = QTextEdit()
         self.detail_panel.setReadOnly(True)
+        self.detail_panel.setAccessibleName("Check details for the selected file")
         _set_role(self.detail_panel, "framed-tool")
         self.detail_panel.setPlaceholderText("Select a file above to view detailed check results.\nDouble-click a row to open in a larger popup window.")
         splitter.addWidget(self.detail_panel)
@@ -2253,12 +2321,12 @@ class ResultsPanel(QWidget):
         frame.setObjectName(f"summary_badge_{key}")
         frame.setProperty("fgInlineStyleAllowed", True)
         frame.setCursor(Qt.PointingHandCursor)
-        frame.setStyleSheet(
-            f"QFrame#summary_badge_{key} {{ "
-            f"background-color: rgba({_hex_to_rgb(color)}, 0.1); "
-            f"border: 1px solid rgba({_hex_to_rgb(color)}, 0.25); "
-            f"border-radius: 8px; padding: 8px 16px; }}"
-        )
+        frame.setStyleSheet(self._badge_style(key, color, get_theme().focus))
+        # Keyboard and screen-reader operable: it was a mouse-only frame
+        # with no name, skipped by Tab.
+        frame.setFocusPolicy(Qt.StrongFocus)
+        frame.setAccessibleName(f"{label}: {count}, show details")
+        frame.setProperty("fgBadgeLabel", label)
         frame.setMinimumWidth(D.SPACE_6 * 3 + D.SPACE_1)
         metric_font = D.ui_font(D.FONT_DISPLAY, D.WEIGHT_SEMIBOLD)
         label_font = D.ui_font(D.FONT_SMALL)
@@ -2298,9 +2366,23 @@ class ResultsPanel(QWidget):
         self._badge_name_labels[key] = name_lbl
         self._badge_colors[key] = color  # Will be updated on theme change
 
-        # Make badge clickable
+        # Make badge clickable (mouse, Space or Return)
         frame.mousePressEvent = lambda e: self._show_summary_popup()
+
+        def _badge_key(event, _frame=frame):
+            if event.key() in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
+                self._show_summary_popup()
+            else:
+                QFrame.keyPressEvent(_frame, event)
+        frame.keyPressEvent = _badge_key
         return frame
+
+    @staticmethod
+    def _badge_style(key: str, color: str, focus: str) -> str:
+        rgb = _hex_to_rgb(color)
+        return (f"QFrame#summary_badge_{key} {{ background-color: rgba({rgb}, 0.1); "
+                f"border: 1px solid rgba({rgb}, 0.25); border-radius: 8px; padding: 8px 16px; }}"
+                f"QFrame#summary_badge_{key}:focus {{ border: 2px solid {focus}; }}")
 
     def _set_summary_compact(self, compact: bool):
         if compact == self._summary_compact:
@@ -2308,12 +2390,29 @@ class ResultsPanel(QWidget):
         self._summary_compact = compact
         for badge in self._summary_badges:
             self.summary_row.removeWidget(badge)
-        columns = 2 if compact else 4
+        # Always one row: the old 2x2 "compact" grid doubled the strip's
+        # height exactly when the window was small, leaving the results
+        # table two rows tall. Compact only tightens the spacing.
+        self.summary_row.setSpacing(D.SPACE_2 if compact else D.SPACE_3)
+        from PySide6.QtWidgets import QBoxLayout
+        metric_font = D.ui_font(D.FONT_DISPLAY, D.WEIGHT_SEMIBOLD)
+        label_font = D.ui_font(D.FONT_SMALL)
         for index, badge in enumerate(self._summary_badges):
-            self.summary_row.addWidget(badge, index // columns, index % columns)
+            # Compact badges put the count beside its label: half the height,
+            # which goes to the results table instead.
+            badge.layout().setDirection(
+                QBoxLayout.LeftToRight if compact else QBoxLayout.TopToBottom)
+            badge.setMinimumHeight(
+                D.label_height(metric_font) + 2 * D.SPACE_2 if compact else
+                D.label_height(metric_font) + D.label_height(label_font)
+                + 2 * D.SPACE_2 + D.SPACE_1)
+            self.summary_row.addWidget(badge, 0, index)
         for column in range(4):
-            self.summary_row.setColumnStretch(column, 1 if column < columns else 0)
-        rows = 2 if compact else 1
+            self.summary_row.setColumnStretch(column, 1)
+        rows = 1
+        for badge in self._summary_badges:
+            badge.layout().invalidate()
+            badge.layout().activate()
         badge_height = max(b.minimumSizeHint().height() for b in self._summary_badges)
         self._summary_scroll.setMinimumHeight(
             rows * badge_height + (rows - 1) * D.SPACE_3 + 2 * D.SPACE_1)
@@ -2334,12 +2433,7 @@ class ResultsPanel(QWidget):
         for key, color in color_map.items():
             self._badge_colors[key] = color
             if key in self._badge_frames:
-                self._badge_frames[key].setStyleSheet(
-                    f"QFrame#summary_badge_{key} {{ "
-                    f"background-color: rgba({_hex_to_rgb(color)}, 0.1); "
-                    f"border: 1px solid rgba({_hex_to_rgb(color)}, 0.25); "
-                    f"border-radius: 8px; padding: 8px 16px; }}"
-                )
+                self._badge_frames[key].setStyleSheet(self._badge_style(key, color, t.focus))
             if key in self._badge_count_labels:
                 self._badge_count_labels[key].setStyleSheet(
                     f"color: {color}; background: transparent; border: none; padding: 4px 0px;"
@@ -2613,6 +2707,55 @@ class ResultsPanel(QWidget):
         self._update_attention_banner(0, 0, 0)
         self.detail_panel.clear()
 
+    FILENAME_MIN_W = 180
+    SUMMARY_MIN_W = 100
+    SUMMARY_MAX_W = 460
+
+    def _on_header_section_resized(self, index, _old, new):
+        if index == 6 and not getattr(self, "_rebalancing", False):
+            self._summary_width_user = new
+
+    # Columns that can drop out on a narrow table, least important first;
+    # their values stay in the detail pane and the popup.
+    _OPTIONAL_COLUMNS = (5, 3)  # Duration, Codec
+
+    def _rebalance_name_columns(self):
+        """Give Filename priority as the table narrows.
+
+        Summary shrinks first, then Duration and Codec are hidden, so the
+        filename (the thing operators scan for) keeps a readable width.
+        """
+        viewport = self.table.viewport().width()
+        if viewport <= 0:
+            return
+        floor = self.FILENAME_MIN_W + self.SUMMARY_MIN_W
+        for col in self._OPTIONAL_COLUMNS:
+            self.table.setColumnHidden(col, False)
+        for col in self._OPTIONAL_COLUMNS:
+            visible_fixed = sum(self.table.columnWidth(c) for c in (0, 1, 3, 4, 5)
+                                if not self.table.isColumnHidden(c))
+            if viewport - visible_fixed >= floor:
+                break
+            self.table.setColumnHidden(col, True)
+        fixed = sum(self.table.columnWidth(c) for c in (0, 1, 3, 4, 5)
+                    if not self.table.isColumnHidden(c))
+        available = viewport - fixed
+        if available <= 0:
+            return
+        wanted = self._summary_width_user or int(available * 0.42)
+        summary = max(self.SUMMARY_MIN_W,
+                      min(self.SUMMARY_MAX_W, wanted, available - self.FILENAME_MIN_W))
+        self._rebalancing = True
+        try:
+            self.table.setColumnWidth(6, summary)
+        finally:
+            self._rebalancing = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "table"):
+            self._rebalance_name_columns()
+
     def _autosize_metadata_columns(self):
         """Fit Status/Codec/Resolution/Duration to their widest actual value.
 
@@ -2637,6 +2780,7 @@ class ResultsPanel(QWidget):
             # Cell margins plus room for a header sort indicator.
             width = max(minimum, min(maximum, widest + 2 * D.SPACE_2 + D.SPACE_4))
             self.table.setColumnWidth(col, width)
+        self._rebalance_name_columns()
 
     def _build_actions_menu(self):
         """Build the overflow menu; returns ``(menu, actions_by_key)``."""
@@ -2915,6 +3059,9 @@ class ResultsPanel(QWidget):
         lbl = self.findChild(QLabel, f"badge_count_{name}")
         if lbl:
             lbl.setText(value)
+        frame = self._badge_frames.get(name)
+        if frame is not None:
+            frame.setAccessibleName(f"{frame.property('fgBadgeLabel')}: {value}, show details")
 
     def _on_header_section_clicked(self, section: int):
         """Clicking the checkbox column header toggles every visible row."""
@@ -3065,6 +3212,8 @@ class SettingsPanel(QWidget):
         self.custom_height = QSpinBox()
         self.custom_height.setRange(1, 99999)
         self.custom_height.setSingleStep(2)
+        self.custom_width.setAccessibleName("Custom width in pixels")
+        self.custom_height.setAccessibleName("Custom height in pixels")
 
         self.custom_res_row = QWidget()
         custom_res_layout = QHBoxLayout(self.custom_res_row)
@@ -3108,6 +3257,8 @@ class SettingsPanel(QWidget):
         self.fps_tol_slider, self.fps_tol_value = self._make_float_slider(
             min_v=0.1, max_v=2.0, step=0.1, tick=0.5, suffix=" fps"
         )
+        self.fps_tol_slider.setAccessibleName("Frame rate tolerance")
+        self.fps_tol_slider.setAccessibleDescription("Allowed difference from the target frame rate, in frames per second")
         self._add_setting(
             delivery_layout,
             key="delivery_fps_tolerance",
@@ -3121,6 +3272,8 @@ class SettingsPanel(QWidget):
         self.min_bitrate_slider, self.min_bitrate_value = self._make_int_slider(
             min_v=1, max_v=100, tick=5, suffix=" Mbps"
         )
+        self.min_bitrate_slider.setAccessibleName("Minimum video bitrate")
+        self.min_bitrate_slider.setAccessibleDescription("In megabits per second")
         self._add_setting(
             delivery_layout,
             key="delivery_min_bitrate_mbps",
@@ -3149,6 +3302,8 @@ class SettingsPanel(QWidget):
         self.silence_slider, self.silence_value = self._make_float_slider(
             min_v=1.0, max_v=30.0, step=0.5, tick=5.0, suffix=" s"
         )
+        self.silence_slider.setAccessibleName("Minimum silence duration")
+        self.silence_slider.setAccessibleDescription("Silence shorter than this is ignored, in seconds")
         self._add_setting(
             audio_layout,
             key="audio_silence_duration_s",
@@ -3188,6 +3343,8 @@ class SettingsPanel(QWidget):
         self.segment_count_slider, self.segment_count_value = self._make_int_slider(
             min_v=2, max_v=16, tick=1, suffix=""
         )
+        self.segment_count_slider.setAccessibleName("Deep scan segments")
+        self.segment_count_slider.setAccessibleDescription("Number of parallel segments the deep scan splits each file into")
         self._add_setting(
             scan_layout,
             key="deep_segment_count",
@@ -4104,18 +4261,19 @@ class SettingsPanel(QWidget):
                 group.hide()
 
 class _FileDiscoverySignals(QObject):
-    """Signals for file discovery worker."""
-    finished = Signal(list)
-    error = Signal(str)
+    """Signals for file discovery worker (each carries the search generation)."""
+    finished = Signal(int, list)
+    error = Signal(int, str)
     terminal = Signal(object)
 
 
 class _FileDiscoveryRunner(QRunnable):
     """Discovers video files in background to avoid blocking GUI thread."""
 
-    def __init__(self, paths):
+    def __init__(self, paths, generation: int = 0):
         super().__init__()
         self.paths = paths if isinstance(paths, (list, tuple)) else [paths]
+        self.generation = generation
         self.signals = _FileDiscoverySignals()
         self.setAutoDelete(True)
 
@@ -4125,9 +4283,9 @@ class _FileDiscoveryRunner(QRunnable):
             all_files = []
             for p in self.paths:
                 all_files.extend(discover_video_files(p))
-            self.signals.finished.emit(all_files)
+            self.signals.finished.emit(self.generation, all_files)
         except Exception as error:
-            self.signals.error.emit(str(error))
+            self.signals.error.emit(self.generation, str(error))
         finally:
             self.signals.terminal.emit(self)
 
@@ -4768,7 +4926,10 @@ class MainWindow(QMainWindow):
         available = _active_available_geometry()
         # Keep the window recoverable on compact or changed monitor layouts.
         # The preferred first-open size remains 1200x800 in _restore_window_state.
-        self.setMinimumSize(min(480, available.width()), min(320, available.height()))
+        # 760x520 is what the pages' layouts actually need (the old 480x320
+        # cut the Results table out entirely); still clamped to small screens.
+        self.setMinimumSize(min(MIN_WINDOW_W, available.width()),
+                            min(MIN_WINDOW_H, available.height()))
 
         # Frameless window with a custom title bar on Windows, where we also
         # reimplement Aero Snap via WM_NCHITTEST. On macOS the same flag would
@@ -4803,6 +4964,7 @@ class MainWindow(QMainWindow):
 
         self._worker: Optional[ScanWorker] = None
         self._worker_thread: Optional[QThread] = None
+        self._scan_total_files = 0
         self._cancel_connected = False
         # Guards the Settings <-> preset-dropdown two-way sync against re-entry.
         self._syncing_preset = False
@@ -4856,6 +5018,7 @@ class MainWindow(QMainWindow):
         # OS mapping into an explicit preference.
         self._apply_theme(self._startup_theme_name, persist=False)
         self._restore_window_state()
+        self._install_autosave()
 
     def _init_ui(self):
         central = QWidget()
@@ -5084,19 +5247,20 @@ class MainWindow(QMainWindow):
         # --- Keyboard Shortcuts ---
         from PySide6.QtGui import QShortcut, QKeySequence
         
-        # Navigation
-        # Navigation (indices follow the sidebar order: Scan, Results, Checks, Watch, Settings)
-        QShortcut(QKeySequence("Ctrl+1"), self, lambda: self._switch_panel(0))  # Scan
-        QShortcut(QKeySequence("Ctrl+2"), self, lambda: self._switch_panel(1))  # Results
-        QShortcut(QKeySequence("Ctrl+3"), self, lambda: self._switch_panel(2))  # Checks
-        QShortcut(QKeySequence("Ctrl+4"), self, lambda: self._switch_panel(3))  # Watch
-        QShortcut(QKeySequence("Ctrl+5"), self, lambda: self._switch_panel(4))  # Settings
-        
-        # Actions
-        QShortcut(QKeySequence("Ctrl+O"), self, self._shortcut_browse)
-        # Open the checked (or highlighted) results in the preferred player.
-        # Ctrl+O already browses for files, hence the Shift.
-        QShortcut(QKeySequence("Ctrl+Shift+O"), self, self._shortcut_open_in_player)
+        # On macOS these keys belong to the real menu bar (_build_mac_menu_bar);
+        # registering them twice makes Qt treat each as ambiguous and fire
+        # neither. Elsewhere they are plain window shortcuts.
+        if sys.platform != "darwin":
+            # Navigation (indices follow the sidebar order: Scan, Results, Checks, Watch, Settings)
+            QShortcut(QKeySequence("Ctrl+1"), self, lambda: self._switch_panel(0))  # Scan
+            QShortcut(QKeySequence("Ctrl+2"), self, lambda: self._switch_panel(1))  # Results
+            QShortcut(QKeySequence("Ctrl+3"), self, lambda: self._switch_panel(2))  # Checks
+            QShortcut(QKeySequence("Ctrl+4"), self, lambda: self._switch_panel(3))  # Watch
+            QShortcut(QKeySequence("Ctrl+5"), self, lambda: self._switch_panel(4))  # Settings
+            QShortcut(QKeySequence("Ctrl+O"), self, self._shortcut_browse)
+            # Open the checked (or highlighted) results in the preferred player.
+            # Ctrl+O already browses for files, hence the Shift.
+            QShortcut(QKeySequence("Ctrl+Shift+O"), self, self._shortcut_open_in_player)
         # Return/Enter on a result row opens it. Space is left alone: it
         # toggles the row's export checkbox.
         for key in ("Return", "Enter"):
@@ -5106,9 +5270,12 @@ class MainWindow(QMainWindow):
         # Ask the OS which players exist now, so the first menu opens instantly.
         from frameguard import players as _players
         _players.warm_cache()
-        QShortcut(QKeySequence("F5"), self, self._shortcut_scan)
-        QShortcut(QKeySequence("Ctrl+E"), self, self._shortcut_export)
-        QShortcut(QKeySequence("Ctrl+Q"), self, self._tray_quit)
+        if sys.platform != "darwin":
+            QShortcut(QKeySequence("F5"), self, self._shortcut_scan)
+            QShortcut(QKeySequence("Ctrl+E"), self, self._shortcut_export)
+            QShortcut(QKeySequence("Ctrl+Q"), self, self._tray_quit)
+        else:
+            self._build_mac_menu_bar()
 
         # --- System Tray (minimize to tray when auto-scan active) ---
         self._tray_icon = None
@@ -5271,6 +5438,7 @@ class MainWindow(QMainWindow):
             self._sidebar.setVisible(True)
 
         def _on_finished():
+            self._schedule_autosave()
             if self._sidebar_collapsed:
                 self._sidebar.setVisible(False)
             label = "Show sidebar" if self._sidebar_collapsed else "Hide sidebar"
@@ -5282,6 +5450,62 @@ class MainWindow(QMainWindow):
         self._sidebar_anim.start()
         self._sidebar_anim2.start()
 
+
+    def _collapse_sidebar_immediately(self):
+        """Restore a collapsed sidebar at startup without animating it."""
+        self._sidebar_collapsed = True
+        self._sidebar.setMinimumWidth(0)
+        self._sidebar.setMaximumWidth(0)
+        self._sidebar.setVisible(False)
+        self._sidebar_toggle_btn.setToolTip("Show sidebar")
+        self._sidebar_toggle_btn.setAccessibleName("Show sidebar")
+        self._refresh_nav_icons()
+
+    # --- Autosave -----------------------------------------------------------
+    # Settings used to be written only on a clean quit (or close-to-tray), so
+    # a crash, force quit or power cut lost the whole session's changes.
+
+    def _install_autosave(self):
+        from PySide6.QtWidgets import (QAbstractButton, QComboBox, QDoubleSpinBox,
+                                       QLineEdit, QSlider, QSpinBox)
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.setInterval(_AUTOSAVE_DELAY_MS)
+        self._autosave_timer.timeout.connect(self._autosave)
+        self.settings_panel.settings_changed.connect(self._schedule_autosave)
+        for panel in (self.settings_panel, self.watch_panel):
+            for button in panel.findChildren(QAbstractButton):
+                if button.isCheckable():
+                    button.toggled.connect(self._schedule_autosave)
+            for spin in panel.findChildren(QSpinBox) + panel.findChildren(QDoubleSpinBox):
+                spin.valueChanged.connect(self._schedule_autosave)
+            for slider in panel.findChildren(QSlider):
+                slider.valueChanged.connect(self._schedule_autosave)
+            for combo in panel.findChildren(QComboBox):
+                combo.currentIndexChanged.connect(self._schedule_autosave)
+            for line in panel.findChildren(QLineEdit):
+                line.editingFinished.connect(self._schedule_autosave)
+        if hasattr(self.results_panel, "_splitter"):
+            self.results_panel._splitter.splitterMoved.connect(self._schedule_autosave)
+
+    def _schedule_autosave(self, *_args):
+        timer = getattr(self, "_autosave_timer", None)
+        if timer is not None and not getattr(self, "_force_quit", False):
+            timer.start()
+
+    def _autosave(self):
+        try:
+            self.settings_panel.save_settings()
+            self.watch_panel.save_watch_settings()
+            self._save_window_state()
+            _sync_settings()
+        except Exception as exc:  # never let persistence break the UI
+            if sys.stderr is not None:
+                sys.stderr.write(f"[FrameGuard] Autosave failed: {exc}\n")
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self._schedule_autosave()
 
     def _shortcut_browse(self):
         """Ctrl+O: Open file browser on Scan tab."""
@@ -5389,6 +5613,8 @@ class MainWindow(QMainWindow):
             settings.remove(_LEGACY_THEME_KEY)
             self._theme_is_explicit = True
 
+        self._sync_color_scheme(theme)
+
         # Force theme colors on all QComboBox popups (Windows fix)
         from PySide6.QtWidgets import QComboBox
         for combo in self.findChildren(QComboBox):
@@ -5408,6 +5634,26 @@ class MainWindow(QMainWindow):
         from frameguard import icons as _icons
         _icons.clear_cache()
         self._refresh_nav_icons(t)
+
+    def _sync_color_scheme(self, theme):
+        """Tell Qt (and through it the OS) whether the app is light or dark.
+
+        Without this, message boxes, file panels and dialog title bars kept
+        the OS appearance: light chrome around a dark app, or the reverse.
+        An explicitly chosen theme pins the scheme; while FrameGuard follows
+        the OS it is left unset, so the OS stays the source of truth (and
+        colorSchemeChanged keeps reporting real OS changes).
+        """
+        hints = QApplication.instance().styleHints()
+        if not hasattr(hints, "setColorScheme"):
+            return  # Qt < 6.8
+        if self._theme_is_explicit:
+            dark = QColor(theme.bg_primary).lightness() < 128
+            wanted = Qt.ColorScheme.Dark if dark else Qt.ColorScheme.Light
+            if hints.colorScheme() != wanted:
+                hints.setColorScheme(wanted)
+        else:
+            hints.unsetColorScheme()
 
     def _on_system_color_scheme_changed(self, scheme):
         """Follow runtime OS appearance changes until the user picks a theme."""
@@ -5446,6 +5692,9 @@ class MainWindow(QMainWindow):
             except (TypeError, RuntimeError):
                 pass
 
+        if settings.value(_SIDEBAR_COLLAPSED_KEY, False, type=bool) and not self._sidebar_collapsed:
+            self._collapse_sidebar_immediately()
+
     def _save_window_state(self):
         """Persist only the restored geometry, never a maximized frame."""
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
@@ -5455,6 +5704,7 @@ class MainWindow(QMainWindow):
             settings.setValue(_WINDOW_GEOMETRY_KEY, _clamp_window_rect(rect, available))
         if hasattr(self.results_panel, "_splitter"):
             settings.setValue(_RESULTS_SPLITTER_KEY, self.results_panel._splitter.saveState())
+        settings.setValue(_SIDEBAR_COLLAPSED_KEY, bool(getattr(self, "_sidebar_collapsed", False)))
 
     def _ensure_output_directory(self) -> str:
         os.makedirs(self._docs_folder, exist_ok=True)
@@ -5650,6 +5900,7 @@ class MainWindow(QMainWindow):
 
         try:
             count = len(queued)
+            self.scan_panel._invalidate_discovery()
             self.scan_panel._set_files(queued)
             self.scan_panel.progress_label.setText(
                 f"Watch folder: scanning {count} queued file{'s' if count != 1 else ''}"
@@ -5725,15 +5976,17 @@ class MainWindow(QMainWindow):
 
         runner = _PdfExportRunner(list(results), output_path, preset)
         self._export_runners.append(runner)
-        runner.signals.finished.connect(
-            lambda path: self._report_idle_status(
-                f"Report saved: {os.path.basename(path)}")
-        )
-        runner.signals.error.connect(
-            lambda err: self._report_idle_status(f"Auto-export failed: {err}")
-        )
+        # Bound slots (queued to the GUI thread); see _on_scan_requested.
+        runner.signals.finished.connect(self._on_auto_export_finished)
+        runner.signals.error.connect(self._on_auto_export_error)
         runner.signals.terminal.connect(self._release_export_runner)
         QThreadPool.globalInstance().start(runner)
+
+    def _on_auto_export_finished(self, path: str):
+        self._report_idle_status(f"Report saved: {os.path.basename(path)}")
+
+    def _on_auto_export_error(self, error: str):
+        self._report_idle_status(f"Auto-export failed: {error}")
 
 
     def _install_update(self, update_info):
@@ -5849,16 +6102,13 @@ class MainWindow(QMainWindow):
             self._worker.moveToThread(self._worker_thread)
             self._worker_thread.started.connect(self._worker.run)
 
-            total_files = len(files)
-            self._worker.scan_started.connect(
-                lambda n: self.scan_panel.progress_label.setText(f"Scanning {n} file{'s' if n != 1 else ''}...")
-            )
-            self._worker.file_started.connect(
-                lambda idx, name: self.scan_panel.progress_label.setText(f"File {idx+1}/{total_files}: {name}")
-            )
-            self._worker.file_progress.connect(
-                lambda idx, phase, cur, tot, lbl: self.scan_panel.update_progress(idx, total_files, phase, cur, tot, lbl)
-            )
+            # Bound methods, never lambdas: a lambda has no receiver object,
+            # so PySide runs it on the emitting (worker) thread and it would
+            # touch widgets off the GUI thread. A MainWindow slot is queued.
+            self._scan_total_files = len(files)
+            self._worker.scan_started.connect(self._on_worker_scan_started)
+            self._worker.file_started.connect(self._on_worker_file_started)
+            self._worker.file_progress.connect(self._on_worker_file_progress)
             self._worker.file_finished.connect(self._on_file_finished)
             self._worker.scan_finished.connect(self._on_scan_finished)
             self._worker.scan_error.connect(self._on_scan_error)
@@ -5886,6 +6136,18 @@ class MainWindow(QMainWindow):
             self._resume_watch_monitor()
             QMessageBox.critical(self, "Scan Error", f"Failed to start scan: {e}")
             return
+
+    def _on_worker_scan_started(self, count: int):
+        self.scan_panel.progress_label.setText(
+            f"Scanning {count} file{'s' if count != 1 else ''}...")
+
+    def _on_worker_file_started(self, idx: int, name: str):
+        self.scan_panel.progress_label.setText(
+            f"File {idx + 1}/{self._scan_total_files}: {name}")
+
+    def _on_worker_file_progress(self, idx: int, phase: str, current, total, label: str):
+        self.scan_panel.update_progress(
+            idx, self._scan_total_files, phase, current, total, label)
 
     def _on_file_finished(self, idx: int, result: QAResult):
         """Stream each finished result into the table as soon as it lands.
@@ -5987,8 +6249,12 @@ class MainWindow(QMainWindow):
                 entries.append(f"FAIL  {name}")
         
         log_text = f"[{timestamp}] Scanned {len(results)} file(s):\n" + "\n".join(entries)
-        
-        # Prepend to existing log (keep last 10 entries)
+        self._prepend_watch_log(log_text)
+
+    def _prepend_watch_log(self, log_text: str):
+        """Add an entry to the top of the Watch activity log (bounded)."""
+        if not hasattr(self, 'watch_panel') or not hasattr(self.watch_panel, '_log'):
+            return
         existing = self.watch_panel._log.toPlainText()
         if existing == "No activity yet":
             existing = ""
@@ -6013,6 +6279,7 @@ class MainWindow(QMainWindow):
             self._watch_monitor.resume()
 
     def _on_scan_error(self, msg: str):
+        unattended = self._watch_batch_in_progress or self._is_in_background()
         self.scan_panel.set_scanning(False)
         self._watch_batch_in_progress = False
         # Replace any stale PASS/FAIL verdict: leaving it in place announces
@@ -6027,7 +6294,23 @@ class MainWindow(QMainWindow):
         # not drained here they are never rediscovered by sync() either - they
         # are simply lost.
         self._process_watch_queue()
-        QMessageBox.critical(self, "Scan Error", msg)
+        if unattended:
+            # Nobody is looking: a modal here would block every later batch
+            # and stack one dialog per failure overnight. Log it, show it in
+            # the banner, and notify once per distinct error.
+            self._report_unattended_error(msg)
+        else:
+            QMessageBox.critical(self, "Scan Error", msg)
+
+    def _report_unattended_error(self, msg: str):
+        from datetime import datetime
+        self._prepend_watch_log(f"[{datetime.now().strftime('%H:%M:%S')}] Scan error: {msg}")
+        self._report_idle_status(f"Scan error: {msg}")
+        if self._tray_icon and msg != getattr(self, "_last_unattended_error", None):
+            self._tray_icon.showMessage(
+                "FrameGuard - Scan Error", msg[:200],
+                QSystemTrayIcon.MessageIcon.Critical, 8000)
+        self._last_unattended_error = msg
 
     def _on_scan_cancelled(self):
         self.scan_panel.set_scanning(False)
@@ -6197,6 +6480,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         """Keep the resize grip anchored, and re-flow panels for the new size."""
         super().resizeEvent(event)
+        self._schedule_autosave()
         if hasattr(self, '_size_grip'):
             grip_geo = self._size_grip.geometry()
             self._size_grip.move(
@@ -6459,7 +6743,10 @@ class MainWindow(QMainWindow):
         icon was clicked.
         """
         self._hidden_to_tray = False
-        self.showNormal()
+        # Un-minimise but keep a maximized/full-screen window that way;
+        # showNormal() used to drop it back to its restored size.
+        self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        self.show()
         self.activateWindow()
         self.raise_()
         if self._tray_icon:
@@ -6869,6 +7156,79 @@ class MainWindow(QMainWindow):
         save_btn.clicked.connect(_save)
         dlg.exec()
 
+    _HELP_URL = "https://github.com/cass-ale/FrameGuard#readme"
+    _RELEASES_URL = "https://github.com/cass-ale/FrameGuard/releases"
+
+    def _build_mac_menu_bar(self):
+        """A real macOS menu bar: About, Settings (Cmd+,), File, View, Window
+        and Help, with the app's shortcuts on menu items where macOS users
+        look for them. Parentless, so it stays while the window is hidden to
+        the menu bar."""
+        from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
+        from PySide6.QtCore import QUrl
+        from PySide6.QtWidgets import QMenuBar
+
+        bar = QMenuBar(None)
+        self._mac_menu_bar = bar
+
+        def action(menu, text, slot, shortcut=None, role=None):
+            act = QAction(text, bar)
+            if shortcut:
+                act.setShortcuts([QKeySequence(k) for k in (
+                    shortcut if isinstance(shortcut, (list, tuple)) else [shortcut])])
+            if role is not None:
+                act.setMenuRole(role)
+            act.triggered.connect(lambda _=False: self._defer(slot))
+            menu.addAction(act)
+            return act
+
+        app_menu = bar.addMenu("FrameGuard")  # roles move these into the app menu
+        action(app_menu, "About FrameGuard", self._show_about, role=QAction.MenuRole.AboutRole)
+        action(app_menu, "Check for Updates\u2026", self.settings_panel._check_for_updates,
+               role=QAction.MenuRole.ApplicationSpecificRole)
+        action(app_menu, "Settings\u2026", lambda: self._show_and_switch(4), "Ctrl+,",
+               role=QAction.MenuRole.PreferencesRole)
+        action(app_menu, "Quit FrameGuard", self._tray_quit, "Ctrl+Q",
+               role=QAction.MenuRole.QuitRole)
+
+        file_menu = bar.addMenu("File")
+        action(file_menu, "Add Videos\u2026", self._shortcut_browse, "Ctrl+O")
+        action(file_menu, "Start Scan", self._shortcut_scan, ["Ctrl+R", "F5"])
+        file_menu.addSeparator()
+        action(file_menu, "Open in Player", self._shortcut_open_in_player, "Ctrl+Shift+O")
+        action(file_menu, "Export Report\u2026", self._shortcut_export, "Ctrl+E")
+        action(file_menu, "Import Preset\u2026", self.settings_panel._import_preset_file)
+        file_menu.addSeparator()
+        action(file_menu, "Close Window", self.close, "Ctrl+W")
+
+        view_menu = bar.addMenu("View")
+        for index, name in enumerate(("Scan", "Results", "Checks", "Watch Folder", "Settings")):
+            action(view_menu, name, lambda i=index: self._show_and_switch(i), f"Ctrl+{index + 1}")
+        view_menu.addSeparator()
+        action(view_menu, "Toggle Sidebar", self._toggle_sidebar, "Ctrl+Meta+S")
+
+        window_menu = bar.addMenu("Window")
+        action(window_menu, "Minimize", self.showMinimized, "Ctrl+M")
+        action(window_menu, "Zoom", self._toggle_zoom)
+        window_menu.addSeparator()
+        action(window_menu, "Bring All to Front", self._tray_show)
+
+        help_menu = bar.addMenu("Help")
+        action(help_menu, "FrameGuard Help", lambda: QDesktopServices.openUrl(QUrl(self._HELP_URL)))
+        action(help_menu, "Release Notes", lambda: QDesktopServices.openUrl(QUrl(self._RELEASES_URL)))
+        action(help_menu, "Report a Problem\u2026", self._report_problem)
+
+    def _show_and_switch(self, index: int):
+        if not self.isVisible() or self.isMinimized():
+            self._tray_show()
+        self._switch_panel(index)
+
+    def _toggle_zoom(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+
     def _show_about(self):
         """Show About dialog with version and build info."""
         from frameguard import __version__
@@ -6988,6 +7348,70 @@ class MainWindow(QMainWindow):
 
 
 
+class _ObjCRuntime:
+    """The Objective-C runtime via ctypes, loaded once and shared.
+
+    The title-bar, Dock-icon and status-item code each used to reload libobjc
+    and rebuild their call wrappers on every call (the title bar on every
+    show and theme switch). Prototypes are cached per signature.
+    """
+
+    def __init__(self):
+        import ctypes
+        import ctypes.util
+        self.ctypes = ctypes
+        objc = ctypes.cdll.LoadLibrary(
+            ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
+        objc.objc_getClass.restype = ctypes.c_void_p
+        objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        objc.sel_registerName.restype = ctypes.c_void_p
+        objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        objc.class_getInstanceMethod.restype = ctypes.c_void_p
+        objc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        objc.method_setImplementation.restype = ctypes.c_void_p
+        objc.method_setImplementation.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.objc = objc
+        self._prototypes = {}
+
+    def send(self, restype, *argtypes):
+        key = (restype, argtypes)
+        fn = self._prototypes.get(key)
+        if fn is None:
+            prototype = self.ctypes.CFUNCTYPE(
+                restype, self.ctypes.c_void_p, self.ctypes.c_void_p, *argtypes)
+            fn = self._prototypes[key] = prototype(("objc_msgSend", self.objc))
+        return fn
+
+    def sel(self, name: str):
+        return self.objc.sel_registerName(name.encode("ascii"))
+
+    def cls(self, name: str):
+        return self.objc.objc_getClass(name.encode("ascii"))
+
+
+_OBJC_RUNTIME: Optional[_ObjCRuntime] = None
+_NS_SIZE = None
+
+
+def _ns_size_type():
+    """ctypes mirror of NSSize, created once (prototype caching keys on it)."""
+    global _NS_SIZE
+    if _NS_SIZE is None:
+        import ctypes
+
+        class NSSize(ctypes.Structure):
+            _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+        _NS_SIZE = NSSize
+    return _NS_SIZE
+
+
+def _objc_runtime() -> _ObjCRuntime:
+    global _OBJC_RUNTIME
+    if _OBJC_RUNTIME is None:
+        _OBJC_RUNTIME = _ObjCRuntime()
+    return _OBJC_RUNTIME
+
+
 # Mouse event types for which -[NSEvent clickCount] is valid.
 _NS_CLICK_EVENT_TYPES = frozenset({1, 2, 3, 4, 25, 26})
 _status_item_guard_state = {"installed": False, "callbacks": []}
@@ -7017,18 +7441,8 @@ def _install_macos_status_item_guard() -> bool:
         return False
     try:
         import ctypes
-        import ctypes.util
 
-        objc = ctypes.cdll.LoadLibrary(
-            ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib")
-        objc.objc_getClass.restype = ctypes.c_void_p
-        objc.objc_getClass.argtypes = [ctypes.c_char_p]
-        objc.sel_registerName.restype = ctypes.c_void_p
-        objc.sel_registerName.argtypes = [ctypes.c_char_p]
-        objc.class_getInstanceMethod.restype = ctypes.c_void_p
-        objc.class_getInstanceMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        objc.method_setImplementation.restype = ctypes.c_void_p
-        objc.method_setImplementation.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        objc = _objc_runtime().objc
 
         delegate_class = objc.objc_getClass(b"QStatusItemDelegate")
         if not delegate_class:
@@ -7095,22 +7509,9 @@ def _apply_macos_titlebar(widget, theme) -> bool:
         return False  # showEvent applies it; avoid creating the window early
     try:
         import ctypes
-        import ctypes.util
 
-        objc_path = ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib"
-        objc = ctypes.cdll.LoadLibrary(objc_path)
-        objc.objc_getClass.restype = ctypes.c_void_p
-        objc.objc_getClass.argtypes = [ctypes.c_char_p]
-        objc.sel_registerName.restype = ctypes.c_void_p
-        objc.sel_registerName.argtypes = [ctypes.c_char_p]
-
-        def send(restype, *argtypes):
-            prototype = ctypes.CFUNCTYPE(
-                restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)
-            return prototype(("objc_msgSend", objc))
-
-        def sel(name: str):
-            return objc.sel_registerName(name.encode("ascii"))
+        runtime = _objc_runtime()
+        objc, send, sel = runtime.objc, runtime.send, runtime.sel
 
         def responds(target, name: str) -> bool:
             return bool(send(ctypes.c_bool, ctypes.c_void_p)(
@@ -7160,7 +7561,6 @@ def _set_macos_dock_icon(image) -> bool:
         return False
     try:
         import ctypes
-        import ctypes.util
         from PySide6.QtCore import QBuffer, QByteArray, QIODevice
 
         data = QByteArray()
@@ -7171,20 +7571,8 @@ def _set_macos_dock_icon(image) -> bool:
         buffer.close()
         raw = bytes(data)
 
-        objc_path = ctypes.util.find_library("objc") or "/usr/lib/libobjc.A.dylib"
-        objc = ctypes.cdll.LoadLibrary(objc_path)
-        objc.objc_getClass.restype = ctypes.c_void_p
-        objc.objc_getClass.argtypes = [ctypes.c_char_p]
-        objc.sel_registerName.restype = ctypes.c_void_p
-        objc.sel_registerName.argtypes = [ctypes.c_char_p]
-
-        def send(restype, *argtypes):
-            prototype = ctypes.CFUNCTYPE(
-                restype, ctypes.c_void_p, ctypes.c_void_p, *argtypes)
-            return prototype(("objc_msgSend", objc))
-
-        def sel(name: str):
-            return objc.sel_registerName(name.encode("ascii"))
+        runtime = _objc_runtime()
+        objc, send, sel = runtime.objc, runtime.send, runtime.sel
 
         # Owned (alloc/init) objects, released below, so nothing depends on
         # an autorelease pool existing (there is none before app.exec()).
@@ -7199,8 +7587,7 @@ def _set_macos_dock_icon(image) -> bool:
         if not ns_image:
             return False
 
-        class _NSSize(ctypes.Structure):
-            _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+        _NSSize = _ns_size_type()
         # Half the pixel size in points: AppKit keeps a 2x copy of the icon,
         # so this maps the bitmap 1:1 instead of upscaling it to 2048 px.
         points = image.width() / 2.0

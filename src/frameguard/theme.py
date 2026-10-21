@@ -135,6 +135,10 @@ class ThemeColors:
     status_warn_border: str = ""
     status_skip_surface: str = ""
     status_skip_border: str = ""
+    # Outline of interactive controls (fields, checkboxes, radios). WCAG
+    # 1.4.11 needs 3:1 against what surrounds them; the divider-weight
+    # `border` reached only 1.4-1.6:1 on light themes.
+    control_border: str = ""
 
     def __post_init__(self):
         state_backgrounds = (self.bg_primary, self.bg_secondary, self.bg_input)
@@ -190,6 +194,8 @@ class ThemeColors:
             state_backgrounds)
         self.scrollbar_bg = self.scrollbar_bg or self.bg_primary
         self.scrollbar_handle = self.scrollbar_handle or self.border
+        self.control_border = self.control_border or _ensure_contrast(
+            self.border, (self.bg_input, self.bg_primary, self.bg_secondary), 3.0)
 
 
 THEMES: Dict[str, ThemeColors] = {
@@ -460,7 +466,7 @@ QPushButton[fgRole="icon"]:disabled, QPushButton[class="reset-btn"]:disabled { b
 #sidebar QPushButton[active="true"]:focus { border: 2px solid %%focus%%; border-left: 3px solid %%accent%%; padding: 7px 11px 7px 10px; }
 
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QDateTimeEdit, QComboBox {
-    background-color: %%bg_input%%; border: 1px solid %%border%%; border-radius: 6px;
+    background-color: %%bg_input%%; border: 1px solid %%control_border%%; border-radius: 6px;
     color: %%text_primary%%; selection-background-color: %%selection%%;
     selection-color: %%selection_foreground%%; padding: 6px 10px; min-height: 18px;
 }
@@ -485,7 +491,7 @@ QCheckBox, QRadioButton { color: %%text_primary%%; spacing: 8px; padding: 3px 3p
 QCheckBox:hover, QRadioButton:hover { color: %%text_primary%%; }
 QCheckBox:focus, QRadioButton:focus { border-color: %%focus%%; }
 QCheckBox:disabled, QRadioButton:disabled { color: %%disabled_text%%; }
-QCheckBox::indicator, QRadioButton::indicator { width: 16px; height: 16px; border: 2px solid %%border%%; background-color: %%bg_input%%; }
+QCheckBox::indicator, QRadioButton::indicator { width: 16px; height: 16px; border: 2px solid %%control_border%%; background-color: %%bg_input%%; }
 QCheckBox::indicator { border-radius: 4px; }
 QRadioButton::indicator { border-radius: 10px; }
 QCheckBox::indicator:hover, QRadioButton::indicator:hover { border-color: %%accent%%; }
@@ -512,7 +518,7 @@ QSlider::sub-page:horizontal { background: %%accent%%; border-radius: 2px; }
 QAbstractItemView { background-color: %%bg_primary%%; alternate-background-color: %%bg_secondary%%; border: 1px solid %%border%%; color: %%text_primary%%; selection-background-color: %%selection%%; selection-color: %%selection_foreground%%; outline: none; }
 QAbstractItemView::item { padding: 6px 10px; border: none; border-bottom: 1px solid %%divider%%; }
 QTableView { gridline-color: %%divider%%; }
-QAbstractItemView::indicator { width: 14px; height: 14px; border: 2px solid %%border%%; border-radius: 4px; background-color: %%bg_input%%; }
+QAbstractItemView::indicator { width: 14px; height: 14px; border: 2px solid %%control_border%%; border-radius: 4px; background-color: %%bg_input%%; }
 QAbstractItemView::indicator:hover { border-color: %%accent%%; }
 QAbstractItemView::indicator:checked { border-color: %%accent%%; background-color: %%accent%%; image: %%img_check%%; }
 QAbstractItemView::item:hover { background-color: %%surface_hover%%; }
@@ -707,6 +713,7 @@ def generate_stylesheet(theme: ThemeColors = None) -> str:
         "surface": theme.surface,
         "surface_hover": theme.surface_hover,
         "border": theme.border,
+        "control_border": theme.control_border,
         "text_primary": theme.text_primary,
         "text_secondary": theme.text_secondary,
         "text_tertiary": theme.text_tertiary,

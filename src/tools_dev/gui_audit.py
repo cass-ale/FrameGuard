@@ -316,6 +316,8 @@ def check_headers(root: QWidget, audit: Audit, state: str) -> None:
         model = table.model()
         metrics = QFontMetrics(header.font())
         for section in range(table.columnCount()):
+            if header.isSectionHidden(section):
+                continue  # hidden by design (e.g. narrow-table columns), not clipped
             value = model.headerData(section, Qt.Horizontal, Qt.DisplayRole)
             text = "" if value is None else str(value)
             if not text:

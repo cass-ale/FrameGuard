@@ -334,6 +334,20 @@ if IS_MAC:
                 "CFBundleTypeRole": "Editor",
                 "LSHandlerRank": "Owner",
                 "LSItemContentTypes": ["com.caprilaria.frameguard.preset"],
+            }, {
+                # Videos and folders: lets Finder's Open With, and dropping
+                # onto the Dock icon, queue them for a scan. "Alternate"
+                # never takes over the user's default player.
+                "CFBundleTypeName": "Video for QA",
+                "CFBundleTypeRole": "Viewer",
+                "LSHandlerRank": "Alternate",
+                "LSItemContentTypes": [
+                    "public.movie", "public.mpeg-4", "com.apple.quicktime-movie",
+                    "public.avi", "public.mpeg-2-transport-stream",
+                    "org.matroska.mkv", "org.webmproject.webm", "org.smpte.mxf",
+                    "public.folder",
+                ],
+                "CFBundleTypeExtensions": ["mp4", "m4v", "mov", "mkv", "mxf", "avi", "ts", "webm"],
             }],
         },
     )

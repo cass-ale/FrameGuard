@@ -223,8 +223,10 @@ class TestResponsiveSurfaces:
             panel.summary_row.getItemPosition(panel.summary_row.indexOf(badge))[0]
             for badge in panel._summary_badges
         }
+        # Compact keeps one row (0.9.0): the old 2x2 grid doubled the strip's
+        # height on small windows and left the results table two rows tall.
         assert wide_rows == {0}
-        assert compact_rows == {0, 1}
+        assert compact_rows == {0}
 
     def test_results_and_checks_headers_are_metric_driven(self, result_factory):
         from frameguard import design as D

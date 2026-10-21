@@ -297,6 +297,8 @@ class TestBackgroundOutputBoundaries:
 
         class _Owner:
             _release_export_runner = G.MainWindow._release_export_runner
+            _on_auto_export_finished = G.MainWindow._on_auto_export_finished
+            _on_auto_export_error = G.MainWindow._on_auto_export_error
 
             def __init__(self):
                 self._export_runners = []

@@ -208,8 +208,10 @@ class TestWindowsNativeContracts:
         window = MainWindow()
         try:
             assert window._resize_border_width() >= 8
-            assert window.minimumWidth() <= 480
-            assert window.minimumHeight() <= 320
+            # Small enough for 1366x768 laptops, large enough for the pages'
+            # layouts (0.9.0 raised it from 480x320, which cut the table off).
+            assert window.minimumWidth() <= 760
+            assert window.minimumHeight() <= 520
         finally:
             window._cleanup_worker()
             window._watch_monitor.stop()

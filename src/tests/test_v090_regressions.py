@@ -221,3 +221,210 @@ def test_installer_shows_the_same_licence_as_the_repository():
     repository's canonical MIT text (GitHub's licence detection reads the root)."""
     root = (SRC.parent / "LICENSE").read_text(encoding="utf-8")
     assert (SRC / "LICENSE").read_text(encoding="utf-8") == root
+
+
+# ---------------------------------------------------------------------------
+# App-shell audit fixes
+# ---------------------------------------------------------------------------
+
+def _pump(qapp, ms):
+    import time
+    end = time.monotonic() + ms / 1000.0
+    while time.monotonic() < end:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+
+class TestWorkerSignalsStayOnTheGuiThread:
+    def test_progress_updates_run_on_the_gui_thread(self, window, qapp, tmp_path, monkeypatch):
+        """Lambdas connected to worker signals ran on the worker thread and
+        touched widgets there; every progress update must be on the GUI thread."""
+        from PySide6.QtCore import QThread
+        from frameguard import gui
+
+        def fake_run(worker):
+            worker.scan_started.emit(1)
+            worker.file_started.emit(0, "clip.mov")
+            for i in range(20):
+                worker.file_progress.emit(0, "decode", i, 20, "Decoding")
+            worker.scan_finished.emit([])
+
+        monkeypatch.setattr(gui.ScanWorker, "configure", lambda self, **kw: None)
+        monkeypatch.setattr(gui.ScanWorker, "run", fake_run)
+        threads = []
+        panel = window.scan_panel
+        original_set, original_update = panel.progress_label.setText, panel.update_progress
+        monkeypatch.setattr(panel.progress_label, "setText",
+                            lambda text: (threads.append(QThread.currentThread()), original_set(text)))
+        monkeypatch.setattr(panel, "update_progress",
+                            lambda *a: (threads.append(QThread.currentThread()), original_update(*a)))
+        clip = tmp_path / "clip.mov"
+        clip.write_bytes(b"\0" * 16)
+        window._on_scan_requested([str(clip)], "custom", True, False)
+        _pump(qapp, 800)
+        assert len(threads) >= 21
+        assert all(t is qapp.thread() for t in threads)
+
+    def test_no_lambda_slots_on_background_signals(self):
+        import re
+        text = (SRC / "frameguard/gui.py").read_text(encoding="utf-8")
+        offenders = re.findall(r"(self\._worker\.\w+|runner\.signals\.\w+)\.connect\(\s*lambda", text)
+        assert not offenders, offenders
+
+
+class TestFolderSearchRace:
+    def test_slow_old_search_cannot_replace_newer_queue_or_refill_a_clear(
+            self, window, qapp, tmp_path, monkeypatch):
+        import time
+        from frameguard import core
+        slow, fast = tmp_path / "slow", tmp_path / "fast"
+        slow.mkdir()
+        fast.mkdir()
+
+        def fake_discover(path):
+            if str(path) == str(slow):
+                time.sleep(0.6)
+                return [str(slow / "old_take.mov")]
+            return [str(fast / "new_take.mov")]
+
+        monkeypatch.setattr(core, "discover_video_files", fake_discover)
+        panel = window.scan_panel
+        panel._discover_files_async([str(slow)])
+        panel._discover_files_async([str(fast)])
+        _pump(qapp, 1200)
+        assert panel._files == [str(fast / "new_take.mov")]
+
+        panel._discover_files_async([str(slow)])
+        panel._on_files_dropped([])  # Clear while the search runs
+        _pump(qapp, 1200)
+        assert panel._files == []
+
+
+class TestUnattendedErrors:
+    def test_watch_errors_never_open_modals(self, window, qapp, monkeypatch):
+        from frameguard import gui
+        modals = []
+        monkeypatch.setattr(gui.QMessageBox, "critical", lambda *a, **k: modals.append(a))
+        window.hide()
+        for _ in range(3):
+            window._watch_batch_in_progress = True
+            window._on_scan_error("FFmpeg not found")
+        assert modals == []
+        assert "Scan error: FFmpeg not found" in window.watch_panel._log.toPlainText()
+
+
+class TestAutosave:
+    def test_settings_are_saved_without_quitting(self, window, qapp):
+        from frameguard import gui
+        target = not window.settings_panel.strict_cb.isChecked()
+        window.settings_panel.strict_cb.setChecked(target)
+        _pump(qapp, gui._AUTOSAVE_DELAY_MS + 400)
+        stored = gui.QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value("scan/strict", type=bool)
+        assert stored is target
+
+    def test_sidebar_collapse_survives_a_restart(self, window, qapp):
+        from frameguard import gui
+        window._toggle_sidebar()
+        _pump(qapp, 400 + gui._AUTOSAVE_DELAY_MS)
+        assert gui.QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value(
+            gui._SIDEBAR_COLLAPSED_KEY, type=bool) is True
+        second = gui.MainWindow()
+        try:
+            assert second._sidebar_collapsed and not second._sidebar.isVisible()
+        finally:
+            second._cleanup_worker()
+            second.deleteLater()
+
+
+class TestLayoutAtSmallSizes:
+    def test_minimum_size_fits_the_pages(self, window, qapp):
+        from frameguard import gui
+        screen = gui._active_available_geometry()
+        assert window.minimumWidth() == min(gui.MIN_WINDOW_W, screen.width())
+        assert window.minimumHeight() == min(gui.MIN_WINDOW_H, screen.height())
+
+    def test_filename_keeps_its_width_and_the_table_its_rows(self, window, qapp):
+        from tests.conftest import make_result
+        window.resize(800, 600)
+        window._switch_panel(1)
+        results = [make_result(name=f"PROJ_CAM0{i}_TAKE_20261018_C00{i}_LONG_DESCRIPTIVE_NAME.mov")
+                   for i in range(8)]
+        window.results_panel.set_results(results)
+        _pump(qapp, 100)
+        table = window.results_panel.table
+        assert table.columnWidth(2) >= 180, table.columnWidth(2)
+        rows_visible = table.viewport().height() // max(1, table.rowHeight(0))
+        assert rows_visible >= 3, rows_visible
+
+
+class TestThemeAndAccessibility:
+    def test_control_outlines_meet_three_to_one(self):
+        from frameguard.theme import THEMES, contrast_ratio, generate_stylesheet
+        for name, theme in THEMES.items():
+            for bg in (theme.bg_input, theme.bg_primary):
+                assert contrast_ratio(theme.control_border, bg) >= 3.0, (name, bg)
+        css = generate_stylesheet(THEMES["Clean Light"])
+        assert f"border: 2px solid {THEMES['Clean Light'].control_border}" in css
+
+    def test_explicit_theme_pins_the_colour_scheme_for_dialogs(self, window, qapp, monkeypatch):
+        from PySide6.QtCore import Qt
+        hints = qapp.styleHints()
+        if not hasattr(hints, "setColorScheme"):
+            pytest.skip("Qt < 6.8")
+        calls = []
+        # Offscreen has no colour-scheme backend (colorScheme() stays
+        # Unknown), so record what the app asks Qt for.
+        monkeypatch.setattr(hints, "setColorScheme", lambda scheme: calls.append(scheme))
+        monkeypatch.setattr(hints, "unsetColorScheme", lambda: calls.append("unset"))
+        monkeypatch.setattr(hints, "colorScheme", lambda: Qt.ColorScheme.Unknown)
+        window._theme_is_explicit = True
+        window._apply_theme("Blue Hour")
+        window._apply_theme("Clean Light")
+        window._theme_is_explicit = False
+        window._apply_theme("Clean Light")  # following the OS again
+        assert calls[-3:] == [Qt.ColorScheme.Dark, Qt.ColorScheme.Light, "unset"]
+
+    def test_every_slider_and_spin_box_has_a_name(self, window, qapp):
+        from PySide6.QtWidgets import QDoubleSpinBox, QSlider, QSpinBox
+        unnamed = [w for cls in (QSlider, QSpinBox, QDoubleSpinBox)
+                   for w in window.findChildren(cls) if not w.accessibleName()]
+        assert not unnamed
+
+    def test_summary_badges_are_keyboard_operable(self, window, qapp):
+        from PySide6.QtCore import Qt
+        panel = window.results_panel
+        for key, frame in panel._badge_frames.items():
+            assert frame.focusPolicy() & Qt.TabFocus
+            assert frame.accessibleName().endswith("show details")
+        panel._update_badge_count("mismatched", "3")
+        assert panel._badge_frames["mismatched"].accessibleName() == "Failed: 3, show details"
+
+    def test_queue_can_be_trimmed_by_keyboard(self, window, qapp, tmp_path):
+        from PySide6.QtCore import Qt
+        files = [str(tmp_path / f"{n}.mov") for n in "abc"]
+        panel = window.scan_panel
+        panel._set_files(files)
+        queue = panel.drop_zone._file_list
+        assert queue.focusPolicy() & Qt.TabFocus
+        queue.remove_requested.emit(1)
+        assert panel._files == [files[0], files[2]]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS menu bar")
+class TestMacMenuBar:
+    def test_menu_bar_has_the_standard_items(self, window):
+        from PySide6.QtGui import QAction, QKeySequence
+        bar = window._mac_menu_bar
+        actions = {a.text(): a for m in bar.findChildren(QAction) for a in [m]}
+        assert actions["Settings\u2026"].menuRole() == QAction.MenuRole.PreferencesRole
+        assert actions["Settings\u2026"].shortcut() == QKeySequence("Ctrl+,")
+        assert actions["About FrameGuard"].menuRole() == QAction.MenuRole.AboutRole
+        for text, key in (("Close Window", "Ctrl+W"), ("Minimize", "Ctrl+M"),
+                          ("Add Videos\u2026", "Ctrl+O"), ("Export Report\u2026", "Ctrl+E")):
+            assert actions[text].shortcut() == QKeySequence(key), text
+
+
+def test_finder_open_with_lists_frameguard_for_videos():
+    spec = (SRC / "frameguard.spec").read_text(encoding="utf-8")
+    assert '"CFBundleTypeRole": "Viewer"' in spec and '"public.movie"' in spec
+    assert '"LSHandlerRank": "Alternate"' in spec
