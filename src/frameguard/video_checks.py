@@ -25,14 +25,18 @@ their lines mid-record.
 
 from __future__ import annotations
 
+import bisect
+import math
 import os
 import re
 import shutil
 import statistics
 import tempfile
+import threading
 import weakref
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Check names (rows) and modes
@@ -50,6 +54,20 @@ VIDEO_CHECK_NAMES = (BLACK, FREEZE, LEVELS, FLASH, INTERLACE)
 # broadcast levels, so "report" measures without judging; "advisory" warns;
 # "essential" (broadcast delivery presets) fails a confident violation.
 LEVELS_MODES = ("off", "report", "advisory", "essential")
+
+
+class ScanCancelled(Exception):
+    """The operator cancelled while the measurements were being evaluated."""
+
+
+def check_cancel(cancel: Optional[threading.Event]) -> None:
+    """Raise ScanCancelled once ``cancel`` is set (cheap; call in long loops)."""
+    if cancel is not None and cancel.is_set():
+        raise ScanCancelled()
+
+
+# Long loops look at the cancel flag every this many items.
+CANCEL_CHECK_EVERY = 8192
 
 # ---------------------------------------------------------------------------
 # Analysis geometry
@@ -100,6 +118,7 @@ RANGE_PC_FLOOR_MAX = 13        # pc: anything here means full-range blacks exist
 RANGE_PC_CEIL_MIN = 242        # pc: anything here means full-range whites exist
 RANGE_PC_BAND_LO = (14, 19)    # pc: a pile-up here is limited-range black clipping
 RANGE_PC_BAND_HI = (231, 237)  # pc: a pile-up here is limited-range white clipping
+RANGE_PC_EXTREMES_SHARE = 0.0001  # pc: above this share, full-range codes are in use
 
 # BT.1702-3 Annex 1: a flash is a pair of opposing changes of at least
 # 20 cd/m2 where the darker state is below 160 cd/m2, on an SDR display
@@ -128,6 +147,15 @@ FREEZE_MAX_BLIP_FRAMES = 8
 FREEZE_RELATIVE_DROP = 0.15
 FREEZE_IDENTICAL_MAFD = 0.004
 FREEZE_CONTEXT_SECONDS = 2.0
+
+# The flash grid is written in segments of this length and consumed while
+# FFmpeg decodes: at most about three segments (~0.8 MB at 60 fps) exist at
+# once, whatever the programme length.
+FLASH_SEGMENT_SECONDS = 5
+
+# Mean luma (8-bit analysis copy) read back for frames not written: the
+# series only records frames dark enough to matter (see mean_luma_limit).
+YAVG_ABSENT = 255.0
 
 # Black: the short tier reports a burst only when it is isolated (not part
 # of a strobe; the Flash check covers those) and cut hard into black on
@@ -316,8 +344,20 @@ def filter_path(path: str) -> str:
     return _escape(_escape(path, "\\':"), "\\'[],;")
 
 
-def _print(key: str, path: str) -> str:
-    return f"metadata=mode=print:key={key}:file={filter_path(path)}"
+def _print(key: str, path: str, value: Optional[str] = None,
+           function: Optional[str] = None) -> str:
+    """metadata print of ``key``; with ``value``/``function`` only matching frames.
+
+    A conditional print still numbers frames by their position in the
+    stream ("frame:N"), so sparse output stays aligned.
+    """
+    condition = f":value={value}:function={function}" if value is not None else ""
+    return f"metadata=mode=print:key={key}{condition}:file={filter_path(path)}"
+
+
+def _select(key: str, value: str, function: str) -> str:
+    """Pass only frames whose ``key`` matches (they keep their own pts)."""
+    return f"metadata=mode=select:key={key}:value={value}:function={function}"
 
 
 def _rgb_mask_expressions(info: PictureInfo,
@@ -383,6 +423,103 @@ def black_filter(config: VideoCheckConfig) -> str:
     return f"blackdetect@v=d=0:pix_th={config.black_pix_th}:pic_th={config.black_pic_th}"
 
 
+def mean_luma_limit(config: VideoCheckConfig, full_range: bool) -> float:
+    """Mean luma at or above which a frame's exact value cannot matter.
+
+    The short-burst test (classify_black) compares a black frame's mean with
+    its neighbours': a neighbour at least BLACK_HARD_CUT_CODES brighter is a
+    hard cut. A black frame's mean is at most ``pic_th`` x black level +
+    (1 - ``pic_th``) x 255, so any neighbour above that plus the cut margin
+    passes the test whatever its exact value. Frames at or above this limit
+    are not written and read back as YAVG_ABSENT (255), which decides
+    identically; 8 codes cover the analysis copy's rounding.
+    """
+    level = config.black_pix_th * 255.0 if full_range else 16.0 + config.black_pix_th * 219.0
+    darkest_black = config.black_pic_th * level + (1.0 - config.black_pic_th) * 255.0
+    return darkest_black + BLACK_HARD_CUT_CODES + 8.0
+
+
+def _release(directory: str, reader: Optional["_FlashSegmentReader"]) -> None:
+    """Stop the flash reader and remove the measurement directory."""
+    if reader is not None:
+        reader.stop()
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+class FlashUnavailable(Exception):
+    """The streamed flash grid could not be read or evaluated."""
+
+
+class _FlashSegmentReader(threading.Thread):
+    """Folds FFmpeg's flash-grid segments into a FlashAccumulator as they close.
+
+    Segment k is complete once segment k+1 exists (the segment muxer closes
+    one file before opening the next) or once FFmpeg has exited; each one is
+    read, fed and deleted. The thread stops on close() or when the scan is
+    cancelled.
+    """
+
+    def __init__(self, directory: str, fps: float, cancel: Optional[threading.Event]):
+        super().__init__(name="frameguard-flash-reader", daemon=True)
+        self.directory = directory
+        self.template = os.path.join(directory, "flash_").replace("%", "%%") + "%06d.rgb"
+        self.accumulator = FlashAccumulator(fps)
+        self.cancel = cancel
+        self.error: Optional[str] = None
+        self.segments_read = 0
+        self._stop_event = threading.Event()
+        self._finish_event = threading.Event()
+
+    def _segment(self, number: int) -> str:
+        return os.path.join(self.directory, f"flash_{number:06d}.rgb")
+
+    def _halted(self) -> bool:
+        return self._stop_event.is_set() or bool(self.cancel is not None and self.cancel.is_set())
+
+    def run(self) -> None:
+        try:
+            while not self._halted():
+                finishing = self._finish_event.is_set()
+                progressed = False
+                while (not self._halted() and os.path.exists(self._segment(self.segments_read))
+                       and (finishing or os.path.exists(self._segment(self.segments_read + 1)))):
+                    self._consume(self._segment(self.segments_read))
+                    self.segments_read += 1
+                    progressed = True
+                if finishing:
+                    if not self._halted():
+                        self.accumulator.finish()
+                    return
+                if not progressed:
+                    self._stop_event.wait(0.2)
+        except Exception as exc:  # noqa: BLE001 - thread boundary: finish() reports it
+            self.error = f"{type(exc).__name__}: {exc}"
+
+    def _consume(self, path: str) -> None:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        self.accumulator.feed(data)
+        os.remove(path)
+
+    def finish(self, cancel: Optional[threading.Event]) -> "FlashAccumulator":
+        """FFmpeg has exited: read the remaining segments and return the result."""
+        self._finish_event.set()
+        while self.is_alive():
+            self.join(0.2)
+            check_cancel(cancel)
+        check_cancel(cancel)
+        if self.error:
+            raise FlashUnavailable(self.error)
+        if not self.accumulator.frames and not self.segments_read:
+            raise FlashUnavailable("FFmpeg wrote no flash measurements")
+        return self.accumulator
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self.is_alive() and self is not threading.current_thread():
+            self.join(5)
+
+
 class VideoAnalysis:
     """The per-scan picture analysis: graph fragment, outputs, parsing.
 
@@ -390,12 +527,15 @@ class VideoAnalysis:
     removed, whatever happens to the scan.
     """
 
-    def __init__(self, video: dict, cfg: dict):
+    def __init__(self, video: dict, cfg: dict,
+                 cancel: Optional[threading.Event] = None):
         self.info = PictureInfo.from_stream(video)
         self.config = VideoCheckConfig.from_cfg(cfg)
         self.index = int(video["index"])
+        self.cancel = cancel
         self.directory: Optional[str] = None
         self.paths: Dict[str, str] = {}
+        self.flash_reader: Optional[_FlashSegmentReader] = None
 
     # -- lifetime -----------------------------------------------------------
     def __enter__(self) -> "VideoAnalysis":
@@ -408,11 +548,15 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        self._cleanup = weakref.finalize(self, shutil.rmtree, self.directory, True)
-        names = ("mafd", "idet", "colmo", "rowmo", "luma", "band1", "band2", "yavg") + tuple(
-            f"gam{k}_{c}" for k in range(len(self.info.gamut_matrices)) for c in "rgb")
+        names = ("mafd", "idet", "colmo", "rowmo", "luma", "band1", "band2", "yavg",
+                 "gam_r", "gam_g", "gam_b")
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
-        self.paths["flash"] = os.path.join(self.directory, "flash.rgb")
+        if self.flash_enabled:
+            self.flash_reader = _FlashSegmentReader(self.directory, self.info.fps, self.cancel)
+            self.flash_reader.start()
+        # The finalizer holds the directory and the reader, never self, so it
+        # still runs when a cancelled scan drops the analysis without close().
+        self._cleanup = weakref.finalize(self, _release, self.directory, self.flash_reader)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -474,18 +618,24 @@ class VideoAnalysis:
         from motion that can comb. Column means come from area reductions
         of at most 16x per step (a single large reduction is not an exact
         mean); tblend difference + signalstats gives mean |delta| per frame.
+
+        Only frames idet calls interlaced (TFF/BFF) are written: they are
+        the only ones the decision reads, and progressive footage then
+        writes nothing. The profiles are kept in step with idet's verdict
+        (tblend keeps the current frame's metadata) and matched by pts.
         """
+        label = "lavfi.idet.multiple.current_frame"
+        interlaced = _select(label, "ff", "ends_with")
         reduce16 = "scale=w={w}:h='max(1,trunc(ih/16))':flags=area"
         return [
             f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
-            "split=3[il_det][il_col][il_row]",
-            f"[il_det]idet@il={IDET_OPTIONS},"
-            f"{_print('lavfi.idet.multiple.current_frame', self.paths['idet'])}[vs_il]",
+            f"idet@il={IDET_OPTIONS},split=3[il_det][il_col][il_row]",
+            f"[il_det]{_print(label, self.paths['idet'], 'ff', 'ends_with')}[vs_il]",
             f"[il_col]format=gray,{reduce16.format(w=64)},{reduce16.format(w=64)},"
-            "scale=w=64:h=1:flags=area,tblend=all_mode=difference,signalstats,"
+            f"scale=w=64:h=1:flags=area,tblend=all_mode=difference,signalstats,{interlaced},"
             f"{_print('lavfi.signalstats.YAVG', self.paths['colmo'])},nullsink",
             "[il_row]format=gray,scale=w='max(1,trunc(iw/16))':h=ih:flags=area,"
-            "scale=w=1:h=ih:flags=area,tblend=all_mode=difference,signalstats,"
+            f"scale=w=1:h=ih:flags=area,tblend=all_mode=difference,signalstats,{interlaced},"
             f"{_print('lavfi.signalstats.YAVG', self.paths['rowmo'])},nullsink",
         ]
 
@@ -519,19 +669,20 @@ class VideoAnalysis:
         if c.levels:
             m1, m2, m3 = _luma_mask_expressions(info)
             for k, matrix in enumerate(matrices):
-                chains += self._gamut_chains(k, matrix, reduce4)
+                chains += self._gamut_chains(k, matrix)
+            chains += self._gamut_combined(len(matrices), reduce4)
             chains += [
                 f"[ar_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p,lutyuv=y='{m1}':u='{m2}':v='{m3}',"
-                f"{reduce4},signalstats,{_print('lavfi.signalstats.YAVG', self.paths['luma'])},"
-                f"{_print('lavfi.signalstats.UAVG', self.paths['band1'])},"
-                f"{_print('lavfi.signalstats.VAVG', self.paths['band2'])},nullsink",
+                f"{reduce4},signalstats,{','.join(self._luma_prints())},nullsink",
             ]
         if c.black or c.levels:
             # Without the flash output this branch is the graph's output.
             tail = "nullsink" if self.flash_enabled else "null[vs_area]"
+            limit = f"{mean_luma_limit(self.config, info.full_range):.3f}"
             chains.append(
                 f"[ar_mean]scale=w='max(1,trunc(iw/8))':h='max(1,trunc(ih/8))':flags=area,"
-                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'])},{tail}")
+                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'], limit, 'less')},"
+                f"{tail}")
         if self.flash_enabled:
             linear = _flash_linear_expression(info)
             cols, rows = FLASH_GRID
@@ -545,8 +696,37 @@ class VideoAnalysis:
                 f"scale={cols}:{rows}:flags=area[vs_flash]")
         return chains
 
-    def _gamut_chains(self, k: int, matrix: str, reduce4: str) -> List[str]:
-        """R, G and B gamut masks of ``[ar_gamut<k>]`` under ``matrix``."""
+    def _share_print(self, plane: str, name: str, above: float = 0.0) -> str:
+        """Print a mask plane's share only for frames where it can matter.
+
+        Frames not written read back as 0. ``above`` is the share at or below
+        which the decision cannot use the value (0: any non-zero share, as
+        the displayed maxima need). Zero is what nearly every frame of clean
+        footage measures, so most series are written for few frames.
+        """
+        # FFmpeg's "greater" also passes a value equal to the reference, so
+        # the reference sits just under the threshold (and just above zero:
+        # the smallest real share on the reduced mask prints as about 0.002).
+        reference = max(above * 255.0 * 0.999, 0.000001)
+        return _print(f"lavfi.signalstats.{plane}AVG", self.paths[name],
+                      f"{reference:.6g}", "greater")
+
+    def _luma_prints(self) -> List[str]:
+        """Prints of the packed luma masks (Y: R 103 luma / extremes, U, V: bands).
+
+        Limited range: the luma share is displayed, so every non-zero value
+        is kept; only "deep black above 1 %" is read from the first band and
+        the second band is not used. Full range: only "extremes above 0.01 %"
+        and "band above 1 %" are read (range_plausibility).
+        """
+        if self.info.full_range:
+            return [self._share_print("Y", "luma", RANGE_PC_EXTREMES_SHARE),
+                    self._share_print("U", "band1", R103_AREA),
+                    self._share_print("V", "band2", R103_AREA)]
+        return [self._share_print("Y", "luma"), self._share_print("U", "band1", R103_AREA)]
+
+    def _gamut_chains(self, k: int, matrix: str) -> List[str]:
+        """Packed (R, G, B) gamut masks of ``[ar_gamut<k>]`` under ``matrix`` -> ``[g<k>_rgb]``."""
         red, blue, helper, green = _rgb_mask_expressions(self.info, matrix)
         g = f"g{k}"
         return [
@@ -559,47 +739,84 @@ class VideoAnalysis:
             f"mergeplanes=map0s=0:map0p=0:map1s=0:map1p=2:map2s=0:map2p=1:format=yuv444p[{g}_rwb]",
             f"[{g}_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0"
             f":format=yuv444p[{g}_yyy]",
-            f"[{g}_rwb][{g}_yyy]lut2=c0='x':c1='{green}':c2='x',"
-            f"{reduce4},signalstats,{_print('lavfi.signalstats.YAVG', self.paths[f'gam{k}_r'])},"
-            f"{_print('lavfi.signalstats.UAVG', self.paths[f'gam{k}_g'])},"
-            f"{_print('lavfi.signalstats.VAVG', self.paths[f'gam{k}_b'])},nullsink",
+            f"[{g}_rwb][{g}_yyy]lut2=c0='x':c1='{green}':c2='x'[{g}_rgb]",
         ]
 
+    def _gamut_combined(self, count: int, reduce4: str) -> List[str]:
+        """R, G and B shares, a pixel counting only if outside under every matrix.
+
+        With one (signalled) matrix this is that matrix's masks. Without a
+        tag, the candidate matrices' masks are intersected per pixel
+        (minimum of 0/255 masks), so the shares are already "outside R 103
+        under every candidate" - and an untagged file that is in gamut under
+        one standard matrix writes nothing.
+        """
+        chains, label = [], "[g0_rgb]"
+        for k in range(1, count):
+            chains.append(f"{label}[g{k}_rgb]lut2=c0='min(x,y)':c1='min(x,y)':c2='min(x,y)'[gand{k}]")
+            label = f"[gand{k}]"
+        chains.append(f"{label}{reduce4},signalstats,{self._share_print('Y', 'gam_r')},"
+                      f"{self._share_print('U', 'gam_g')},{self._share_print('V', 'gam_b')},nullsink")
+        return chains
+
     def extra_outputs(self) -> List[str]:
-        """Arguments for the raw flash-grid output (after the main output)."""
-        if not self.flash_enabled:
+        """Arguments for the raw flash-grid output (after the main output).
+
+        The grid (432 bytes a frame) is written in short segments that the
+        reader thread folds into a FlashAccumulator and deletes while FFmpeg
+        is still decoding, so it never accumulates on disk. Timestamps are
+        passed through untouched: one grid per decoded frame, in order.
+        """
+        if self.flash_reader is None:
             return []
-        # -y: the file lives in this scan's private directory; never prompt.
-        return ["-y", "-map", "[vs_flash]", "-f", "rawvideo", "-pix_fmt", "gbrp",
-                self.paths["flash"]]
+        # -y: the files live in this scan's private directory; never prompt.
+        return ["-y", "-map", "[vs_flash]", "-fps_mode", "passthrough",
+                "-c:v", "rawvideo", "-pix_fmt", "gbrp", "-f", "segment",
+                "-segment_format", "rawvideo", "-segment_time", str(FLASH_SEGMENT_SECONDS),
+                self.flash_reader.template]
 
     # -- results --------------------------------------------------------------
     def collect(self) -> "VideoSeries":
-        """Read every per-frame series FFmpeg wrote (missing files -> empty)."""
-        times, mafd = read_metadata_series(self.paths.get("mafd", ""))
-        series = VideoSeries(times=times, mafd=[_to_float(v) for v in mafd])
+        """Read every per-frame series FFmpeg wrote (missing files -> empty).
+
+        The frame difference is written for every frame and is the master
+        timeline; sparse series are placed by frame number (or by pts after
+        a frame-selecting filter) and the rest read back as their default.
+        Raises ScanCancelled when the scan is cancelled meanwhile.
+        """
+        cancel = self.cancel
+        master = read_print_entries(self.paths.get("mafd", ""), cancel)
+        series = VideoSeries(times=[e[2] for e in master], mafd=[_to_float(e[3]) for e in master])
+        by_frame = {e[0]: k for k, e in enumerate(master)}
+        by_pts = {e[1]: k for k, e in enumerate(master)}
+
+        def sparse(name: str, default, convert, table=by_frame, key: int = 0) -> list:
+            values = [default] * len(master)
+            for entry in read_print_entries(self.paths[name], cancel):
+                position = table.get(entry[key])
+                if position is not None and entry[3] != "":
+                    values[position] = convert(entry[3])
+            return values
+
         if self.needs_interlace_branch:
-            series.idet = read_metadata_series(self.paths["idet"])[1]
-            # tblend has no output for the first frame: align by time.
-            series.col_motion = align_by_time(times, *read_metadata_series(self.paths["colmo"]))
-            series.row_motion = align_by_time(times, *read_metadata_series(self.paths["rowmo"]))
+            series.idet = sparse("idet", "", str)
+            series.col_motion = sparse("colmo", None, lambda v: _to_float(v, None), by_pts, 1)
+            series.row_motion = sparse("rowmo", None, lambda v: _to_float(v, None), by_pts, 1)
         if self.needs_area_branch and self.config.levels:
             def fraction(name: str) -> List[float]:
-                return [_to_float(v) / 255.0 for v in read_metadata_series(self.paths[name])[1]]
+                return sparse(name, 0.0, lambda v: _to_float(v) / 255.0)
             series.luma, series.band1, series.band2 = fraction("luma"), fraction("band1"), fraction("band2")
-            for k, matrix in enumerate(self.info.gamut_matrices):
-                # The largest single-component share: never above the union
-                # of R, G and B violations, so it can only under-report.
-                series.gam_by_matrix[matrix] = [
-                    max(r, g, b) for r, g, b in
-                    zip(fraction(f"gam{k}_r"), fraction(f"gam{k}_g"), fraction(f"gam{k}_b"))]
-            # A pixel share counts only if it is out of gamut under every
-            # candidate matrix (one candidate when the matrix is signalled).
-            series.gam = [min(values) for values in zip(*series.gam_by_matrix.values())]
+            # The largest single-component share: never above the union of
+            # R, G and B violations, so it can only under-report.
+            series.gam = [max(r, g, b) for r, g, b in
+                          zip(fraction("gam_r"), fraction("gam_g"), fraction("gam_b"))]
         if self.needs_area_branch and (self.config.black or self.config.levels):
-            series.yavg = [_to_float(v) for v in read_metadata_series(self.paths["yavg"])[1]]
-        if self.flash_enabled:
-            series.flash = read_flash_grid(self.paths["flash"])
+            series.yavg = sparse("yavg", YAVG_ABSENT, _to_float)
+        if self.flash_reader is not None:
+            try:
+                series.flash_stream = self.flash_reader.finish(cancel)
+            except FlashUnavailable as exc:
+                series.flash_error = str(exc)
         series.align()
         return series
 
@@ -608,53 +825,37 @@ class VideoAnalysis:
 # Parsing
 # ---------------------------------------------------------------------------
 
-_FRAME_LINE = re.compile(r"^frame:\s*(\d+)\s+pts:\s*\S+\s+pts_time:\s*(\S+)")
+_FRAME_LINE = re.compile(r"^frame:\s*(\d+)\s+pts:\s*(\S+)\s+pts_time:\s*(\S+)")
 
 
-def read_metadata_series(path: str) -> Tuple[List[float], List[str]]:
-    """(pts_time per frame, value per frame) from a ``metadata=print`` file.
+def read_print_entries(path: str, cancel: Optional[threading.Event] = None) -> List[list]:
+    """[frame number, pts, pts_time, value] per frame of a ``metadata=print`` file.
 
-    A frame without the key (possible on the first frame of scdet) gets the
-    value "" so positions stay aligned with the frame order.
+    A frame without the key (scdet's first frame) has the value "".
     """
-    times: List[float] = []
-    values: List[str] = []
+    entries: List[list] = []
     if not path or not os.path.exists(path):
-        return times, values
+        return entries
     with open(path, "r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
+        for number, line in enumerate(handle):
+            if number % CANCEL_CHECK_EVERY == 0:
+                check_cancel(cancel)
             match = _FRAME_LINE.match(line)
             if match:
                 try:
-                    times.append(float(match.group(2)))
+                    when = float(match.group(3))
                 except ValueError:
-                    times.append(times[-1] if times else 0.0)
-                values.append("")
-            elif "=" in line and values:
-                values[-1] = line.split("=", 1)[1].strip()
-    return times, values
+                    when = entries[-1][2] if entries else 0.0
+                entries.append([int(match.group(1)), match.group(2), when, ""])
+            elif "=" in line and entries:
+                entries[-1][3] = line.split("=", 1)[1].strip()
+    return entries
 
 
-def align_by_time(times: Sequence[float], value_times: Sequence[float],
-                  values: Sequence[str]) -> List[Optional[float]]:
-    """``values`` placed at the frames of ``times`` they belong to (None if absent)."""
-    lookup = {round(t, 4): _to_float(v, None) for t, v in zip(value_times, values) if v != ""}
-    return [lookup.get(round(t, 4)) for t in times]
-
-
-def read_flash_grid(path: str) -> List[Tuple[bytes, bytes, bytes]]:
-    """Per-frame (G, B, R) planes of the 16x9 linear-light grid (gbrp)."""
-    cols, rows = FLASH_GRID
-    plane = cols * rows
-    frames = []
-    if not os.path.exists(path):
-        return frames
-    with open(path, "rb") as handle:
-        data = handle.read()
-    for offset in range(0, len(data) - 3 * plane + 1, 3 * plane):
-        chunk = data[offset:offset + 3 * plane]
-        frames.append((chunk[:plane], chunk[plane:2 * plane], chunk[2 * plane:]))
-    return frames
+def read_metadata_series(path: str) -> Tuple[List[float], List[str]]:
+    """(pts_time per frame, value per frame) from a ``metadata=print`` file."""
+    entries = read_print_entries(path)
+    return [e[2] for e in entries], [e[3] for e in entries]
 
 
 def _to_float(value: str, default: float = 0.0) -> float:
@@ -673,12 +874,13 @@ class VideoSeries:
     col_motion: List[Optional[float]] = field(default_factory=list)
     row_motion: List[Optional[float]] = field(default_factory=list)
     luma: List[float] = field(default_factory=list)   # tv: outside R 103; pc: extremes used
-    gam: List[float] = field(default_factory=list)       # min over candidate matrices
-    gam_by_matrix: Dict[str, List[float]] = field(default_factory=dict)
+    gam: List[float] = field(default_factory=list)       # outside under every candidate matrix
     band1: List[float] = field(default_factory=list)
     band2: List[float] = field(default_factory=list)
     yavg: List[float] = field(default_factory=list)
-    flash: List[tuple] = field(default_factory=list)
+    flash: List[tuple] = field(default_factory=list)   # in-memory grid (tests, batch use)
+    flash_stream: Optional["FlashAccumulator"] = None   # streamed grid (scans)
+    flash_error: Optional[str] = None
 
     def align(self) -> None:
         """Truncate every non-empty series to the shortest one.
@@ -697,11 +899,14 @@ class VideoSeries:
             values = getattr(self, name)
             if values:
                 setattr(self, name, values[:common])
-        self.gam_by_matrix = {m: v[:common] for m, v in self.gam_by_matrix.items()}
 
     @property
     def frames(self) -> int:
         return len(self.times)
+
+    @property
+    def flash_frames(self) -> int:
+        return self.flash_stream.frames if self.flash_stream is not None else len(self.flash)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,10 +1219,8 @@ class LevelsFindings:
     max_luma: float
     max_gamut: float
     range_hint: Optional[str] = None
-    # Unsignalled matrix: the candidates judged, and whether the first
-    # (size-based) guess alone would have reported a gamut excursion.
+    # Unsignalled matrix: the candidate matrices gamut was judged under.
     gamut_matrices: Tuple[str, ...] = ()
-    guess_alone_flags: bool = False
 
 
 def _area_events(fractions: Sequence[float], times: Sequence[float],
@@ -1059,7 +1262,7 @@ def range_plausibility(series: VideoSeries, full_range: bool) -> Optional[str]:
                     f"{_share(deep) * 100:.0f}% of frames: the content looks full range (0-255) "
                     f"but is tagged limited (tv)")
         return None
-    uses_extremes = max(series.luma or [0.0]) > 0.0001
+    uses_extremes = max(series.luma or [0.0]) > RANGE_PC_EXTREMES_SHARE
     if uses_extremes:
         return None
     piled = [b1 > R103_AREA or b2 > R103_AREA for b1, b2 in zip(series.band1, series.band2)]
@@ -1080,15 +1283,14 @@ def assess_levels(series: VideoSeries, fps: float, full_range: bool,
     needs at least R103_MIN_FRAMES consecutive violating frames, so a single
     corrupt or transitional frame does not count. Full-range pictures cannot
     leave the luma range (0-255 is the nominal range), so only gamut applies.
-    With more than one candidate matrix (unsignalled), ``series.gam`` already
-    holds the per-frame minimum over the candidates.
+    With more than one candidate matrix (unsignalled), ``series.gam`` only
+    counts pixels outside R 103 under every candidate (see _gamut_combined).
     """
     period = _frame_period(fps, series.times)
     count = series.frames
     luma_fraction = (list(series.luma) if not full_range and series.luma else [0.0] * count)
     gamut_fraction = list(series.gam) if series.gam else [0.0] * count
     candidates = tuple(gamut_matrices) if len(gamut_matrices) > 1 else ()
-    guess = series.gam_by_matrix.get(candidates[0], []) if candidates else []
     return LevelsFindings(
         luma=_area_events(luma_fraction, series.times, period),
         gamut=_area_events(gamut_fraction, series.times, period),
@@ -1096,7 +1298,6 @@ def assess_levels(series: VideoSeries, fps: float, full_range: bool,
         max_gamut=max(gamut_fraction or [0.0]),
         range_hint=range_plausibility(series, full_range),
         gamut_matrices=candidates,
-        guess_alone_flags=bool(guess and _area_events(guess, series.times, period)),
     )
 
 
@@ -1119,10 +1320,8 @@ def _matrix_note(findings: LevelsFindings) -> str:
     if findings.gamut:
         return (f" The colour matrix is not signalled; the gamut excursion holds under "
                 f"{names}.")
-    if findings.guess_alone_flags:
-        return (f" The colour matrix is not signalled; gamut was judged under {names} "
-                f"and is within R 103 under at least one.")
-    return f" The colour matrix is not signalled; gamut was judged under {names}."
+    return (f" The colour matrix is not signalled; gamut was judged under {names}, "
+            f"counting only pixels outside R 103 under every one.")
 
 
 def levels_entry(findings: LevelsFindings, mode: str, full_range: bool) -> Tuple[str, str, int]:
@@ -1165,53 +1364,77 @@ class FlashEvent:
     kind: str                        # "general" or "red"
 
 
-def _transitions(values: Sequence[float], delta: float,
-                 dark_limit: Optional[float] = None,
-                 qualifies: Optional[Callable[[int, int], bool]] = None) -> List[Tuple[int, int]]:
-    """(frame index, +1 rising / -1 falling) where a swing of ``delta`` completes.
+class _ZigZag:
+    """Incremental hysteresis zig-zag: where a swing of ``delta`` completes.
 
-    A hysteresis zig-zag over the series: a transition is a move of at least
-    ``delta`` away from the last turning point, timed at the frame where the
-    swing first reaches ``delta``. The direction only reverses after a move
-    of ``delta`` back from the extreme, so a slow fade counts once and
-    frame-to-frame jitter never counts. ``dark_limit`` is BT.1702-3's
-    "darker state below 160 cd/m2" condition; ``qualifies(i, j)`` can veto a
-    swing between frame indices i and j (the saturated-red rule).
+    A transition is a move of at least ``delta`` away from the last turning
+    point, timed at the frame where the swing first reaches ``delta``. The
+    direction only reverses after a move of ``delta`` back from the extreme,
+    so a slow fade counts once and frame-to-frame jitter never counts.
+    ``dark_limit`` is BT.1702-3's "darker state below 160 cd/m2" condition;
+    with ``red`` set, one end of the swing must be saturated red.
+
+    Turning points are kept as (index, value, saturated) so the detector can
+    run over a stream without holding the series; batch and streaming use
+    this one implementation.
     """
-    out: List[Tuple[int, int]] = []
-    if len(values) < 2:
-        return out
 
-    def accept(pivot: int, extreme: int) -> bool:
-        if abs(values[extreme] - values[pivot]) < delta:
-            return False
-        if dark_limit is not None and min(values[extreme], values[pivot]) >= dark_limit:
-            return False
-        return qualifies is None or qualifies(pivot, extreme)
+    __slots__ = ("delta", "dark_limit", "red", "index", "low", "high", "pivot",
+                 "extreme", "trend", "counted")
 
-    low = high = 0
-    trend = 0
-    pivot = extreme = 0
-    counted = False
-    for i in range(1, len(values)):
-        value = values[i]
-        if trend == 0:
-            if value > values[high]:
-                high = i
-            if value < values[low]:
-                low = i
-            if values[high] - values[low] < delta:
-                continue
-            trend = 1 if high > low else -1
-            pivot, extreme = (low, high) if trend == 1 else (high, low)
-            counted = False
-        elif (value - values[extreme]) * trend >= 0:
-            extreme = i
-        elif abs(values[extreme] - value) >= delta:
-            pivot, extreme, trend, counted = extreme, i, -trend, False
-        if not counted and accept(pivot, extreme):
-            out.append((i, 1 if values[extreme] > values[pivot] else -1))
-            counted = True
+    def __init__(self, delta: float, dark_limit: Optional[float] = None, red: bool = False):
+        self.delta, self.dark_limit, self.red = delta, dark_limit, red
+        self.index = -1
+        self.low = self.high = self.pivot = self.extreme = None
+        self.trend = 0
+        self.counted = False
+
+    def _accept(self) -> bool:
+        pivot, extreme = self.pivot, self.extreme
+        if abs(extreme[1] - pivot[1]) < self.delta:
+            return False
+        if self.dark_limit is not None and min(extreme[1], pivot[1]) >= self.dark_limit:
+            return False
+        return not self.red or pivot[2] or extreme[2]
+
+    def push(self, value: float, saturated: bool = False) -> int:
+        """Feed the next value; +1 / -1 when a rising / falling swing completes, else 0."""
+        self.index += 1
+        point = (self.index, value, saturated)
+        if self.index == 0:
+            self.low = self.high = self.pivot = self.extreme = point
+            return 0
+        if self.trend == 0:
+            if value > self.high[1]:
+                self.high = point
+            if value < self.low[1]:
+                self.low = point
+            if self.high[1] - self.low[1] < self.delta:
+                return 0
+            self.trend = 1 if self.high[0] > self.low[0] else -1
+            self.pivot, self.extreme = ((self.low, self.high) if self.trend == 1
+                                        else (self.high, self.low))
+            self.counted = False
+        elif (value - self.extreme[1]) * self.trend >= 0:
+            self.extreme = point
+        elif abs(self.extreme[1] - value) >= self.delta:
+            self.pivot, self.extreme = self.extreme, point
+            self.trend, self.counted = -self.trend, False
+        if not self.counted and self._accept():
+            self.counted = True
+            return 1 if self.extreme[1] > self.pivot[1] else -1
+        return 0
+
+
+def _transitions(values: Sequence[float], delta: float, dark_limit: Optional[float] = None,
+                 saturated: Optional[Sequence[bool]] = None) -> List[Tuple[int, int]]:
+    """(frame index, +1 rising / -1 falling) for every completed swing (see _ZigZag)."""
+    detector = _ZigZag(delta, dark_limit, red=saturated is not None)
+    out = []
+    for i, value in enumerate(values):
+        direction = detector.push(value, bool(saturated[i]) if saturated is not None else False)
+        if direction:
+            out.append((i, direction))
     return out
 
 
@@ -1241,7 +1464,8 @@ def _flash_transitions(kind: str, grid, frames: Sequence[int],
     linear grid scaled to the 200 cd/m2 peak, swings of 20 cd/m2 with the
     darker state below 160 cd/m2. "red": (R - G - B) x 320 on linear values
     0..1, swings of 20 where one end is saturated red (R/(R+G+B) >= 0.8).
-    Returned indices are positions within ``frames``.
+    ``grid[i]`` is frame i's (G, B, R) planes. Returned indices are
+    positions within ``frames``.
     """
     n = float(len(blocks))
     values, saturated = [], []
@@ -1256,11 +1480,234 @@ def _flash_transitions(kind: str, grid, frames: Sequence[int],
             saturated.append(r > 0 and r >= FLASH_RED_RATIO * (r + g + bl))
     if kind == "general":
         return _transitions(values, FLASH_DELTA_CD, FLASH_DARK_CD)
-    return _transitions(values, FLASH_RED_DELTA, None,
-                        lambda i, j: saturated[i] or saturated[j])
+    return _transitions(values, FLASH_RED_DELTA, None, saturated)
 
 
-def assess_flash(series: VideoSeries, fps: float) -> List[FlashEvent]:
+_FLASH_KINDS = ("general", "red")
+# Per-byte terms of the single-block series, computed exactly as
+# _flash_transitions computes them for one block (same products, same
+# addition order), so streaming and batch values are bit-identical.
+_LUM_R = [0.2126 * v for v in range(256)]
+_LUM_G = [0.7152 * v for v in range(256)]
+_LUM_B = [0.0722 * v for v in range(256)]
+_LUM_SCALE = FLASH_PEAK_CD / 255.0
+_RED = [max(0.0, v / 255.0) * 320.0 for v in range(-510, 256)]
+
+
+class FlashAccumulator:
+    """BT.1702-3 flash counting over a stream of 16x9 linear-light grids.
+
+    The grid arrives in chunks while FFmpeg decodes (one 432-byte gbrp
+    frame per video frame). Every block's swings are detected on the fly;
+    the raw grid is kept only where the final decision can need it, so
+    memory and disk stay small for any length of programme.
+
+    What is kept, and why it is enough for an exact result (identical to
+    judging the whole series at once):
+
+    * A block is hazardous over 7 consecutive swings spanning less than one
+      second. In frames that is at most ``span_frames`` (two seconds' worth
+      at the stream rate, leaving room for timing jitter), so swings are
+      committed only when seven of them fall within ``span_frames`` - a
+      superset of every hazardous run.
+    * The concurrency check (assess_flash step 2) needs the raw grid from
+      ``lead`` frames before a flagged run to its end. A frame can only be
+      flagged where more than 25 % of the blocks have a committed run over
+      it; those frames, and the ``lead`` frames before them, are retained.
+
+    Exact spans, flagged runs and events are computed in events() with the
+    real frame times.
+    """
+
+    PLANE = FLASH_GRID[0] * FLASH_GRID[1]
+    FRAME_BYTES = 3 * PLANE
+
+    def __init__(self, fps: float):
+        rate = fps if 0 < fps < 1000 else 0.0
+        self.span_frames = int(math.ceil(2.0 * rate)) + 2 if rate else 482
+        self.lead = max(1, int(round(rate))) if rate else 240
+        blocks = self.PLANE
+        self.detectors = {
+            "general": [_ZigZag(FLASH_DELTA_CD, FLASH_DARK_CD) for _ in range(blocks)],
+            "red": [_ZigZag(FLASH_RED_DELTA, None, red=True) for _ in range(blocks)]}
+        self.recent = {kind: [deque(maxlen=FLASH_MAX_TRANSITIONS) for _ in range(blocks)]
+                       for kind in _FLASH_KINDS}
+        self.swing_count = {kind: [0] * blocks for kind in _FLASH_KINDS}
+        self.committed: Dict[str, List[Dict[int, int]]] = {
+            kind: [{} for _ in range(blocks)] for kind in _FLASH_KINDS}
+        self.covered_until = {kind: [-1] * blocks for kind in _FLASH_KINDS}
+        self.coverage_delta: Dict[str, Dict[int, int]] = {kind: {} for kind in _FLASH_KINDS}
+        self.coverage_running = {kind: 0 for kind in _FLASH_KINDS}
+        self.final_through = -1          # coverage is final for frames <= this
+        self.frames = 0
+        self.pending = b""
+        self.recent_rows: deque = deque()   # (first frame, bytes) of unfinalised chunks
+        self.retained: Dict[int, bytes] = {}
+
+    # -- streaming -----------------------------------------------------------
+    def feed(self, data: bytes) -> None:
+        """Add raw gbrp grid bytes (any length; partial frames are carried)."""
+        data = self.pending + data
+        whole = len(data) - len(data) % self.FRAME_BYTES
+        self.pending = data[whole:]
+        if whole:
+            self._feed_frames(data[:whole])
+
+    def _feed_frames(self, data: bytes) -> None:
+        start, count, stride, plane = self.frames, len(data) // self.FRAME_BYTES, self.FRAME_BYTES, self.PLANE
+        for b in range(plane):
+            g_series, b_series, r_series = data[b::stride], data[plane + b::stride], data[2 * plane + b::stride]
+            general = self.detectors["general"][b].push
+            for k, (r, g, x) in enumerate(zip(r_series, g_series, b_series)):
+                if general(_LUM_SCALE * (_LUM_R[r] + _LUM_G[g] + _LUM_B[x])):
+                    self._swing("general", b, start + k)
+            red = self.detectors["red"][b].push
+            for k, (r, g, x) in enumerate(zip(r_series, g_series, b_series)):
+                if red(_RED[r - g - x + 510], r > 0 and r >= FLASH_RED_RATIO * (r + g + x)):
+                    self._swing("red", b, start + k)
+        self.frames += count
+        self.recent_rows.append((start, data))
+        self._finalise(self.frames - 1 - self.span_frames)
+
+    def _swing(self, kind: str, block: int, frame: int) -> None:
+        """Record a completed swing; commit runs that may form a hazard."""
+        seq = self.swing_count[kind][block]
+        self.swing_count[kind][block] = seq + 1
+        recent = self.recent[kind][block]
+        if len(recent) == recent.maxlen and frame - recent[0][1] <= self.span_frames:
+            committed = self.committed[kind][block]
+            for mark_seq, mark_frame in recent:
+                committed[mark_seq] = mark_frame
+            committed[seq] = frame
+            first = max(recent[0][1], self.covered_until[kind][block] + 1)
+            if first <= frame:
+                delta = self.coverage_delta[kind]
+                delta[first] = delta.get(first, 0) + 1
+                delta[frame + 1] = delta.get(frame + 1, 0) - 1
+                self.covered_until[kind][block] = frame
+        recent.append((seq, frame))
+
+    def _finalise(self, through: int) -> None:
+        """Decide retention for frames whose coverage can no longer grow."""
+        threshold = FLASH_AREA * self.PLANE
+        for frame in range(self.final_through + 1, through + 1):
+            flagged = False
+            for kind in _FLASH_KINDS:
+                running = self.coverage_running[kind] + self.coverage_delta[kind].pop(frame, 0)
+                self.coverage_running[kind] = running
+                flagged = flagged or running > threshold
+            if flagged:
+                for keep in range(max(0, frame - self.lead), frame + 1):
+                    if keep not in self.retained:
+                        self.retained[keep] = self._row(keep)
+        self.final_through = max(self.final_through, through)
+        oldest_needed = self.final_through + 1 - self.lead
+        while self.recent_rows and (self.recent_rows[0][0]
+                                    + len(self.recent_rows[0][1]) // self.FRAME_BYTES) <= oldest_needed:
+            self.recent_rows.popleft()
+
+    def _row(self, frame: int) -> bytes:
+        for start, data in self.recent_rows:
+            offset = (frame - start) * self.FRAME_BYTES
+            if 0 <= offset < len(data):
+                return data[offset:offset + self.FRAME_BYTES]
+        raise LookupError(f"flash grid frame {frame} is no longer buffered")
+
+    def finish(self) -> None:
+        """All frames fed: finalise the tail."""
+        self._finalise(self.frames - 1)
+        self.recent_rows.clear()
+
+    # -- decision --------------------------------------------------------------
+    def _grid(self, frame: int) -> Tuple[bytes, bytes, bytes]:
+        row = self.retained[frame]
+        plane = self.PLANE
+        return row[:plane], row[plane:2 * plane], row[2 * plane:]
+
+    def events(self, times: Sequence[float], fps: float,
+               cancel: Optional["threading.Event"] = None) -> List[FlashEvent]:
+        """Flash events with the real frame times (assess_flash's decision)."""
+        frames = min(self.frames, len(times))
+        if frames < FLASH_MAX_TRANSITIONS + 1:
+            return []
+        times = times[:frames]
+        period = _frame_period(fps, times)
+        window = 1.0 - 0.5 * period
+        lead = max(1, int(round(1.0 / period)))
+        if lead > self.lead:
+            raise LookupError("frame rate above the streaming buffer's assumption")
+        blocks = self.PLANE
+        grid = _RetainedGrid(self)
+        events: List[FlashEvent] = []
+        for kind in _FLASH_KINDS:
+            hazard: Dict[int, List[int]] = {}
+            for b in range(blocks):
+                check_cancel(cancel)
+                for first, last in self._exact_spans(kind, b, times, frames, window):
+                    for f in range(first, last + 1):
+                        members = hazard.setdefault(f, [])
+                        if not members or members[-1] != b:
+                            members.append(b)
+            flagged = sorted(f for f, members in hazard.items() if len(members) > FLASH_AREA * blocks)
+            for first, last in _consecutive_runs(flagged):
+                members = sorted({b for f in range(first, last + 1) for b in hazard[f]})
+                lo = max(0, first - lead)
+                local_times = times[lo:last + 1]
+                marks = _flash_transitions(kind, grid, range(lo, last + 1), members)
+                spans = _hazard_spans(marks, local_times, window)
+                if not spans:
+                    continue
+                start = local_times[spans[0][0]]
+                end = local_times[spans[-1][1]] + period
+                area = max(len(hazard[f]) for f in range(first, last + 1)) / blocks
+                events.append(FlashEvent(start, end, area, kind))
+        return sorted(events, key=lambda e: e.start)
+
+    def _exact_spans(self, kind: str, block: int, times: Sequence[float], frames: int,
+                     window: float) -> List[Tuple[int, int]]:
+        """_hazard_spans over the block's swings, from the committed ones.
+
+        Every hazardous run of seven consecutive swings was committed whole,
+        so only runs whose sequence numbers are consecutive are judged.
+        """
+        committed = self.committed[kind][block]
+        if len(committed) < FLASH_MAX_TRANSITIONS + 1:
+            return []
+        seqs = sorted(committed)
+        need = FLASH_MAX_TRANSITIONS + 1
+        spans = []
+        for k in range(len(seqs) - need + 1):
+            if seqs[k + need - 1] - seqs[k] != need - 1:
+                continue
+            first, last = committed[seqs[k]], committed[seqs[k + need - 1]]
+            if last < frames and times[last] - times[first] < window:
+                spans.append((first, last))
+        return spans
+
+
+class _RetainedGrid:
+    """grid[i] view over the frames a FlashAccumulator retained."""
+
+    def __init__(self, accumulator: FlashAccumulator):
+        self.accumulator = accumulator
+
+    def __getitem__(self, frame: int) -> Tuple[bytes, bytes, bytes]:
+        return self.accumulator._grid(frame)
+
+
+def _consecutive_runs(frames: Sequence[int]) -> List[Tuple[int, int]]:
+    """(first, last) runs of consecutive integers in a sorted list."""
+    runs: List[Tuple[int, int]] = []
+    for f in frames:
+        if runs and f == runs[-1][1] + 1:
+            runs[-1] = (runs[-1][0], f)
+        else:
+            runs.append((f, f))
+    return runs
+
+
+def assess_flash(series: VideoSeries, fps: float,
+                 cancel: Optional["threading.Event"] = None) -> List[FlashEvent]:
     """BT.1702-3 general and red flash counting on a 16x9 grid of linear light.
 
     1. Per block, the rule's quantity (luminance Y = 0.2126 R + 0.7152 G +
@@ -1275,41 +1722,17 @@ def assess_flash(series: VideoSeries, fps: float) -> List[FlashEvent]:
        different moments, which cancels in the mean (real 4K camera footage
        otherwise produced false hazards).
 
+    The scan streams the grid into ``series.flash_stream`` while FFmpeg
+    runs; a series built in memory (``series.flash``) is fed here.
     Advisory only: BT.1702 compliance is certified with a Harding FPA class
     analyser.
     """
-    grid = series.flash
-    frames = min(len(grid), len(series.times))
-    if frames < FLASH_MAX_TRANSITIONS + 1:
-        return []
-    times = series.times[:frames]
-    period = _frame_period(fps, times)
-    window = 1.0 - 0.5 * period
-    blocks = len(grid[0][0])
-    events: List[FlashEvent] = []
-    for kind in ("general", "red"):
-        hazard_frames: List[List[int]] = [[] for _ in range(frames)]
-        for b in range(blocks):
-            marks = _flash_transitions(kind, grid, range(frames), [b])
-            for first, last in _hazard_spans(marks, times, window):
-                for f in range(first, last + 1):
-                    if not hazard_frames[f] or hazard_frames[f][-1] != b:
-                        hazard_frames[f].append(b)
-        flagged = [len(h) > FLASH_AREA * blocks for h in hazard_frames]
-        lead = max(1, int(round(1.0 / period)))
-        for first, last in frame_runs(flagged):
-            members = sorted({b for f in range(first, last + 1) for b in hazard_frames[f]})
-            lo = max(0, first - lead)
-            local_times = times[lo:last + 1]
-            marks = _flash_transitions(kind, grid, range(lo, last + 1), members)
-            spans = _hazard_spans(marks, local_times, window)
-            if not spans:
-                continue
-            start = local_times[spans[0][0]]
-            end = local_times[spans[-1][1]] + period
-            area = max(len(hazard_frames[f]) for f in range(first, last + 1)) / blocks
-            events.append(FlashEvent(start, end, area, kind))
-    return sorted(events, key=lambda e: e.start)
+    accumulator = series.flash_stream
+    if accumulator is None:
+        accumulator = FlashAccumulator(fps)
+        accumulator.feed(b"".join(g + b + r for g, b, r in series.flash))
+        accumulator.finish()
+    return accumulator.events(series.times, fps, cancel)
 
 
 def flash_entry(events: Sequence[FlashEvent]) -> Tuple[str, str, int]:
@@ -1341,16 +1764,21 @@ class InterlaceFindings:
     scrolls: List[Interval] = field(default_factory=list)  # idet hits that are vertical scrolls
 
 
-def _vertical_scroll(first: int, last: int, col_motion: Sequence[Optional[float]],
+def _vertical_scroll(first: int, last: int, interlaced: Sequence[bool],
+                     col_motion: Sequence[Optional[float]],
                      row_motion: Sequence[Optional[float]]) -> bool:
     """True when the motion in frames first..last is a vertical translation.
 
-    Needs measurable profile motion on at least half the frames, with the
-    column-profile change under INTERLACE_VERTICAL_SHARE of the total.
+    Judged on the frames idet calls interlaced (the only ones whose profile
+    change is recorded): measurable motion on at least half of them, with
+    the column-profile change under INTERLACE_VERTICAL_SHARE of the total.
     """
     shares = []
-    frames = last - first + 1
-    for k in range(first, min(last + 1, len(col_motion), len(row_motion))):
+    frames = 0
+    for k in range(first, min(last + 1, len(col_motion), len(row_motion), len(interlaced))):
+        if not interlaced[k]:
+            continue
+        frames += 1
         col, row = col_motion[k], row_motion[k]
         if col is None or row is None or col + row <= INTERLACE_MOTION_FLOOR:
             continue
@@ -1383,14 +1811,21 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
     flagged = _FIELD_ORDER_NAMES.get(field_order)
     combed: List[Interval] = []
     if flagged is None and count >= window:
-        dense = [False] * count
+        # An interlaced frame is "dense" when some one-second window holding
+        # it is more than half interlaced; windows are unioned with a
+        # difference array (linear in the frame count).
+        cover = [0] * (count + 1)
         running = sum(interlaced[:window])
         for k in range(count - window + 1):
             if k:
                 running += interlaced[k + window - 1] - interlaced[k - 1]
             if running > INTERLACE_WINDOW_SHARE * window:
-                for j in range(k, k + window):
-                    dense[j] = dense[j] or interlaced[j]
+                cover[k] += 1
+                cover[k + window] -= 1
+        dense, depth = [False] * count, 0
+        for j in range(count):
+            depth += cover[j]
+            dense[j] = depth > 0 and interlaced[j]
         min_frames = max(1, int(round(INTERLACE_MIN_SECONDS / period)))
         for first, last in frame_runs(dense, 1):
             span = _interval_of(times, first, last, period)
@@ -1405,11 +1840,12 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
     scrolls: List[Interval] = []
     if combed and col_motion and row_motion:
         kept = []
+        frame_times = list(times[:count])
         for start, length in combed:
-            first = next(i for i, t in enumerate(times[:count]) if t >= start - 1e-6)
-            last = max(first, max(i for i, t in enumerate(times[:count]) if t < start + length - 1e-6))
-            (scrolls if _vertical_scroll(first, last, col_motion, row_motion) else kept).append(
-                (start, length))
+            first = bisect.bisect_left(frame_times, start - 1e-6)
+            last = max(first, bisect.bisect_left(frame_times, start + length - 1e-6) - 1)
+            vertical = _vertical_scroll(first, last, interlaced, col_motion, row_motion)
+            (scrolls if vertical else kept).append((start, length))
         combed = kept
     tff, bff = labels.count("tff"), labels.count("bff")
     content = None
@@ -1472,17 +1908,29 @@ def report_video(result, config: VideoCheckConfig, video: dict, fps: float, *,
 
     A check switched off in the settings is SKIP; one whose per-frame
     measurements are missing although frames were decoded is "Not
-    verified" - never a silent PASS.
+    verified" - never a silent PASS. Evaluation looks at the scan's cancel
+    flag throughout; when it is set, every row not yet added is reported
+    not verified and the work stops.
     """
-    series = analysis.collect() if analysis is not None else VideoSeries()
-    reason = analysis_error or _NO_MEASUREMENTS
-    if series.frames:
-        result.set_metadata("video_frames_analysed", series.frames)
-    black = _report_black(result, config, black_events, video_end, fps, series)
-    _report_freeze(result, config, series, video_end, fps, black, decoded_frames, reason)
-    _report_levels(result, config, series, analysis, fps, decoded_frames, reason)
-    _report_flash(result, config, series, analysis, fps, decoded_frames, reason)
-    _report_interlace(result, config, series, analysis, video, fps, decoded_frames, reason)
+    try:
+        series = analysis.collect() if analysis is not None else VideoSeries()
+        reason = analysis_error or _NO_MEASUREMENTS
+        if series.frames:
+            result.set_metadata("video_frames_analysed", series.frames)
+        cancel = analysis.cancel if analysis is not None else None
+        black = _report_black(result, config, black_events, video_end, fps, series)
+        check_cancel(cancel)
+        _report_freeze(result, config, series, video_end, fps, black, decoded_frames, reason)
+        check_cancel(cancel)
+        _report_levels(result, config, series, analysis, fps, decoded_frames, reason)
+        _report_flash(result, config, series, analysis, fps, decoded_frames, reason, cancel)
+        check_cancel(cancel)
+        _report_interlace(result, config, series, analysis, video, fps, decoded_frames, reason)
+    except ScanCancelled:
+        reported = {check[0] for check in result.checks}
+        for name in config.enabled_names():
+            if name not in reported:
+                result.add_not_verified(name, "the scan was cancelled during the picture analysis.")
 
 
 def _report_black(result, config, events, duration, fps, series) -> List[Interval]:
@@ -1539,7 +1987,8 @@ def _report_levels(result, config, series, analysis, fps, decoded, reason) -> No
     _add(result, LEVELS, *levels_entry(findings, config.levels_mode, full))
 
 
-def _report_flash(result, config, series, analysis, fps, decoded, reason) -> None:
+def _report_flash(result, config, series, analysis, fps, decoded, reason,
+                  cancel: Optional[threading.Event] = None) -> None:
     if not config.flash:
         result.add_skip(FLASH, "Switched off in the settings.")
         return
@@ -1550,10 +1999,17 @@ def _report_flash(result, config, series, analysis, fps, decoded, reason) -> Non
     if analysis is not None and not analysis.info.analysable:
         result.add_skip(FLASH, "Picture too small to analyse.")
         return
-    if decoded and not series.flash:
+    if series.flash_error:
+        result.add_not_verified(FLASH, f"the flash measurements could not be read ({series.flash_error}).")
+        return
+    if decoded and not series.flash_frames:
         result.add_not_verified(FLASH, reason)
         return
-    events = assess_flash(series, fps)
+    try:
+        events = assess_flash(series, fps, cancel)
+    except LookupError as exc:
+        result.add_not_verified(FLASH, f"the flash measurements are incomplete ({exc}).")
+        return
     if events:
         result.set_metadata("flash_risk_events", len(events))
     _add(result, FLASH, *flash_entry(events))
