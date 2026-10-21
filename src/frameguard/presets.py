@@ -15,6 +15,7 @@ Handles:
 """
 
 import json
+import math
 import os
 import re
 import sys
@@ -36,8 +37,10 @@ MAX_PRESET_NESTING = 64
 PRESET_CONFIG_KEYS = (
     "target_width",
     "target_height",
+    "allow_larger_resolution",
     "target_fps",
     "fps_tolerance",
+    "allow_fps_multiples",
     "min_bitrate_mbps",
     "accepted_codecs",
     "accepted_containers",
@@ -45,8 +48,20 @@ PRESET_CONFIG_KEYS = (
     "audio_required",
     "min_audio_sample_rate",
     "require_cfr",
+    "require_progressive",
+    "min_bit_depth",
+    "required_transfer",
+    "required_projection",
+    "required_stereo_mode",
+    "max_decode_errors",
     "silence_duration",
     "silence_noise_db",
+    "loudness_mode",
+    "target_loudness_lufs",
+    "loudness_tolerance_lu",
+    "true_peak_max_dbtp",
+    # Compatibility-only (see core.COMPAT_ONLY_CONFIG_KEYS): still accepted so
+    # presets and saved settings written by 0.8.x round-trip unchanged.
     "use_hwaccel",
     "segment_enabled",
     "segment_count",
@@ -75,96 +90,193 @@ _EXCLUDED_KEYS = frozenset({
 })
 
 
-def normalize_preset_config(config: dict) -> dict:
-    """Translate a preset's ``config`` block into engine (``DEFAULT_CONFIG``) keys.
+class PresetValidationError(ValueError):
+    """A preset's config block is invalid; ``problems`` lists every bad key."""
 
-    Accepts both the current schema and the legacy ``delivery_*``/``deep_*``
-    spellings, and drops anything that isn't a shareable scan parameter.
+    def __init__(self, problems: List[str], unknown: List[str]):
+        self.problems = list(problems)
+        self.unknown = list(unknown)
+        parts = []
+        if self.problems:
+            parts.append("invalid values: " + "; ".join(self.problems))
+        if self.unknown:
+            parts.append("unknown keys: " + ", ".join(sorted(self.unknown)))
+        super().__init__("Preset rejected — " + " | ".join(parts))
+
+
+def _ignored_key(key: str) -> bool:
+    """Keys that are known but deliberately not applied (never an error)."""
+    from frameguard.core import RETIRED_CONFIG_KEYS
+    return key in _EXCLUDED_KEYS or key in RETIRED_CONFIG_KEYS
+
+
+def validate_preset_config(config: dict) -> dict:
+    """Strictly normalise a preset ``config`` block or raise PresetValidationError.
+
+    Out-of-range values used to be clamped (``target_fps: 0`` became 1 fps,
+    ``fps_tolerance: 60`` disabled the frame-rate check) and misspelt keys were
+    dropped silently, so an imported spec could be looser than its author
+    wrote without anyone being told. Every problem is now collected and the
+    preset is rejected with the full list. Retired and machine-local keys are
+    ignored, not rejected, so older presets still load.
+    """
+    if not isinstance(config, dict):
+        raise PresetValidationError(["config block is not an object"], [])
+    out, problems, unknown = {}, [], []
+    for raw_key, value in config.items():
+        key = _LEGACY_KEY_ALIASES.get(raw_key, raw_key)
+        if key not in PRESET_CONFIG_KEYS:
+            if not _ignored_key(key):
+                unknown.append(str(raw_key))
+            continue
+        coerced, problem = _coerce_preset_value(key, value)
+        if problem:
+            problems.append(f"{raw_key}={value!r} ({problem})")
+        else:
+            out[key] = coerced
+    if problems or unknown:
+        raise PresetValidationError(problems, unknown)
+    return out
+
+
+def normalize_preset_config(config: dict) -> dict:
+    """Leniently translate a config block into engine (``DEFAULT_CONFIG``) keys.
+
+    Used for the app's own saved settings, where one stale or retired value
+    must not throw away the whole configuration: invalid values and unknown
+    keys are dropped (never clamped, so nothing is silently loosened), and
+    the engine default applies for those keys. Imported preset files go
+    through validate_preset_config instead, which rejects them.
     """
     if not isinstance(config, dict):
         return {}
     out = {}
     for key, value in config.items():
         key = _LEGACY_KEY_ALIASES.get(key, key)
-        if key in _EXCLUDED_KEYS or key not in PRESET_CONFIG_KEYS:
+        if key not in PRESET_CONFIG_KEYS:
             continue
-        coerced = _coerce_preset_value(key, value)
-        if coerced is not _INVALID:
+        coerced, problem = _coerce_preset_value(key, value)
+        if not problem:
             out[key] = coerced
     return out
 
 
-_INVALID = object()
 # Values are interpolated into FFmpeg filter graphs (e.g. silence_noise_db
 # becomes "silencedetect=n=<value>dB"), so a string that slipped through could
 # append arbitrary filters - including ones that write files. Every value is
-# therefore coerced to the type of its engine default, or dropped.
+# therefore coerced to the type of its engine default, or rejected.
 _PRESET_VALUE_RANGES = {
     "target_width": (16, 16384),
     "target_height": (16, 16384),
     "target_fps": (1.0, 1000.0),
-    "fps_tolerance": (0.0, 60.0),
+    # The Settings slider tops out at 2.0; anything wider stops the frame-rate
+    # check meaning anything (24 vs 25 fps would pass).
+    "fps_tolerance": (0.0, 2.0),
     "min_bitrate_mbps": (0.0, 100000.0),
     "min_audio_sample_rate": (1000, 768000),
+    "max_decode_errors": (0, 1_000_000),
     "silence_duration": (0.1, 3600.0),
     "silence_noise_db": (-120.0, 0.0),
+    "target_loudness_lufs": (-70.0, 0.0),
+    "loudness_tolerance_lu": (0.0, 20.0),
+    "true_peak_max_dbtp": (-20.0, 3.0),
     "segment_count": (1, 16),
 }
 _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_containers")
 # Only these are genuinely whole numbers. Everything else numeric accepts a
-# fraction even when its default happens to be written as an int
-# (min_bitrate_mbps: 20, silence_noise_db: -50): rejecting 12.5 Mbps silently
-# fell back to the stricter default and failed compliant files.
+# fraction even when its default happens to be written as an int.
 _INTEGER_PRESET_KEYS = frozenset({
     "target_width", "target_height", "min_audio_sample_rate", "segment_count",
+    "max_decode_errors",
 })
 
 
+def _enum_choices(key: str):
+    from frameguard import core
+    return {
+        "min_bit_depth": core.BIT_DEPTH_CHOICES,
+        "required_transfer": core.TRANSFER_CHOICES,
+        "required_projection": core.PROJECTION_CHOICES,
+        "required_stereo_mode": core.STEREO_CHOICES,
+        "loudness_mode": core.LOUDNESS_MODES,
+    }.get(key)
+
+
+def _coerce_enum(key: str, value, choices):
+    if isinstance(value, bool):
+        return None, f"must be one of {', '.join(map(str, choices))}"
+    if isinstance(value, str):
+        text = value.strip().lower().replace("-", "_").replace(" ", "_")
+        for choice in choices:
+            if str(choice) == text:
+                return choice, None
+    elif isinstance(value, (int, float)) and value in choices:
+        return int(value), None
+    return None, f"must be one of {', '.join(map(str, choices))}"
+
+
 def _coerce_preset_value(key: str, value):
-    """Return ``value`` converted to the engine type for ``key``, or _INVALID."""
-    import math
+    """``(value converted to the engine type for key, None)`` or ``(None, problem)``."""
     from frameguard.core import DEFAULT_CONFIG
 
+    choices = _enum_choices(key)
+    if choices is not None:
+        return _coerce_enum(key, value, choices)
     default = DEFAULT_CONFIG.get(key)
     if isinstance(default, bool):
         if isinstance(value, bool):
-            return value
+            return value, None
         if isinstance(value, int) and value in (0, 1):
-            return bool(value)
+            return bool(value), None
         if isinstance(value, str) and value.strip().lower() in ("true", "false"):
-            return value.strip().lower() == "true"
-        return _INVALID
+            return value.strip().lower() == "true", None
+        return None, "must be true or false"
     if isinstance(default, (int, float)):
-        if isinstance(value, bool):
-            return _INVALID
-        try:
-            number = float(value.strip()) if isinstance(value, str) else float(value)
-        except (TypeError, ValueError, AttributeError):
-            return _INVALID
-        if not math.isfinite(number):
-            return _INVALID
-        low, high = _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
-        number = min(max(number, low), high)
-        if key in _INTEGER_PRESET_KEYS:
-            if number != int(number):
-                return _INVALID
-            return int(number)
-        return int(number) if isinstance(default, int) and number == int(number) else number
+        return _coerce_number(key, value, default)
     if isinstance(default, list):
-        if not isinstance(value, list):
-            return _INVALID
-        items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
-        if key in _LOWERCASE_LIST_KEYS:
-            # Probed codec names and os.path.splitext() output are lowercase;
-            # "H264" or ".MP4" in a hand-written preset failed every file.
-            items = [item.lower() for item in items]
-        if key == "accepted_containers":
-            # Compared against splitext() output, which keeps the leading dot.
-            items = [item if item.startswith(".") else f".{item}" for item in items]
-        return items
+        return _coerce_list(key, value)
     if isinstance(default, str):
-        return value if isinstance(value, str) else _INVALID
-    return _INVALID
+        return (value, None) if isinstance(value, str) else (None, "must be text")
+    return None, "unsupported type"
+
+
+def _coerce_number(key: str, value, default):
+    if isinstance(value, bool):
+        return None, "must be a number"
+    try:
+        number = float(value.strip()) if isinstance(value, str) else float(value)
+    except (TypeError, ValueError, AttributeError):
+        return None, "must be a number"
+    if not math.isfinite(number):
+        return None, "must be a finite number"
+    low, high = _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
+    if not low <= number <= high:
+        return None, f"out of range {low:g}..{high:g}"
+    if key in _INTEGER_PRESET_KEYS:
+        if number != int(number):
+            return None, "must be a whole number"
+        return int(number), None
+    if isinstance(default, int) and number == int(number):
+        return int(number), None
+    return number, None
+
+
+def _coerce_list(key: str, value):
+    if not isinstance(value, list):
+        return None, "must be a list"
+    items = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    if len(items) != len(value):
+        return None, "every entry must be non-empty text"
+    if not items:
+        # An empty acceptance list fails every file.
+        return None, "must not be empty"
+    if key in _LOWERCASE_LIST_KEYS:
+        # Probed codec names and os.path.splitext() output are lowercase.
+        items = [item.lower() for item in items]
+    if key == "accepted_containers":
+        # Compared against splitext() output, which keeps the leading dot.
+        items = [item if item.startswith(".") else f".{item}" for item in items]
+    return items, None
 
 
 def get_bundled_presets_dir() -> Path:
@@ -330,23 +442,26 @@ def export_preset(name: str, config: dict, output_path: Optional[str] = None) ->
     return output_path
 
 
-def import_preset(filepath: str) -> Optional[Dict]:
+def import_preset(filepath: str, raise_errors: bool = False) -> Optional[Dict]:
     """Import a preset from a .fg or .json file.
 
     Returns:
         Dict with 'name', 'config', 'description', 'format_version' keys,
-        or None if invalid/unreadable. 'config' is always normalized to
-        engine key names.
+        or None if the file is unreadable or its config is invalid. 'config'
+        is always normalized to engine key names.
+
+    With ``raise_errors`` an invalid config raises PresetValidationError,
+    whose message lists every bad and unknown key (for showing to the user).
     """
     try:
         data = _load_preset_json(filepath)
         if not isinstance(data, dict) or not isinstance(data.get("config"), dict):
+            if raise_errors:
+                raise PresetValidationError(["file has no 'config' object"], [])
             return None
-
-        config = normalize_preset_config(data["config"])
+        config = validate_preset_config(data["config"])
         if not config:
-            return None
-
+            raise PresetValidationError(["config contains no scan settings"], [])
         return {
             "name": str(data.get("name") or Path(filepath).stem),
             "config": config,
@@ -354,8 +469,14 @@ def import_preset(filepath: str) -> Optional[Dict]:
             "format_version": data.get("format_version", 0),
             "source_path": filepath,
         }
+    except PresetValidationError:
+        if raise_errors:
+            raise
+        return None
     except (json.JSONDecodeError, OSError, UnicodeDecodeError,
             RecursionError, ValueError):
+        if raise_errors:
+            raise
         return None
 
 
@@ -458,20 +579,66 @@ def is_preset_file(filepath: str) -> bool:
     return False
 
 
-def detect_preset_from_filename(filename: str, presets: dict) -> Optional[str]:
-    """Auto-detect which preset to use based on the video filename."""
-    name_lower = filename.lower()
-    
-    if any(x in name_lower for x in ["4k", "uhd", "3840", "2160"]):
-        if any(x in name_lower for x in ["60p", "60fps", "_60_"]):
-            return "4k60"
-        elif any(x in name_lower for x in ["24p", "24fps", "_24_"]):
-            return "4k24"
-        return "4k30"
-    elif any(x in name_lower for x in ["1080", "fhd", "fullhd"]):
-        return "1080p30"
-    elif any(x in name_lower for x in ["5.7k", "5760", "vr", "360"]):
-        return "5.7k30"
-    elif any(x in name_lower for x in ["8k", "7680"]):
-        return "8k30"
+_FPS_TOKENS = {
+    24: ("24p", "24fps", "2398", "23.976", "23976"),
+    30: ("30p", "30fps", "2997", "29.97"),
+    60: ("60p", "60fps", "5994", "59.94"),
+}
+_RESOLUTION_TOKENS = {
+    "4k": ("4k", "uhd", "2160p", "3840x2160"),
+    "1080p": ("1080p", "fhd", "fullhd", "1920x1080"),
+    "720p": ("720p", "1280x720"),
+    "5.7k": ("5.7k", "5760x2880"),
+    "8k": ("8k", "4320p", "7680x4320"),
+}
+# Resolution family + frame rate -> built-in preset. Combinations with no
+# matching preset (e.g. 4K 25p) deliberately produce no suggestion.
+_PRESET_BY_TOKENS = {
+    ("4k", 30): "4k30", ("4k", 60): "4k60", ("4k", 24): "4k24",
+    ("1080p", 30): "1080p30", ("1080p", 60): "1080p60", ("1080p", 24): "1080p24",
+    ("720p", 30): "720p30", ("5.7k", 30): "5.7k30", ("8k", 30): "8k30",
+}
+
+
+def _filename_tokens(filename: str) -> List[str]:
+    """Lower-case whole tokens of a file name, split on separators.
+
+    Dots inside a token survive ("5.7k", "29.97"); the extension does not.
+    """
+    stem = os.path.splitext(os.path.basename(filename))[0].lower()
+    return [t for t in re.split(r"[\s_\-\[\]\(\)+,]+", stem) if t]
+
+
+def detect_preset_from_filename(filename: str, presets: dict = None) -> Optional[str]:
+    """Suggest a built-in preset from whole tokens in a file name, or None.
+
+    The old substring matcher read "_C360" and "overview_vr_cut" as 5.7K VR
+    and any "1080" (a take number) as 1080p. Only unambiguous whole tokens
+    count now: a resolution token ("4k", "uhd", "2160p", "1920x1080" ...),
+    optionally with a frame-rate token ("24p", "59.94" ...; 30 when absent).
+    Bare numbers, "vr" and "360" never match. This only suggests: callers
+    must never replace a spec the user chose.
+    """
+    tokens = set(_filename_tokens(filename))
+    families = [fam for fam, words in _RESOLUTION_TOKENS.items() if tokens & set(words)]
+    rates = {fps for fps, words in _FPS_TOKENS.items() if tokens & set(words)}
+    known_rate_words = {w for words in _FPS_TOKENS.values() for w in words}
+    for token in tokens - known_rate_words:
+        rate = re.fullmatch(r"(\d{2,3}(?:\.\d+)?)(?:p|fps)", token)
+        if rate and float(rate.group(1)) <= 240:
+            return None  # a frame rate no built-in preset has (25p, 50p, 120fps)
+    if len(families) != 1 or len(rates) > 1:
+        return None
+    rates = sorted(rates)
+    key = _PRESET_BY_TOKENS.get((families[0], rates[0] if rates else 30))
+    if key and presets is not None and key not in presets:
+        return None
+    return key
+
+
+def suggest_preset_for_files(filenames: List[str], presets: dict = None) -> Optional[str]:
+    """A suggestion only when every file name points at the same preset."""
+    suggestions = {detect_preset_from_filename(name, presets) for name in filenames}
+    if len(suggestions) == 1:
+        return suggestions.pop()
     return None

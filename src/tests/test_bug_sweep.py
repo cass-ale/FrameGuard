@@ -16,8 +16,8 @@ from frameguard.core import (
     CHECK_SEVERITY_WEIGHTS,
     DEFAULT_CONFIG,
     QAResult,
-    _cap_stderr_text,
-    _run_segment_filter_scan,
+    _BoundedStderrCapture,
+    _run_scan_process,
     check_severity,
     discover_video_files,
     result_severity,
@@ -32,6 +32,32 @@ def _cfg(**overrides):
     cfg = dict(DEFAULT_CONFIG)
     cfg.update(overrides)
     return cfg
+
+
+def _cap_stderr_text(text, cfg):
+    """Feed completed text through the live capture (what the scan retains)."""
+    capture = _BoundedStderrCapture(cfg)
+    for line in text.splitlines():
+        capture.add(line)
+    captured = capture.result()
+    return str(captured), captured.truncated_records
+
+
+def _scan_process(proc_or_factory, cfg, cancel_event=None, process_owner=None, timeout=60):
+    """Run the single-pass scan runner against a fake Popen."""
+    kwargs = ({"side_effect": proc_or_factory} if callable(proc_or_factory)
+              and not hasattr(proc_or_factory, "pid") else {"return_value": proc_or_factory})
+    with mock.patch("frameguard.core.subprocess.Popen", **kwargs) as popen:
+        outcome = _run_scan_process(["ffmpeg"], timeout, 40.0, cfg, None,
+                                    cancel_event, process_owner)
+    return outcome, popen
+
+
+_VIDEO_PROBE = {"streams": [{"codec_type": "video", "index": 0, "avg_frame_rate": "30/1",
+                             "nb_frames": "1200"}],
+                "format": {"duration": "40.0"}}
+_STATS_LINE = (b"[in#0/mov @ 0x1] [verbose]   Input stream #0:0 (video): 1200 packets read "
+               b"(1 bytes); 1200 frames decoded; 0 decode errors; \n")
 
 
 def _finalized(name, outcome="fail", **kw):
@@ -481,6 +507,10 @@ class TestBlockingProbeCancellation:
 
 
 class TestStderrCap:
+    """The single-pass scan keeps every detection record and decoder error
+    while bounding everything else (0.9.0 ported these from the segment
+    runner, which no longer exists)."""
+
     def test_huge_stderr_is_bounded(self):
         text = "\n".join(f"[info] frame={i} fps=30" for i in range(100_000))
         cfg = _cfg(deep_scan_max_stderr_lines=5000,
@@ -496,7 +526,7 @@ class TestStderrCap:
 
     def test_early_evidence_survives_line_and_character_caps(self):
         evidence = (
-            "[h264] Invalid NAL unit size (-1 > 100).\n"
+            "[h264 @ 0x1] [error] Invalid NAL unit size (-1 > 100).\n"
             "black_start:5 black_end:15 black_duration:10\n"
             "silence_start: 6\nsilence_end: 14 | silence_duration: 8"
         )
@@ -522,8 +552,8 @@ class TestStderrCap:
             *(f"black_start:{i} black_end:{i + 1} black_duration:1"
               for i in range(40)),
             "freeze_start:20 freeze_end:25 freeze_duration:5",
-            "[h264] Invalid NAL unit size (-1 > 100).",
-            "[h264] Invalid NAL unit size (-1 > 100).",
+            "[h264 @ 0x1] [error] Invalid NAL unit size (-1 > 100).",
+            "[h264 @ 0x1] [error] Invalid NAL unit size (-1 > 100).",
             *(f"black_start:{100 + i} black_end:{101 + i} black_duration:1"
               for i in range(40)),
             *(f"frame={i}" for i in range(50)),
@@ -540,7 +570,7 @@ class TestStderrCap:
         assert capped.count("Invalid NAL unit size") == 2
         assert "frame=0" not in capped
 
-    def test_segment_multimegabyte_unterminated_record_uses_bounded_binary_reads(self):
+    def test_multimegabyte_unterminated_record_uses_bounded_binary_reads(self):
         stream = _GeneratedBinaryStream(
             prefix=(b"\xffblack_start:5 black_end:15 black_duration:10 "),
             noise_bytes=3 * 1024 * 1024,
@@ -550,13 +580,9 @@ class TestStderrCap:
         proc = _BinaryProc(stream)
         cfg = _cfg(deep_scan_max_stderr_lines=10,
                    deep_scan_max_stderr_chars=1200)
-        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
-            captured = _run_segment_filter_scan(
-                "clip.mp4", 0, 30, "blackdetect", None, False, cfg)
+        outcome, _ = _scan_process(proc, cfg)
 
-        assert captured is not None
+        captured = outcome.log_text
         assert stream.max_read_size <= 64 * 1024
         assert captured.peak_pending_chars <= 70 * 1024
         assert len(captured) <= 1200
@@ -564,83 +590,30 @@ class TestStderrCap:
         assert "freeze_start:20" in captured
         assert "Invalid NAL unit size" in captured
 
-    def test_late_distinct_evidence_survives_category_pressure_end_to_end(self):
-        def noisy_stream():
-            early_black = b"".join(
-                f"black_start:{i} black_end:{i + 1} black_duration:1\n".encode()
-                for i in range(40)
-            )
-            late_distinct = (
-                b"freeze_start:20 freeze_end:25 freeze_duration:5\n"
-                b"[h264] Invalid NAL unit size (-1 > 100).\n"
-            )
-            later_black = b"".join(
-                f"black_start:{100 + i} black_end:{101 + i} black_duration:1\n".encode()
-                for i in range(40)
-            )
-            return io.BytesIO(early_black + late_distinct + later_black + b"frame=500\n")
-
-        procs = []
-
-        def make_proc(*args, **kwargs):
-            proc = _BinaryProc(noisy_stream())
-            procs.append(proc)
-            return proc
-
+    def test_decoder_damage_is_counted_exactly_under_capture_pressure(self):
+        """Counts come from the live accounting, not the bounded text: a
+        thousand damaged frames under a 6-line cap are all counted."""
+        stderr = b"".join([
+            b"[blackdetect@v @ 0x1] [info] black_start:5 black_end:15 black_duration:10\n",
+            *(b"[vist#0:0/h264 @ 0x2] [dec:h264 @ 0x3] [warning] corrupt decoded frame\n"
+              for _ in range(1000)),
+            *(f"[info] frame={i} ".encode() + b"x" * 100 + b"\n" for i in range(500)),
+            _STATS_LINE,
+        ])
         result = QAResult("clip.mp4")
-        cfg = _cfg(
-            segment_enabled=True, segment_count=2, segment_min_duration=1,
-            deep_scan_max_stderr_lines=10, deep_scan_max_stderr_chars=1200,
-        )
-        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
-             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
-             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", side_effect=make_proc):
-            run_deep_scan(
-                "clip.mp4", result, cfg,
-                probe_data={"streams": [{"codec_type": "video"}]},
-            )
+        cfg = _cfg(deep_scan_max_stderr_lines=6, deep_scan_max_stderr_chars=500)
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
+             mock.patch("frameguard.core.subprocess.Popen",
+                        return_value=_BinaryProc(io.BytesIO(stderr))):
+            run_deep_scan("clip.mp4", result, cfg, probe_data=_VIDEO_PROBE)
 
-        result.finalize()
-        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
-        freeze = next(c for c in result.checks if c[0] == "Freeze Frames")
-        assert len(procs) == 2
-        assert decode[1] == "FAIL", result.checks
-        assert freeze[1] in ("WARN", "FAIL"), result.checks
+        integrity = next(c for c in result.checks if c[0] == "File Integrity")
+        black = next(c for c in result.checks if c[0] == "Black Frames")
+        assert integrity[1] == "FAIL" and "1000 decoder error" in integrity[2], integrity
+        assert black[1] in ("WARN", "FAIL"), result.checks
+        assert result.metadata["deep_scan_stderr_truncated_lines"] > 0
 
-    def test_single_pass_multimegabyte_unterminated_record_changes_verdict(self):
-        stream = _GeneratedBinaryStream(
-            prefix=b"header \xff ",
-            noise_bytes=3 * 1024 * 1024,
-            suffix=(b" freeze_start:20 freeze_end:25 freeze_duration:5 "
-                    b"Invalid NAL unit size (-1 > 100). frame=300"),
-        )
-        proc = _BinaryProc(stream)
-        result = QAResult("clip.mp4")
-        cfg = _cfg(
-            segment_enabled=False,
-            deep_scan_max_stderr_lines=10,
-            deep_scan_max_stderr_chars=1200,
-        )
-        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
-             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
-             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
-            run_deep_scan(
-                "clip.mp4", result, cfg,
-                probe_data={"streams": [{"codec_type": "video"}]},
-            )
-
-        result.finalize()
-        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
-        freeze = next(c for c in result.checks if c[0] == "Freeze Frames")
-        assert stream.max_read_size <= 64 * 1024
-        assert decode[1] == "FAIL", result.checks
-        assert freeze[1] in ("WARN", "FAIL"), result.checks
-
-    def test_segment_capture_is_bounded_while_process_is_running(self):
+    def test_capture_is_bounded_while_process_is_running(self):
         class _NoisyStderr:
             def __init__(self, line_factory, drained):
                 self._lines = iter(line_factory())
@@ -671,12 +644,13 @@ class TestStderrCap:
                 self.communicate_called = False
                 self.drained = threading.Event()
                 self.stderr = _NoisyStderr(self._lines, self.drained)
+                self.stdout = io.BytesIO(b"progress=end\n")
 
             def _lines(self):
                 yield "black_start:5 black_end:15 black_duration:10\n"
                 for i in range(20_000):
                     yield f"frame={i} " + "x" * 100 + "\n"
-                yield "[h264] Invalid NAL unit size (-1 > 100).\n"
+                yield "[h264 @ 0x1] [error] Invalid NAL unit size (-1 > 100).\n"
                 yield "frame= 20000 fps=30\n"
 
             def communicate(self, timeout=None):
@@ -693,11 +667,8 @@ class TestStderrCap:
         proc = _NoisyProc()
         cfg = _cfg(deep_scan_max_stderr_lines=8,
                    deep_scan_max_stderr_chars=600)
-        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
-            captured = _run_segment_filter_scan(
-                "clip.mp4", 0, 10, "blackdetect", None, False, cfg)
+        outcome, _ = _scan_process(proc, cfg)
+        captured = outcome.log_text
 
         assert not proc.communicate_called
         assert len(captured.splitlines()) <= 8
@@ -709,111 +680,29 @@ class TestStderrCap:
         assert "Invalid NAL unit size" in captured
         assert "frame= 20000" in captured
 
-    def test_segment_capture_evidence_reaches_end_to_end_verdict(self):
-        class _NoisyProc:
-            _next_pid = 9000
-
-            def __init__(self):
-                type(self)._next_pid += 1
-                self.pid = type(self)._next_pid
-                self.returncode = 0
-                self.stderr = io.BytesIO(b"".join([
-                    b"black_start:5 black_end:15 black_duration:10\n",
-                    *(f"frame={i} ".encode() + b"x" * 100 + b"\n"
-                      for i in range(500)),
-                    b"[h264] Invalid NAL unit size (-1 > 100).\n",
-                    b"frame= 500 fps=30\n",
-                ]))
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-            def kill(self):
-                self.returncode = -9
-
-        result = QAResult("clip.mp4")
-        procs = []
-
-        def make_proc(*args, **kwargs):
-            proc = _NoisyProc()
-            procs.append(proc)
-            return proc
-
-        cfg = _cfg(
-            segment_enabled=True, segment_count=2, segment_min_duration=1,
-            deep_scan_max_stderr_lines=6, deep_scan_max_stderr_chars=500,
-        )
-        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
-             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
-             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", side_effect=make_proc):
-            run_deep_scan(
-                "clip.mp4", result, cfg,
-                probe_data={"streams": [{"codec_type": "video"}]},
-            )
-
-        result.finalize()
-        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
-        black = next(c for c in result.checks if c[0] == "Black Frames")
-        assert len(procs) == 2
-        assert decode[1] == "FAIL", result.checks
-        assert black[1] in ("WARN", "FAIL"), result.checks
-        assert result.metadata["deep_scan_stderr_truncated_lines"] > 0
-
-    def test_segmented_scan_verdict_keeps_early_defect_evidence(self):
-        result = QAResult("clip.mp4")
-        early = (
-            "[h264] Invalid NAL unit size (-1 > 100).\n"
-            "black_start:5 black_end:15 black_duration:10\n"
-        )
-        noise = "\n".join(f"frame={i} " + "x" * 100 for i in range(100))
-        cfg = _cfg(
-            segment_enabled=True, segment_count=2, segment_min_duration=1,
-            deep_scan_max_stderr_lines=6, deep_scan_max_stderr_chars=500,
-        )
-        with mock.patch("frameguard.core.get_file_duration", return_value=40.0), \
-             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core._run_segment_filter_scan",
-                        return_value=early + noise):
-            run_deep_scan(
-                "clip.mp4", result, cfg,
-                probe_data={"streams": [{"codec_type": "video"}]},
-            )
-
-        result.finalize()
-        decode = next(c for c in result.checks if c[0] == "Decode Integrity")
-        black = next(c for c in result.checks if c[0] == "Black Frames")
-        assert decode[1] == "FAIL", result.checks
-        assert black[1] in ("WARN", "FAIL"), result.checks
-        assert result.metadata["deep_scan_stderr_truncated_lines"] > 0
-
-    def test_segment_scan_returns_none_immediately_when_cancelled(self):
+    def test_scan_returns_none_immediately_when_cancelled(self):
         """A pre-set cancel_event must not spawn ffmpeg at all."""
-        cfg = _cfg()
         ev = threading.Event()
         ev.set()
-        with mock.patch("frameguard.core.subprocess.Popen") as popen:
-            out = _run_segment_filter_scan("x.mp4", 0, 10, "blackdetect", None,
-                                           False, cfg, cancel_event=ev)
-        assert out is None
+        outcome, popen = _scan_process(mock.Mock(), _cfg(), cancel_event=ev)
+        assert outcome is None
         popen.assert_not_called()
 
-    def test_segment_scan_never_calls_popen_with_none_tool(self):
-        """get_ffmpeg_path() -> None must short-circuit, not Popen(None)."""
-        with mock.patch("frameguard.core.get_ffmpeg_path", return_value=None):
-            with mock.patch("frameguard.core.subprocess.Popen") as popen:
-                out = _run_segment_filter_scan("x.mp4", 0, 10, "blackdetect",
-                                               None, False, _cfg())
-        assert out is None
+    def test_deep_scan_never_calls_popen_with_none_tool(self):
+        """get_ffmpeg_path() -> None must short-circuit (visibly), not Popen(None)."""
+        result = QAResult("x.mp4")
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value=None), \
+             mock.patch("frameguard.core.subprocess.Popen") as popen:
+            run_deep_scan("x.mp4", result, _cfg(), probe_data=_VIDEO_PROBE)
         popen.assert_not_called()
+        integrity = next(c for c in result.checks if c[0] == "File Integrity")
+        assert integrity[1] == "WARN" and "FFmpeg was not found" in integrity[2]
 
-    def test_segment_timeout_kills_process_and_unblocks_stderr_reader(self):
+    def test_timeout_kills_process_and_is_not_verified(self):
         stopped = threading.Event()
         reader_started = threading.Event()
 
-        class _BlockingStderr:
+        class _BlockingStream:
             def read(self, size=-1):
                 assert size > 0
                 reader_started.set()
@@ -826,7 +715,8 @@ class TestStderrCap:
         class _TimedOutProc:
             pid = 9191
             returncode = None
-            stderr = _BlockingStderr()
+            stderr = _BlockingStream()
+            stdout = _BlockingStream()
 
             def __init__(self):
                 self.killed = 0
@@ -842,18 +732,19 @@ class TestStderrCap:
                 stopped.set()
 
         proc = _TimedOutProc()
+        result = QAResult("x.mp4")
         with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
              mock.patch("frameguard.core.subprocess.Popen", return_value=proc) as popen:
-            out = _run_segment_filter_scan(
-                "x.mp4", 0, 10, "blackdetect", None, False, _cfg())
+            run_deep_scan("x.mp4", result, _cfg(), probe_data=_VIDEO_PROBE)
 
         assert reader_started.is_set()
-        assert out is None
         assert proc.killed == 1
-        assert popen.call_args.kwargs["stdout"] is subprocess.DEVNULL
+        assert popen.call_args.kwargs["stdout"] is subprocess.PIPE  # progress
+        rows = {c[0]: c for c in result.checks}
+        for name in ("File Integrity", "Black Frames", "Freeze Frames"):
+            assert rows[name][1] == "WARN" and "timed out" in rows[name][2], rows[name]
 
-    def test_segment_cancel_terminates_owner_and_joins_stderr_reader(self):
+    def test_cancel_terminates_owner_and_joins_readers(self):
         import builtins
         from frameguard.worker import ScanWorker
 
@@ -861,7 +752,7 @@ class TestStderrCap:
         reader_started = threading.Event()
         real_import = builtins.__import__
 
-        class _BlockingStderr:
+        class _BlockingStream:
             def read(self, size=-1):
                 assert size > 0
                 reader_started.set()
@@ -874,13 +765,14 @@ class TestStderrCap:
         class _CancellableProc:
             pid = 9292
             returncode = None
-            stderr = _BlockingStderr()
+            stderr = _BlockingStream()
+            stdout = _BlockingStream()
 
             def __init__(self):
                 self.terminated = 0
 
             def wait(self, timeout=None):
-                assert stopped.wait(2), "cancel did not stop segment process"
+                assert stopped.wait(2), "cancel did not stop the scan process"
                 self.returncode = -15
                 return self.returncode
 
@@ -897,13 +789,10 @@ class TestStderrCap:
         owner = ScanWorker()
         proc = _CancellableProc()
         output = []
-        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
+        with mock.patch("frameguard.core.subprocess.Popen", return_value=proc):
             thread = threading.Thread(target=lambda: output.append(
-                _run_segment_filter_scan(
-                    "x.mp4", 0, 10, "blackdetect", None, False, _cfg(),
-                    cancel_event=owner._cancel_event, process_owner=owner)))
+                _run_scan_process(["ffmpeg"], 60, 10.0, _cfg(), None,
+                                  owner._cancel_event, owner)))
             thread.start()
             assert reader_started.wait(1)
 
@@ -914,37 +803,22 @@ class TestStderrCap:
 
             with mock.patch.object(builtins, "__import__", _no_psutil):
                 owner.cancel()
-            thread.join(timeout=1)
+            thread.join(timeout=3)
 
         assert not thread.is_alive()
         assert output == [None]
         assert proc.terminated == 1
 
-    def test_segment_process_is_registered_to_its_explicit_owner(self):
+    def test_scan_process_is_registered_to_its_explicit_owner(self):
         from frameguard.worker import ScanWorker
 
         worker = ScanWorker()
-
-        class _Proc:
-            pid = 9090
-            returncode = 0
-            stderr = io.BytesIO(b"frame= 10\n")
-
-            def wait(self, timeout=None):
-                return self.returncode
-
-        proc = _Proc()
-        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
-             mock.patch("frameguard.core.subprocess.Popen", return_value=proc), \
-             mock.patch.object(worker, "register_proc", wraps=worker.register_proc) as register, \
+        proc = _BinaryProc(io.BytesIO(b"frame= 10\n"))
+        with mock.patch.object(worker, "register_proc", wraps=worker.register_proc) as register, \
              mock.patch.object(worker, "unregister_proc", wraps=worker.unregister_proc) as unregister:
-            out = _run_segment_filter_scan(
-                "x.mp4", 0, 10, "blackdetect", None, False, _cfg(),
-                process_owner=worker,
-            )
+            outcome, _ = _scan_process(proc, _cfg(), process_owner=worker)
 
-        assert out == "frame= 10"
+        assert str(outcome.log_text) == "frame= 10"
         register.assert_called_once_with(proc)
         unregister.assert_called_once_with(proc)
 
@@ -978,23 +852,22 @@ class TestToolPathGuards:
 
 
 class TestDeepScanDefaults:
-    def test_segment_parallelism_is_capped(self):
-        """8 concurrent 4K ffmpeg decodes OOM'd Windows; cap is 4."""
-        assert DEFAULT_CONFIG["segment_count"] <= 4
-        assert DEFAULT_CONFIG["max_workers"] <= 4
+    def test_single_pass_has_no_parallel_decode_knobs(self):
+        """0.9.0 decodes once, in one process; segment_count is accepted for
+        settings compatibility only and max_workers is gone."""
+        from frameguard.core import COMPAT_ONLY_CONFIG_KEYS, RETIRED_CONFIG_KEYS
+        assert "segment_count" in COMPAT_ONLY_CONFIG_KEYS
+        assert "max_workers" in RETIRED_CONFIG_KEYS and "max_workers" not in DEFAULT_CONFIG
 
     def test_stderr_bounds_exist(self):
         assert DEFAULT_CONFIG["deep_scan_max_stderr_lines"] > 0
         assert DEFAULT_CONFIG["deep_scan_max_stderr_chars"] > 0
 
-    def test_size_gate_exists(self):
-        assert DEFAULT_CONFIG["deep_scan_max_file_gb"] > 0
-        assert DEFAULT_CONFIG["deep_scan_max_duration_s"] > 0
+    def test_no_size_gate_skips_frame_analysis(self):
+        """The 8 GB gate skipped nearly every ProRes mezzanine master."""
+        assert "deep_scan_max_file_gb" not in DEFAULT_CONFIG
+        assert "deep_scan_max_duration_s" not in DEFAULT_CONFIG
 
-
-# ---------------------------------------------------------------------------
-# Phase B: banner lifecycle
-# ---------------------------------------------------------------------------
 
 class TestBannerLifecycle:
     def _panel(self):
@@ -1089,11 +962,11 @@ class TestSeverityWeights:
 
         assert corrupt.severity_score > fr.severity_score
 
-    def test_decode_integrity_fail_outranks_framerate_warn(self):
-        """Decode Integrity FAIL used to share a bucket with Frame Rate WARN."""
+    def test_file_integrity_fail_outranks_framerate_warn(self):
+        """An integrity FAIL used to share a bucket with Frame Rate WARN."""
         decode = QAResult("d.mov")
         decode.add_pass("Container Format", "ok")
-        decode.add_fail("Decode Integrity", "3 decode errors", confidence=90)
+        decode.add_fail("File Integrity", "3 decode errors", confidence=90)
         decode.finalize()
 
         fr = QAResult("f.mov")
@@ -1143,9 +1016,9 @@ class TestSeverityWeights:
     def test_result_severity_returns_top_check(self):
         r = QAResult("x.mov")
         r.add_warn("Frame Rate", "off", confidence=80)
-        r.add_fail("Decode Integrity", "errors", confidence=90)
+        r.add_fail("File Integrity", "errors", confidence=90)
         score, top = result_severity(r)
-        assert top == "Decode Integrity"
+        assert top == "File Integrity"
         assert score > 0
 
 

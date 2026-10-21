@@ -14,8 +14,8 @@ import pytest
 from frameguard.core import (
     DEFAULT_CONFIG,
     QAResult,
-    _extract_decode_errors,
-    _offset_event_times,
+    _DecodeAccounting,
+    _is_decode_evidence,
     _pair_detect_events,
     run_qa_checks,
 )
@@ -65,7 +65,7 @@ def clean_clip(tmp_path_factory):
 def _cfg(**overrides):
     cfg = dict(DEFAULT_CONFIG)
     cfg.update({"target_width": 640, "target_height": 360, "target_fps": 30.0,
-                "min_bitrate_mbps": 1, "segment_min_duration": 10.0})
+                "min_bitrate_mbps": 1})
     cfg.update(overrides)
     return cfg
 
@@ -105,11 +105,12 @@ class TestQAResult:
         r.finalize()
         assert r.status == expected
 
-    def test_warn_on_a_removed_check_does_not_change_status(self):
+    def test_unknown_check_warning_is_never_dropped(self):
+        """0.9.0 deleted the disabled checks; any WARN now reaches the verdict."""
         r = QAResult("x.mov")
         r.add_warn("Color Space", "bt601")
         r.finalize()
-        assert r.status == "PASS"
+        assert r.status == "PASS_WITH_WARNINGS"
 
 
 class TestMalformedMetadata:
@@ -180,30 +181,6 @@ class TestMalformedMetadata:
         assert _check(result, "Frame Count")["status"] == "PASS"
 
 
-class TestTimestampOffset:
-    def test_event_times_shift_onto_the_whole_file_timeline(self):
-        """-ss before -i zeroes each segment's PTS."""
-        line = "black_start:1.500 black_end:3.000 black_duration:1.500"
-        out = _offset_event_times(line, 300.0)
-        assert "black_start:301.500" in out
-        assert "black_end:303.000" in out
-        # A duration is an interval, not a point — it must not be shifted.
-        assert "black_duration:1.500" in out
-
-    def test_separator_format_is_preserved(self):
-        """The downstream parser matches 'black_start:12.3' with no space."""
-        out = _offset_event_times("black_start:1.0 black_end:2.0 black_duration:1.0", 5.0)
-        assert "black_start:6.000 black_end:7.000" in out
-
-    def test_zero_offset_is_a_no_op(self):
-        line = "silence_start: 4.2"
-        assert _offset_event_times(line, 0) == line
-
-    def test_silence_events_shift(self):
-        out = _offset_event_times("silence_start: 2.0\nsilence_end: 8.0", 100.0)
-        assert "102.000" in out and "108.000" in out
-
-
 class TestDetectEventPairing:
     """FFmpeg logs from several filter threads share one stderr pipe, and
     under threaded filtering the lines interleave mid-line: a detect
@@ -237,55 +214,46 @@ class TestDetectEventPairing:
         assert abs(start - 10.005333) < 0.0001
         assert abs(dur - 6.016) < 0.001
 
-    def test_glued_token_is_shifted_for_segments(self):
-        out = _offset_event_times("LUFSblack_start:10 black_end:16.0", 100.0)
-        assert "black_start:110.000" in out
-        assert "black_end:116.000" in out
-
 
 class TestDecodeErrorClassifier:
+    """Errors are identified by FFmpeg's own severity tag and accounting."""
+
     def test_ffmpeg_banner_is_not_a_decode_error(self):
-        """At -v info FFmpeg prints its banner and stream mapping."""
-        noise = "\n".join([
-            "ffmpeg version 8.1.2-essentials_build-www.gyan.dev Copyright (c) 2000-2025",
-            "  built with gcc 14.2.0 (Rev1, Built by MSYS2 project)",
-            "  configuration: --enable-gpl --enable-libx264",
-            "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mov':",
-            "  Duration: 00:00:40.00, start: 0.000000, bitrate: 12000 kb/s",
-            "Stream mapping:",
-            "Output #0, null, to 'pipe:':",
-            "[out#0/null @ 0000] video:1024KiB audio:0KiB",
-        ])
-        assert _extract_decode_errors(noise) == []
+        noise = [
+            "[info] ffmpeg version 8.1.2-essentials_build-www.gyan.dev Copyright (c) 2000-2025",
+            "[info]   configuration: --enable-gpl --enable-libx264",
+            "[info] Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'corrupt_error_clip.mov':",
+            "[info]   Duration: 00:00:40.00, start: 0.000000, bitrate: 12000 kb/s",
+            "[info] Stream mapping:",
+            "[out#0/null @ 0000] [info] video:1024KiB audio:0KiB",
+        ]
+        assert not any(_is_decode_evidence(line) for line in noise)
 
     def test_filter_output_is_not_a_decode_error(self):
-        text = ("[blackdetect @ 000001] black_start:10 black_end:16 black_duration:6\n"
-                "[silencedetect @ 000002] silence_start: 10.0")
-        assert _extract_decode_errors(text) == []
+        accounting = _DecodeAccounting()
+        accounting.add("[blackdetect@v @ 000001] [info] black_start:10 black_end:16 black_duration:6")
+        accounting.add("[silencedetect@a0 @ 000002] [info] silence_start: 10.0")
+        assert accounting.total_errors == 0 and accounting.messages == []
 
     @pytest.mark.parametrize("line", [
-        "[h264 @ 0000] error while decoding MB 12 34, bytestream -7",
-        "[h264 @ 0000] Invalid NAL unit size (-1 > 100).",
-        "[h264 @ 0000] concealing 1200 DC, 1200 AC, 1200 MV errors in I frame",
-        "Error while decoding stream #0:0: Invalid data found when processing input",
-        "[mov,mp4 @ 0000] Invalid sample size",
-        "Truncating packet of size 100 to 20",
+        "[h264 @ 0000] [error] error while decoding MB 12 34, bytestream -7",
+        "[h264 @ 0000] [error] Invalid NAL unit size (-1 > 100).",
+        "[vist#0:0/h264 @ 0000] [dec:h264 @ 0001] [warning] corrupt decoded frame",
+        "[in#0/mov @ 0000] [warning] corrupt input packet in stream 0",
     ])
     def test_real_errors_are_detected(self, line):
-        assert _extract_decode_errors(line) == [line]
+        assert _is_decode_evidence(line)
 
 
 @needs_ffmpeg
 class TestDeepScanEndToEnd:
-    @pytest.mark.parametrize("segmented", [True, False], ids=["segmented", "single-pass"])
-    def test_black_frames_and_silence_are_detected(self, defect_clip, segmented):
-        cfg = _cfg(segment_enabled=segmented, segment_count=4)
-        r = run_qa_checks(defect_clip, cfg=cfg)
+    def test_black_frames_and_silence_are_detected(self, defect_clip):
+        r = run_qa_checks(defect_clip, cfg=_cfg())
         r.finalize()
 
         black = _check(r, "Black Frames")
         assert black and black["status"] in ("FAIL", "WARN"), \
-            f"black frames not detected (segmented={segmented}): {black}"
+            f"black frames not detected: {black}"
         # Injected at 10s for 6s; the reported time must be absolute, and
         # every occurrence must be listed, not just the first.
         assert "00:00:10" in r.metadata["black_frame_timestamps"], r.metadata
@@ -294,19 +262,17 @@ class TestDeepScanEndToEnd:
 
         silence = _check(r, "Audio Silence")
         assert silence and silence["status"] in ("FAIL", "WARN"), \
-            f"silence not detected (segmented={segmented}): {silence}"
+            f"silence not detected: {silence}"
         assert "00:00:10" in r.metadata["silence_timestamps"], r.metadata
 
-    @pytest.mark.parametrize("segmented", [True, False], ids=["segmented", "single-pass"])
-    def test_clean_file_has_no_false_positives(self, clean_clip, segmented):
-        cfg = _cfg(segment_enabled=segmented, segment_count=4)
-        r = run_qa_checks(clean_clip, cfg=cfg)
+    def test_clean_file_has_no_false_positives(self, clean_clip):
+        r = run_qa_checks(clean_clip, cfg=_cfg())
         r.finalize()
 
         assert r.status == "PASS", [c for c in r.checks if c[1] in ("FAIL", "WARN")]
         assert _check(r, "Black Frames")["status"] == "PASS"
         assert _check(r, "Audio Silence")["status"] == "PASS"
-        assert _check(r, "Decode Integrity")["status"] == "PASS"
+        assert _check(r, "File Integrity")["status"] == "PASS"
 
     def test_settings_actually_change_the_verdict(self, clean_clip):
         """The whole point of the config fix: overrides must reach the engine."""

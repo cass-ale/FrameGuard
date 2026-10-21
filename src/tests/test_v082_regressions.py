@@ -417,14 +417,12 @@ class TestOpenRegions:
                 "lavfi.freezedetect.freeze_end: 3")
         assert core._close_open_regions(text, 10.0) == text
 
-    def test_static_file_scanned_in_segments_is_one_long_freeze(self):
-        segments = [(0.0, 11.0), (9.0, 21.0), (19.0, 31.0), (29.0, 40.0)]
-        parts = [core._close_open_regions(core._offset_event_times(
-            "lavfi.freezedetect.freeze_start: 0", start), end) for start, end in segments]
-        events = core._merge_event_intervals(core._pair_detect_events("\n".join(parts), "freeze"))
-        assert len(events) == 1
-        assert events[0][0] == pytest.approx(0.0)
-        assert events[0][1] == pytest.approx(40.0)
+    def test_static_file_is_one_long_freeze(self):
+        """freezedetect never closes a freeze that lasts to EOF; the single-pass
+        scan closes it at the decoded end (0.9.0 removed segmenting)."""
+        text = core._close_open_regions("lavfi.freezedetect.freeze_start: 0", 40.0)
+        events = core._merge_event_intervals(core._pair_detect_events(text, "freeze"))
+        assert events == [(0.0, 40.0)]
 
     @pytest.mark.parametrize("value, text", [(0.0068, "7 KB"), (40.31, "40.3 MB")])
     def test_sizes_never_read_zero(self, value, text):

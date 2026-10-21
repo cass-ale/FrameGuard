@@ -16,6 +16,7 @@
       "mov",
       "mp4"
     ],
-    "audio_required": true
+    "audio_required": true,
+    "required_projection": "equirectangular"
   }
 }

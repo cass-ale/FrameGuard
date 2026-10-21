@@ -17,9 +17,9 @@ import math
 import os
 import re
 import threading
-from collections import deque
+from collections import Counter, deque
+from datetime import datetime
 from typing import Optional, List, Dict, Tuple, Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Live handles remain observable for diagnostics, but cancellation never reads
 # this global set. Every cancellable scan subprocess is registered explicitly
@@ -84,12 +84,11 @@ def _run_owned_subprocess(cmd: list, timeout: float, process_owner=None,
     finally:
         _unregister_owned_proc(proc, process_owner)
 
+
 # Tool detection (optional — graceful fallback if tools.py not available)
 try:
     from frameguard.tools import (
-        get_ffmpeg_path, get_ffprobe_path,
-        get_mediaconch_path, get_mediainfo_path,
-        detect_ffmpeg_capabilities, get_xr_policy_path
+        get_ffmpeg_path, get_ffprobe_path, get_mediainfo_path,
     )
     _HAS_TOOLS_MODULE = True
 except ImportError:
@@ -102,22 +101,17 @@ except ImportError:
     def get_ffprobe_path():
         return "ffprobe"
 
-    def get_mediaconch_path():
-        return None
-
     def get_mediainfo_path():
         return None
-
-    def detect_ffmpeg_capabilities(*args, **kwargs):
-        return {}
-
-    def get_xr_policy_path():
-        return ""
 
 
 # ============================================================================
 # PRESET PROFILES
 # ============================================================================
+# Keys other than label/width/height/fps/fps_tolerance/min_bitrate_mbps are
+# engine config keys applied verbatim by ScanWorker.configure(). Only presets
+# that are unambiguously 360 carry a projection requirement: "8K High-End VR"
+# is 16:9 and may be flat or stereo, so it states nothing about projection.
 
 PRESETS = {
     "4k30": {"label": "4K UHD @ 30fps", "width": 3840, "height": 2160, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 20},
@@ -127,71 +121,94 @@ PRESETS = {
     "1080p60": {"label": "1080p Full HD @ 60fps", "width": 1920, "height": 1080, "fps": 60.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 12},
     "1080p24": {"label": "1080p Full HD @ 24fps (Cinematic)", "width": 1920, "height": 1080, "fps": 24.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 6},
     "720p30": {"label": "720p HD @ 30fps (Proxy/Review)", "width": 1280, "height": 720, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 4},
-    "5.7k30": {"label": "5.7K @ 30fps (360 VR Capture)", "width": 5760, "height": 2880, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 40},
+    "5.7k30": {"label": "5.7K @ 30fps (360 VR Capture)", "width": 5760, "height": 2880, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 40,
+               "required_projection": "equirectangular"},
     "8k30": {"label": "8K UHD @ 30fps (High-End VR)", "width": 7680, "height": 4320, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 60},
 }
 
+# Preset fields that are not engine config keys under their own name.
+PRESET_FIELD_TO_CONFIG = {
+    "width": "target_width",
+    "height": "target_height",
+    "fps": "target_fps",
+    "fps_tolerance": "fps_tolerance",
+    "min_bitrate_mbps": "min_bitrate_mbps",
+}
+
+
+def preset_config(preset_key: str) -> dict:
+    """Engine config overrides for a built-in preset (raises KeyError)."""
+    entry = PRESETS[preset_key]
+    config = {}
+    for field, value in entry.items():
+        if field == "label":
+            continue
+        config[PRESET_FIELD_TO_CONFIG.get(field, field)] = value
+    return config
+
+
 # ---------------------------------------------------------------------------
-# CHECK CLASSIFICATION (v0.4.4)
+# CHECK CLASSIFICATION
 # ---------------------------------------------------------------------------
-# Essential checks determine overall PASS/MISMATCH status.
-# Advisory checks show as yellow caution but don't affect overall status.
-# Removed checks are disabled but code is preserved for future re-enablement.
+# A confident FAIL on an essential check makes the file a MISMATCH. Checks
+# whose enforcement is optional (Color / HDR, XR Metadata, Audio Loudness)
+# are essential by name but only ever FAIL when the spec asks for enforcement;
+# otherwise they report PASS (informational) or WARN (advisory).
 
 ESSENTIAL_CHECKS = {
-    "Container Format", "Video Codec", "Resolution", "Frame Rate",
-    "CFR Check", "Bitrate", "Audio Stream", "Audio Codec",
-    "Audio Channels", "A/V Duration",
-    "Audio Silence",
+    "Container Format", "Video Codec", "Resolution", "Aspect Ratio",
+    "Frame Rate", "CFR Check", "Scan Type", "Color / HDR", "XR Metadata",
+    "Bitrate", "Audio Stream", "Audio Codec", "Audio Channels",
+    "Audio Sample Rate", "A/V Duration", "File Integrity", "Audio Silence",
+    "Dead Channel", "Audio Loudness",
 }
 
 ADVISORY_CHECKS = {
-    "Decode Integrity", "Frame Count", "Black Frames",
-    "Freeze Frames",
-    # Raised when part of the file could not be scanned. Previously in neither
-    # set, which meant overall_status() ignored it and a partially-scanned file
-    # was indistinguishable from a fully clean one.
-    "Deep Scan", "Filter Scan",
+    "Frame Count", "Black Frames", "Freeze Frames",
+    # Raised when part of the analysis could not run.
+    "Deep Scan",
 }
 
-# Checks removed in v0.4.4 (can be re-enabled via config if needed):
-# - "Color Space": validates rec709/bt2020 color metadata
-# - "Pixel Aspect Ratio": validates SAR is 1:1 (square pixels)
-# - "Audio Sample Rate": validates 48kHz sample rate
-# - "MediaConch Policy": validates against XR delivery XML policy
-REMOVED_CHECKS = {"Color Space", "Pixel Aspect Ratio", "Audio Sample Rate", "MediaConch Policy", "Naming Convention",
-}
+# The checks produced by the full-decode pass. When that pass cannot run,
+# every one of them is reported "Not verified" rather than left out.
+FRAME_LEVEL_CHECKS = (
+    "File Integrity", "Black Frames", "Freeze Frames", "Audio Silence",
+    "Dead Channel", "Audio Loudness",
+)
+
+NOT_VERIFIED_PREFIX = "Not verified: "
 
 # ---------------------------------------------------------------------------
 # CHECK SEVERITY WEIGHTS (visual hierarchy)
 # ---------------------------------------------------------------------------
-# A corrupted/unreadable file must read as more urgent than a file whose only
-# problem is an off-spec framerate. overall_status() collapses everything to
-# three buckets (MISMATCH / WARN / PASS), so the GUI sorts within those
-# buckets by this weight x confidence. Weights are 0-100; higher = more
-# severe. Checks not listed here default to 50.
+# overall_status() collapses everything to three buckets, so the GUI sorts
+# within those buckets by weight x confidence. Weights are 0-100; checks not
+# listed default to 50.
 CHECK_SEVERITY_WEIGHTS = {
-    # Unreadable / corrupt: nothing else matters until this is fixed.
     "Container Format": 100,
     "FFprobe": 100,
     "Internal Error": 95,
-    "Decode Integrity": 85,
-    # Structural conformance: fails delivery spec.
+    "File Integrity": 90,
     "Video Codec": 75,
     "Resolution": 70,
+    "Aspect Ratio": 70,
     "A/V Duration": 65,
+    "XR Metadata": 60,
     "Bitrate": 60,
     "Audio Stream": 60,
+    "Scan Type": 55,
     "Audio Channels": 55,
+    "Color / HDR": 50,
     "Frame Count": 50,
+    "Audio Sample Rate": 45,
     "CFR Check": 45,
-    "Filter Scan": 45,
+    "Dead Channel": 40,
     "Deep Scan": 40,
-    # Content advisories: visible defects, usually fixable in edit.
     "Freeze Frames": 38,
     "Black Frames": 35,
     "Audio Silence": 30,
     "Audio Codec": 25,
+    "Audio Loudness": 25,
     "Frame Rate": 20,
 }
 
@@ -200,8 +217,7 @@ def check_severity(check_name: str, status: str, confidence: int = 100) -> float
     """Severity score for one check entry: weight x confidence.
 
     FAIL counts full, WARN counts half (same defect, less certainty about
-    impact), PASS/SKIP count zero. Lets a confident Decode Integrity FAIL
-    outrank a marginal Frame Rate WARN instead of sharing one bucket.
+    impact), PASS/SKIP count zero.
     """
     base = CHECK_SEVERITY_WEIGHTS.get(check_name, 50)
     conf = max(0, min(100, confidence or 0)) / 100.0
@@ -213,11 +229,7 @@ def check_severity(check_name: str, status: str, confidence: int = 100) -> float
 
 
 def result_severity(result: "QAResult") -> tuple:
-    """(score, top_check_name) for a whole file: max over its checks.
-
-    The GUI sorts failures-first, then by this score, so a corrupted file
-    (weight 100) always lists above a framerate-only file (weight 20).
-    """
+    """(score, top_check_name) for a whole file: max over its checks."""
     best = 0.0
     top = ""
     for entry in getattr(result, "checks", []):
@@ -230,18 +242,30 @@ def result_severity(result: "QAResult") -> tuple:
     return round(best, 1), top
 
 
-
-
 # ============================================================================
 # DEFAULT CONFIGURATION
 # ============================================================================
 
+# Enumerated spec values. "any" means "report, do not enforce".
+BIT_DEPTH_CHOICES = ("any", 8, 10, 12, 16)
+TRANSFER_CHOICES = ("any", "sdr", "pq", "hlg", "hdr")
+PROJECTION_CHOICES = (
+    "any", "none", "equirectangular", "cubemap", "fisheye",
+    "half_equirectangular", "tiled_equirectangular", "rectilinear",
+)
+STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
+LOUDNESS_MODES = ("off", "advisory", "essential")
+
 DEFAULT_CONFIG = {
-    # Resolution & frame rate
+    # Picture geometry and timing. Resolution must match exactly unless
+    # allow_larger_resolution; the frame rate must match within tolerance
+    # (integer multiples only when allow_fps_multiples).
     "target_width": 3840,
     "target_height": 2160,
+    "allow_larger_resolution": False,
     "target_fps": 30.0,
     "fps_tolerance": 0.5,
+    "allow_fps_multiples": False,
     "min_bitrate_mbps": 20,
 
     # Codec acceptance lists
@@ -253,32 +277,30 @@ DEFAULT_CONFIG = {
     "audio_required": True,
     "min_audio_sample_rate": 44100,
 
-    # CFR / VFR
+    # Frame timing: fraction of frame intervals allowed to deviate by more
+    # than half a frame from the dominant interval before the file is VFR.
     "require_cfr": True,
-    "vfr_threshold": 0.02,
+    "vfr_threshold": 0.01,
+    # Files larger than this get a sampled (windowed) packet-timestamp scan
+    # so the VFR check never reads a 100 GB master end to end.
+    "vfr_full_scan_max_mb": 2048,
 
-    # Naming convention
-    "naming_pattern": r"^[A-Z]{2,5}_[A-Za-z0-9]+_[A-Z]+_\d{8}_C\d{3,4}\.\w{3,4}$",
-    "naming_example": "PROJ_CAM01_TAKE_20260319_C004.mp4",
+    # Picture format
+    "require_progressive": True,
+    "min_bit_depth": "any",
+    "required_transfer": "any",
+
+    # XR metadata
+    "required_projection": "any",
+    "required_stereo_mode": "any",
+
+    # File integrity (full software decode)
+    "max_decode_errors": 0,
 
     # File discovery
     "video_extensions": {".mp4", ".mov", ".mkv", ".avi", ".mxf", ".ts", ".webm"},
 
-    # Performance
-    "max_workers": min(os.cpu_count() or 4, 4),
-    "use_hwaccel": True,
-    "hwaccel_method": "auto",
-
-    # Segment-based parallel deep scan
-    "segment_enabled": True,
-    "segment_min_duration": 30.0,
-    # Capped at 4: 8 concurrent 4K ffmpeg decodes OOM'd / crashed Windows.
-    # See run_deep_scan max_workers cap below.
-    "segment_count": min(os.cpu_count() or 4, 4),
-
-    # Deep-scan safety bounds (Phase A hardening)
-    "deep_scan_max_file_gb": 8.0,
-    "deep_scan_max_duration_s": 7200.0,
+    # Deep-scan output bounds
     "deep_scan_max_stderr_lines": 5000,
     "deep_scan_max_stderr_chars": 512 * 1024,
 
@@ -289,15 +311,15 @@ DEFAULT_CONFIG = {
     "freeze_detect_duration": 2.0,
     "silence_noise_db": -50,
     "silence_duration": 2.0,
+    # A channel (or a whole track) silent for at least this fraction of its
+    # length is dead.
+    "dead_channel_ratio": 0.95,
 
-    # Loudness (EBU R128)
+    # Loudness (EBU R128). "off" skips ebur128 entirely.
+    "loudness_mode": "advisory",
     "target_loudness_lufs": -23.0,
     "loudness_tolerance_lu": 2.0,
     "true_peak_max_dbtp": -1.0,
-
-    # Duration thresholds
-    "min_duration_fail": 5.0,
-    "min_duration_warn": 30.0,
 
     # A/V sync
     "duration_mismatch_threshold": 0.5,
@@ -307,23 +329,33 @@ DEFAULT_CONFIG = {
     "timeout_multiplier": 3.0,
     "timeout_max_seconds": 7200,
 
-    # Multi-tool integration (v0.3)
-    "use_mediaconch": True,
+    # Optional enrichment
     "use_mediainfo": True,
-    "use_signalstats": True,
-    "signalstats_sample_seconds": 10,
-    "signalstats_decimate_fps": 5,
-    "signalstats_num_samples": 3,
-    "quality_ymin_floor": 16,
-    "quality_ymax_ceil": 235,
-    "quality_satavg_min": 5,
 
-    # v0.4.2 Performance tuning
+    # Threads for the deep-scan filter graph.
     "filter_threads": min(os.cpu_count() or 4, 8),
+
+    # Accepted for settings/preset compatibility only; the engine never reads
+    # them. The integrity scan always decodes in software in one pass (see
+    # run_deep_scan), so these cannot change a verdict.
+    "use_hwaccel": False,
+    "segment_enabled": True,
+    "segment_count": min(os.cpu_count() or 4, 4),
 }
 
-# Cached FFmpeg capabilities (populated on first use)
-_ffmpeg_caps_cache: Optional[dict] = None
+COMPAT_ONLY_CONFIG_KEYS = frozenset({"use_hwaccel", "segment_enabled", "segment_count"})
+
+# Keys removed in 0.9.0. Old saved settings and presets may still carry them;
+# they are ignored rather than rejected so those files keep loading.
+RETIRED_CONFIG_KEYS = frozenset({
+    "hwaccel_method", "max_workers", "segment_min_duration",
+    "deep_scan_max_file_gb", "deep_scan_max_duration_s",
+    "min_duration_fail", "min_duration_warn",
+    "naming_pattern", "naming_example",
+    "use_mediaconch", "use_signalstats", "signalstats_sample_seconds",
+    "signalstats_decimate_fps", "signalstats_num_samples",
+    "quality_ymin_floor", "quality_ymax_ceil", "quality_satavg_min",
+})
 
 
 def _get_clean_env() -> dict:
@@ -331,18 +363,16 @@ def _get_clean_env() -> dict:
 
     PyInstaller modifies LD_LIBRARY_PATH (Linux), DYLD_LIBRARY_PATH (macOS),
     and DLL search paths (Windows) to prefer bundled libs. External programs
-    like FFmpeg, MediaConch, MediaInfo need their own libs, so we restore
-    the original environment variables.
+    like FFmpeg and MediaInfo need their own libs, so we restore the original
+    environment variables.
     """
     import sys as _sys
     env = os.environ.copy()
     if getattr(_sys, 'frozen', False):
-        # Linux: restore original LD_LIBRARY_PATH
         if 'LD_LIBRARY_PATH_ORIG' in env:
             env['LD_LIBRARY_PATH'] = env['LD_LIBRARY_PATH_ORIG']
         elif 'LD_LIBRARY_PATH' in env:
             del env['LD_LIBRARY_PATH']
-        # macOS: restore original DYLD_LIBRARY_PATH
         if 'DYLD_LIBRARY_PATH_ORIG' in env:
             env['DYLD_LIBRARY_PATH'] = env['DYLD_LIBRARY_PATH_ORIG']
         elif 'DYLD_LIBRARY_PATH' in env:
@@ -356,39 +386,16 @@ def _subprocess_kwargs() -> dict:
     - Hides the console window on Windows (no flashing black terminals).
     - Forces UTF-8 decoding with replacement. FFmpeg emits UTF-8, but text=True
       defaults to the locale encoding (cp1252 on most Windows installs) with
-      strict errors, so a non-ASCII filename or a '©' in the banner raises
-      UnicodeDecodeError — which escapes as an "Internal Error" mid-scan, or
-      crashes the app outright during the startup FFmpeg check.
+      strict errors, so a non-ASCII filename raised UnicodeDecodeError.
     """
     kwargs = {"encoding": "utf-8", "errors": "replace"}
     if os.name == 'nt':  # Windows
-        # CREATE_NO_WINDOW = 0x08000000
-        kwargs['creationflags'] = 0x08000000
-        # Belt-and-suspenders: also set startupinfo
+        kwargs['creationflags'] = 0x08000000  # CREATE_NO_WINDOW
         si = subprocess.STARTUPINFO()
         si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         si.wShowWindow = 0  # SW_HIDE
         kwargs['startupinfo'] = si
     return kwargs
-
-
-# Hwaccel noise patterns to filter from decode stderr.
-# Keep these SPECIFIC: bare tokens like "display", "cuda" or "Cannot open" also
-# match genuine decode errors ("Cannot open file", "Discarding invalid packet"),
-# which would be silently dropped and reported as a clean decode.
-HWACCEL_NOISE_PATTERNS = [
-    "Cannot load", "Could not dynamically load", "Device creation failed",
-    "Failed to initialise", "Failed to initialize", "No device available",
-    "hwaccel", "hw_device", "device_create",
-    "libcuda", "libnvidia", "libvdpau", "libva",
-    "No VAAPI", "No CUDA", "No VA display",
-    "vaInitialize failed", "AVHWDeviceContext", "init_device_type",
-    "Cannot open display", "X11 display", "DRM render node", "dri/renderD",
-    "Cannot open the device", "Failed to create", "Failed to open",
-    "does not support hwaccel", "hardware acceleration",
-    "Error creating a NVDEC", "Cannot init CUDA", "Cannot open VDPAU",
-    "vulkan", "opencl", "qsv device", "d3d11va", "dxva2", "videotoolbox device",
-]
 
 
 # ============================================================================
@@ -409,12 +416,18 @@ class QAResult:
         self.metadata: Dict = {}
         self._lock = threading.Lock()
         self.status = None  # Set by finalize() after all checks complete
-        self.severity_score = 0.0  # Set by finalize(); max weight x confidence
-        self.severity_reason = ""  # Check name driving the score
-        # Strict mode ("treat warnings as failures"). Recorded here — not
-        # passed through finalize() — because the worker calls finalize()
-        # with no arguments after run_qa_checks() returns.
+        self.severity_score = 0.0
+        self.severity_reason = ""
+        # Strict mode ("treat warnings as failures"). Recorded here because the
+        # worker calls finalize() with no arguments after run_qa_checks().
         self.strict = False
+        # Audit trail for exports: the exact settings and tools that produced
+        # this verdict, so a report can be reproduced later.
+        self.config: Dict = {}
+        self.tool_versions: Dict = {}
+        self.engine_version = __version__
+        self.started_at: Optional[str] = None
+        self.finished_at: Optional[str] = None
 
     def add_pass(self, check_name: str, detail: str = "", confidence: int = 100):
         """confidence: 0-100, how certain this result is correct."""
@@ -435,48 +448,57 @@ class QAResult:
             self.warnings.append(f"{check_name}: {detail}")
 
     def add_skip(self, check_name: str, detail: str = "", confidence: int = 100):
+        """A check that does not apply to this file (e.g. silence with no audio)."""
         with self._lock:
             self.checks.append((check_name, "SKIP", detail, confidence))
+
+    def add_not_verified(self, check_name: str, reason: str):
+        """Record an analysis that should have run but could not.
+
+        SKIP is ignored by the verdict, so an unrun integrity scan used to read
+        exactly like a clean one. "Not verified" is a WARN with an explicit
+        label: the file can never come out a clean PASS on unverified ground.
+        """
+        with self._lock:
+            detail = f"{NOT_VERIFIED_PREFIX}{reason}"
+            self.checks.append((check_name, "WARN", detail, 100))
+            self.warnings.append(f"{check_name}: {detail}")
+            self.metadata.setdefault("not_verified", [])
+            if check_name not in self.metadata["not_verified"]:
+                self.metadata["not_verified"].append(check_name)
 
     def set_metadata(self, key, value):
         with self._lock:
             self.metadata[key] = value
 
     def plain_summary(self) -> str:
-        """Return a brief, jargon-free one-line summary of what's wrong.
-        Designed for operators who need quick, actionable feedback.
-        """
+        """Return a brief, jargon-free one-line summary of what's wrong."""
         if self.passed and not self.warnings:
             return "All checks passed."
 
-        # Map technical check names to plain-language descriptions
-        # M3: Keep dictionary aligned with actual check names used in this module.
         _PLAIN = {
             "Container Format": "wrong file type",
             "Video Codec": "video uses an unsupported format",
             "Resolution": "video resolution doesn't match the target",
-            "Frame Rate": "frame rate is off",
+            "Aspect Ratio": "picture shape doesn't match the target",
+            "Frame Rate": "frame rate doesn't match the target",
             "CFR Check": "frame rate is inconsistent (variable)",
-            "CFR": "frame rate is inconsistent (variable)",  # legacy alias
+            "Scan Type": "video is interlaced",
+            "Color / HDR": "bit depth or HDR format doesn't match the spec",
+            "XR Metadata": "360/stereo metadata is missing or wrong",
             "Bitrate": "video quality (bitrate) is too low",
             "Audio Codec": "audio uses an unsupported format",
             "Audio Sample Rate": "audio sample rate is too low",
             "Audio Channels": "audio is missing or has no channels",
             "Audio Stream": "audio is missing",
-            # "Duration"  # REMOVED v0.4.4: "video is too short",
-            "Color Space": "color settings may look wrong on screen",
-            "Naming Convention": "file name doesn't follow the naming rule",
             "A/V Duration": "audio and video lengths don't match",
-            "A/V Duration Mismatch": "audio and video lengths don't match",  # legacy alias
-            "Pixel Aspect Ratio": "pixels are non-square (image may look stretched)",
             "Frame Count": "frame count doesn't match the expected number",
-            "Decode Integrity": "file may have encoding defects (dropped frames, decode errors) - does not always mean visible issues during playback",
+            "File Integrity": "file is incomplete or damaged",
             "Black Frames": "unexpected black frames detected",
             "Freeze Frames": "video freezes detected",
             "Audio Silence": "long stretches of silence found",
+            "Dead Channel": "an audio channel is silent",
             "Audio Loudness": "audio levels are outside the target range",
-            "MediaConch Policy": "file doesn't meet delivery format rules",
-            # "Signal Quality"  # REMOVED v0.4.4: "video signal analysis detected anomalies (black levels, freeze frames, noise) - may not be visible during normal playback",
             "FFprobe": "file could not be read (may be corrupt)",
             "Internal Error": "an unexpected error occurred during the scan",
         }
@@ -484,48 +506,39 @@ class QAResult:
         issues = []
         for check_name, status, *_ in self.checks:
             if status == "FAIL":
-                plain = _PLAIN.get(check_name, check_name.lower() + " issue")
-                issues.append(plain)
+                issues.append(_PLAIN.get(check_name, check_name.lower() + " issue"))
 
         if not issues:
-            # Warnings only
             warn_names = []
-            for check_name, status, *_ in self.checks:
-                if status == "WARN":
-                    plain = _PLAIN.get(check_name, check_name.lower() + " concern")
-                    warn_names.append(plain)
+            for check_name, status, detail, *_ in self.checks:
+                if status != "WARN":
+                    continue
+                if str(detail).startswith(NOT_VERIFIED_PREFIX):
+                    warn_names.append(f"{check_name.lower()} not verified")
+                else:
+                    warn_names.append(_PLAIN.get(check_name, check_name.lower() + " concern"))
             if warn_names:
-                return "Heads up: " + ", ".join(warn_names) + "."
+                unique = list(dict.fromkeys(warn_names))
+                return "Heads up: " + ", ".join(unique) + "."
             return "Passed with minor notes."
 
         if len(issues) == 1:
             return issues[0][0].upper() + issues[0][1:] + "."
-        else:
-            return ", ".join(i.capitalize() for i in issues) + "."
+        return ", ".join(i.capitalize() for i in issues) + "."
 
     def overall_status(self, strict: bool = False) -> str:
         """Return the file's overall verdict.
 
         Returns:
             "PASS" - nothing flagged anything
-            "PASS_WITH_WARNINGS" - something was flagged, but nothing disqualifying
+            "PASS_WITH_WARNINGS" - something was flagged (or not verified),
+                                   but nothing disqualifying
             "MISMATCH" - an essential check failed with confidence
 
         Only a confident FAIL on an ESSENTIAL check (or a hard FFprobe/Internal
-        Error) disqualifies a file. Everything else that is not a clean PASS
-        downgrades to PASS_WITH_WARNINGS — including:
-
-          * a WARN on an essential check. A 2000x2140 master warned against a
-            4K target and this method ignored it entirely, so the file was
-            reported as a clean PASS.
-          * a low-confidence essential FAIL, which is advisory by design.
-          * a FAIL or WARN on a check in neither classification set, such as
-            the "Deep Scan" warning raised when segments time out. Those were
-            silently dropped, so a scan that covered half the file looked
-            identical to one that covered all of it.
-
-        Checks in REMOVED_CHECKS are ignored: they are disabled features whose
-        code is retained, and they must leave no trace in the verdict.
+        Error) disqualifies a file. Every other non-PASS entry, including any
+        "Not verified" result and checks in neither set, downgrades the file to
+        PASS_WITH_WARNINGS so partial analysis never reads as a clean pass.
 
         When strict is true ("treat any warning as a failure"), any flagged
         check escalates to MISMATCH instead of PASS_WITH_WARNINGS.
@@ -537,7 +550,7 @@ class QAResult:
             name, status = check_tuple[0], check_tuple[1]
             confidence = check_tuple[3] if len(check_tuple) > 3 else 100
 
-            if status in ("PASS", "SKIP") or name in REMOVED_CHECKS:
+            if status in ("PASS", "SKIP"):
                 continue
 
             if name in ("FFprobe", "Internal Error") and status == "FAIL":
@@ -558,81 +571,155 @@ class QAResult:
 
         Call this AFTER all checks are complete. Avoids property descriptor
         issues when passing QAResult across PySide6 Signal threads.
-
-        strict overrides the ``strict`` attribute recorded by
-        run_qa_checks(); both exist because the worker finalizes with no
-        arguments after the engine has already returned.
         """
         if strict:
             self.strict = True
-        self.status = self.overall_status()  # Call method, cache as plain attr cache as plain attr
-        try:
-            score, top = result_severity(self)
-        except Exception:
-            score, top = 0.0, ""
+        self.status = self.overall_status()
+        score, top = result_severity(self)
         self.severity_score = score
         self.severity_reason = top
         self.set_metadata("severity_score", score)
         if top:
             self.set_metadata("severity_reason", top)
 
-
-    
     def has_advisory_warnings(self) -> bool:
         """True if any advisory checks flagged issues."""
         return any(name in ADVISORY_CHECKS and status in ("FAIL", "WARN")
                    for name, status, *_ in self.checks)
 
+
 # ============================================================================
 # FFPROBE UTILITIES
 # ============================================================================
 
-
-
 def run_ffprobe(filepath: str, process_owner=None,
                 cancel_event: Optional[threading.Event] = None) -> Optional[dict]:
-    """Run FFprobe on a file and return parsed JSON output."""
+    """Run FFprobe on a file and return its full format/stream description.
+
+    Every stream field, tag and side-data entry is requested. An earlier
+    field allow-list (``:stream_tags=rotate``) silently discarded the
+    Matroska ``DURATION`` tags, so A/V duration was never checked on MKV, and
+    never asked for the spherical / stereo-3D side data XR deliverables need.
+    """
     ffprobe = get_ffprobe_path()
     if not ffprobe:
         return None
-    # start_time feeds the A/V duration check (streams must be aligned by
-    # their start offsets before their ends are compared), and the side-data
-    # rotation / legacy rotate tag feed the resolution check (a stored
-    # 1920x1080 frame with 90-degree rotation displays as 1080x1920).
-    entries = (
-        "stream=codec_name,codec_type,width,height,r_frame_rate,"
-        "avg_frame_rate,nb_frames,duration,start_time,bit_rate,sample_rate,"
-        "channels,channel_layout,pix_fmt,color_space,color_transfer,"
-        "color_primaries,field_order,sample_aspect_ratio,display_aspect_ratio"
-        ":stream_side_data=side_data_type,rotation"
-        ":stream_tags=rotate"
-    )
-    legacy_entries = (
-        "stream=codec_name,codec_type,width,height,r_frame_rate,"
-        "avg_frame_rate,nb_frames,duration,bit_rate,sample_rate,"
-        "channels,channel_layout,pix_fmt,color_space,color_transfer,"
-        "color_primaries,field_order,sample_aspect_ratio,display_aspect_ratio"
-    )
-    base_cmd = [
-        ffprobe, "-v", "quiet", "-print_format", "json",
-        "-show_format", "-show_streams", "-show_entries",
-    ]
+    cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
+           "-show_format", "-show_streams", filepath]
     try:
-        result = _run_owned_subprocess(
-            base_cmd + [entries, filepath], 120, process_owner, cancel_event)
-        if result is None:
-            return None
-        if result.returncode != 0:
-            # An ffprobe too old to know the side-data section must not take
-            # probing down with it: retry with the original field list.
-            result = _run_owned_subprocess(
-                base_cmd + [legacy_entries, filepath], 120,
-                process_owner, cancel_event)
+        result = _run_owned_subprocess(cmd, 120, process_owner, cancel_event)
         if result is None or result.returncode != 0:
             return None
-        return json.loads(result.stdout)
+        data = json.loads(result.stdout)
+        return data if isinstance(data, dict) else None
     except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError, TypeError, OSError):
         return None
+
+
+def probe_first_video_frame(filepath: str, stream_index: int, process_owner=None,
+                            cancel_event: Optional[threading.Event] = None) -> dict:
+    """Decode one frame of ``stream_index`` and return its ffprobe frame entry.
+
+    Stream headers omit things that only the bitstream carries: H.264 frame
+    packing (stereo 3D) SEI, HDR mastering metadata, an un-flagged interlaced
+    picture, colour tags absent from the container. One frame costs ~30 ms.
+    Returns {} when the frame cannot be read; callers treat that as "no
+    extra information", never as evidence the file is fine.
+    """
+    ffprobe = get_ffprobe_path()
+    if not ffprobe:
+        return {}
+    cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
+           "-select_streams", str(stream_index), "-read_intervals", "%+#1",
+           "-show_frames", "-show_entries",
+           "frame=pix_fmt,color_transfer,color_primaries,color_space,"
+           "interlaced_frame,top_field_first:frame_side_data:frame_tags",
+           filepath]
+    try:
+        result = _run_owned_subprocess(cmd, 60, process_owner, cancel_event)
+        if result is None or result.returncode != 0:
+            return {}
+        frames = json.loads(result.stdout).get("frames") or []
+        return frames[0] if frames and isinstance(frames[0], dict) else {}
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, FileNotFoundError,
+            TypeError, OSError, AttributeError):
+        return {}
+
+
+class FrameTiming:
+    """Presentation timestamps of a video stream, read from packets only."""
+
+    def __init__(self, windows: List[List[float]], sampled: bool, description: str):
+        self.windows = windows          # sorted pts lists, one per read window
+        self.sampled = sampled
+        self.description = description
+
+    @property
+    def packet_count(self) -> int:
+        return sum(len(w) for w in self.windows)
+
+
+def _timing_windows(duration: Optional[float], file_size: int, cfg: dict) -> List[Optional[str]]:
+    """``-read_intervals`` specs for the packet-timestamp scan.
+
+    Reading packets still reads every byte of the file, so a full pass over a
+    100 GB master on a network share is not acceptable as a pre-check. Files
+    above ``vfr_full_scan_max_mb`` are sampled in 12 windows of 5 s spread
+    evenly across the duration. [None] means "whole file".
+    """
+    max_bytes = float(cfg.get("vfr_full_scan_max_mb", 2048)) * 1024 * 1024
+    if file_size <= max_bytes:
+        return [None]
+    if not duration or duration <= 0:
+        return ["%+60"]
+    count, length = 12, 5.0
+    if duration <= count * length:
+        return [None]
+    step = (duration - length) / (count - 1)
+    return [f"{i * step:.3f}%+{length:g}" for i in range(count)]
+
+
+def probe_frame_timing(filepath: str, stream_index: int, duration: Optional[float],
+                       cfg: dict, process_owner=None,
+                       cancel_event: Optional[threading.Event] = None) -> Optional[FrameTiming]:
+    """Read packet timestamps for one video stream (no decoding).
+
+    Returns None when ffprobe fails, so the CFR check can say "not verified"
+    instead of passing on no evidence.
+    """
+    ffprobe = get_ffprobe_path()
+    if not ffprobe:
+        return None
+    try:
+        file_size = os.path.getsize(filepath)
+    except OSError:
+        return None
+    specs = _timing_windows(duration, file_size, cfg)
+    windows = []
+    for spec in specs:
+        cmd = [ffprobe, "-v", "error", "-select_streams", str(stream_index)]
+        if spec:
+            cmd += ["-read_intervals", spec]
+        cmd += ["-show_entries", "packet=pts_time", "-of", "csv=p=0", filepath]
+        try:
+            proc = _run_owned_subprocess(cmd, 300, process_owner, cancel_event)
+        except (subprocess.TimeoutExpired, FileNotFoundError, TypeError, OSError):
+            return None
+        if proc is None or proc.returncode != 0:
+            return None
+        pts = []
+        for line in proc.stdout.splitlines():
+            value = _safe_float(line.strip().strip(","))
+            if value is not None:
+                pts.append(value)
+        windows.append(sorted(pts))
+    sampled = specs != [None]
+    if sampled:
+        description = (f"sampled {len(specs)} windows "
+                       f"(file is {file_size / 1024 ** 3:.1f} GB)")
+    else:
+        description = "all packets"
+    return FrameTiming(windows, sampled, description)
 
 
 def _safe_float(value, default=None):
@@ -670,28 +757,10 @@ def parse_frame_rate(rate_str: str) -> float:
     return _safe_float(rate_str, 0.0)
 
 
-def get_file_duration(filepath: str, process_owner=None,
-                      cancel_event: Optional[threading.Event] = None) -> float:
-    ffprobe = get_ffprobe_path()
-    if not ffprobe:
-        return 0.0
-    cmd = [
-        ffprobe, "-v", "quiet",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        filepath
-    ]
-    try:
-        result = _run_owned_subprocess(
-            cmd, 60, process_owner, cancel_event)
-        if result is None or result.returncode != 0:
-            return 0.0
-        return _safe_float(result.stdout.strip(), 0.0)
-    except (subprocess.TimeoutExpired, ValueError, FileNotFoundError, TypeError, OSError):
-        return 0.0
-
-
-def _calc_timeout(duration: float, cfg: dict) -> float:
+def _calc_timeout(duration: Optional[float], cfg: dict) -> float:
+    """Deep-scan timeout; the configured ceiling when the duration is unknown."""
+    if not duration or duration <= 0:
+        return float(cfg["timeout_max_seconds"])
     timeout = cfg["timeout_base_seconds"] + (cfg["timeout_multiplier"] * duration)
     return min(timeout, cfg["timeout_max_seconds"])
 
@@ -715,50 +784,115 @@ def check_ffmpeg_available() -> Tuple[bool, str]:
     return True, "FFmpeg and FFprobe available"
 
 
+_tool_version_cache: Dict[tuple, Dict] = {}
+_tool_version_lock = threading.Lock()
+
+
+def get_tool_versions() -> Dict[str, Dict[str, Optional[str]]]:
+    """Path and ``-version`` banner of ffmpeg/ffprobe, cached per binary.
+
+    Exports record these so a verdict can be reproduced: a decoder fix in a
+    newer FFmpeg can change what counts as a decode error.
+    """
+    paths = (("ffmpeg", get_ffmpeg_path()), ("ffprobe", get_ffprobe_path()))
+    key = tuple(p for _, p in paths)
+    with _tool_version_lock:
+        if key in _tool_version_cache:
+            return dict(_tool_version_cache[key])
+    versions = {}
+    for name, path in paths:
+        version = None
+        if path:
+            try:
+                proc = subprocess.run([path, "-version"], capture_output=True, text=True,
+                                      timeout=10, env=_get_clean_env(), **_subprocess_kwargs())
+                if proc.returncode == 0 and proc.stdout:
+                    version = proc.stdout.splitlines()[0].strip()
+            except (subprocess.TimeoutExpired, OSError, TypeError) as exc:
+                version = f"unavailable ({type(exc).__name__})"
+        versions[name] = {"path": path, "version": version}
+    with _tool_version_lock:
+        _tool_version_cache[key] = versions
+    return dict(versions)
+
+
 # ============================================================================
-# METADATA QA CHECKS (1-13)
+# STREAM HELPERS
 # ============================================================================
 
-def check_container_format(filepath: str, result: QAResult, cfg: dict):
-    """Check 1: Validate container format and file integrity."""
-    if not os.path.isfile(filepath):
-        result.add_fail("Container Format", f"File not found: {filepath}")
-        return
-    file_size = os.path.getsize(filepath)
-    file_size_mb = file_size / (1024 * 1024)
-    ext = os.path.splitext(filepath)[1].lower()
-    result.set_metadata("file_size_mb", round(file_size_mb, 2))
-    result.set_metadata("container", ext)
-    if file_size == 0:
-        result.add_fail("Container Format", "File is empty (0 bytes).")
-        return
-    if ext not in cfg["accepted_containers"]:
-        result.add_fail("Container Format", f"Container '{ext}' not in accepted list {cfg['accepted_containers']}.")
-        return
-    result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
+def _primary_video_stream(probe_data: dict) -> Optional[dict]:
+    """The picture stream that is the deliverable.
+
+    Cover art is stored as a video stream flagged ``attached_pic``; when it
+    is listed first, judging "the first video stream" checked a PNG.
+    """
+    for stream in (probe_data or {}).get("streams", []) or []:
+        if stream.get("codec_type") != "video":
+            continue
+        if (stream.get("disposition") or {}).get("attached_pic"):
+            continue
+        return stream
+    return None
 
 
-def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 2: Validate video codec."""
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    if not video_streams:
-        result.add_fail("Video Codec", "No video stream found.")
-        return
-    codec = video_streams[0].get("codec_name", "unknown").lower()
-    result.set_metadata("video_codec", codec)
-    if codec in cfg["accepted_codecs"]:
-        result.add_pass("Video Codec", f"Codec: {codec}")
-    else:
-        result.add_fail("Video Codec", f"Codec '{codec}' not in accepted list {cfg['accepted_codecs']}.")
+def _audio_streams(probe_data: dict) -> List[dict]:
+    return [s for s in (probe_data or {}).get("streams", []) or []
+            if s.get("codec_type") == "audio"]
+
+
+def _track_label(position: int, stream: dict, total: int) -> str:
+    """'Track 2 (aac 5.1)' for multi-track files, '' when there is one track."""
+    if total <= 1:
+        return ""
+    codec = stream.get("codec_name", "?")
+    layout = stream.get("channel_layout") or f"{_safe_int(stream.get('channels'), 0)}ch"
+    return f"Track {position + 1} ({codec} {layout})"
+
+
+def _with_track(label: str, text: str) -> str:
+    return f"{label}: {text}" if label else text
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(max(0, seconds))
+    return f"{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}"
+
+
+def _probed_duration(probe_data: dict) -> Optional[float]:
+    value = _safe_float(((probe_data or {}).get("format") or {}).get("duration"))
+    return value if value and value > 0 else None
+
+
+def _stream_duration_text(stream: dict) -> Optional[str]:
+    """Per-stream duration in seconds as text, including Matroska's tag form.
+
+    MKV and WebM streams carry no ``duration`` field; the length lives in a
+    ``DURATION`` tag formatted ``HH:MM:SS.nnnnnnnnn``.
+    """
+    value = stream.get("duration")
+    if value and value != "N/A":
+        return str(value)
+    tags = stream.get("tags") or {}
+    for key, raw in tags.items():
+        if str(key).upper().startswith("DURATION") and isinstance(raw, str):
+            match = re.fullmatch(r"\s*(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*", raw)
+            if match:
+                hours, minutes, seconds = match.groups()
+                return str(int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+    return None
+
+
+def _stream_duration(stream: dict) -> Optional[float]:
+    value = _safe_float(_stream_duration_text(stream or {}))
+    return value if value and value > 0 else None
 
 
 def _stream_rotation_degrees(stream: dict) -> int:
     """Rotation a player applies to this stream, in degrees.
 
     ffprobe reports it in the Display Matrix side data (negated: a video
-    displayed 90 degrees clockwise carries -90); older files may carry
-    only the QuickTime ``rotate`` tag. 0 when neither is present. Only
-    the magnitude matters to callers: 90/270 swap the displayed axes.
+    displayed 90 degrees clockwise carries -90); older files may carry only
+    the QuickTime ``rotate`` tag. 0 when neither is present.
     """
     for side_data in stream.get("side_data_list") or []:
         if isinstance(side_data, dict) and "rotation" in side_data:
@@ -775,64 +909,11 @@ def _stream_rotation_degrees(stream: dict) -> int:
     return 0
 
 
-def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 3: Validate resolution meets target.
-
-    A delivery spec is a floor, not a suggestion: a frame smaller than the
-    target in either dimension cannot be conformed up without resampling, so
-    it fails. The old rule accepted anything above 50% of the target, which
-    passed a 2000x2140 master against a 3840x2160 spec.
-
-    The narrow band above is for mod-2 padding and rounding only (a 3840x2158
-    encode), not for genuinely undersized footage.
-    """
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    if not video_streams:
-        result.add_fail("Resolution", "No video stream found.")
-        return
-    width = video_streams[0].get("width", 0)
-    height = video_streams[0].get("height", 0)
-    # Judge the frame the audience sees, not the frame as stored: a
-    # 90/270-degree rotation flag swaps the displayed axes, so a portrait
-    # phone capture stored as 1920x1080 must not pass a landscape spec.
-    rotation = _stream_rotation_degrees(video_streams[0])
-    if rotation:
-        result.set_metadata("rotation", rotation)
-        result.set_metadata("stored_resolution", f"{width}x{height}")
-    if abs(rotation) % 180 == 90 and width and height:
-        width, height = height, width
-    result.set_metadata("resolution", f"{width}x{height}")
-    result.set_metadata("width", width)
-    result.set_metadata("height", height)
-    tw, th = cfg["target_width"], cfg["target_height"]
-
-    rot_note = f" (displayed after {abs(rotation)}° rotation)" if rotation else ""
-    if width >= tw and height >= th:
-        if width > tw or height > th:
-            result.add_pass("Resolution", f"{width}x{height} (exceeds {tw}x{th} target){rot_note}")
-        else:
-            result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}")
-        return
-
-    shortfall_pct = max(
-        (tw - width) / tw * 100 if tw > 0 else 0,
-        (th - height) / th * 100 if th > 0 else 0,
-    )
-
-    if shortfall_pct <= 1.0:
-        result.add_warn(
-            "Resolution",
-            f"{width}x{height} is {shortfall_pct:.1f}% under the {tw}x{th} target{rot_note}. "
-            f"Within rounding/mod-2 tolerance — verify this is intentional.",
-            confidence=75,
-        )
-    else:
-        result.add_fail(
-            "Resolution",
-            f"{width}x{height} does not meet the {tw}x{th} target{rot_note} "
-            f"({shortfall_pct:.0f}% short). Upscaling to spec would resample the image.",
-            confidence=95,
-        )
+def _side_data(entries, kind: str) -> Optional[dict]:
+    for entry in entries or []:
+        if isinstance(entry, dict) and str(entry.get("side_data_type", "")).lower() == kind.lower():
+            return entry
+    return None
 
 
 def _format_size(size_mb: float) -> str:
@@ -858,14 +939,147 @@ def _format_pct(pct: float) -> str:
     return f"{pct:.0f}%"
 
 
+# ============================================================================
+# METADATA QA CHECKS
+# ============================================================================
+
+def check_container_format(filepath: str, result: QAResult, cfg: dict):
+    """Validate the container extension and that the file is non-empty."""
+    if not os.path.isfile(filepath):
+        result.add_fail("Container Format", f"File not found: {filepath}")
+        return
+    file_size = os.path.getsize(filepath)
+    file_size_mb = file_size / (1024 * 1024)
+    ext = os.path.splitext(filepath)[1].lower()
+    result.set_metadata("file_size_mb", round(file_size_mb, 2))
+    result.set_metadata("container", ext)
+    if file_size == 0:
+        result.add_fail("Container Format", "File is empty (0 bytes).")
+        return
+    if ext not in cfg["accepted_containers"]:
+        result.add_fail("Container Format", f"Container '{ext}' not in accepted list {cfg['accepted_containers']}.")
+        return
+    result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
+
+
+def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
+    """Validate the primary video stream's codec."""
+    video = _primary_video_stream(probe_data)
+    if video is None:
+        result.add_fail("Video Codec", "No video stream found.")
+        return
+    codec = str(video.get("codec_name", "unknown")).lower()
+    result.set_metadata("video_codec", codec)
+    if codec in cfg["accepted_codecs"]:
+        result.add_pass("Video Codec", f"Codec: {codec}")
+    else:
+        result.add_fail("Video Codec", f"Codec '{codec}' not in accepted list {cfg['accepted_codecs']}.")
+
+
+def _displayed_size(video: dict) -> Tuple[int, int, int]:
+    """(width, height, rotation) of the picture as a player shows it."""
+    width = _safe_int(video.get("width"), 0) or 0
+    height = _safe_int(video.get("height"), 0) or 0
+    rotation = _stream_rotation_degrees(video)
+    if abs(rotation) % 180 == 90 and width and height:
+        width, height = height, width
+    return width, height, rotation
+
+
+def check_resolution(probe_data: dict, result: QAResult, cfg: dict):
+    """The displayed frame must equal the target exactly.
+
+    Larger frames are accepted only with ``allow_larger_resolution``: a 4K
+    master passed a 1080 spec, and a 5760x2880 equirect passed a 16:9 UHD
+    target, because the old rule was a floor. Anything smaller would need
+    upscaling and always fails. A 90/270-degree rotation flag swaps the
+    displayed axes, so a portrait phone capture stored as 1920x1080 is judged
+    as 1080x1920.
+    """
+    video = _primary_video_stream(probe_data)
+    if video is None:
+        result.add_fail("Resolution", "No video stream found.")
+        return
+    stored = f"{video.get('width', 0)}x{video.get('height', 0)}"
+    width, height, rotation = _displayed_size(video)
+    if rotation:
+        result.set_metadata("rotation", rotation)
+        result.set_metadata("stored_resolution", stored)
+    result.set_metadata("resolution", f"{width}x{height}")
+    result.set_metadata("width", width)
+    result.set_metadata("height", height)
+    tw, th = int(cfg["target_width"]), int(cfg["target_height"])
+    rot_note = f" (displayed after {abs(rotation)}° rotation)" if rotation else ""
+
+    if (width, height) == (tw, th):
+        result.add_pass("Resolution", f"{width}x{height} (matches {tw}x{th} target){rot_note}")
+    elif width >= tw and height >= th and cfg.get("allow_larger_resolution", False):
+        result.add_pass("Resolution", f"{width}x{height} exceeds the {tw}x{th} target "
+                                      f"(larger frames allowed by this spec){rot_note}")
+    elif width >= tw and height >= th:
+        result.add_fail("Resolution", f"{width}x{height} does not match the {tw}x{th} target{rot_note}. "
+                                      f"Larger frames are not allowed by this spec.", confidence=95)
+    else:
+        result.add_fail("Resolution", f"{width}x{height} is smaller than the {tw}x{th} target{rot_note}. "
+                                      f"Conforming would upscale the image.", confidence=95)
+
+
+def _ratio(text) -> Optional[float]:
+    """'16:9' or '16/9' as a float, None when absent/invalid/zero."""
+    if not text or not isinstance(text, str):
+        return None
+    parts = re.split(r"[:/]", text)
+    if len(parts) != 2:
+        return None
+    num, den = _safe_float(parts[0]), _safe_float(parts[1])
+    if not num or not den:
+        return None
+    return num / den
+
+
+def check_aspect_ratio(probe_data: dict, result: QAResult, cfg: dict):
+    """The displayed picture shape must match the target's shape.
+
+    Uses the sample aspect ratio, so an anamorphic 1440x1080 frame is judged
+    by its 16:9 display shape. With ``allow_larger_resolution`` this is what
+    stops a larger frame of the wrong shape (4096x2160 for UHD) passing.
+    """
+    video = _primary_video_stream(probe_data)
+    if video is None:
+        result.add_skip("Aspect Ratio", "No video stream found.")
+        return
+    width, height, _ = _displayed_size(video)
+    tw, th = int(cfg["target_width"]), int(cfg["target_height"])
+    if not width or not height or not tw or not th:
+        result.add_not_verified("Aspect Ratio", "frame size is unknown.")
+        return
+    sar = _ratio(video.get("sample_aspect_ratio")) or 1.0
+    if abs(_stream_rotation_degrees(video)) % 180 == 90:
+        sar = 1.0 / sar
+    display = width * sar / height
+    target = tw / th
+    result.set_metadata("display_aspect_ratio", round(display, 4))
+    sar_note = f", SAR {video.get('sample_aspect_ratio')}" if abs(sar - 1.0) > 1e-3 else ""
+    if abs(display - target) / target <= 0.005:
+        result.add_pass("Aspect Ratio", f"{display:.3f}:1 matches the target {target:.3f}:1{sar_note}")
+    else:
+        result.add_fail("Aspect Ratio", f"Displays at {display:.3f}:1, target is {target:.3f}:1 "
+                                        f"({tw}x{th}){sar_note}.", confidence=95)
+
+
 def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 4: Validate frame rate."""
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    if not video_streams:
+    """The frame rate must match the target within ``fps_tolerance``.
+
+    25p against a 24p spec used to be a warning; conforming it needs a speed
+    change, so any mismatch now fails. Integer multiples (60p for a 30p
+    spec) pass only with ``allow_fps_multiples``.
+    """
+    video = _primary_video_stream(probe_data)
+    if video is None:
         result.add_fail("Frame Rate", "No video stream found.")
         return
-    r_fps = parse_frame_rate(video_streams[0].get("r_frame_rate", "0/0"))
-    avg_fps = parse_frame_rate(video_streams[0].get("avg_frame_rate", "0/0"))
+    r_fps = parse_frame_rate(video.get("r_frame_rate", "0/0"))
+    avg_fps = parse_frame_rate(video.get("avg_frame_rate", "0/0"))
     result.set_metadata("r_frame_rate", r_fps)
     result.set_metadata("avg_frame_rate", avg_fps)
     fps = avg_fps if avg_fps > 0 else r_fps
@@ -874,46 +1088,294 @@ def check_frame_rate(probe_data: dict, result: QAResult, cfg: dict):
         result.add_warn("Frame Rate", "Could not determine the frame rate from the container.",
                         confidence=50)
         return
-    if abs(fps - cfg["target_fps"]) <= cfg["fps_tolerance"]:
-        result.add_pass("Frame Rate", f"{fps:.2f} fps (target: {cfg['target_fps']} fps)")
-    elif fps > cfg["target_fps"]:
-        result.add_warn("Frame Rate", f"{fps:.2f} fps — above {cfg['target_fps']} fps target (higher frame rate is generally acceptable; can be conformed if needed)")
-    else:
-        result.add_fail("Frame Rate", f"{fps:.2f} fps (below target {cfg['target_fps']} fps)")
+    target = float(cfg["target_fps"])
+    tolerance = float(cfg["fps_tolerance"])
+    if abs(fps - target) <= tolerance:
+        result.add_pass("Frame Rate", f"{fps:.3f} fps (target: {target:g} ± {tolerance:g} fps)")
+        return
+    multiple = round(fps / target) if target > 0 else 0
+    if multiple >= 2 and abs(fps / multiple - target) <= tolerance:
+        if cfg.get("allow_fps_multiples", False):
+            result.add_pass("Frame Rate", f"{fps:.3f} fps is {multiple}x the {target:g} fps target "
+                                          f"(integer multiples allowed by this spec)")
+            return
+        result.add_fail("Frame Rate", f"{fps:.3f} fps is {multiple}x the {target:g} fps target; "
+                                      f"integer multiples are not allowed by this spec.")
+        return
+    result.add_fail("Frame Rate", f"{fps:.3f} fps does not match the {target:g} ± {tolerance:g} fps target.")
 
 
-def check_cfr(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 5: Detect variable frame rate."""
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    if not video_streams:
+def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
+    """(dominant interval, total intervals, irregular count, irregular samples).
+
+    The dominant interval is the most common gap between consecutive
+    presentation timestamps (rounded to 0.1 ms, which absorbs Matroska's
+    millisecond rounding of 33/34 ms). A gap more than half a frame away
+    from it is irregular: a dropped/held frame or a genuine rate change.
+    """
+    gaps = []
+    last = len(timing.windows) - 1
+    for number, window in enumerate(timing.windows):
+        window_gaps = [(b, b - a) for a, b in zip(window, window[1:])]
+        # The stream's first and last intervals absorb edit-list and priming
+        # offsets (a fragmented MP4's first frame lasts 55 ms instead of
+        # 33 ms); they say nothing about the cadence.
+        if number == 0:
+            window_gaps = window_gaps[1:]
+        if number == last:
+            window_gaps = window_gaps[:-1]
+        gaps.extend(window_gaps)
+    if not gaps:
+        return None, 0, 0, []
+    counts = Counter(round(delta, 4) for _, delta in gaps if delta > 0)
+    if not counts:
+        return None, len(gaps), len(gaps), gaps[:6]
+    bucket = counts.most_common(1)[0][0]
+    # Average the intervals near the most common one: Matroska stores 30 fps
+    # as alternating 33/34 ms, whose mean is the true 33.33 ms.
+    near = [d for _, d in gaps if abs(d - bucket) <= bucket / 4]
+    dominant = sum(near) / len(near)
+    irregular = [(t, d) for t, d in gaps if abs(d - dominant) > dominant / 2]
+    return dominant, len(gaps), len(irregular), irregular
+
+
+def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
+              timing: Optional[FrameTiming] = None):
+    """Detect variable frame rate from real packet timestamps.
+
+    The old check compared two header fields (r_frame_rate vs
+    avg_frame_rate), which agree on most VFR files: a clip that switched from
+    30 to 15 fps halfway, and one that dropped a frame every 2 s, both passed.
+    Fails when more than ``vfr_threshold`` of intervals are irregular (and at
+    least two are). A single gap is a warning: one dropped or held frame.
+    """
+    if _primary_video_stream(probe_data) is None:
         result.add_skip("CFR Check", "No video stream found.")
         return
-    r_fps = parse_frame_rate(video_streams[0].get("r_frame_rate", "0/0"))
-    avg_fps = parse_frame_rate(video_streams[0].get("avg_frame_rate", "0/0"))
-    if r_fps == 0 or avg_fps == 0:
-        result.add_warn("CFR Check", "Could not determine frame rate type.")
+    if timing is None:
+        result.add_not_verified("CFR Check", "packet timestamps could not be read.")
         return
-    # FIX: Some containers (MKV) report r_frame_rate as 1000/1 or 90000/1
-    # which is a container default, not actual VFR. Skip CFR comparison.
-    if r_fps in (1000.0, 90000.0):
-        result.add_pass("CFR Check", f"Container r_frame_rate={r_fps:.0f} (default); using avg={avg_fps:.2f} fps")
+    dominant, total, irregular, samples = _interval_stats(timing)
+    if dominant is None or total < 2:
+        result.add_not_verified("CFR Check", f"too few frames to measure timing ({timing.packet_count} packets).")
         return
-    deviation = abs(r_fps - avg_fps) / max(r_fps, avg_fps)
-    result.set_metadata("fps_deviation", round(deviation, 4))
-    if deviation <= cfg["vfr_threshold"]:
-        result.add_pass("CFR Check", f"Constant frame rate (r={r_fps:.2f}, avg={avg_fps:.2f})")
-    elif cfg["require_cfr"]:
-        result.add_fail("CFR Check", f"Variable frame rate detected (r={r_fps:.2f}, avg={avg_fps:.2f})")
+    measured_fps = 1.0 / dominant
+    ratio = irregular / total
+    result.set_metadata("measured_frame_interval_ms", round(dominant * 1000, 3))
+    result.set_metadata("measured_fps", round(measured_fps, 3))
+    result.set_metadata("irregular_frame_intervals", irregular)
+    result.set_metadata("fps_deviation", round(ratio, 4))
+    scope = f"; {timing.description}" if timing.sampled else ""
+    where = ", ".join(f"{_timecode(t)} ({d * 1000:.0f} ms)" for t, d in samples[:6])
+    if irregular == 0:
+        result.add_pass("CFR Check", f"Constant frame rate: {total} intervals of "
+                                     f"{dominant * 1000:.2f} ms ({measured_fps:.3f} fps){scope}")
+        return
+    if irregular == 1:
+        result.add_warn("CFR Check", f"1 irregular frame interval at {where} against "
+                                     f"{dominant * 1000:.2f} ms (possible dropped or held frame){scope}",
+                        confidence=80)
+        return
+    result.set_metadata("vfr_detected", ratio > float(cfg.get("vfr_threshold", 0.01)))
+    detail = (f"{irregular} of {total} frame intervals ({ratio * 100:.1f}%) deviate from "
+              f"{dominant * 1000:.2f} ms ({measured_fps:.3f} fps). First at: {where}{scope}")
+    if ratio <= float(cfg.get("vfr_threshold", 0.01)):
+        result.add_warn("CFR Check", f"Minor timing irregularity: {detail}", confidence=75)
+    elif cfg.get("require_cfr", True):
+        result.add_fail("CFR Check", f"Variable frame rate: {detail}")
     else:
-        result.add_warn("CFR Check", f"Variable frame rate detected (r={r_fps:.2f}, avg={avg_fps:.2f}). File is usable but may need conform for timeline stability.")
+        result.add_warn("CFR Check", f"Variable frame rate (allowed by this spec): {detail}")
+
+
+_INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}
+
+
+def check_scan_type(probe_data: dict, result: QAResult, cfg: dict,
+                    first_frame: Optional[dict] = None):
+    """Fail interlaced video when the spec requires progressive.
+
+    ``field_order`` was probed and ignored, so an interlaced master passed.
+    When the container does not declare a field order, the first decoded
+    frame's interlaced flag is used.
+    """
+    video = _primary_video_stream(probe_data)
+    if video is None:
+        result.add_skip("Scan Type", "No video stream found.")
+        return
+    field_order = str(video.get("field_order") or "unknown").lower()
+    frame_flag = (first_frame or {}).get("interlaced_frame")
+    if field_order in _INTERLACED_FIELD_ORDERS:
+        interlaced, source = True, f"field order '{field_order}'"
+    elif field_order == "progressive":
+        interlaced, source = False, "declared progressive"
+    elif frame_flag in (1, "1", True):
+        interlaced, source = True, "first frame is flagged interlaced"
+    else:
+        interlaced, source = False, "not flagged interlaced (field order not declared)"
+    result.set_metadata("scan_type", "interlaced" if interlaced else "progressive")
+    if not interlaced:
+        confidence = 100 if field_order == "progressive" else 85
+        result.add_pass("Scan Type", f"Progressive ({source})", confidence=confidence)
+    elif cfg.get("require_progressive", True):
+        result.add_fail("Scan Type", f"Interlaced video ({source}); this spec requires progressive.")
+    else:
+        result.add_pass("Scan Type", f"Interlaced ({source}); allowed by this spec.")
+
+
+def _bit_depth(video: dict, first_frame: dict) -> Optional[int]:
+    """Luma bit depth from bits_per_raw_sample, else from the pixel format name."""
+    raw = _safe_int(video.get("bits_per_raw_sample"))
+    if raw and raw > 0:
+        return raw
+    pix_fmt = str(video.get("pix_fmt") or (first_frame or {}).get("pix_fmt") or "").lower()
+    if not pix_fmt:
+        return None
+    match = re.search(r"(?:p|le|be|f)?(\d{2})(?:le|be)$", pix_fmt) or re.search(r"p0?(\d{2})$", pix_fmt)
+    if match and int(match.group(1)) in (9, 10, 12, 14, 16):
+        return int(match.group(1))
+    if pix_fmt in ("rgb48le", "rgb48be", "rgba64le", "rgba64be"):
+        return 16
+    return 8
+
+
+_TRANSFER_NAMES = {"smpte2084": "pq", "arib-std-b67": "hlg"}
+
+
+def _transfer(video: dict, first_frame: dict) -> Tuple[str, str]:
+    """(class, raw name): class is 'pq', 'hlg', 'sdr' or 'unspecified'."""
+    raw = video.get("color_transfer") or (first_frame or {}).get("color_transfer") or ""
+    raw = str(raw).lower()
+    if raw in ("", "unknown", "unspecified", "reserved"):
+        return "unspecified", raw or "unspecified"
+    return _TRANSFER_NAMES.get(raw, "sdr"), raw
+
+
+def check_color_hdr(probe_data: dict, result: QAResult, cfg: dict,
+                    first_frame: Optional[dict] = None):
+    """Report bit depth and transfer (SDR/PQ/HLG); enforce only what the spec sets.
+
+    ``min_bit_depth`` and ``required_transfer`` default to "any" (report
+    only). An untagged file counts as SDR for an SDR spec, but can never
+    satisfy an HDR spec: PQ/HLG must be signalled to display correctly.
+    """
+    video = _primary_video_stream(probe_data)
+    if video is None:
+        result.add_skip("Color / HDR", "No video stream found.")
+        return
+    first_frame = first_frame or {}
+    depth = _bit_depth(video, first_frame)
+    transfer, raw = _transfer(video, first_frame)
+    primaries = video.get("color_primaries") or first_frame.get("color_primaries") or "unspecified"
+    side = first_frame.get("side_data_list") or []
+    hdr_meta = [name for name, key in (("mastering display", "Mastering display metadata"),
+                                        ("content light level", "Content light level metadata"))
+                if _side_data(side, key)]
+    result.set_metadata("bit_depth", depth)
+    result.set_metadata("color_transfer", raw)
+    result.set_metadata("color_primaries", primaries)
+    label = {"pq": "HDR PQ (SMPTE ST 2084)", "hlg": "HDR HLG (ARIB STD-B67)",
+             "sdr": f"SDR ({raw})", "unspecified": "SDR (transfer not signalled)"}[transfer]
+    summary = (f"{depth if depth else '?'}-bit, {label}, primaries {primaries}"
+               + (f", {' + '.join(hdr_meta)} metadata" if hdr_meta else ""))
+
+    problems = []
+    min_depth = cfg.get("min_bit_depth", "any")
+    if min_depth not in ("any", None):
+        if depth is None:
+            problems.append(f"bit depth unknown (spec requires {min_depth}-bit or more)")
+        elif depth < int(min_depth):
+            problems.append(f"{depth}-bit is below the required {min_depth}-bit")
+    required = cfg.get("required_transfer", "any")
+    if required not in ("any", None):
+        allowed = {"sdr": {"sdr", "unspecified"}, "pq": {"pq"}, "hlg": {"hlg"},
+                   "hdr": {"pq", "hlg"}}[required]
+        if transfer not in allowed:
+            problems.append(f"transfer is {label}, spec requires {required.upper()}")
+
+    if problems:
+        result.add_fail("Color / HDR", f"{summary}. " + "; ".join(problems) + ".")
+    else:
+        enforced = [n for n, v in (("bit depth", min_depth), ("transfer", required)) if v not in ("any", None)]
+        note = f" (meets spec: {', '.join(enforced)})" if enforced else " (not enforced by this spec)"
+        result.add_pass("Color / HDR", summary + note)
+
+
+def _normalise_projection(name) -> str:
+    return re.sub(r"[\s-]+", "_", str(name or "").strip().lower())
+
+
+def _normalise_stereo(name) -> str:
+    text = _normalise_projection(name)
+    aliases = {
+        "2d": "mono", "mono": "mono", "none": "mono",
+        "top_and_bottom": "top_bottom", "top_bottom": "top_bottom", "tb": "top_bottom",
+        "bottom_top": "top_bottom", "over_under": "top_bottom",
+        "side_by_side": "side_by_side", "left_right": "side_by_side", "sbs": "side_by_side",
+        "right_left": "side_by_side",
+    }
+    return aliases.get(text, text)
+
+
+def _xr_metadata(video: dict, first_frame: dict) -> Tuple[Optional[str], Optional[str]]:
+    """(projection, stereo layout) from stream side data, SEI or Matroska tags."""
+    sources = (video.get("side_data_list") or [], (first_frame or {}).get("side_data_list") or [])
+    projection = stereo = None
+    for entries in sources:
+        spherical = _side_data(entries, "Spherical Mapping")
+        if spherical and projection is None:
+            projection = _normalise_projection(spherical.get("projection") or "unknown")
+        stereo3d = _side_data(entries, "Stereo 3D")
+        if stereo3d and stereo is None:
+            stereo = _normalise_stereo(stereo3d.get("type") or "unknown")
+    if stereo is None:
+        tags = {str(k).lower(): v for k, v in (video.get("tags") or {}).items()}
+        tags.update({str(k).lower(): v for k, v in ((first_frame or {}).get("tags") or {}).items()})
+        if tags.get("stereo_mode"):
+            stereo = _normalise_stereo(tags["stereo_mode"])
+    return projection, stereo
+
+
+def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
+                      first_frame: Optional[dict] = None):
+    """Require the spherical / stereo-3D signalling a 360 or VR spec declares.
+
+    A 360 file without spherical metadata plays flat on every headset and
+    web player. With "any" the findings are reported but not enforced.
+    """
+    video = _primary_video_stream(probe_data)
+    if video is None:
+        result.add_skip("XR Metadata", "No video stream found.")
+        return
+    projection, stereo = _xr_metadata(video, first_frame or {})
+    result.set_metadata("projection", projection or "none")
+    result.set_metadata("stereo_mode", stereo or "mono")
+    found = (f"projection {projection}" if projection else "no spherical metadata (flat)")
+    found += f", stereo {stereo}" if stereo else ", no stereo metadata (mono)"
+
+    problems = []
+    want_projection = _normalise_projection(cfg.get("required_projection", "any") or "any")
+    if want_projection == "none" and projection:
+        problems.append(f"spec requires a flat (non-360) picture but the file declares {projection}")
+    elif want_projection not in ("any", "none") and projection != want_projection:
+        problems.append(f"spec requires {want_projection} projection metadata"
+                        + ("; players will show this file flat" if not projection else f", file declares {projection}"))
+    want_stereo = _normalise_stereo(cfg.get("required_stereo_mode", "any") or "any")
+    actual_stereo = stereo or "mono"
+    if want_stereo != "any" and actual_stereo != want_stereo:
+        problems.append(f"spec requires stereo layout {want_stereo}, file declares {actual_stereo}")
+
+    if problems:
+        result.add_fail("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(problems) + ".")
+    else:
+        enforced = want_projection != "any" or want_stereo != "any"
+        result.add_pass("XR Metadata", f"{found[0].upper()}{found[1:]}"
+                        + (" (matches spec)" if enforced else " (not enforced by this spec)"))
 
 
 def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 6: Validate video bitrate meets minimum."""
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    bitrate_str = None
-    if video_streams:
-        bitrate_str = video_streams[0].get("bit_rate")
+    """Validate video bitrate meets minimum."""
+    video = _primary_video_stream(probe_data)
+    bitrate_str = video.get("bit_rate") if video else None
     is_format_level = False
     if not bitrate_str:
         bitrate_str = probe_data.get("format", {}).get("bit_rate")
@@ -925,239 +1387,159 @@ def check_bitrate(probe_data: dict, result: QAResult, cfg: dict):
     if bitrate_bps is None or bitrate_bps < 0:
         result.add_warn("Bitrate", f"Could not parse bitrate: {bitrate_str}")
         return
-    # v1.6 FIX: Subtract audio bitrate when using format-level total
     if is_format_level:
-        audio_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]
-        total_audio_bps = 0
-        for a_stream in audio_streams:
-            audio_bps = _safe_int(a_stream.get("bit_rate"), 0)
-            if audio_bps > 0:
-                total_audio_bps += audio_bps
+        # A container total includes every audio track.
+        total_audio_bps = sum(max(0, _safe_int(a.get("bit_rate"), 0) or 0)
+                              for a in _audio_streams(probe_data))
         if total_audio_bps > 0:
             bitrate_bps = max(bitrate_bps - total_audio_bps, 0)
     bitrate_mbps = bitrate_bps / 1_000_000
     result.set_metadata("video_bitrate_mbps", round(bitrate_mbps, 2))
     min_br = cfg["min_bitrate_mbps"]
-    # FIX: Sanity check for PCM audio subtraction artifacts
-    # If format-level subtraction yielded implausibly low video bitrate,
-    # but original format bitrate was above minimum, issue WARN not FAIL
-    if is_format_level and bitrate_mbps < 1.0:
-        orig_bps = _safe_int(probe_data.get("format", {}).get("bit_rate"), 0)
-        orig_mbps = orig_bps / 1_000_000
+    # Subtracting a large PCM track can push a container total under the
+    # floor; only then is the estimate too uncertain to fail on.
+    if is_format_level and bitrate_mbps < 1.0 and bitrate_mbps < min_br:
+        orig_mbps = (_safe_int(probe_data.get("format", {}).get("bit_rate"), 0) or 0) / 1_000_000
         if orig_mbps >= min_br:
             result.add_warn("Bitrate", f"Video bitrate ~{bitrate_mbps:.1f} Mbps after subtracting audio "
-                           f"(format total: {orig_mbps:.1f} Mbps). PCM audio may skew calculation.")
+                                       f"(format total: {orig_mbps:.1f} Mbps). PCM audio may skew calculation.")
             return
     if bitrate_mbps >= min_br:
         result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps (min: {min_br} Mbps)")
+        return
+    deficit_pct = ((min_br - bitrate_mbps) / min_br * 100) if min_br > 0 else 0
+    if deficit_pct <= 10:
+        result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps ({deficit_pct:.0f}% below target {min_br} Mbps - within VBR tolerance)", confidence=70)
+    elif deficit_pct <= 25:
+        result.add_warn("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps — {deficit_pct:.0f}% below {min_br} Mbps target. Likely still usable; verify no visible compression artifacts.", confidence=75)
     else:
-        # Percentage-based tolerance: VBR encoding commonly varies 10-15% below target
-        deficit_pct = ((min_br - bitrate_mbps) / min_br * 100) if min_br > 0 else 0
-        if deficit_pct <= 10:
-            # Within 10% - marginal pass (normal VBR variance)
-            result.add_pass("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps ({deficit_pct:.0f}% below target {min_br} Mbps - within VBR tolerance)", confidence=70)
-        elif deficit_pct <= 25:
-            # 10-25% below - warn but don't fail
-            result.add_warn("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps — {deficit_pct:.0f}% below {min_br} Mbps target. Likely still usable; verify no visible compression artifacts.", confidence=75)
-        else:
-            # >25% below - definite fail
-            result.add_fail("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps is {_format_pct(deficit_pct)} below minimum {min_br} Mbps. Likely visible compression artifacts.", confidence=95)
+        result.add_fail("Bitrate", f"{_format_mbps(bitrate_mbps)} Mbps is {_format_pct(deficit_pct)} below minimum {min_br} Mbps. Likely visible compression artifacts.", confidence=95)
+
+
+_STATUS_RANK = {"FAIL": 3, "WARN": 2, "PASS": 1, "SKIP": 0}
+
+
+def _add_aggregate(result: QAResult, name: str, entries: List[Tuple[str, str]], confidence: int = 100):
+    """Record one row for a per-track check: the worst status, every track's detail.
+
+    The checks matrix keys cells by check name, so one row per track would
+    keep only the last track and could hide a failing one.
+    """
+    if not entries:
+        return
+    status = max((s for s, _ in entries), key=lambda s: _STATUS_RANK.get(s, 0))
+    detail = "; ".join(d for _, d in entries)
+    {"FAIL": result.add_fail, "WARN": result.add_warn,
+     "PASS": result.add_pass, "SKIP": result.add_skip}[status](name, detail, confidence)
 
 
 def check_audio(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 7: Validate audio stream (3 sub-checks matching CLI v1.6.1)."""
-    audio_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]
-    if not audio_streams:
+    """Validate every audio track: codec, channels and sample rate.
+
+    Only the first track used to be read, so a delivery whose second track
+    was a silent 5.1 stem (or an 8 kHz scratch track) passed.
+    """
+    tracks = _audio_streams(probe_data)
+    if not tracks:
         if cfg["audio_required"]:
             result.add_fail("Audio Stream", "No audio stream found (audio is required).")
         else:
             result.add_pass("Audio Stream", "No audio stream (audio not required).")
         return
-    audio = audio_streams[0]
-    codec = audio.get("codec_name", "unknown").lower()
-    sample_rate = _safe_int(audio.get("sample_rate"), 0)
-    channels = _safe_int(audio.get("channels"), 0)
-    channel_layout = audio.get("channel_layout", "unknown")
-    result.set_metadata("audio_codec", codec)
-    result.set_metadata("audio_sample_rate", sample_rate)
-    result.set_metadata("audio_channels", channels)
+    result.add_pass("Audio Stream", f"{len(tracks)} audio track(s)")
+    result.set_metadata("audio_tracks", len(tracks))
+    first = tracks[0]
+    result.set_metadata("audio_codec", str(first.get("codec_name", "unknown")).lower())
+    result.set_metadata("audio_sample_rate", _safe_int(first.get("sample_rate"), 0))
+    result.set_metadata("audio_channels", _safe_int(first.get("channels"), 0))
 
-    # Sub-check 7a: Audio codec
-    if codec in cfg["accepted_audio_codecs"]:
-        result.add_pass("Audio Codec", f"Codec: {codec}")
-    else:
-        result.add_warn("Audio Codec", f"Codec '{codec}' — not in the expected codec list but may still be compatible.")
+    codecs, channels, rates = [], [], []
+    min_rate = int(cfg["min_audio_sample_rate"])
+    for position, track in enumerate(tracks):
+        label = _track_label(position, track, len(tracks))
+        codec = str(track.get("codec_name", "unknown")).lower()
+        if codec in cfg["accepted_audio_codecs"]:
+            codecs.append(("PASS", _with_track(label, f"Codec: {codec}")))
+        else:
+            codecs.append(("WARN", _with_track(label, f"Codec '{codec}' — not in the expected codec list but may still be compatible.")))
 
-    # Sub-check 7b: Sample rate
-    if sample_rate >= cfg["min_audio_sample_rate"]:
-        # REMOVED v0.4.4: result.add_pass("Audio Sample Rate", f"{sample_rate} Hz (minimum: {cfg['min_audio_sample_rate']} Hz)")
-        pass
-    else:
-        # REMOVED v0.4.4: result.add_fail("Audio Sample Rate", f"{sample_rate} Hz (below minimum {cfg['min_audio_sample_rate']} Hz)")
-        pass
+        count = _safe_int(track.get("channels"), 0) or 0
+        layout = track.get("channel_layout", "unknown")
+        if count > 0:
+            channels.append(("PASS", _with_track(label, f"{count} channel(s), layout: {layout}")))
+        else:
+            channels.append(("WARN", _with_track(label, "Could not determine audio channel configuration.")))
 
-    # Sub-check 7c: Channels
-    if channels > 0:
-        result.add_pass("Audio Channels", f"{channels} channel(s), layout: {channel_layout}")
-    else:
-        result.add_warn("Audio Channels", "Could not determine audio channel configuration.")
+        rate = _safe_int(track.get("sample_rate"), 0) or 0
+        if rate <= 0:
+            rates.append(("WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}sample rate unknown.")))
+        elif rate >= min_rate:
+            rates.append(("PASS", _with_track(label, f"{rate} Hz (minimum {min_rate} Hz)")))
+        else:
+            rates.append(("FAIL", _with_track(label, f"{rate} Hz is below the {min_rate} Hz minimum")))
 
-
-def check_duration(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 8: Report duration and flag short files."""
-    duration_str = probe_data.get("format", {}).get("duration")
-    if not duration_str:
-        result.add_warn("Duration", "Could not determine file duration.")
-        return
-    duration = _safe_float(duration_str)
-    if duration is None or duration < 0:
-        result.add_warn("Duration", f"Could not parse duration: {duration_str}")
-        return
-    hours = int(duration // 3600)
-    minutes = int((duration % 3600) // 60)
-    seconds = int(duration % 60)
-    result.set_metadata("duration_seconds", round(duration, 2))
-    result.set_metadata("duration_display", f"{hours:02d}:{minutes:02d}:{seconds:02d}")
-    dur_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-    min_fail = cfg.get("min_duration_fail", 5.0)
-    min_warn = cfg.get("min_duration_warn", 30.0)
-    if duration < min_fail:
-        result.add_fail("Duration", f"{dur_str} (less than {min_fail}s -- possible incomplete capture)")
-    elif duration < min_warn:
-        result.add_warn("Duration", f"{dur_str} (less than {min_warn}s -- verify intentional)")
-    else:
-        result.add_pass("Duration", f"{dur_str} ({duration:.1f}s)")
-
-
-# Check 9 (Color Space) was removed in v0.4.4. Commenting out only its `def`
-# line left the whole body indented into check_duration above, so this
-# function silently recorded "Color Space" results too. The body is gone
-# rather than re-commented; "Color Space" remains listed in REMOVED_CHECKS.
-
-
-def check_naming(filepath: str, result: QAResult, cfg: dict):
-    """Check 10: Validate file naming convention."""
-    filename = os.path.basename(filepath)
-    pattern = cfg["naming_pattern"]
-    if re.match(pattern, filename):
-        result.add_pass("Naming Convention", f"Matches pattern: {cfg['naming_example']}")
-    else:
-        result.add_warn("Naming Convention", f"Does not match expected pattern: {cfg['naming_example']}")
-
-
-def _stream_duration_text(stream: dict) -> Optional[str]:
-    """Per-stream duration in seconds as text, including Matroska's tag form.
-
-    MKV and WebM streams carry no ``duration`` field; the length lives in a
-    ``DURATION`` tag formatted ``HH:MM:SS.nnnnnnnnn``. Without this fallback
-    every Matroska file with audio raised an A/V Duration warning.
-    """
-    value = stream.get("duration")
-    if value and value != "N/A":
-        return str(value)
-    tags = stream.get("tags") or {}
-    for key, raw in tags.items():
-        if str(key).upper().startswith("DURATION") and isinstance(raw, str):
-            match = re.fullmatch(r"\s*(\d+):(\d{1,2}):(\d{1,2}(?:\.\d+)?)\s*", raw)
-            if match:
-                hours, minutes, seconds = match.groups()
-                return str(int(hours) * 3600 + int(minutes) * 60 + float(seconds))
-    return None
+    _add_aggregate(result, "Audio Codec", codecs)
+    _add_aggregate(result, "Audio Channels", channels)
+    _add_aggregate(result, "Audio Sample Rate", rates)
 
 
 def check_av_duration_mismatch(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 11: Detect video/audio duration mismatch with tiered severity."""
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    audio_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]
-    if not video_streams or not audio_streams:
+    """Compare each audio track's end against the video's end, tiered."""
+    video = _primary_video_stream(probe_data)
+    tracks = _audio_streams(probe_data)
+    if video is None or not tracks:
         result.add_skip("A/V Duration", "Need both video and audio streams to compare.")
         return
-    v_dur_str = _stream_duration_text(video_streams[0])
-    a_dur_str = _stream_duration_text(audio_streams[0])
-    if not v_dur_str or not a_dur_str:
-        result.add_warn("A/V Duration", "Per-stream duration not available.")
-        return
-    v_dur = _safe_float(v_dur_str)
-    a_dur = _safe_float(a_dur_str)
-    if v_dur is None or a_dur is None:
-        result.add_warn("A/V Duration", "Could not parse durations.")
-        return
-    if v_dur <= 0 or a_dur <= 0:
-        result.add_warn("A/V Duration", "Duration data unavailable.")
-        return
-    # Compare stream ENDS, not raw durations. Streams routinely start at
-    # different offsets (an audio stream beginning 40 ms in, a video
-    # stream at a negative PTS origin), and comparing durations alone
-    # reads that offset as a mismatch — or hides a real one behind it.
-    # Missing/unparseable start_time falls back to 0, the old behaviour.
+    v_dur = _safe_float(_stream_duration_text(video))
+
     def _start_of(stream):
-        try:
-            return float(stream.get("start_time") or 0.0)
-        except (TypeError, ValueError):
-            return 0.0
-    v_start = _start_of(video_streams[0])
-    a_start = _start_of(audio_streams[0])
-    diff = abs((v_start + v_dur) - (a_start + a_dur))
-    result.set_metadata("video_duration", round(v_dur, 3))
-    result.set_metadata("audio_duration", round(a_dur, 3))
-    if v_start or a_start:
-        result.set_metadata("video_start_time", round(v_start, 3))
-        result.set_metadata("audio_start_time", round(a_start, 3))
-    result.set_metadata("av_duration_diff", round(diff, 3))
+        return _safe_float(stream.get("start_time"), 0.0) or 0.0
+
     threshold = cfg["duration_mismatch_threshold"]
-    if diff <= threshold:
-        result.add_pass("A/V Duration", f"Video: {v_dur:.2f}s, Audio: {a_dur:.2f}s (diff: {diff:.3f}s)")
-    elif diff <= 2.0:
-        result.add_warn("A/V Duration", f"Video: {v_dur:.2f}s, Audio: {a_dur:.2f}s (diff: {diff:.3f}s). Minor offset — usually safe but verify lip sync on dialogue.")
-    else:
-        result.add_fail("A/V Duration", f"Video: {v_dur:.2f}s, Audio: {a_dur:.2f}s (diff: {diff:.3f}s -- significant mismatch)")
-
-
-def check_pixel_aspect_ratio(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 12: Validate pixel aspect ratio is square (1:1)."""
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    if not video_streams:
-        result.add_skip("Pixel Aspect Ratio", "No video stream.")
-        return
-    sar = video_streams[0].get("sample_aspect_ratio", "N/A")
-    dar = video_streams[0].get("display_aspect_ratio", "N/A")
-    result.set_metadata("sar", sar)
-    result.set_metadata("display_aspect_ratio", dar)
-    if sar in ("1:1", "N/A", None, "", "0:1"):
-        result.add_pass("Pixel Aspect Ratio", f"SAR: {sar}, DAR: {dar}")
-    else:
-        result.add_warn("Pixel Aspect Ratio", f"Non-square pixels (SAR: {sar}, DAR: {dar}). File is usable but verify display renders at correct aspect.")
+    entries = []
+    worst_diff = 0.0
+    for position, track in enumerate(tracks):
+        label = _track_label(position, track, len(tracks))
+        a_dur = _safe_float(_stream_duration_text(track))
+        if v_dur is None or a_dur is None or v_dur <= 0 or a_dur <= 0:
+            entries.append(("WARN", _with_track(label, "Per-stream duration not available.")))
+            continue
+        # Compare stream ENDS: streams routinely start at different offsets.
+        diff = abs((_start_of(video) + v_dur) - (_start_of(track) + a_dur))
+        worst_diff = max(worst_diff, diff)
+        text = f"Video: {v_dur:.2f}s, Audio: {a_dur:.2f}s (diff: {diff:.3f}s)"
+        if diff <= threshold:
+            entries.append(("PASS", _with_track(label, text)))
+        elif diff <= 2.0:
+            entries.append(("WARN", _with_track(label, text + ". Minor offset — usually safe but verify lip sync on dialogue.")))
+        else:
+            entries.append(("FAIL", _with_track(label, text + " -- significant mismatch")))
+    if v_dur:
+        result.set_metadata("video_duration", round(v_dur, 3))
+    first_audio = _safe_float(_stream_duration_text(tracks[0]))
+    if first_audio:
+        result.set_metadata("audio_duration", round(first_audio, 3))
+    result.set_metadata("av_duration_diff", round(worst_diff, 3))
+    _add_aggregate(result, "A/V Duration", entries)
 
 
 def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
-    """Check 13: Validate actual frame count matches expected (duration * fps).
-    Uses video stream duration (not format duration) per v1.6 fix.
-    Skips when VFR is detected to prevent false failures.
+    """Advisory: header frame count vs duration x frame rate.
+
+    Skipped when the CFR check found variable timing (the expectation is
+    meaningless) and for Matroska, which records no frame count.
     """
-    video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    if not video_streams:
+    vs = _primary_video_stream(probe_data)
+    if vs is None:
         result.add_skip("Frame Count", "No video stream.")
         return
-    # FIX: Skip frame count check when VFR was detected (fps_deviation stored by check_cfr)
-    # Professional codecs report minor rate differences - increase tolerance
-    _video_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"]
-    _codec = _video_streams[0].get("codec_name", "").lower() if _video_streams else ""
-    _vfr_thresh = cfg.get("vfr_threshold", 0.02)
-    if _codec in ("prores", "dnxhd", "dnxhr", "cfhd", "v210", "rawvideo"):
-        _vfr_thresh = max(_vfr_thresh, 0.05)  # More lenient for pro codecs
-    
-    if result.metadata.get("fps_deviation", 0) > _vfr_thresh:
+    if result.metadata.get("vfr_detected"):
         result.add_skip("Frame Count", "Skipped — variable frame rate detected (frame count unreliable for VFR).")
         return
-    vs = video_streams[0]
     nb_frames_str = vs.get("nb_frames")
     if not nb_frames_str or nb_frames_str == "N/A":
-        # Matroska and WebM never record a per-stream frame count, so its
-        # absence there says nothing about the file; every .mkv used to carry
-        # a Frame Count warning. Elsewhere a missing count stays a warning.
         format_name = str((probe_data.get("format") or {}).get("format_name") or "")
-        if nb_frames_str in (None, "", "N/A") and (
-                "matroska" in format_name or "webm" in format_name):
+        if "matroska" in format_name or "webm" in format_name:
             result.add_skip("Frame Count", "Frame count is not recorded in Matroska/WebM files.")
         else:
             result.add_warn("Frame Count", "nb_frames not available in container metadata.")
@@ -1166,12 +1548,8 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     if actual_frames is None or actual_frames < 0:
         result.add_warn("Frame Count", f"Could not parse frame count: {nb_frames_str}")
         return
-    # v1.6: Use video stream duration first (not format duration)
-    duration_str = vs.get("duration")
-    if not duration_str:
-        duration_str = probe_data.get("format", {}).get("duration")
+    duration = _safe_float(vs.get("duration") or probe_data.get("format", {}).get("duration"))
     fps = parse_frame_rate(vs.get("r_frame_rate", "0/1"))
-    duration = _safe_float(duration_str)
     if duration is None or duration <= 0 or fps <= 0:
         result.add_warn("Frame Count", "Cannot determine expected frame count.")
         return
@@ -1183,99 +1561,16 @@ def check_frame_count(probe_data: dict, result: QAResult, cfg: dict):
     result.set_metadata("frame_count_diff", diff)
     if diff <= tolerance:
         result.add_pass("Frame Count", f"{actual_frames} frames (expected ~{expected_frames}, diff: {diff})")
-    elif diff <= expected_frames * 0.10:  # Up to 10% deviation is WARN (common for static/slow content)
+    elif diff <= expected_frames * 0.10:
         result.add_warn("Frame Count", f"{actual_frames} frames vs ~{expected_frames} (diff: {diff}, {diff/expected_frames*100:.1f}%). May be normal for static/slow-motion content.")
     else:
         result.add_fail("Frame Count", f"{actual_frames} frames vs ~{expected_frames} (diff: {diff}, {diff/expected_frames*100:.1f}%). Likely frame drops or encoding issue.")
 
 
+
 # ============================================================================
-# DEEP SCAN UTILITIES
+# DEEP SCAN: LOG CAPTURE AND EVENT PARSING
 # ============================================================================
-
-def _filter_hwaccel_noise(stderr_text: str) -> str:
-    """Remove hwaccel fallback messages from stderr to prevent false positives."""
-    # Split without stripping the whole text: the first line's indentation
-    # tells _extract_decode_errors whether it belongs to the metadata dump.
-    lines = stderr_text.split("\n")
-    filtered = []
-    for line in lines:
-        line_lower = line.lower()
-        if any(p.lower() in line_lower for p in HWACCEL_NOISE_PATTERNS):
-            continue
-        if line.strip():
-            filtered.append(line)
-    return "\n".join(filtered)
-
-
-# Signatures of genuine decode/demux problems in FFmpeg stderr.
-#
-# This is deliberately an ALLOW-list. The scan runs at `-v info` (required, or
-# the detect filters log nothing), which also emits the banner, build config,
-# stream mapping and progress lines. Treating "anything unrecognised" as an
-# error — as this used to — reports hundreds of decode errors for every clean file.
-DECODE_ERROR_PATTERNS = (
-    "error while decoding",
-    "Error while decoding",
-    "Invalid data found when processing input",
-    "invalid nal unit",
-    "Invalid NAL unit",
-    "missing picture in access unit",
-    "concealing",
-    "corrupt",
-    "Corrupt",
-    "Truncating packet",
-    "no frame!",
-    "decode_slice_header error",
-    "illegal short term buffer state",
-    "co located POCs unavailable",
-    "mmco: unref short failure",
-    "Invalid sample size",
-    "Invalid frame size",
-    "out of range",
-    "Application provided invalid",
-    "non-existing PPS",
-    "non-existing SPS",
-    "Frame parameters mismatch",
-    "Could not find codec parameters",
-    "Failed to decode",
-)
-
-
-_NON_DECODER_LINE_RE = re.compile(
-    r"^(?:Input|Output) #\d|^Stream #\d|^Duration:|^Metadata:|^Chapters?:"
-    r"|^[A-Za-z_][\w .-]*?\s{2,}:\s"   # padded "key        : value" dump rows
-)
-
-
-# "[h264 @ 0x7f..]" - present on decoder messages, including one glued onto
-# an indented line by interleaved filter-thread output.
-_DECODER_TAG_RE = re.compile(r"\[[^\]@\n]+ @ 0x[0-9a-fA-F]+\]")
-
-
-def _extract_decode_errors(stderr_clean: str) -> list:
-    """Return the lines in FFmpeg stderr that indicate a real decode problem.
-
-    FFmpeg's input banner ("Input #0, mov,... from '/path/not_corrupt.mp4':")
-    and metadata dump are not suppressed by -hide_banner, and they contain the
-    file path and tags. Matching patterns such as "corrupt" against those
-    lines failed Decode Integrity for a clean file purely because of its name.
-    """
-    errors = []
-    for raw in stderr_clean.split("\n"):
-        # The banner, metadata dump and stream list are indented; decoder
-        # messages start at column 0 or with a "[codec @ 0x...]" prefix. This
-        # also covers long keys whose padding collapses ("com.apple.quicktime
-        # .description: corrupt take") and ": ..." continuation rows.
-        if raw[:1] in (" ", "\t") and not _DECODER_TAG_RE.search(raw):
-            continue
-        line = raw.strip()
-        if not line or _NON_DECODER_LINE_RE.match(line):
-            continue
-        if any(p in line for p in DECODE_ERROR_PATTERNS):
-            errors.append(line)
-    return errors
-
 
 _STDERR_EVIDENCE_TOKENS = {
     "black": ("black_start", "black_end", "black_duration"),
@@ -1288,9 +1583,16 @@ _STDERR_RECORD_OVERLAP_CHARS = 128
 
 
 def _stderr_evidence_categories(line: str) -> tuple:
+    """Semantic categories of one FFmpeg log record; () for plain context.
+
+    Evidence records are always retained by _BoundedStderrCapture because the
+    verdicts are parsed from them; everything else is a bounded tail.
+    """
     categories = []
-    if _extract_decode_errors(line):
+    if _is_decode_evidence(line):
         categories.append("decode")
+    if _LOUDNESS_LINE_RE.search(line):
+        categories.append("loudness")
     for category in ("freeze", "silence", "black"):
         if any(token in line for token in _STDERR_EVIDENCE_TOKENS[category]):
             categories.append(category)
@@ -1319,9 +1621,8 @@ def _clip_evidence_line(line: str, categories: tuple, limit: int) -> str:
                        // max(1, len(categories)))
     snippets = []
     for category in categories:
-        if category == "decode":
-            positions = [line.find(pattern) for pattern in DECODE_ERROR_PATTERNS
-                         if line.find(pattern) >= 0]
+        if category in ("decode", "loudness"):
+            positions = [0]
         else:
             positions = [line.find(token)
                          for token in _STDERR_EVIDENCE_TOKENS[category]
@@ -1329,23 +1630,6 @@ def _clip_evidence_line(line: str, categories: tuple, limit: int) -> str:
         start = max(0, min(positions) - 16) if positions else 0
         snippets.append(line[start:start + per_category])
     return " | ".join(snippets)[:limit]
-
-
-def _cap_stderr_text(text: str, cfg: dict) -> tuple:
-    """Bound completed stderr with the same category allocation as capture."""
-    max_lines = max(1, int(cfg.get("deep_scan_max_stderr_lines", 5000) or 5000))
-    max_chars = max(1, int(cfg.get("deep_scan_max_stderr_chars", 512 * 1024)
-                           or 512 * 1024))
-    if not text:
-        return "", 0
-    lines = text.splitlines()
-    if len(lines) <= max_lines and len(text) <= max_chars:
-        return text, 0
-    capture = _BoundedStderrCapture(cfg)
-    for line in lines:
-        capture.add(line)
-    capped = capture.result()
-    return str(capped), capped.truncated_records
 
 
 class _CapturedStderr(str):
@@ -1496,18 +1780,16 @@ def _drain_binary_records(stream, on_record: Callable[[str], None]) -> int:
     return peak_pending
 
 
+
 def _merge_event_intervals(events: list, join_gap: float = 0.25) -> list:
     """Merge overlapping/adjacent (start, duration) events into distinct ones.
 
-    Segments are scanned with an overlap so an event straddling a boundary is
-    seen whole by at least one of them, which means the same event is often
-    reported twice — once truncated. Merging by interval (rather than by
-    start-time proximity, as the old ``_dedup_events`` did) collapses those
-    into a single event with the correct full duration, while keeping two
-    genuinely separate events separate no matter how close together they are.
+    Detect filters can report one visual event as several touching regions
+    (a region closed at EOF, a freeze interrupted for a single frame).
+    Merging by interval collapses those into one event with the full
+    duration while keeping genuinely separate events separate.
 
-    ``join_gap`` absorbs the sub-frame drift between a segment's own report of
-    an event and the overlapping segment's report of the same one.
+    ``join_gap`` absorbs sub-frame drift between adjacent reports.
     """
     intervals = []
     for e in events:
@@ -1604,19 +1886,6 @@ def _pair_detect_events(stderr_text: str, prefix: str) -> list:
     return events
 
 
-# Timestamps emitted by blackdetect / freezedetect / silencedetect. Durations
-# ("black_duration", "silence_duration") are intervals, not points on the
-# timeline, so they must NOT be shifted.
-_EVENT_TIME_RE = re.compile(
-    r"(black_start|black_end|freeze_start|freeze_end|silence_start|silence_end)"
-    # The value may be negative: a region that began just before a segment's
-    # seek point is reported as e.g. "silence_start: -0.0213". Leaving it
-    # unshifted paired it with a shifted end and fabricated a silence
-    # hundreds of seconds long.
-    r"(\s*[:=]\s*)(-?\d+(?:\.\d+)?)"
-)
-
-
 _REGION_CLOSERS = {
     "freeze": "lavfi.freezedetect.freeze_end: {end:.3f}",
     "silence": "[silencedetect] silence_end: {end:.3f}",
@@ -1630,9 +1899,7 @@ def _close_open_regions(stderr_text: str, end_time: float) -> str:
     freezedetect never prints freeze_end for a freeze that lasts until the
     input ends, so a clip that froze for its last six seconds - or a whole
     static deliverable - was reported as "1 freeze event, total 0.0s" and
-    passed. With segmented scans every segment of a frozen file ended that
-    way, giving several 0.0s events instead of one long freeze. The open
-    region now ends where the scanned range ends.
+    passed. The open region now ends where the decoded range ends.
     """
     if not stderr_text or end_time is None:
         return stderr_text or ""
@@ -1648,649 +1915,506 @@ def _close_open_regions(stderr_text: str, end_time: float) -> str:
     return stderr_text + "\n" + "\n".join(additions)
 
 
-def _offset_event_times(stderr_text: str, offset: float) -> str:
-    """Shift segment-relative event timestamps onto the whole-file timeline.
-
-    ``-ss`` before ``-i`` resets output PTS to zero, so a black frame five
-    minutes into the file is reported at 00:12 by the segment that starts at
-    04:60. Without this, reported timestamps are wrong and ``_dedup_events``
-    collapses genuine events from different segments.
-
-    The original separator is preserved verbatim because the downstream
-    parsers match on the exact ``black_start:12.345 black_end:...`` spacing.
-    """
-    if not stderr_text or not offset:
-        return stderr_text or ""
-
-    def _shift(match):
-        return f"{match.group(1)}{match.group(2)}{float(match.group(3)) + offset:.3f}"
-
-    return _EVENT_TIME_RE.sub(_shift, stderr_text)
-
-
-def _segment_boundaries(duration: float, seg_count: int, overlap: float) -> List[Tuple[float, float]]:
-    """Split a file into deterministic, overlapping scan segments.
-
-    Two separate bugs lived in the old scheme, and together they made repeat
-    scans of the same file disagree:
-
-    1. Split points came from ``ffprobe`` keyframe probes with an 8s timeout.
-       Under load a probe timed out and silently fell back to an even split,
-       so the boundaries themselves changed from run to run.
-    2. Segments were butt-jointed. ``freezedetect`` needs an uninterrupted run
-       of ``freeze_detect_duration`` seconds, so a freeze lying across a
-       boundary was cut into two shorter halves and detected by neither.
-
-    Boundaries are now a pure function of (duration, seg_count), and each
-    segment after the first starts ``overlap`` seconds early so any event
-    shorter than ``overlap`` is seen whole by at least one segment.
-    ``_merge_event_intervals`` collapses the resulting duplicates.
-    """
-    seg_count = max(1, int(seg_count))
-    if duration <= 0:
-        return [(0.0, 0.0)]
-
-    step = duration / seg_count
-    segments = []
-    for i in range(seg_count):
-        start = max(0.0, i * step - (overlap if i else 0.0))
-        end = duration if i == seg_count - 1 else (i + 1) * step
-        if end - start > 0.05:
-            segments.append((start, end))
-    return segments or [(0.0, duration)]
-
-
 # ---------------------------------------------------------------------------
-# Hardware acceleration selection
+# FFmpeg log records
 #
-# ``ffmpeg -hwaccels`` lists the methods the binary was COMPILED with, not
-# the methods that can open a device on this machine. A gyan.dev build lists
-# ``cuda`` on a laptop with no NVIDIA GPU; ``-hwaccel cuda`` there does not
-# fall back to software — device creation fails, FFmpeg exits 255 having
-# decoded zero frames, and because the failure lines are exactly what
-# HWACCEL_NOISE_PATTERNS scrubs from stderr, the deep scan then reported a
-# clean pass for every frame-level check. Selection therefore probes each
-# candidate with a real one-frame decode of the file being scanned (cached
-# per process), and a method that fails device initialisation is never
-# offered again.
+# The integrity scan runs with ``-loglevel level+verbose``: every record then
+# carries its severity tag ("[h264 @ 0x..] [error] ..."), and FFmpeg prints
+# exact per-stream accounting at the end ("Input stream #0:0 (video): 1200
+# packets read ...; 1198 frames decoded; 2 decode errors"). Verdicts come
+# from that accounting and from the severity tags, never from free-text
+# pattern matches, which used to trip on file names and metadata.
 # ---------------------------------------------------------------------------
 
-_hwaccel_failed_methods: set = set()
-_hwaccel_probe_cache: dict = {}
+_LOG_LINE_RE = re.compile(
+    r"^(?P<ctx>(?:\[[^\[\]\n]* @ [0-9A-Fa-fx]+\]\s*)*)"
+    r"\[(?P<level>trace|debug|verbose|info|warning|error|fatal|panic)\]\s?(?P<msg>.*)$")
+_CONTEXT_RE = re.compile(r"\[([^\[\]\n]*) @ [0-9A-Fa-fx]+\]")
+_STREAM_STATS_RE = re.compile(
+    r"Input stream #(\d+):(\d+) \((\w+)\): (\d+) packets read \((\d+) bytes\); "
+    r"(\d+) frames decoded(?:; (\d+) decode errors)?(?: \((\d+) samples\))?")
+_CORRUPT_FRAME_RE = re.compile(r"corrupt decoded frame")
+_CORRUPT_PACKET_RE = re.compile(r"corrupt input packet in stream (\d+)")
+_INPUT_STREAM_CONTEXT_RE = re.compile(r"^[vas]ist#\d+:(\d+)")
+_LOUDNESS_LINE_RE = re.compile(
+    r"\[ebur128@|^\s*(?:I|Peak|Threshold|LRA(?: low| high)?):\s"
+    r"|Integrated loudness:|True peak:|Loudness range:")
+_DECODER_UNAVAILABLE_RE = re.compile(
+    r"no decoder|decoder \(codec [^)]*\) not found|unknown decoder|unsupported codec"
+    r"|could not find codec|decoding requested, but no decoder", re.IGNORECASE)
+_ERROR_LEVELS = ("error", "fatal", "panic")
+MAX_ERROR_SAMPLES = 20
+# Above this many channels per track the per-channel split is skipped (and
+# reported as not verified) rather than building an enormous filter graph.
+MAX_CHANNEL_SPLIT = 32
+INTEGRITY_MIN_DECODED_RATIO = 0.98
 
-# Lines that mean "the hardware device could not be initialised", as opposed
-# to "the file is damaged". A decode that dies this way produced no frames,
-# so its (empty) findings must never be read as a clean result.
-_HWACCEL_DEVICE_FAILURE_PATTERNS = (
-    "Device creation failed",
-    "No device available",
-    "Hardware device setup failed",
-    "Failed to initialise",
-    "Failed to initialize",
-    "Cannot init CUDA",
-    "vaInitialize failed",
-)
+
+def _parse_log_line(line: str) -> Tuple[List[str], Optional[str], str]:
+    """(contexts, level, message) of one record; level None for continuations."""
+    match = _LOG_LINE_RE.match(line)
+    if not match:
+        return [], None, line
+    return _CONTEXT_RE.findall(match.group("ctx")), match.group("level"), match.group("msg")
 
 
-def _stderr_shows_device_failure(stderr_text: str) -> bool:
-    if not stderr_text:
-        return False
-    return any(p in stderr_text for p in _HWACCEL_DEVICE_FAILURE_PATTERNS)
+def _is_decode_evidence(line: str) -> bool:
+    """Records the integrity verdict depends on: errors and decoder accounting."""
+    _, level, message = _parse_log_line(line)
+    return (level in _ERROR_LEVELS
+            or bool(_CORRUPT_FRAME_RE.search(message)
+                    or _CORRUPT_PACKET_RE.search(message)
+                    or _STREAM_STATS_RE.search(message)))
 
 
-def _probe_hwaccel(ffmpeg_path: str, method: str, sample_file: str) -> bool:
-    """True if `method` can really decode on this machine.
+class _DecodeAccounting:
+    """Exact running counts of decoder-reported damage.
 
-    One frame is enough: device creation happens before the first frame, so
-    a method with no usable device fails immediately. Cached per
-    (binary, method) — the answer cannot change while the process runs.
+    Counted while the log streams, independently of the bounded text capture,
+    so a file with thousands of damaged frames is never under-counted.
     """
-    key = (ffmpeg_path, method)
-    if key in _hwaccel_probe_cache:
-        return _hwaccel_probe_cache[key]
-    ok = False
-    try:
-        proc = subprocess.run(
-            [ffmpeg_path, "-nostdin", "-hide_banner", "-v", "error",
-             "-hwaccel", method, "-i", sample_file,
-             "-frames:v", "1", "-f", "null", "-"],
-            capture_output=True, text=True, timeout=30,
-            env=_get_clean_env(), **_subprocess_kwargs())
-        ok = proc.returncode == 0
-    except Exception:
-        ok = False
-    _hwaccel_probe_cache[key] = ok
-    if not ok:
-        _hwaccel_failed_methods.add(method)
-    return ok
+
+    def __init__(self):
+        self.stream_stats: Dict[int, dict] = {}
+        self.corrupt_frames: Counter = Counter()
+        self.corrupt_packets: Counter = Counter()
+        self.messages: List[str] = []
+
+    def add(self, line: str) -> None:
+        contexts, level, message = _parse_log_line(line)
+        stats = _STREAM_STATS_RE.search(message)
+        if stats:
+            index = int(stats.group(2))
+            self.stream_stats[index] = {
+                "kind": stats.group(3),
+                "packets": int(stats.group(4)),
+                "frames": int(stats.group(6)),
+                "errors": int(stats.group(7) or 0),
+                "samples": int(stats.group(8)) if stats.group(8) else None,
+            }
+            return
+        if _CORRUPT_FRAME_RE.search(message):
+            self.corrupt_frames[self._stream_index(contexts)] += 1
+            self._sample(contexts, message)
+            return
+        packet = _CORRUPT_PACKET_RE.search(message)
+        if packet:
+            self.corrupt_packets[int(packet.group(1))] += 1
+            self._sample(contexts, message)
+            return
+        if level in _ERROR_LEVELS:
+            self._sample(contexts, message)
+
+    @staticmethod
+    def _stream_index(contexts: List[str]) -> int:
+        for context in contexts:
+            match = _INPUT_STREAM_CONTEXT_RE.match(context)
+            if match:
+                return int(match.group(1))
+        return -1
+
+    def _sample(self, contexts: List[str], message: str) -> None:
+        if len(self.messages) < MAX_ERROR_SAMPLES:
+            source = contexts[-1] if contexts else "ffmpeg"
+            self.messages.append(f"[{source}] {message.strip()}"[:200])
+
+    @property
+    def decode_failures(self) -> int:
+        return sum(s["errors"] for s in self.stream_stats.values())
+
+    @property
+    def total_errors(self) -> int:
+        """Undecodable packets + frames the decoder flagged corrupt + packets
+        the demuxer flagged corrupt: all FFmpeg's own accounting."""
+        return (self.decode_failures + sum(self.corrupt_frames.values())
+                + sum(self.corrupt_packets.values()))
+
+    def decoder_unavailable(self) -> bool:
+        return any(_DECODER_UNAVAILABLE_RE.search(m) for m in self.messages)
 
 
-def _get_optimal_hwaccel(cfg: dict, probe_file: Optional[str] = None) -> List[str]:
-    """Determine the best hwaccel method available on this system.
-    Returns FFmpeg hwaccel args list, or empty list if disabled/software.
+class _ScanLog:
+    """Feeds every record to the exact accounting and the bounded capture."""
 
-    A candidate is returned only if it is not already known to fail on this
-    machine and — when `probe_file` is given — a one-frame probe decode of
-    that file succeeds with it. With no probe file the compile-time list is
-    trusted as before, minus any method already known to fail.
+    def __init__(self, cfg: dict):
+        self.capture = _BoundedStderrCapture(cfg)
+        self.accounting = _DecodeAccounting()
+
+    def add(self, line: str) -> None:
+        self.accounting.add(line)
+        self.capture.add(line)
+
+    def note_fragment_split(self) -> None:
+        self.capture.note_fragment_split()
+
+
+def _lines_with_context(text: str, name: str) -> str:
+    """Records logged by the filter instance ``name`` (exact match)."""
+    kept = []
+    for line in text.splitlines():
+        contexts, _, _ = _parse_log_line(line)
+        if name in contexts:
+            kept.append(line)
+    return "\n".join(kept)
+
+
+# ---------------------------------------------------------------------------
+# Scan plan
+# ---------------------------------------------------------------------------
+
+_LAYOUT_CHANNELS = {
+    "mono": ["FC"], "stereo": ["FL", "FR"], "2.1": ["FL", "FR", "LFE"],
+    "3.0": ["FL", "FR", "FC"], "quad": ["FL", "FR", "BL", "BR"],
+    "4.0": ["FL", "FR", "FC", "BC"], "5.0": ["FL", "FR", "FC", "BL", "BR"],
+    "5.0(side)": ["FL", "FR", "FC", "SL", "SR"],
+    "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
+    "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
+    "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
+    "7.1(wide)": ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"],
+}
+
+
+def _channel_names(track: dict, count: int) -> List[str]:
+    names = _LAYOUT_CHANNELS.get(str(track.get("channel_layout") or "").lower())
+    if names and len(names) == count:
+        return names
+    return [f"ch{k + 1}" for k in range(count)]
+
+
+class _ScanPlan:
+    """What the integrity pass decodes and what it should find."""
+
+    def __init__(self, probe_data: dict, cfg: dict, variable_rate: bool = False):
+        self.video = _primary_video_stream(probe_data)
+        self.audio = _audio_streams(probe_data)
+        self.duration = _probed_duration(probe_data)
+        self.loudness = (cfg.get("loudness_mode", "advisory") != "off") and bool(self.audio)
+        self.variable_rate = variable_rate
+
+    def video_frames_unreliable(self) -> bool:
+        """True when no declared frame count exists and the timing is variable."""
+        declared = _safe_int((self.video or {}).get("nb_frames"))
+        return bool(self.variable_rate) and not (declared and declared > 0)
+
+    def video_fps(self) -> float:
+        if not self.video:
+            return 0.0
+        return (parse_frame_rate(self.video.get("avg_frame_rate", "0/0"))
+                or parse_frame_rate(self.video.get("r_frame_rate", "0/0")))
+
+    def video_expected_frames(self) -> Optional[int]:
+        """Frames the container says exist: nb_frames, else duration x rate."""
+        if not self.video:
+            return None
+        declared = _safe_int(self.video.get("nb_frames"))
+        if declared and declared > 0:
+            return declared
+        fps = self.video_fps()
+        duration = _stream_duration(self.video) or self.duration
+        if fps > 0 and duration:
+            return int(round(duration * fps))
+        return None
+
+    @staticmethod
+    def channels(track: dict) -> int:
+        return _safe_int(track.get("channels"), 0) or 0
+
+    def audio_expected_seconds(self, track: dict) -> Optional[float]:
+        return _stream_duration(track) or self.duration
+
+    def frame_check_names(self) -> List[str]:
+        names = ["File Integrity"]
+        if self.video:
+            names += ["Black Frames", "Freeze Frames"]
+        if self.audio:
+            names += ["Audio Silence", "Dead Channel"]
+            if self.loudness:
+                names.append("Audio Loudness")
+        return names
+
+
+def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) -> List[str]:
+    """One software-decode pass over the whole file with every detector attached.
+
+    No ``-hwaccel``: hardware decoders conceal damage differently (the same
+    corrupt clip gave 16 errors and a phantom freeze on VideoToolbox, 175
+    errors and no freeze in software), so the verdict depended on the machine
+    and on which file happened to be scanned first.
     """
-    if not cfg.get("use_hwaccel", True):
-        return []
+    noise = float(cfg["silence_noise_db"])
+    silence = float(cfg["silence_duration"])
+    chains, maps = [], []
+    if plan.video is not None:
+        chains.append(
+            f"[0:{int(plan.video['index'])}]"
+            f"blackdetect@v=d={float(cfg['black_detect_duration'])}"
+            f":pix_th={float(cfg['black_detect_pix_threshold'])},"
+            f"freezedetect@v=n={float(cfg['freeze_detect_noise'])}"
+            f":d={float(cfg['freeze_detect_duration'])}[v]")
+        maps += ["-map", "[v]"]
+    for i, track in enumerate(plan.audio):
+        source = f"[0:{int(track['index'])}]"
+        count = plan.channels(track)
+        if 1 < count <= MAX_CHANNEL_SPLIT:
+            labels = [f"[a{i}m]"] + [f"[a{i}c{k}]" for k in range(count)]
+            chains.append(f"{source}asplit={count + 1}{''.join(labels)}")
+            source = f"[a{i}m]"
+            for k in range(count):
+                chains.append(f"[a{i}c{k}]pan=mono|c0=c{k},"
+                              f"silencedetect@a{i}c{k}=n={noise}dB:d={silence},anullsink")
+        chain = f"{source}silencedetect@a{i}=n={noise}dB:d={silence}"
+        if plan.loudness:
+            chain += f",ebur128@a{i}=peak=true:framelog=quiet"
+        chains.append(chain + f"[a{i}]")
+        maps += ["-map", f"[a{i}]"]
+    threads = max(1, int(cfg.get("filter_threads", 4) or 4))
+    return ([ffmpeg, "-nostdin", "-hide_banner", "-nostats",
+             "-loglevel", "level+verbose", "-progress", "pipe:1",
+             "-i", filepath, "-filter_complex_threads", str(threads),
+             "-filter_complex", ";".join(chains)]
+            + maps + ["-f", "null", "-"])
 
-    method = cfg.get("hwaccel_method", "auto")
-    ffmpeg_path = get_ffmpeg_path() if _HAS_TOOLS_MODULE else "ffmpeg"
 
-    def _usable(candidate: str) -> bool:
-        if candidate in _hwaccel_failed_methods:
-            return False
-        if probe_file and ffmpeg_path:
-            return _probe_hwaccel(ffmpeg_path, candidate, probe_file)
-        return True
-
-    if method != "auto":
-        return ["-hwaccel", method] if _usable(method) else []
-
-    # Auto-detect: try preferred methods in order
-    if _HAS_TOOLS_MODULE:
-        caps = detect_ffmpeg_capabilities()
-        hw_methods = caps.get("hwaccel_methods", [])
-        # Priority order: cuda > videotoolbox > vaapi > dxva2 > d3d11va
-        for preferred in ["cuda", "videotoolbox", "vaapi", "dxva2", "d3d11va"]:
-            if preferred in hw_methods and _usable(preferred):
-                return ["-hwaccel", preferred]
-
-    # FFmpeg's own "auto" probes devices itself and falls back to software
-    # decoding when none initialises, so it is safe to offer unprobed.
-    if _usable("auto"):
-        return ["-hwaccel", "auto"]
-    return []
+class _ScanOutcome:
+    def __init__(self):
+        self.returncode: Optional[int] = None
+        self.timed_out = False
+        self.timeout = 0.0
+        self.reader_failed = False
+        self.launch_error: Optional[str] = None
+        self.last_out_time: Optional[float] = None
+        self.log_text = ""
+        self.accounting = _DecodeAccounting()
 
 
-def _run_segment_filter_scan(filepath: str, start_time: float, end_time: float,
-                             vf_str: str, af_str: Optional[str], has_audio: bool,
-                             cfg: dict,
-                             cancel_event: Optional[threading.Event] = None,
-                             process_owner=None) -> Optional[str]:
-    """Run a filter scan on a time segment. Returns stderr text, or None on failure.
-
-    Uses ``-ss`` before ``-i`` for fast input seeking, which resets output PTS
-    to zero — callers must add ``start_time`` back to every parsed timestamp.
-
-    Verbosity must stay at ``info``: blackdetect/freezedetect/silencedetect all
-    report their findings at AV_LOG_INFO, so ``-v error`` would suppress every
-    detection and make the deep scan silently pass everything.
-    """
+def _run_scan_process(cmd: List[str], timeout: float, duration: Optional[float], cfg: dict,
+                      progress_callback: Optional[Callable],
+                      cancel_event: Optional[threading.Event],
+                      process_owner) -> Optional[_ScanOutcome]:
+    """Run the integrity pass; None when cancelled."""
     if cancel_event is not None and cancel_event.is_set():
         return None
-    duration = end_time - start_time
-    ffmpeg_path = get_ffmpeg_path()
-    if not ffmpeg_path:
-        return None
-    hwaccel_args = _get_optimal_hwaccel(cfg, probe_file=filepath)
-    ft = str(cfg.get("filter_threads", 4))
-    cmd = [ffmpeg_path, "-nostdin", "-hide_banner"] + hwaccel_args + [
-        "-ss", str(start_time), "-t", str(duration),
-        "-i", filepath,
-        "-filter_threads", ft,
-        "-v", "info",
-        "-vf", vf_str
-    ]
-    if af_str and has_audio:
-        cmd += ["-af", af_str]
-    cmd += ["-f", "null", "-"]
-
-    proc = None
-    stderr_thread = None
-    stderr_started = False
+    outcome = _ScanOutcome()
+    outcome.timeout = timeout
+    log = _ScanLog(cfg)
     try:
-        # stdout is unused. Sending it to DEVNULL leaves one pipe to drain and
-        # avoids the classic two-pipe deadlock while stderr is consumed live.
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=False, bufsize=0, env=_get_clean_env(), **_subprocess_kwargs())
-        _register_owned_proc(proc, process_owner)
-        capture = _BoundedStderrCapture(cfg)
-        reader_errors = []
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=False, bufsize=0, env=_get_clean_env(),
+                                **_subprocess_kwargs())
+    except (OSError, ValueError) as exc:
+        outcome.launch_error = f"{type(exc).__name__}: {exc}"
+        return outcome
+    _register_owned_proc(proc, process_owner)
+    reader_errors = []
 
-        def _drain_stderr():
+    def _read_stderr():
+        try:
+            log.capture.peak_pending_chars = _drain_binary_records(proc.stderr, log.add)
+        except (OSError, ValueError, TypeError, AssertionError) as exc:
+            reader_errors.append(exc)
+
+    def _on_progress(line: str):
+        line = line.strip()
+        if not line.startswith("out_time_us="):
+            return
+        microseconds = _safe_int(line.split("=", 1)[1])
+        if microseconds is None or microseconds < 0:
+            return
+        outcome.last_out_time = microseconds / 1_000_000
+        if progress_callback:
+            progress_callback("filter", outcome.last_out_time, duration or 0.0,
+                              "Integrity scan (software decode)")
+
+    def _read_stdout():
+        try:
+            _drain_binary_records(proc.stdout, _on_progress)
+        except (OSError, ValueError, TypeError, AssertionError) as exc:
+            reader_errors.append(exc)
+
+    def _join(thread, stream) -> bool:
+        thread.join(timeout=5)
+        if thread.is_alive():
             try:
-                capture.peak_pending_chars = _drain_binary_records(
-                    proc.stderr, capture.add)
-            except (OSError, ValueError, TypeError, AssertionError) as exc:
-                reader_errors.append(exc)
+                stream.close()
+            except (OSError, ValueError):
+                pass
+            thread.join(timeout=1)
+        return not thread.is_alive()
 
-        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    try:
+        stderr_thread = threading.Thread(target=_read_stderr, daemon=True)
+        stdout_thread = threading.Thread(target=_read_stdout, daemon=True)
         stderr_thread.start()
-        stderr_started = True
-
-        def _join_stderr_reader() -> bool:
-            stderr_thread.join(timeout=5)
-            if stderr_thread.is_alive():
-                # A completed/killed child must close its pipe. Refuse a
-                # partial clean result if an abnormal stream stays blocked.
-                try:
-                    proc.stderr.close()
-                except (OSError, ValueError):
-                    pass
-                stderr_thread.join(timeout=1)
-            return not stderr_thread.is_alive()
-
-        proc.wait(timeout=_calc_timeout(duration, cfg))
-        if not _join_stderr_reader():
-            return None
-        if reader_errors and not (cancel_event and cancel_event.is_set()):
-            return None
-
-        stderr = capture.result()
-        if cancel_event is not None and cancel_event.is_set():
-            return None
-        if proc.returncode:
-            # A non-zero exit used to be ignored, so a decode that died at
-            # device initialisation (zero frames) returned its error text
-            # and was parsed as "no events found" — a clean pass.
-            if hwaccel_args and _stderr_shows_device_failure(stderr):
-                # Remember it so no later segment or file picks it again.
-                _hwaccel_failed_methods.add(hwaccel_args[1])
-                return None
-            produced = stderr or ""
-            if not any(tok in produced for tok in (
-                    "black_start", "freeze_start", "silence_start", "frame=")):
-                # Nothing was decoded and nothing was detected: this segment
-                # failed, and the caller must count it as uncovered rather
-                # than clean. (A segment that decoded part of the file before
-                # failing keeps its real findings and its decode errors.)
-                return None
-        return stderr
-    except subprocess.TimeoutExpired:
-        if proc:
+        stdout_thread.start()
+        try:
+            outcome.returncode = proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            outcome.timed_out = True
             proc.kill()
             try:
                 proc.wait(timeout=5)
             except (subprocess.TimeoutExpired, OSError, ValueError):
                 pass
-            if stderr_thread is not None and stderr_started:
-                _join_stderr_reader()
-        return None
-    except (OSError, ValueError, TypeError):
-        if proc:
-            try:
-                proc.kill()
-                proc.wait(timeout=5)
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                pass
-            if stderr_thread is not None and stderr_started:
-                _join_stderr_reader()
-        return None
+        readers_done = _join(stderr_thread, proc.stderr) and _join(stdout_thread, proc.stdout)
+        outcome.reader_failed = not readers_done or bool(reader_errors)
     finally:
-        # None (not "") so the caller can tell a failed segment apart from a
-        # clean one — an empty string would look like "no events found".
         _unregister_owned_proc(proc, process_owner)
+    if cancel_event is not None and cancel_event.is_set():
+        return None
+    outcome.log_text = log.capture.result()
+    outcome.accounting = log.accounting
+    return outcome
 
 
-# ============================================================================
-# DEEP SCAN (Checks 14-18)
-# ============================================================================
 
-def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
-                  progress_callback: Optional[Callable] = None,
-                  cancel_event: Optional[threading.Event] = None,
-                  quick: bool = False,
-                  probe_data: Optional[dict] = None,
-                  process_owner=None):
+# ---------------------------------------------------------------------------
+# Integrity scan reporting
+# ---------------------------------------------------------------------------
+
+def _mark_not_verified(result: QAResult, names: List[str], reason: str) -> None:
+    for name in names:
+        result.add_not_verified(name, reason)
+
+
+def _not_run_reason(outcome: _ScanOutcome, plan: _ScanPlan) -> Optional[str]:
+    """Why the pass produced no usable evidence, or None if it did."""
+    if outcome.launch_error:
+        return f"FFmpeg could not be started ({outcome.launch_error})."
+    if outcome.timed_out:
+        reached = (f" after decoding {outcome.last_out_time:.1f} s" if outcome.last_out_time else "")
+        of = f" of {plan.duration:.1f} s" if plan.duration else ""
+        return f"the integrity scan timed out after {int(outcome.timeout)} s{reached}{of}."
+    if outcome.reader_failed:
+        return "FFmpeg output could not be read completely."
+    accounting = outcome.accounting
+    if not accounting.stream_stats and outcome.returncode:
+        if accounting.decoder_unavailable():
+            return "the bundled FFmpeg has no decoder for this codec."
+        first = accounting.messages[0] if accounting.messages else "no error message"
+        return f"FFmpeg exited with code {outcome.returncode} before decoding ({first})."
+    return None
+
+
+def _decoded_video_seconds(plan: _ScanPlan, accounting: _DecodeAccounting) -> Optional[float]:
+    stats = accounting.stream_stats.get(int(plan.video["index"])) if plan.video else None
+    fps = plan.video_fps()
+    if stats is None or fps <= 0:
+        return None
+    return stats["frames"] / fps
+
+
+def _decoded_audio_seconds(track: dict, accounting: _DecodeAccounting) -> Optional[float]:
+    stats = accounting.stream_stats.get(int(track["index"]))
+    rate = _safe_int(track.get("sample_rate"), 0) or 0
+    if stats is None or stats.get("samples") is None or rate <= 0:
+        return None
+    return stats["samples"] / rate
+
+
+def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
+              last_out_time: Optional[float]) -> Tuple[List[str], List[str], List[str]]:
+    """(per-stream descriptions, shortfalls, streams whose completeness is unknown).
+
+    A stream is short when it decoded under 98% of what its own header
+    declares, with a small absolute slack (2 frames / 0.1 s) so a 1-second
+    clip that loses its last frame to an edit list is not called truncated.
+    A truncated copy keeps its original header, so this is the measurement
+    that catches it: the old scan never compared decoded media with the
+    probed duration.
     """
-    Run FFmpeg-based deep scan for frame-level defects.
+    described, short, unknown = [], [], []
+    if plan.video is not None and plan.video_frames_unreliable():
+        # VFR without a declared frame count: duration x rate predicts the
+        # wrong number of frames, so judge the video by decoded time instead.
+        expected_s = _stream_duration(plan.video) or plan.duration
+        decoded_s = last_out_time or 0.0
+        if not expected_s:
+            unknown.append("video")
+        else:
+            described.append(f"{decoded_s:.2f}/{expected_s:.2f} s video (variable frame rate)")
+            if decoded_s < expected_s * INTEGRITY_MIN_DECODED_RATIO - 0.1:
+                short.append(f"decoding stopped at {decoded_s:.2f} of {expected_s:.2f} s "
+                             f"({decoded_s / expected_s * 100:.0f}%)")
+    elif plan.video is not None:
+        stats = accounting.stream_stats.get(int(plan.video["index"]))
+        expected = plan.video_expected_frames()
+        decoded = stats["frames"] if stats else 0
+        if not expected:
+            unknown.append("video")
+            described.append(f"{decoded} video frames")
+        else:
+            described.append(f"{decoded}/{expected} video frames")
+            if decoded < expected * INTEGRITY_MIN_DECODED_RATIO - 2:
+                short.append(f"video decoded {decoded} of {expected} frames "
+                             f"({decoded / expected * 100:.0f}%)")
+    total = len(plan.audio)
+    for position, track in enumerate(plan.audio):
+        name = f"audio track {position + 1}" if total > 1 else "audio"
+        expected = plan.audio_expected_seconds(track)
+        decoded = _decoded_audio_seconds(track, accounting)
+        if decoded is None:
+            decoded = 0.0 if accounting.stream_stats else None
+        if decoded is None or not expected:
+            unknown.append(name)
+            if decoded is not None:
+                described.append(f"{decoded:.2f} s {name}")
+            continue
+        described.append(f"{decoded:.2f}/{expected:.2f} s {name}")
+        if decoded < expected * INTEGRITY_MIN_DECODED_RATIO - 0.1:
+            short.append(f"{name} decoded {decoded:.2f} of {expected:.2f} s "
+                         f"({decoded / expected * 100:.0f}%)")
+    return described, short, unknown
 
-    Single-pass decode+filter scan, executed as parallel segments for files
-    long enough to benefit, with a parallel loudness pass.
 
-    Segmentation is deterministic and overlapping (see ``_segment_boundaries``):
-    repeat scans of the same file with the same settings produce the same
-    findings, and an event lying across a segment join is still detected.
-    """
-    duration = get_file_duration(filepath, process_owner, cancel_event)
-    if duration <= 0:
-        result.add_skip("Deep Scan", "Could not determine file duration.")
+def _report_file_integrity(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:
+    """FAIL a truncated or damaged file; "Not verified" when completeness is unmeasurable."""
+    accounting = outcome.accounting
+    if not accounting.stream_stats:
+        result.add_not_verified("File Integrity", "FFmpeg reported no decoder statistics.")
         return
+    described, short, unknown = _coverage(plan, accounting, outcome.last_out_time)
+    errors = accounting.total_errors
+    allowed = int(cfg.get("max_decode_errors", 0))
+    result.set_metadata("decode_errors", errors)
+    if accounting.messages:
+        result.set_metadata("decode_error_samples", accounting.messages[:5])
+    decoded_video = _decoded_video_seconds(plan, accounting)
+    if decoded_video is not None:
+        result.set_metadata("decoded_video_seconds", round(decoded_video, 3))
 
-    # Safety gate: a 20GB+/multi-hour file decoded at full parallelism OOM'd
-    # Windows. Skip frame-level analysis with a clear reason instead of
-    # crashing; metadata checks above still ran.
-    try:
-        file_gb = os.path.getsize(filepath) / (1024 ** 3)
-    except OSError:
-        file_gb = 0.0
-    max_gb = float(cfg.get("deep_scan_max_file_gb", 8.0) or 8.0)
-    max_dur = float(cfg.get("deep_scan_max_duration_s", 7200.0) or 7200.0)
-    if file_gb > max_gb or duration > max_dur:
-        result.add_warn(
-            "Deep Scan",
-            f"Frame-level analysis not run: file is {file_gb:.1f} GB / "
-            f"{duration:.0f}s (limits {max_gb:.0f} GB / {max_dur:.0f}s). "
-            f"Metadata checks still apply.")
-        result.set_metadata("deep_scan_skipped_reason", "size_or_duration_gate")
+    problems = []
+    if short:
+        problems.append("Truncated or incomplete: " + "; ".join(short))
+    if errors > allowed:
+        breakdown = []
+        if accounting.decode_failures:
+            breakdown.append(f"{accounting.decode_failures} undecodable packet(s)")
+        if accounting.corrupt_frames:
+            breakdown.append(f"{sum(accounting.corrupt_frames.values())} corrupt frame(s)")
+        if accounting.corrupt_packets:
+            breakdown.append(f"{sum(accounting.corrupt_packets.values())} corrupt packet(s)")
+        sample = "; ".join(accounting.messages[:3])
+        problems.append(f"{errors} decoder error(s), max allowed {allowed} "
+                        f"({', '.join(breakdown)})" + (f". First: {sample}" if sample else ""))
+    if problems:
+        result.add_fail("File Integrity", ". ".join(problems) + ".")
         return
-
-    # Set duration metadata if not already set by check_duration
-    if "duration_seconds" not in result.metadata:
-        result.set_metadata("duration_seconds", round(duration, 2))
-        dur_s = int(duration)
-        result.set_metadata("duration_display", f"{dur_s // 3600:02d}:{(dur_s % 3600) // 60:02d}:{dur_s % 60:02d}")
-
-    timeout = _calc_timeout(duration, cfg)
-
-    # v0.4.2: Reuse probe_data from caller to avoid redundant FFprobe call
-    if probe_data is None:
-        probe_data = run_ffprobe(filepath, process_owner, cancel_event)
-    audio_streams = [s for s in (probe_data or {}).get("streams", []) if s.get("codec_type") == "audio"]
-    has_audio = len(audio_streams) > 0
-
-    # Build hwaccel args (v0.3: adaptive detection). Probed against this
-    # file: a compile-time hwaccel method with no device on this machine
-    # must never be selected — its decode dies before the first frame and
-    # the empty result used to be reported as a clean pass.
-    # ---- Quick mode: skip deep scan entirely ----
-    # Checked before hardware-decode probing: those probes spawn up to five
-    # FFmpeg test decodes that quick mode never uses.
-    if quick:
-        result.add_skip("Decode Integrity", "Skipped (quick mode)")
-        result.add_skip("Black Frames", "Skipped (quick mode)")
-        result.add_skip("Freeze Frames", "Skipped (quick mode)")
-        result.add_skip("Audio Silence", "Skipped (quick mode)")
-        # REMOVED v0.4.4: result.add_skip("Audio Loudness", "Skipped (quick mode)")
+    summary = f"Software decode of {', '.join(described)}; {errors} decoder error(s)"
+    if errors:
+        summary += f" (within the allowed {allowed})"
+    if unknown:
+        result.add_not_verified(
+            "File Integrity",
+            f"completeness cannot be measured because the container declares no duration "
+            f"for {', '.join(unknown)} ({summary}).")
         return
+    result.add_pass("File Integrity", summary + ".")
 
-    hwaccel_args = _get_optimal_hwaccel(cfg, probe_file=filepath)
 
-    # Build filter strings — video and audio SEPARATE
-    vf_str = (
-        f"blackdetect=d={cfg['black_detect_duration']}:pix_th={cfg['black_detect_pix_threshold']},"
-        f"freezedetect=n={cfg['freeze_detect_noise']}:d={cfg['freeze_detect_duration']}"
-    )
-
-    if has_audio:
-        af_str = (
-            f"silencedetect=n={cfg['silence_noise_db']}dB:d={cfg['silence_duration']},"
-            f"ebur128=peak=true"
-        )
-    else:
-        af_str = None
-
-    if progress_callback:
-        progress_callback("filter", 0, duration, "Deep Scan [combined]")
-
-    # Segment-based parallel scan for large files
-    use_segments = (
-        cfg.get("segment_enabled", True)
-        and duration >= cfg.get("segment_min_duration", 30.0)
-        and cfg.get("segment_count", 8) > 1
-    )
-
-    stderr_text = ""
-
-    if use_segments:
-        seg_count = cfg.get("segment_count", 8)
-
-        # Each segment must overlap its predecessor by at least the longest
-        # detection window, or an event straddling the join is split into two
-        # sub-threshold halves and reported by neither segment.
-        overlap = max(
-            float(cfg.get("black_detect_duration", 0.5)),
-            float(cfg.get("freeze_detect_duration", 2.0)),
-            float(cfg.get("silence_duration", 2.0)),
-        ) + 1.0
-        segments = _segment_boundaries(duration, seg_count, overlap)
-
-        # Segments use silence detection only (no ebur128 — needs full file)
-        seg_af_str = f"silencedetect=n={cfg['silence_noise_db']}dB:d={cfg['silence_duration']}" if has_audio else None
-
-        try:
-            segment_results = []
-            segment_capture_truncated = 0
-            failed_segments = 0
-            cancelled = False
-
-            # Cap max_workers: up to 8 concurrent 4K ffmpeg decodes OOM'd /
-            # crashed Windows. 2-4 workers saturate decode on most machines;
-            # more only multiplies memory (each holds its own stderr).
-            max_workers = min(len(segments), max(1, (os.cpu_count() or 4) // 2), 4)
-
-            with ThreadPoolExecutor(max_workers=max_workers) as seg_executor:
-                seg_futures = {
-                    seg_executor.submit(
-                        _run_segment_filter_scan, filepath,
-                        seg_start, seg_end, vf_str, seg_af_str, has_audio, cfg,
-                        cancel_event, process_owner
-                    ): idx
-                    for idx, (seg_start, seg_end) in enumerate(segments)
-                }
-
-                completed = 0
-                for future in as_completed(seg_futures):
-                    if cancel_event and cancel_event.is_set():
-                        cancelled = True
-                        for f in seg_futures:
-                            if not f.done():
-                                f.cancel()
-                        break
-
-                    idx = seg_futures[future]
-                    try:
-                        seg_stderr = future.result()
-                    except Exception:
-                        seg_stderr = None
-                    if seg_stderr is None:
-                        failed_segments += 1
-                        seg_stderr = ""
-                    else:
-                        segment_capture_truncated += getattr(
-                            seg_stderr, "truncated_records", 0)
-                    # -ss before -i zeroes the segment's PTS, so shift every
-                    # reported timestamp back onto the whole-file timeline.
-                    segment_results.append((idx, _close_open_regions(
-                        _offset_event_times(seg_stderr, segments[idx][0]),
-                        segments[idx][1])))
-                    completed += 1
-                    if progress_callback:
-                        progress_callback("filter", completed * (duration / len(segments)), duration, "Deep Scan [combined]")
-
-            if cancelled:
-                return
-
-            if failed_segments:
-                # Never let a failed segment masquerade as a clean one. "Deep
-                # Scan" is in ADVISORY_CHECKS so this actually reaches the
-                # verdict as PASS_WITH_WARNINGS instead of being discarded.
-                covered_pct = (len(segments) - failed_segments) / len(segments) * 100
-                result.set_metadata("deep_scan_coverage_pct", round(covered_pct, 1))
-                result.add_warn(
-                    "Deep Scan",
-                    f"{failed_segments} of {len(segments)} segments failed to scan "
-                    f"(timeout or decode error). Only ~{covered_pct:.0f}% of the file "
-                    f"was analysed — findings below are not a full-coverage result.",
-                    confidence=40,
-                )
-
-            if failed_segments and failed_segments >= len(segments):
-                # Nothing was scanned at all. Parsing the empty stderr below
-                # would still record clean PASSes ("Full decode completed
-                # with no errors") for checks that never ran — the coverage
-                # warning above is the whole verdict.
-                return
-
-            segment_results.sort(key=lambda x: x[0])
-            stderr_text, truncated = _cap_stderr_text(
-                "\n".join(r[1] for r in segment_results), cfg)
-            total_truncated = segment_capture_truncated + truncated
-            if total_truncated:
-                result.set_metadata(
-                    "deep_scan_stderr_truncated_lines", total_truncated)
-
-        except Exception as e:
-            result.add_warn("Filter Scan", f"Segment scan failed: {str(e)[:100]}. Falling back to single-pass.")
-            use_segments = False
-
-    if not use_segments:
-        # Single-pass combined scan (decode + filters in one FFmpeg call).
-        # -v info is required: the detect filters log their findings at info level.
-        ffmpeg_path = get_ffmpeg_path()
-        if not ffmpeg_path:
-            result.add_skip("Deep Scan", "FFmpeg not found.")
-            return
-        ft = str(cfg.get("filter_threads", 4))
-        filter_cmd = [ffmpeg_path, "-nostdin", "-hide_banner"] + hwaccel_args + [
-            "-v", "info", "-progress", "pipe:1",
-            "-i", filepath,
-            "-filter_threads", ft,
-            "-vf", vf_str
-        ]
-        if af_str:
-            filter_cmd += ["-af", af_str]
-        filter_cmd += ["-f", "null", "-"]
-
-        try:
-            proc = subprocess.Popen(
-                filter_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=False, bufsize=0, env=_get_clean_env(),
-                **_subprocess_kwargs()
-            )
-            _register_owned_proc(proc, process_owner)
-            capture = _BoundedStderrCapture(cfg)
-            stderr_errors = []
-            stdout_errors = []
-            decode_progressed = False
-
-            def _read_stderr_combined():
-                try:
-                    capture.peak_pending_chars = _drain_binary_records(
-                        proc.stderr, capture.add)
-                except (OSError, ValueError, TypeError, AssertionError) as exc:
-                    stderr_errors.append(exc)
-
-            def _handle_progress_record(line: str):
-                nonlocal decode_progressed
-                line = line.strip()
-                if line.startswith("out_time_us="):
-                    try:
-                        us = int(line.split("=", 1)[1])
-                        if us > 0:
-                            decode_progressed = True
-                        if progress_callback:
-                            progress_callback(
-                                "filter", us / 1_000_000, duration,
-                                "Deep Scan [combined]")
-                    except (ValueError, IndexError):
-                        pass
-
-            def _read_stdout_progress():
-                try:
-                    _drain_binary_records(proc.stdout, _handle_progress_record)
-                except (OSError, ValueError, TypeError, AssertionError) as exc:
-                    stdout_errors.append(exc)
-
-            stderr_thread = threading.Thread(
-                target=_read_stderr_combined, daemon=True)
-            stdout_thread = threading.Thread(
-                target=_read_stdout_progress, daemon=True)
-            stderr_thread.start()
-            stdout_thread.start()
-
-            def _join_reader(thread, stream) -> bool:
-                thread.join(timeout=5)
-                if thread.is_alive():
-                    try:
-                        stream.close()
-                    except (OSError, ValueError):
-                        pass
-                    thread.join(timeout=1)
-                return not thread.is_alive()
-
-            try:
-                returncode = proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                try:
-                    proc.wait(timeout=5)
-                except (subprocess.TimeoutExpired, OSError, ValueError):
-                    pass
-                _join_reader(stderr_thread, proc.stderr)
-                _join_reader(stdout_thread, proc.stdout)
-                result.add_warn(
-                    "Deep Scan", f"Scan timed out after {int(timeout)}s.")
-                if progress_callback:
-                    progress_callback(
-                        "filter", duration, duration, "Deep Scan [combined]")
-                return
-
-            readers_done = (
-                _join_reader(stderr_thread, proc.stderr)
-                and _join_reader(stdout_thread, proc.stdout)
-            )
-            if cancel_event and cancel_event.is_set():
-                return
-            if not readers_done or stderr_errors or stdout_errors:
-                result.add_warn(
-                    "Deep Scan",
-                    "FFmpeg output could not be read completely; frame-level "
-                    "checks were not treated as clean.",
-                    confidence=40,
-                )
-                return
-
-            stderr_text = capture.result()
-            if stderr_text.truncated_records:
-                result.set_metadata(
-                    "deep_scan_stderr_truncated_lines",
-                    stderr_text.truncated_records)
-
-            if returncode and not decode_progressed and not any(
-                    tok in stderr_text for tok in (
-                        "black_start", "freeze_start", "silence_start")):
-                # FFmpeg exited without decoding a single frame. Parsing the
-                # (event-free) stderr below would report every frame-level
-                # check as a clean PASS for a file that never decoded.
-                if hwaccel_args and _stderr_shows_device_failure(stderr_text):
-                    _hwaccel_failed_methods.add(hwaccel_args[1])
-                result.add_warn(
-                    "Deep Scan",
-                    f"FFmpeg could not decode this file (exit code "
-                    f"{returncode}); frame-level checks were not run. "
-                    f"The file may be corrupt or use an unsupported codec.",
-                    confidence=40,
-                )
-                return
-
-        except FileNotFoundError:
-            result.add_skip("Deep Scan", "FFmpeg not found.")
-            return
-        finally:
-            if 'proc' in locals():
-                _unregister_owned_proc(proc, process_owner)
-
-    if progress_callback:
-        progress_callback("filter", duration, duration, "Deep Scan [combined]")
-
-    # ---- Parse decode errors from stderr (merged from Pass 1) ----
-    stderr_clean = _filter_hwaccel_noise(stderr_text)
-    # Regions still open when the input ended (see _close_open_regions).
-    events_text = _close_open_regions(stderr_text, duration)
-    decode_errors = _extract_decode_errors(stderr_clean)
-
-    if not decode_errors:
-        result.add_pass("Decode Integrity", "Full decode completed with no errors.")
-    else:
-        count = len(decode_errors)
-        sample = "; ".join(e[:80] for e in decode_errors[:3])
-        result.add_fail("Decode Integrity", f"{count} decode error(s). First 3: {sample}")
-        result.set_metadata("decode_errors", count)
-
-    # ---- Parse filter results from combined stderr ----
-
-    # Check 15: Black frames
+def _report_black_frames(result: QAResult, events_text: str, duration: float) -> None:
     black_events = _merge_event_intervals(_pair_detect_events(events_text, "black"))
-    # FIX: Exclude black events in first 1s and last 1s (legitimate fade-in/fade-out)
-    # Trim the first and last second instead of discarding whole events:
-    # dropping any event that touched a margin let an entirely black file,
-    # or one opening or ending on 20s of black, pass as "no black frames".
+    # Trim the first and last second (legitimate fades) instead of discarding
+    # whole events, so an entirely black file still fails.
     if duration > 3.0:
         trimmed = []
         for start, dur in black_events:
@@ -2299,139 +2423,310 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
             if finish - begin > 0:
                 trimmed.append((begin, finish - begin))
         black_events = trimmed
-
-    if black_events:
-        total_black = sum(d for _, d in black_events)
-        count = len(black_events)
-        positions = _format_event_list(black_events)
-        result.set_metadata("black_frame_sequences", count)
-        result.set_metadata("black_frame_total_seconds", round(total_black, 2))
-        # Operators reported being unable to find flagged black frames because
-        # only the first event's raw seconds offset was given. Every position
-        # is now recorded as a scrubbable timecode.
-        result.set_metadata("black_frame_timestamps", positions)
-        if total_black > duration * 0.1:
-            # Contextual suppression: short total black is likely transitions/slates
-            if total_black < 4.0:
-                result.add_warn("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s (likely transitions/slates). At: {positions}", confidence=60)
-            else:
-                result.add_fail("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s. At: {positions}", confidence=90)
-        else:
-            result.add_warn("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s. At: {positions}", confidence=65)
-    else:
+    if not black_events:
         result.add_pass("Black Frames", "No black frame sequences detected.")
-
-    # Check 16: Freeze frames
-    freeze_events = _merge_event_intervals(_pair_detect_events(events_text, "freeze"))
-
-    if freeze_events:
-        total_freeze = sum(d for _, d in freeze_events)
-        count = len(freeze_events)
-        positions = _format_event_list(freeze_events)
-        result.set_metadata("freeze_frame_count", count)
-        result.set_metadata("freeze_frame_total_seconds", round(total_freeze, 2))
-        result.set_metadata("freeze_frame_timestamps", positions)
-        if total_freeze > duration * 0.1:
-            result.add_fail("Freeze Frames", f"{count} freeze event(s), total {total_freeze:.1f}s. At: {positions}")
+        return
+    total_black = sum(d for _, d in black_events)
+    count = len(black_events)
+    positions = _format_event_list(black_events)
+    result.set_metadata("black_frame_sequences", count)
+    result.set_metadata("black_frame_total_seconds", round(total_black, 2))
+    result.set_metadata("black_frame_timestamps", positions)
+    if total_black > duration * 0.1:
+        if total_black < 4.0:
+            result.add_warn("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s (likely transitions/slates). At: {positions}", confidence=60)
         else:
-            result.add_warn("Freeze Frames", f"{count} freeze event(s), total {total_freeze:.1f}s. At: {positions}")
+            result.add_fail("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s. At: {positions}", confidence=90)
     else:
+        result.add_warn("Black Frames", f"{count} black sequence(s), total {total_black:.1f}s. At: {positions}", confidence=65)
+
+
+def _report_freeze_frames(result: QAResult, events_text: str, duration: float) -> None:
+    freeze_events = _merge_event_intervals(_pair_detect_events(events_text, "freeze"))
+    if not freeze_events:
         result.add_pass("Freeze Frames", "No freeze events detected.")
+        return
+    total_freeze = sum(d for _, d in freeze_events)
+    count = len(freeze_events)
+    positions = _format_event_list(freeze_events)
+    result.set_metadata("freeze_frame_count", count)
+    result.set_metadata("freeze_frame_total_seconds", round(total_freeze, 2))
+    result.set_metadata("freeze_frame_timestamps", positions)
+    if total_freeze > duration * 0.1:
+        result.add_fail("Freeze Frames", f"{count} freeze event(s), total {total_freeze:.1f}s. At: {positions}")
+    else:
+        result.add_warn("Freeze Frames", f"{count} freeze event(s), total {total_freeze:.1f}s. At: {positions}")
 
-    # Check 17: Audio silence
-    if has_audio:
-        silence_events = _merge_event_intervals(_pair_detect_events(events_text, "silence"))
 
-        if silence_events:
-            count = len(silence_events)
-            # A region still open at EOF has no end token; _pair_detect_events
-            # gives it a zero duration, so close it against the file duration
-            # rather than reporting a fabricated 0.0s.
-            silence_events = [
-                (start, dur if dur > 0 else max(0.0, duration - start))
-                for start, dur in silence_events
-            ]
-            total_silence = sum(d for _, d in silence_events)
-            positions = _format_event_list(silence_events)
-            result.set_metadata("silence_regions", count)
-            result.set_metadata("silence_total_seconds", round(total_silence, 2))
-            result.set_metadata("silence_timestamps", positions)
+def _silence_events(log_text: str, instance: str, end_time: float) -> List[Tuple[float, float]]:
+    text = _close_open_regions(_lines_with_context(log_text, instance), end_time)
+    events = _merge_event_intervals(_pair_detect_events(text, "silence"))
+    return [(start, dur if dur > 0 else max(0.0, end_time - start)) for start, dur in events]
 
-            if total_silence > duration * 0.5 and duration > 30:
-                # Long silence (>50% of file) - real issue
-                result.add_fail("Audio Silence", f"{count} silence region(s), total {total_silence:.1f}s. Extended silence in deliverable. At: {positions}", confidence=90)
-            elif total_silence < 1.0:
-                # Contextual suppression: very short silence is normal
-                result.add_pass("Audio Silence", f"{count} brief silence(s), total {total_silence:.1f}s (natural pauses)", confidence=75)
-            else:
-                result.add_warn("Audio Silence", f"{count} silence region(s), total {total_silence:.1f}s. At: {positions}", confidence=70)
-        else:
-            result.add_pass("Audio Silence", "No extended silence detected.")
+
+def _track_silence_entry(label: str, events, duration: float, cfg: dict) -> Tuple[str, str]:
+    """Status/detail for one track's silence, using the long-standing tiers.
+
+    New: a track silent for at least ``dead_channel_ratio`` of its length is
+    dead and fails whatever its length (the old >30 s condition let a
+    completely silent 20 s clip through as a warning).
+    """
+    if not events:
+        return "PASS", _with_track(label, "No extended silence detected.")
+    total = sum(d for _, d in events)
+    positions = _format_event_list(events)
+    count = len(events)
+    if duration > 0 and total >= duration * float(cfg.get("dead_channel_ratio", 0.95)):
+        return "FAIL", _with_track(label, f"Silent for {total:.1f}s of {duration:.1f}s "
+                                          f"({total / duration * 100:.0f}%): track carries no audio.")
+    if total > duration * 0.5 and duration > 30:
+        return "FAIL", _with_track(label, f"{count} silence region(s), total {total:.1f}s. Extended silence in deliverable. At: {positions}")
+    if total < 1.0:
+        return "PASS", _with_track(label, f"{count} brief silence(s), total {total:.1f}s (natural pauses)")
+    return "WARN", _with_track(label, f"{count} silence region(s), total {total:.1f}s. At: {positions}")
+
+
+def _dead_channel_entry(label: str, track: dict, position: int, log_text: str,
+                        duration: float, track_dead: bool, cfg: dict) -> Tuple[str, str]:
+    """Per-channel silence: one dead channel in a live track.
+
+    silencedetect on a whole track only fires when every channel is silent,
+    so a stereo file with a dead right channel passed.
+    """
+    count = _ScanPlan.channels(track)
+    if count <= 1:
+        return "SKIP", _with_track(label, "Single-channel track.")
+    if count > MAX_CHANNEL_SPLIT:
+        return "WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}{count} channels exceed the "
+                                          f"{MAX_CHANNEL_SPLIT}-channel analysis limit.")
+    if track_dead:
+        return "SKIP", _with_track(label, "Whole track is silent (see Audio Silence).")
+    names = _channel_names(track, count)
+    ratio = float(cfg.get("dead_channel_ratio", 0.95))
+    dead = []
+    for k in range(count):
+        events = _silence_events(log_text, f"silencedetect@a{position}c{k}", duration)
+        if duration > 0 and sum(d for _, d in events) >= duration * ratio:
+            dead.append(names[k])
+    if not dead:
+        return "PASS", _with_track(label, f"All {count} channels carry signal.")
+    live_dead = [n for n in dead if n != "LFE"]
+    if not live_dead:
+        return "PASS", _with_track(label, "LFE channel is silent (common when the mix has no low-frequency content); all other channels carry signal.")
+    text = f"Silent channel(s): {', '.join(dead)} of {count} ({track.get('channel_layout') or 'unknown layout'})."
+    if count == 2:
+        return "FAIL", _with_track(label, text)
+    return "WARN", _with_track(label, text + " Verify the mix is intentionally sparse.")
+
+
+def _parse_loudness(log_text: str) -> Dict[int, dict]:
+    """Integrated loudness and true peak per ebur128@aN summary block."""
+    results: Dict[int, dict] = {}
+    current = None
+    number = r"(-?inf|-?\d+(?:\.\d+)?)"
+    for line in log_text.splitlines():
+        header = re.search(r"\[ebur128@a(\d+) @ [0-9A-Fa-fx]+\].*Summary:", line)
+        if header:
+            current = int(header.group(1))
+            results[current] = {}
+            continue
+        if current is None:
+            continue
+        integrated = re.match(rf"^\s*I:\s+{number}\s+LUFS", line)
+        if integrated:
+            results[current]["integrated"] = float(integrated.group(1))
+            continue
+        peak = re.match(rf"^\s*Peak:\s+{number}\s+dBFS", line)
+        if peak:
+            results[current]["true_peak"] = float(peak.group(1))
+            current = None
+    return results
+
+
+def _loudness_entry(label: str, measured: Optional[dict], cfg: dict) -> Tuple[str, str]:
+    if not measured or "integrated" not in measured:
+        return "WARN", _with_track(label, f"{NOT_VERIFIED_PREFIX}loudness summary not reported by FFmpeg.")
+    essential = cfg.get("loudness_mode") == "essential"
+    target = float(cfg["target_loudness_lufs"])
+    tolerance = float(cfg["loudness_tolerance_lu"])
+    peak_max = float(cfg["true_peak_max_dbtp"])
+    integrated = measured["integrated"]
+    peak = measured.get("true_peak")
+    issues = []
+    if integrated <= -69.9:
+        issues.append("no measurable programme loudness (silent)")
+    elif abs(integrated - target) > tolerance:
+        issues.append(f"integrated {integrated:.1f} LUFS is outside {target:g} ± {tolerance:g} LUFS")
+    if peak is not None and peak > peak_max:
+        issues.append(f"true peak {peak:.1f} dBTP exceeds {peak_max:g} dBTP")
+    peak_text = f"{peak:.1f} dBTP" if peak is not None and math.isfinite(peak) else "-inf dBTP"
+    text = f"I {integrated:.1f} LUFS (target {target:g} ± {tolerance:g}), true peak {peak_text} (max {peak_max:g})"
+    if not issues:
+        return "PASS", _with_track(label, text)
+    status = "FAIL" if essential else "WARN"
+    return status, _with_track(label, f"{text}: " + "; ".join(issues))
+
+
+def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:
+    silence, dead, loudness = [], [], []
+    measured = _parse_loudness(outcome.log_text) if plan.loudness else {}
+    total = len(plan.audio)
+    for position, track in enumerate(plan.audio):
+        label = _track_label(position, track, total)
+        duration = (_decoded_audio_seconds(track, outcome.accounting)
+                    or plan.audio_expected_seconds(track) or 0.0)
+        events = _silence_events(outcome.log_text, f"silencedetect@a{position}", duration)
+        status, detail = _track_silence_entry(label, events, duration, cfg)
+        silence.append((status, detail))
+        if position == 0 and events:
+            result.set_metadata("silence_regions", len(events))
+            result.set_metadata("silence_total_seconds", round(sum(d for _, d in events), 2))
+            result.set_metadata("silence_timestamps", _format_event_list(events))
+        track_dead = (duration > 0 and sum(d for _, d in events)
+                      >= duration * float(cfg.get("dead_channel_ratio", 0.95)))
+        dead.append(_dead_channel_entry(label, track, position, outcome.log_text,
+                                        duration, track_dead, cfg))
+        if plan.loudness:
+            entry = measured.get(position)
+            loudness.append(_loudness_entry(label, entry, cfg))
+            if entry and position == 0:
+                result.set_metadata("integrated_loudness_lufs", entry.get("integrated"))
+                result.set_metadata("true_peak_dbtp", entry.get("true_peak"))
+    confidence = 90 if any(s == "FAIL" for s, _ in silence) else 100
+    _add_aggregate(result, "Audio Silence", silence, confidence)
+    _add_aggregate(result, "Dead Channel", dead)
+    if plan.loudness:
+        _add_aggregate(result, "Audio Loudness", loudness)
+    else:
+        result.add_skip("Audio Loudness", "Loudness not measured (disabled by this spec).")
+
+
+def _report_scan(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg: dict) -> None:
+    reason = _not_run_reason(outcome, plan)
+    if reason:
+        _mark_not_verified(result, plan.frame_check_names(), reason)
+        return
+    _report_file_integrity(result, plan, outcome, cfg)
+    if plan.video is not None:
+        video_end = (_decoded_video_seconds(plan, outcome.accounting)
+                     or _stream_duration(plan.video) or plan.duration or 0.0)
+        _report_black_frames(result, _close_open_regions(
+            _lines_with_context(outcome.log_text, "blackdetect@v"), video_end), video_end)
+        _report_freeze_frames(result, _close_open_regions(
+            _lines_with_context(outcome.log_text, "freezedetect@v"), video_end), video_end)
+    if plan.audio:
+        _report_audio(result, plan, outcome, cfg)
     else:
         result.add_skip("Audio Silence", "No audio stream to analyze.")
 
-    # Audio Loudness (EBU R128) was removed in v0.4.4. It used to record a SKIP
-    # entry saying so, which meant every report and the Checks matrix still
-    # listed a row for a check that no longer exists, reading as "N/A" to
-    # operators. A removed check should leave no trace.
+
+# ============================================================================
+# DEEP SCAN
+# ============================================================================
+
+def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
+                  progress_callback: Optional[Callable] = None,
+                  cancel_event: Optional[threading.Event] = None,
+                  quick: bool = False,
+                  probe_data: Optional[dict] = None,
+                  process_owner=None):
+    """Decode the whole file once, in software, with every detector attached.
+
+    One pass, always:
+      * it needs no duration, so OBS-style recordings with none are still
+        scanned (they used to be skipped with an ignored SKIP);
+      * memory does not grow with file size, so there is no size gate (the
+        old 8 GB gate skipped nearly every ProRes mezzanine master);
+      * decode errors are counted exactly once (overlapping segments counted
+        175 errors where there were 141) and decoded coverage is exact;
+      * measured on an M3 Max it is as fast or faster than the former
+        4-way segmented scan for HEVC 10-bit and ProRes, and ~1.45x slower
+        only for light 8-bit H.264.
+
+    Anything that cannot run is reported "Not verified", never omitted.
+    """
+    if probe_data is None:
+        probe_data = run_ffprobe(filepath, process_owner, cancel_event)
+    plan = _ScanPlan(probe_data or {}, cfg,
+                     variable_rate=bool(result.metadata.get("vfr_detected")))
+    if quick:
+        _mark_not_verified(result, plan.frame_check_names(),
+                           "quick scan — the file was not decoded.")
+        return
+    if probe_data is None:
+        _mark_not_verified(result, plan.frame_check_names(), "the file could not be probed.")
+        return
+    if plan.video is None and not plan.audio:
+        result.add_not_verified("File Integrity", "the file has no video or audio stream to decode.")
+        return
+    ffmpeg_path = get_ffmpeg_path()
+    if not ffmpeg_path:
+        _mark_not_verified(result, plan.frame_check_names(), "FFmpeg was not found.")
+        return
+    if plan.duration and "duration_seconds" not in result.metadata:
+        result.set_metadata("duration_seconds", round(plan.duration, 2))
+        result.set_metadata("duration_display", _format_duration(plan.duration))
+
+    cmd = _build_scan_command(ffmpeg_path, filepath, plan, cfg)
+    if progress_callback:
+        progress_callback("filter", 0, plan.duration or 0.0, "Integrity scan (software decode)")
+    outcome = _run_scan_process(cmd, _calc_timeout(plan.duration, cfg), plan.duration, cfg,
+                                progress_callback, cancel_event, process_owner)
+    if outcome is None:
+        return
+    if getattr(outcome.log_text, "truncated_records", 0):
+        result.set_metadata("deep_scan_stderr_truncated_lines", outcome.log_text.truncated_records)
+    if progress_callback:
+        end = plan.duration or outcome.last_out_time or 0.0
+        progress_callback("filter", end, end, "Integrity scan (software decode)")
+    _report_scan(result, plan, outcome, cfg)
+
 
 
 # ============================================================================
-# MEDIAINFO ENRICHED METADATA (Check 20)
+# MEDIAINFO ENRICHED METADATA
 # ============================================================================
 
 def run_mediainfo_enrichment(filepath: str, result: QAResult, cfg: dict,
                              process_owner=None,
                              cancel_event: Optional[threading.Event] = None):
-    """Check 20: Use MediaInfo for enriched metadata extraction.
-    Adds writing library, encoding settings, and commercial format names
-    that FFprobe may not expose. Also cross-validates key fields.
-    Gracefully skips if MediaInfo is not installed.
+    """Add writing application/library and commercial format names.
+
+    Informational only: it never adds a check row. A failure is recorded in
+    metadata (``mediainfo_error``) instead of being swallowed silently.
     """
-    if not cfg.get("use_mediainfo", True):
+    if not cfg.get("use_mediainfo", True) or not _HAS_TOOLS_MODULE:
         return
-
-    if not _HAS_TOOLS_MODULE:
-        return
-
     mi_path = get_mediainfo_path()
     if not mi_path:
         return
-
     try:
-        cmd = [mi_path, "--Output=JSON", filepath]
-        proc = _run_owned_subprocess(
-            cmd, 60, process_owner, cancel_event)
-        if proc is None or proc.returncode != 0:
-            return
-
-        mi_data = json.loads(proc.stdout)
-        tracks = mi_data.get("media", {}).get("track", [])
-
-        for track in tracks:
-            track_type = track.get("@type", "")
-
-            if track_type == "General":
-                if track.get("Encoded_Application"):
-                    result.set_metadata("encoding_app", track["Encoded_Application"])
-                if track.get("Encoded_Library"):
-                    result.set_metadata("encoding_library", track["Encoded_Library"])
-                if track.get("Format_Commercial_IfAny"):
-                    result.set_metadata("format_commercial", track["Format_Commercial_IfAny"])
-                if track.get("FileSize"):
-                    try:
-                        size_mb = int(track["FileSize"]) / (1024 * 1024)
-                        result.set_metadata("file_size_mb", round(size_mb, 1))
-                    except (ValueError, TypeError):
-                        pass
-                if track.get("OverallBitRate"):
-                    try:
-                        overall_mbps = int(track["OverallBitRate"]) / 1_000_000
-                        result.set_metadata("mediainfo_overall_bitrate_mbps", round(overall_mbps, 2))
-                    except (KeyError, ValueError, TypeError):
-                        pass
-    except Exception:
-        pass
+        proc = _run_owned_subprocess([mi_path, "--Output=JSON", filepath], 60,
+                                     process_owner, cancel_event)
+    except (subprocess.TimeoutExpired, OSError, TypeError) as exc:
+        result.set_metadata("mediainfo_error", f"{type(exc).__name__}: {exc}"[:200])
+        return
+    if proc is None:
+        return
+    if proc.returncode != 0:
+        result.set_metadata("mediainfo_error", f"exit code {proc.returncode}")
+        return
+    try:
+        tracks = json.loads(proc.stdout).get("media", {}).get("track", [])
+    except (json.JSONDecodeError, AttributeError) as exc:
+        result.set_metadata("mediainfo_error", f"unreadable output: {exc}"[:200])
+        return
+    for track in tracks:
+        if not isinstance(track, dict) or track.get("@type") != "General":
+            continue
+        for source, key in (("Encoded_Application", "encoding_app"),
+                            ("Encoded_Library", "encoding_library"),
+                            ("Format_Commercial_IfAny", "format_commercial")):
+            if track.get(source):
+                result.set_metadata(key, track[source])
+        overall = _safe_float(track.get("OverallBitRate"))
+        if overall:
+            result.set_metadata("mediainfo_overall_bitrate_mbps", round(overall / 1_000_000, 2))
 
 
 def discover_video_files(path: str, extensions: set = None) -> List[str]:
@@ -2443,64 +2738,93 @@ def discover_video_files(path: str, extensions: set = None) -> List[str]:
     """
     if extensions is None:
         extensions = DEFAULT_CONFIG["video_extensions"]
-
     try:
         if os.path.isfile(path):
             ext = os.path.splitext(path)[1].lower()
-            if ext in extensions:
-                return [path]
-            return []
-
+            return [path] if ext in extensions else []
         if os.path.isdir(path):
-            files = []
             try:
                 entries = sorted(os.listdir(path))
             except (PermissionError, OSError):
                 return []
-            for f in entries:
-                try:
-                    ext = os.path.splitext(f)[1].lower()
-                except Exception:
-                    continue
-                if ext in extensions:
-                    files.append(os.path.join(path, f))
-            return files
+            return [os.path.join(path, f) for f in entries
+                    if os.path.splitext(f)[1].lower() in extensions]
     except (PermissionError, OSError):
         return []
-
     return []
 
 
+def config_snapshot(cfg: dict) -> dict:
+    """JSON-safe copy of the settings a scan actually used.
+
+    Compatibility-only keys are left out: they have no effect and would
+    suggest otherwise in an exported report.
+    """
+    snapshot = {}
+    for key, value in cfg.items():
+        if key in COMPAT_ONLY_CONFIG_KEYS:
+            continue
+        if isinstance(value, (set, frozenset, tuple)):
+            value = sorted(value)
+        elif isinstance(value, list):
+            value = list(value)
+        snapshot[key] = value
+    return snapshot
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
+                         filepath: str, process_owner, cancel_event) -> None:
+    """Every check answerable from the container and a few packet/frame reads."""
+    video = _primary_video_stream(probe_data)
+    first_frame, timing = {}, None
+    if video is not None and "index" in video:
+        first_frame = probe_first_video_frame(filepath, int(video["index"]),
+                                              process_owner, cancel_event)
+        timing = probe_frame_timing(filepath, int(video["index"]),
+                                    _probed_duration(probe_data), cfg,
+                                    process_owner, cancel_event)
+    check_video_codec(probe_data, result, cfg)
+    check_resolution(probe_data, result, cfg)
+    check_aspect_ratio(probe_data, result, cfg)
+    check_frame_rate(probe_data, result, cfg)
+    check_cfr(probe_data, result, cfg, timing)
+    check_scan_type(probe_data, result, cfg, first_frame)
+    check_color_hdr(probe_data, result, cfg, first_frame)
+    check_xr_metadata(probe_data, result, cfg, first_frame)
+    check_bitrate(probe_data, result, cfg)
+    check_audio(probe_data, result, cfg)
+    check_av_duration_mismatch(probe_data, result, cfg)
+    check_frame_count(probe_data, result, cfg)
+
+
 def run_qa_checks(filepath: str, cfg: dict = None,
-                  strict: bool = False, naming_check: bool = False,
+                  strict: bool = False,
                   quick: bool = False,
                   progress_callback: Optional[Callable] = None,
                   cancel_event: Optional[threading.Event] = None,
                   process_owner=None) -> QAResult:
-    """
-    Run all QA checks on a single file.
-    Wrapped in try/except for per-file error isolation (v1.4 parity).
-    """
+    """Run all QA checks on a single file, isolating any unexpected error."""
     if cfg is None:
         cfg = DEFAULT_CONFIG.copy()
 
     result = QAResult(filepath)
-    # Record the strict flag on the result itself: finalize() is called later
-    # by the worker with no arguments, and only the verdict method knows how
-    # to escalate warnings — flipping result.passed here left status as
-    # PASS_WITH_WARNINGS because _result_status() only reads status/passed.
+    # Recorded on the result: finalize() is called later with no arguments.
     result.strict = bool(strict)
+    result.config = config_snapshot(cfg)
+    result.started_at = _now_iso()
 
     try:
-        # Check for cancellation at start
         if cancel_event and cancel_event.is_set():
             return result
+        result.tool_versions = get_tool_versions()
 
-        # --- Metadata checks (fast) ---
         check_container_format(filepath, result, cfg)
         if not result.passed:
             return result
-
         if cancel_event and cancel_event.is_set():
             return result
 
@@ -2510,33 +2834,10 @@ def run_qa_checks(filepath: str, cfg: dict = None,
                            "Possible causes: file is corrupt, codec not supported by installed FFmpeg, "
                            "or file is still being written. Try opening in VLC to verify.")
             return result
-
         if cancel_event and cancel_event.is_set():
             return result
 
-        check_video_codec(probe_data, result, cfg)
-        check_resolution(probe_data, result, cfg)
-        check_frame_rate(probe_data, result, cfg)
-        check_cfr(probe_data, result, cfg)
-        check_bitrate(probe_data, result, cfg)
-        check_audio(probe_data, result, cfg)
-        # REMOVED v0.4.4: check_duration(probe_data, result, cfg)
-        # REMOVED v0.4.4: check_color_space(probe_data, result, cfg)
-
-        if naming_check:
-            if cancel_event and cancel_event.is_set():
-                return result
-            # REMOVED v0.4.4: check_naming(filepath, result, cfg)
-
-        # --- Metadata-based structural checks ---
-        if cancel_event and cancel_event.is_set():
-            return result
-
-        check_av_duration_mismatch(probe_data, result, cfg)
-        # REMOVED v0.4.4: check_pixel_aspect_ratio(probe_data, result, cfg)
-        check_frame_count(probe_data, result, cfg)
-
-        # --- Deep scan checks (require full decode) ---
+        _run_metadata_checks(probe_data, result, cfg, filepath, process_owner, cancel_event)
         if cancel_event and cancel_event.is_set():
             return result
 
@@ -2546,207 +2847,15 @@ def run_qa_checks(filepath: str, cfg: dict = None,
                       quick=quick,
                       probe_data=probe_data,
                       process_owner=process_owner)
-
-        # --- Multi-tool checks (v0.4.1 — run in parallel for speed) ---
         if cancel_event and cancel_event.is_set():
             return result
-        with ThreadPoolExecutor(max_workers=2) as tool_executor:
-            # REMOVED v0.4.4: mc_future = tool_executor.submit(run_mediaconch_check, filepath, result, cfg)
-            mi_future = tool_executor.submit(
-                run_mediainfo_enrichment, filepath, result, cfg,
-                process_owner, cancel_event)
-            # REMOVED v0.4.4: ss_future = tool_executor.submit(
-                # REMOVED v0.4.4: run_signalstats_check, filepath, result, cfg,
-                # REMOVED v0.4.4: file_duration, cancel_event
-            # REMOVED v0.4.4: )
-            # Wait for all to complete (they write to result directly)
-            for f in [mi_future]:
-                if cancel_event and cancel_event.is_set():
-                    break
-                try:
-                    f.result(timeout=120)
-                except Exception:
-                    pass
 
-        # --- Strict mode enforcement ---
-        # Handled by QAResult.overall_status() via result.strict (recorded
-        # above): any flagged check escalates to MISMATCH at finalize() time.
-        # The old code flipped result.passed here, which the verdict helpers
-        # never read once status was cached — strict was a silent no-op.
-        if strict:
-            result.strict = True
-
+        run_mediainfo_enrichment(filepath, result, cfg, process_owner, cancel_event)
     except KeyboardInterrupt:
         raise
     except Exception as e:
         result.add_fail("Internal Error", f"Unexpected error during scan: {type(e).__name__}: {str(e)[:200]}")
+    finally:
+        result.finished_at = _now_iso()
 
     return result
-
-
-# ============================================================================
-# FILE DISCOVERY
-# ============================================================================
-
-def run_signalstats_check(filepath: str, result: QAResult, cfg: dict,
-                          duration: float = 0,
-                          cancel_event: Optional[threading.Event] = None):
-    """Check 21: No-reference video quality scoring via FFmpeg signalstats.
-    Detects crushed blacks, clipped whites, low saturation, and banding.
-    Samples evenly across the file for speed (default: 10s sample).
-    Gracefully skips if signalstats filter is not available.
-    """
-    if not cfg.get("use_signalstats", True):
-        result.add_skip("Signal Quality", "Disabled in settings.")
-        return
-
-    ffmpeg_path = "ffmpeg"
-    if _HAS_TOOLS_MODULE:
-        fp = get_ffmpeg_path()
-        if fp:
-            ffmpeg_path = fp
-
-    # Check if signalstats filter is available (cached)
-    global _ffmpeg_caps_cache
-    if _HAS_TOOLS_MODULE:
-        if _ffmpeg_caps_cache is None:
-            _ffmpeg_caps_cache = detect_ffmpeg_capabilities(ffmpeg_path)
-        if not _ffmpeg_caps_cache.get("has_signalstats", False):
-            result.add_skip("Signal Quality", "FFmpeg signalstats filter not available in this build.")
-            return
-
-    if duration <= 0:
-        result.add_skip("Signal Quality", "Could not determine file duration.")
-        return
-
-    # v0.4.2: Multi-sample signalstats with frame decimation
-    sample_secs = cfg.get("signalstats_sample_seconds", 10)
-    decimate_fps = cfg.get("signalstats_decimate_fps", 5)
-    num_samples = cfg.get("signalstats_num_samples", 3)
-    hwaccel_args = _get_optimal_hwaccel(cfg)
-    ft = str(cfg.get("filter_threads", 4))
-
-    # v0.4.2: fps=N decimation before signalstats reduces frames analyzed by ~6x
-    vf_chain = f"fps={decimate_fps},signalstats=stat=tout+vrep+brng,metadata=mode=print"
-
-    # Build sample points: evenly distributed across file duration
-    if sample_secs <= 0 or duration <= sample_secs:
-        sample_points = [(0, duration)]  # scan full file
-    elif duration <= sample_secs * num_samples:
-        sample_points = [(0, duration)]  # file too short for multi-sample
-    else:
-        # v0.4.2: 3 evenly-spaced samples (beginning, middle, end)
-        spacing = duration / (num_samples + 1)
-        sample_points = [
-            (max(0, spacing * (i + 1) - sample_secs / 2), sample_secs)
-            for i in range(num_samples)
-        ]
-
-    # Run all samples and collect stderr
-    all_stderr = []
-    for sp_start, sp_dur in sample_points:
-        ss_args = ["-ss", str(sp_start)] if sp_start > 0 else []
-        t_args = ["-t", str(sp_dur)] if sp_dur < duration else []
-
-        cmd = [ffmpeg_path, "-nostdin"] + hwaccel_args + ss_args + [
-            "-i", filepath
-        ] + t_args + [
-            "-filter_threads", ft,
-            "-vf", vf_chain,
-            "-an", "-f", "null", "-"
-        ]
-
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  timeout=max(60, duration * 0.5), env=_get_clean_env(), **_subprocess_kwargs())
-            all_stderr.append(proc.stderr)
-        except (subprocess.TimeoutExpired, Exception):
-            pass
-
-    stderr = "\n".join(all_stderr)
-
-    try:
-
-        if cancel_event and cancel_event.is_set():
-            return
-
-        # Parse signalstats output
-        ymin_vals = [float(m) for m in re.findall(r"YMIN=(\d+\.?\d*)", stderr)]
-        ymax_vals = [float(m) for m in re.findall(r"YMAX=(\d+\.?\d*)", stderr)]
-        yavg_vals = [float(m) for m in re.findall(r"YAVG=(\d+\.?\d*)", stderr)]
-        satavg_vals = [float(m) for m in re.findall(r"SATAVG=(\d+\.?\d*)", stderr)]
-        brng_vals = [float(m) for m in re.findall(r"BRNG=(\d+\.?\d*)", stderr)]
-        tout_vals = [float(m) for m in re.findall(r"TOUT=(\d+\.?\d*)", stderr)]
-
-        if not ymin_vals:
-            result.add_skip("Signal Quality", "Could not parse signalstats output.")
-            return
-
-        # Calculate averages
-        avg_ymin = sum(ymin_vals) / len(ymin_vals)
-        avg_ymax = sum(ymax_vals) / len(ymax_vals) if ymax_vals else 235
-        avg_yavg = sum(yavg_vals) / len(yavg_vals) if yavg_vals else 128
-        avg_satavg = sum(satavg_vals) / len(satavg_vals) if satavg_vals else 50
-        avg_brng = sum(brng_vals) / len(brng_vals) if brng_vals else 0
-        avg_tout = sum(tout_vals) / len(tout_vals) if tout_vals else 0
-
-        result.metadata["signal_ymin_avg"] = round(avg_ymin, 1)
-        result.metadata["signal_ymax_avg"] = round(avg_ymax, 1)
-        result.metadata["signal_yavg"] = round(avg_yavg, 1)
-        result.metadata["signal_satavg"] = round(avg_satavg, 1)
-        result.metadata["signal_brng_avg"] = round(avg_brng, 1)
-        result.metadata["signal_tout_avg"] = round(avg_tout, 3)
-
-        # Quality assessment
-        issues = []
-        ymin_floor = cfg.get("quality_ymin_floor", 16)
-        ymax_ceil = cfg.get("quality_ymax_ceil", 235)
-        satavg_min = cfg.get("quality_satavg_min", 5)
-
-        # Check for crushed blacks (YMIN consistently at 0)
-        crushed_pct = sum(1 for v in ymin_vals if v < ymin_floor) / len(ymin_vals) * 100
-        if crushed_pct > 50:
-            issues.append(f"crushed blacks in {crushed_pct:.0f}% of frames (YMIN<{ymin_floor})")
-
-        # Check for clipped whites (YMAX consistently at 255)
-        clipped_pct = sum(1 for v in ymax_vals if v > ymax_ceil) / len(ymax_vals) * 100 if ymax_vals else 0
-        if clipped_pct > 50:
-            issues.append(f"clipped whites in {clipped_pct:.0f}% of frames (YMAX>{ymax_ceil})")
-
-        # Check for desaturation
-        if avg_satavg < satavg_min:
-            issues.append(f"very low saturation (avg={avg_satavg:.1f})")
-
-        # Check for out-of-range values (banding/artifacts)
-        if avg_brng > 5:
-            issues.append(f"out-of-broadcast-range pixels detected (BRNG avg={avg_brng:.1f})")
-
-        # Check for temporal outliers (compression artifacts)
-        if avg_tout > 0.02:
-            issues.append(f"temporal outliers detected (TOUT avg={avg_tout:.3f})")
-
-        detail = (f"YMIN avg={avg_ymin:.0f}, YMAX avg={avg_ymax:.0f}, "
-                  f"YAVG={avg_yavg:.0f}, SAT avg={avg_satavg:.0f}")
-
-        if issues:
-            result.add_warn("Signal Quality", f"{detail}. Issues: {'; '.join(issues)}")
-        else:
-            result.add_pass("Signal Quality", f"{detail}. No quality anomalies detected.")
-
-    except subprocess.TimeoutExpired:
-        result.add_warn("Signal Quality", "Signalstats analysis timed out.")
-    except FileNotFoundError:
-        result.add_skip("Signal Quality", "FFmpeg not found.")
-    except Exception as e:
-        result.add_skip("Signal Quality", f"Signalstats error: {str(e)[:100]}")
-
-
-# ============================================================================
-# ORCHESTRATION
-# ============================================================================
-
-
-
-
-
-

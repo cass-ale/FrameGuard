@@ -1851,18 +1851,16 @@ class ScanPanel(QWidget):
         self._files = files
         # A new selection invalidates the previous scan's verdict banner.
         self.hide_completion("files-changed")
-        # Auto-detect preset from filename if set to Custom
-        if files and self.preset_combo.currentData() == "custom":
-            from frameguard.presets import detect_preset_from_filename
-            from frameguard.core import PRESETS
-            detected = detect_preset_from_filename(os.path.basename(files[0]), PRESETS)
-            if detected:
-                for i in range(self.preset_combo.count()):
-                    if self.preset_combo.itemData(i) == detected:
-                        self.preset_combo.setCurrentIndex(i)
-                        break
+        # File names may suggest a preset, but never switch the spec the user
+        # chose or customised: the suggestion is shown, not applied.
+        from frameguard.presets import suggest_preset_for_files
+        from frameguard.core import PRESETS
+        suggested = suggest_preset_for_files([os.path.basename(f) for f in files], PRESETS)
         count = len(files)
-        self.file_count_label.setText(f"{count} file{'s' if count != 1 else ''} selected")
+        note = ""
+        if suggested and suggested != self.preset_combo.currentData():
+            note = f" \u2014 names suggest \u201c{PRESETS[suggested]['label']}\u201d (not applied)"
+        self.file_count_label.setText(f"{count} file{'s' if count != 1 else ''} selected{note}")
         self._style_file_count("primary")
         self.scan_btn.setEnabled(True)
         self.drop_zone.show_file_queue(files)
@@ -4314,12 +4312,15 @@ class _PdfExportRunner(QRunnable):
     def run(self):
         try:
             from frameguard.report import generate_report
-            generate_report(
+            pdf_path = generate_report(
                 self.results,
                 self.output_path,
                 preset_label=self.preset_label,
                 colors=self.colors,
             )
+            from frameguard.report import write_data_exports
+            write_data_exports(self.results, pdf_path or self.output_path,
+                               self.preset_label or "")
             self.signals.finished.emit(self.output_path)
         except Exception as e:
             self.signals.error.emit(str(e))
@@ -6455,7 +6456,7 @@ class MainWindow(QMainWindow):
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Information)
         box.setWindowTitle("Export Complete")
-        box.setText("PDF report saved.")
+        box.setText("PDF report saved, with JSON and CSV data alongside.")
         box.setInformativeText(path)
         open_btn = box.addButton("Open PDF", QMessageBox.AcceptRole)
         folder_btn = box.addButton("Show in Folder", QMessageBox.ActionRole)

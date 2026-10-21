@@ -18,12 +18,9 @@ from frameguard.core import (
     DEFAULT_CONFIG,
     ESSENTIAL_CHECKS,
     QAResult,
-    REMOVED_CHECKS,
     _merge_event_intervals,
     _pair_detect_events,
-    _segment_boundaries,
     _timecode,
-    check_duration,
     check_resolution,
 )
 
@@ -62,23 +59,34 @@ class TestResolutionVerdict:
         assert _check(r, "Resolution")["status"] == "FAIL"
         assert r.status == "MISMATCH"
 
-    @pytest.mark.parametrize("w,h", [(3840, 2160), (4096, 2160), (7680, 4320)])
-    def test_meeting_or_exceeding_the_target_passes(self, w, h):
+    def test_exact_target_passes(self):
         r = QAResult("ok.mov")
-        check_resolution(_probe(w, h), r, _cfg(target_width=3840, target_height=2160))
+        check_resolution(_probe(3840, 2160), r, _cfg(target_width=3840, target_height=2160))
         r.finalize()
-
         assert _check(r, "Resolution")["status"] == "PASS"
         assert r.status == "PASS"
 
-    def test_mod2_rounding_warns_rather_than_fails(self):
-        """A 3840x2158 encode is a rounding artefact, not undersized footage."""
+    @pytest.mark.parametrize("w,h", [(4096, 2160), (7680, 4320)])
+    def test_larger_frames_fail_unless_the_spec_allows_them(self, w, h):
+        """0.9.0 (M2): the target is exact. A 4K master used to pass a 1080
+        spec because the rule was only a floor."""
+        strict = QAResult("big.mov")
+        check_resolution(_probe(w, h), strict, _cfg(target_width=3840, target_height=2160))
+        assert _check(strict, "Resolution")["status"] == "FAIL"
+
+        allowed = QAResult("big.mov")
+        check_resolution(_probe(w, h), allowed, _cfg(target_width=3840, target_height=2160,
+                                                     allow_larger_resolution=True))
+        assert _check(allowed, "Resolution")["status"] == "PASS"
+
+    def test_mod2_rounding_is_not_the_target(self):
+        """0.9.0 (M2): 3840x2158 needs padding to conform, so exact matching
+        fails it (it used to be a rounding-tolerance warning)."""
         r = QAResult("mod2.mov")
         check_resolution(_probe(3840, 2158), r, _cfg(target_width=3840, target_height=2160))
         r.finalize()
-
-        assert _check(r, "Resolution")["status"] == "WARN"
-        assert r.status == "PASS_WITH_WARNINGS"
+        assert _check(r, "Resolution")["status"] == "FAIL"
+        assert r.status == "MISMATCH"
 
     def test_quick_and_deep_agree_on_resolution(self):
         """The operator saw a pass in Quick mode and a flag in Deep mode.
@@ -137,14 +145,6 @@ class TestOverallStatus:
         r.finalize()
         assert r.status == "MISMATCH"
 
-    @pytest.mark.parametrize("name", sorted(REMOVED_CHECKS))
-    def test_removed_checks_leave_no_trace(self, name):
-        """Disabled features must not affect the verdict if they still record."""
-        r = QAResult("x.mov")
-        r.add_fail(name, "should be ignored")
-        r.finalize()
-        assert r.status == "PASS"
-
     def test_hard_failure_short_circuits(self):
         r = QAResult("x.mov")
         r.add_fail("FFprobe", "unreadable")
@@ -162,41 +162,12 @@ class TestOverallStatus:
         """Guards the classification that makes the test above meaningful."""
         assert "Deep Scan" in ADVISORY_CHECKS
         assert not (ESSENTIAL_CHECKS & ADVISORY_CHECKS)
-        assert not (ESSENTIAL_CHECKS & REMOVED_CHECKS)
 
 
 # ---------------------------------------------------------------------------
 # "I got different results on same files. First scan found issues that 2nd
 #  scan didn't. 2nd scan found different issues"
 # ---------------------------------------------------------------------------
-
-class TestDeepScanDeterminism:
-    def test_segment_boundaries_are_a_pure_function(self):
-        """Boundaries used to come from keyframe probes with an 8s timeout, so
-        they silently changed between runs whenever the machine was busy."""
-        first = _segment_boundaries(600.0, 8, 3.0)
-        for _ in range(100):
-            assert _segment_boundaries(600.0, 8, 3.0) == first
-
-    def test_segments_overlap_so_boundary_events_are_not_split(self):
-        """A freeze needs an uninterrupted run; butt-jointed segments cut one
-        in half and neither half met the threshold."""
-        overlap = 3.0
-        segments = _segment_boundaries(600.0, 8, overlap)
-        for (_, prev_end), (next_start, _) in zip(segments, segments[1:]):
-            assert next_start <= prev_end - overlap + 1e-9
-
-    def test_segments_cover_the_whole_file(self):
-        segments = _segment_boundaries(600.0, 8, 3.0)
-        assert segments[0][0] == 0.0
-        assert segments[-1][1] == pytest.approx(600.0)
-
-    @pytest.mark.parametrize("duration,count", [(1.0, 8), (30.0, 8), (0.0, 4), (600.0, 1)])
-    def test_degenerate_inputs_still_produce_usable_segments(self, duration, count):
-        segments = _segment_boundaries(duration, count, 3.0)
-        assert segments
-        assert all(end >= start for start, end in segments)
-
 
 class TestEventParsing:
     def test_unterminated_event_does_not_shift_later_durations(self):
@@ -263,20 +234,6 @@ class TestTimecodes:
 
     def test_negative_input_is_clamped(self):
         assert _timecode(-5.0) == "00:00:00.000"
-
-
-# ---------------------------------------------------------------------------
-# Dead code that still executed.
-# ---------------------------------------------------------------------------
-
-def test_check_duration_does_not_emit_color_space():
-    """Commenting out only the `def` line of the removed colour-space check
-    left its whole body indented into check_duration, which therefore recorded
-    Color Space results as a side effect."""
-    r = QAResult("x.mov")
-    check_duration({"format": {"duration": "120.0"}}, r, _cfg())
-    names = {c[0] for c in r.checks}
-    assert names == {"Duration"}
 
 
 # ---------------------------------------------------------------------------

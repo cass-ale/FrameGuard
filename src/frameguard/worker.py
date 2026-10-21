@@ -12,7 +12,7 @@ from typing import List, Optional
 from PySide6.QtCore import QObject, Signal
 
 from frameguard.core import (
-    run_qa_checks, DEFAULT_CONFIG, PRESETS
+    run_qa_checks, DEFAULT_CONFIG, PRESETS, RETIRED_CONFIG_KEYS, preset_config,
 )
 
 
@@ -98,37 +98,60 @@ class ScanWorker(QObject):
                   quick: bool = False, naming: bool = False,
                   strict: bool = False,
                   cfg_overrides: dict = None):
-        """Configure the scan before starting."""
-        # H5: Prevent configure while scan is running
+        """Configure the scan before starting.
+
+        ``naming`` is accepted for GUI compatibility; the naming-convention
+        check was removed and the flag has no effect.
+
+        Overrides are validated with the same rules as imported presets: an
+        unknown key or an out-of-range value raises ValueError naming it,
+        because a silently discarded value would scan against defaults.
+        Keys retired in 0.9.0 (still present in older saved settings) are
+        ignored.
+        """
         with self._state_lock:
             if self._is_running:
                 raise RuntimeError("Cannot configure ScanWorker while a scan is running.")
+
+        cfg = DEFAULT_CONFIG.copy()
+        if cfg_overrides:
+            cfg.update(self._validated_overrides(cfg_overrides))
+        if preset:
+            if preset not in PRESETS:
+                raise ValueError(f"Unknown scan preset: {preset!r}")
+            # A built-in preset is the spec the user picked: every key it
+            # defines (including e.g. required_projection) wins.
+            cfg.update(preset_config(preset))
 
         self._files = list(files)  # Defensive copy
         self._preset = preset
         self._quick = quick
         self._naming = naming
         self._strict = strict
-        self._cfg = DEFAULT_CONFIG.copy()
-        if cfg_overrides:
-            unknown = set(cfg_overrides) - set(DEFAULT_CONFIG)
-            if unknown:
-                # A key the engine never reads is always a caller bug: the value
-                # would be silently discarded and the scan would run on defaults.
-                raise ValueError(
-                    "Unknown scan config key(s): " + ", ".join(sorted(unknown))
-                )
-            self._cfg.update(cfg_overrides)
-        if preset:
-            if preset not in PRESETS:
-                raise ValueError(f"Unknown scan preset: {preset!r}")
-            p = PRESETS[preset]
-            self._cfg["target_width"] = p["width"]
-            self._cfg["target_height"] = p["height"]
-            self._cfg["target_fps"] = p["fps"]
-            self._cfg["fps_tolerance"] = p["fps_tolerance"]
-            self._cfg["min_bitrate_mbps"] = p["min_bitrate_mbps"]
+        self._cfg = cfg
         self._cancel_event.clear()
+
+    @staticmethod
+    def _validated_overrides(cfg_overrides: dict) -> dict:
+        from frameguard.presets import PRESET_CONFIG_KEYS, _coerce_preset_value
+
+        unknown = set(cfg_overrides) - set(DEFAULT_CONFIG) - RETIRED_CONFIG_KEYS
+        if unknown:
+            raise ValueError(
+                "Unknown scan config key(s): " + ", ".join(sorted(unknown)))
+        accepted, problems = {}, []
+        for key, value in cfg_overrides.items():
+            if key in RETIRED_CONFIG_KEYS:
+                continue
+            if key in PRESET_CONFIG_KEYS:
+                value, problem = _coerce_preset_value(key, value)
+                if problem:
+                    problems.append(f"{key} ({problem})")
+                    continue
+            accepted[key] = value
+        if problems:
+            raise ValueError("Invalid scan config value(s): " + "; ".join(problems))
+        return accepted
 
     def cancel(self):
         """Request cancellation of the current scan and kill subprocesses."""
@@ -237,7 +260,6 @@ class ScanWorker(QObject):
                     cfg=self._cfg,
                     strict=self._strict,
                     quick=self._quick,
-                    naming_check=self._naming,
                     progress_callback=progress_cb,
                     cancel_event=self._cancel_event,
                     process_owner=self,

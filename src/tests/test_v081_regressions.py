@@ -68,29 +68,33 @@ class TestDetectionEventsSurviveCapture:
         assert result.truncated_records >= 40
 
 
-class TestSegmentOffsets:
-    def test_negative_segment_start_is_shifted_onto_the_file_timeline(self):
-        text = ("[silencedetect @ 0x1] silence_start: -0.0213\n"
-                "[silencedetect @ 0x1] silence_end: 12.5 | silence_duration: 12.52")
-        shifted = core._offset_event_times(text, 300.0)
-        events = core._pair_detect_events(shifted, "silence")
-        assert len(events) == 1
-        start, duration = events[0]
-        assert start == pytest.approx(299.979, abs=0.01)
-        assert duration < 13
-
-
 class TestDecodeErrorMatching:
+    """0.9.0: decode evidence comes from FFmpeg's severity tags and its own
+    per-stream accounting (``-loglevel level+verbose``), not from free-text
+    patterns, so banner paths and metadata can never count as errors."""
+
     def test_input_banner_with_a_suspicious_path_is_not_a_decode_error(self):
-        text = ("Input #0, mov,mp4,m4a,3gp,3g2,mj2, from '/Volumes/Shoot/not_corrupt_take.mp4':\n"
-                "  Metadata:\n"
-                "    title           : corrupt_take_out_of_range\n"
-                "  Duration: 00:05:00.00, start: 0.000000, bitrate: 50000 kb/s\n")
-        assert core._extract_decode_errors(text) == []
+        accounting = core._DecodeAccounting()
+        for line in (
+                "[info] Input #0, mov,mp4, from '/Volumes/Shoot/not_corrupt_[error]_take.mp4':",
+                "[info]   Metadata:",
+                "[info]     title           : corrupt_take_out_of_range",
+                "[info]   Duration: 00:05:00.00, start: 0.000000, bitrate: 50000 kb/s"):
+            accounting.add(line)
+            assert not core._is_decode_evidence(line)
+        assert accounting.total_errors == 0 and accounting.messages == []
 
     def test_real_decoder_errors_are_still_counted_individually(self):
-        text = "\n".join(["[h264 @ 0x7f] Invalid NAL unit size (-1 > 100)."] * 3)
-        assert len(core._extract_decode_errors(text)) == 3
+        accounting = core._DecodeAccounting()
+        for _ in range(3):
+            accounting.add("[vist#0:0/h264 @ 0x7f] [dec:h264 @ 0x7e] [warning] corrupt decoded frame")
+        accounting.add("[in#0/mov @ 0x7d] [warning] corrupt input packet in stream 1")
+        accounting.add("[in#0/mov @ 0x7d] [verbose]   Input stream #0:0 (video): 10 packets read "
+                       "(100 bytes); 8 frames decoded; 2 decode errors; ")
+        assert accounting.corrupt_frames[0] == 3
+        assert accounting.corrupt_packets[1] == 1
+        assert accounting.decode_failures == 2
+        assert accounting.total_errors == 6
 
 
 class TestFrameRateAndContainers:
@@ -125,7 +129,9 @@ class TestFrameRateAndContainers:
 class TestBlackFrameMargins:
     def _run(self, events_text, duration=600.0):
         result = QAResult("clip.mp4")
-        cfg = _cfg(segment_enabled=False)
+        frames = int(duration * 30)
+        stats = (f"[in#0/mov @ 0x1] [verbose]   Input stream #0:0 (video): {frames} packets read "
+                 f"(1 bytes); {frames} frames decoded; 0 decode errors; \n")
 
         class _Proc:
             pid = 4242
@@ -133,7 +139,7 @@ class TestBlackFrameMargins:
 
             def __init__(self, *args, **kwargs):
                 import io
-                self.stderr = io.BytesIO(events_text.encode())
+                self.stderr = io.BytesIO((events_text + stats).encode())
                 self.stdout = io.BytesIO(b"out_time_us=1\nprogress=end\n")
 
             def wait(self, timeout=None):
@@ -145,38 +151,41 @@ class TestBlackFrameMargins:
             def kill(self):
                 pass
 
-        with mock.patch("frameguard.core.get_file_duration", return_value=duration), \
-             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
-             mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
-             mock.patch("frameguard.core._get_optimal_hwaccel", return_value=[]), \
+        probe = {"streams": [{"codec_type": "video", "index": 0, "avg_frame_rate": "30/1",
+                              "nb_frames": str(frames)}],
+                 "format": {"duration": str(duration)}}
+        with mock.patch("frameguard.core.get_ffmpeg_path", return_value="ffmpeg"), \
              mock.patch("frameguard.core.subprocess.Popen", _Proc):
-            core.run_deep_scan("clip.mp4", result, cfg,
-                               probe_data={"streams": [{"codec_type": "video"}]})
+            core.run_deep_scan("clip.mp4", result, _cfg(), probe_data=probe)
         return next(c for c in result.checks if c[0] == "Black Frames")
 
     def test_entirely_black_file_fails(self):
-        check = self._run("[blackdetect @ 0x1] black_start:0 black_end:600 black_duration:600\n")
+        check = self._run("[blackdetect@v @ 0x1] [info] black_start:0 black_end:600 black_duration:600\n")
         assert check[1] == "FAIL", check
 
     def test_opening_black_beyond_the_fade_margin_is_reported(self):
-        check = self._run("[blackdetect @ 0x1] black_start:0 black_end:20 black_duration:20\n")
+        check = self._run("[blackdetect@v @ 0x1] [info] black_start:0 black_end:20 black_duration:20\n")
         assert check[1] in ("WARN", "FAIL"), check
 
     def test_a_short_fade_in_is_still_ignored(self):
-        check = self._run("[blackdetect @ 0x1] black_start:0 black_end:0.8 black_duration:0.8\n")
+        check = self._run("[blackdetect@v @ 0x1] [info] black_start:0 black_end:0.8 black_duration:0.8\n")
         assert check[1] == "PASS", check
 
 
-class TestQuickModeSkipsHardwareProbes:
-    def test_quick_mode_never_probes_hardware_decoders(self):
+class TestQuickModeIsNeverAClaimOfIntegrity:
+    def test_quick_mode_decodes_nothing_and_says_so(self):
+        """Quick mode used to SKIP the frame checks, which the verdict ignores,
+        so a truncated file could come out a clean PASS without being decoded."""
         result = QAResult("clip.mp4")
-        with mock.patch("frameguard.core.get_file_duration", return_value=60.0), \
-             mock.patch("frameguard.core.os.path.getsize", return_value=1024), \
-             mock.patch("frameguard.core._get_optimal_hwaccel",
-                        side_effect=AssertionError("probed in quick mode")):
+        with mock.patch("frameguard.core.subprocess.Popen",
+                        side_effect=AssertionError("decoded in quick mode")):
             core.run_deep_scan("clip.mp4", result, _cfg(), quick=True,
-                               probe_data={"streams": [{"codec_type": "video"}]})
-        assert any(c[0] == "Black Frames" and c[1] == "SKIP" for c in result.checks)
+                               probe_data={"streams": [{"codec_type": "video", "index": 0}]})
+        integrity = next(c for c in result.checks if c[0] == "File Integrity")
+        assert integrity[1] == "WARN" and integrity[2].startswith(core.NOT_VERIFIED_PREFIX)
+        result.add_pass("Container Format", "ok")
+        result.finalize()
+        assert result.status == "PASS_WITH_WARNINGS"
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +202,9 @@ class TestPresetValuesAreTyped:
         })
         assert "silence_noise_db" not in config
         assert config["target_fps"] == 30.0
-        assert config["segment_count"] == 16
+        # 0.9.0: out-of-range values are dropped (strict import rejects them),
+        # never clamped into range.
+        assert "segment_count" not in config
 
     def test_codec_and_container_lists_are_normalised(self):
         from frameguard.presets import normalize_preset_config
@@ -478,29 +489,27 @@ class TestSplash:
 
 class TestReviewFollowUps:
     def test_long_metadata_keys_and_continuations_are_not_decode_errors(self):
-        text = ("Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mov':\n"
-                "  Metadata:\n"
-                "    com.apple.quicktime.description: corrupt take, re-shoot\n"
-                "    comment         : line one\n"
-                "                    : corrupt frames fixed in v2\n"
-                "    abcdefghijklmno : value out of range\n"
-                "[h264 @ 0x7f] error while decoding MB 10 20\n")
-        assert core._extract_decode_errors(text) == [
-            "[h264 @ 0x7f] error while decoding MB 10 20"]
+        lines = ["[info] Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'clip.mov':",
+                 "[info]   Metadata:",
+                 "[info]     com.apple.quicktime.description: corrupt take, re-shoot",
+                 "[info]                     : corrupt frames fixed in v2",
+                 "[info]     abcdefghijklmno : value out of range",
+                 "[h264 @ 0x7f] [error] error while decoding MB 10 20"]
+        accounting = core._DecodeAccounting()
+        for line in lines:
+            accounting.add(line)
+        assert accounting.messages == ["[h264] error while decoding MB 10 20"]
 
-    def test_dump_line_first_after_trimming_and_glued_errors(self):
-        leading = core._filter_hwaccel_noise(
-            "    com.apple.quicktime.description: corrupt take\n"
-            "    LRA: 4.8 LU[h264 @ 0x7f] error while decoding MB 1 2\n")
-        errors = core._extract_decode_errors(leading)
-        assert errors == ["LRA: 4.8 LU[h264 @ 0x7f] error while decoding MB 1 2"]
-        demuxer = ("    LRA: 4.8 LU[mov,mp4,m4a,3gp,3g2,mj2 @ 0x7f] "
-                   "Invalid data found when processing input")
-        assert core._extract_decode_errors(demuxer) == [demuxer.strip()]
+    def test_log_prefix_parsing_handles_nested_contexts_and_windows_pointers(self):
+        contexts, level, message = core._parse_log_line(
+            "[vist#0:1/hevc @ 000001D2C3F0] [dec:hevc @ 0x7f] [warning] corrupt decoded frame")
+        assert contexts == ["vist#0:1/hevc", "dec:hevc"]
+        assert (level, message) == ("warning", "corrupt decoded frame")
+        assert core._parse_log_line("    I:   -23.0 LUFS") == ([], None, "    I:   -23.0 LUFS")
 
     def test_retained_evidence_has_a_character_ceiling(self):
         capture = core._BoundedStderrCapture(_cfg(deep_scan_max_event_chars=64 * 1024))
-        line = "[h264 @ 0x1] corrupt " + "x" * 4000
+        line = "[h264 @ 0x1] [error] corrupt " + "x" * 4000
         for i in range(2000):
             capture.add(f"{line}{i}")
         result = capture.result()
