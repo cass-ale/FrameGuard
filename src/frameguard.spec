@@ -152,6 +152,7 @@ hidden_imports = [
     'frameguard.updater',
     'frameguard.presets',
     'frameguard.players',
+    'frameguard.brand',
     
     # Dependencies
     'fpdf',

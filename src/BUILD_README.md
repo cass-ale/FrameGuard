@@ -261,7 +261,8 @@ The cache is gitignored — these are large binaries, not source.
 | `build_mac.sh` | macOS build using isolated state under `~/Library/Caches/FrameGuard/<checkout>/` |
 | `frameguard.spec` | PyInstaller config for both platforms (`BUNDLE()` = the .app) |
 | `download_tools.py` | Fetches and stages FFmpeg/MediaInfo per platform |
-| `assets/make_icns.py` | Generates the macOS `.icns` from the 2048px logo |
+| `assets/make_icns.py` | Packs the macOS `.icns` from `branding/icon_mac_*.png` (no imaging library needed) |
+| `tools_dev/make_brand_assets.py` | Regenerates `branding/` and `assets/frameguard.ico` from the vector mark in `frameguard/brand.py`; `--check` verifies they are current |
 | `write_build_stamp.py` | Records build metadata for the About dialog |
 | `validate_version.py` | Pre-build version consistency check |
 | `installer.iss` | Inno Setup script (Windows shortcuts, `.fg` association) |
