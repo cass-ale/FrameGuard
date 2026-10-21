@@ -217,9 +217,17 @@ def classify_path(path: str) -> set[str]:
     """Return conservative impact areas, or an empty set for unknown paths."""
     if path.startswith(".github/workflows/"):
         return {"workflow_packaging"}
-    if path.startswith("docs/") or path in {"README.md", "CODE_SIGNING_POLICY.md", "LICENSE"}:
+    if path.startswith(("docs/", "assets/")) or path in {
+            "README.md", "CHANGELOG.md", "CODE_SIGNING_POLICY.md",
+            "SECURITY.md", "LICENSE"}:
+        # Top-level assets/ holds README screenshots and demo media only;
+        # the app's bundled assets live under src/assets/.
         return {"documentation"}
-    if path in {".gitignore", ".gitattributes"} or path.startswith(".github/dependabot"):
+    if path == "src/LICENSE":
+        # installer.iss shows this file as the Setup licence page.
+        return {"documentation", "workflow_packaging"}
+    if path in {".gitignore", ".gitattributes", "src/.gitignore"} \
+            or path.startswith(".github/dependabot"):
         return {"repository_config"}
     if path.startswith("src/tests/"):
         return {"tests"}
@@ -227,7 +235,9 @@ def classify_path(path: str) -> set[str]:
         return {"developer_tools", "workflow_packaging"}
     if path.startswith("src/presets/"):
         return {"ingestion"}
-    if path.startswith("src/assets/"):
+    if path.startswith(("src/assets/", "src/branding/")):
+        # Brand sources feed the generated app icons that the spec bundles,
+        # so a change there affects both the rendered UI and the packages.
         return {"ui", "workflow_packaging"}
     if path.startswith("src/frameguard/"):
         name = Path(path).name
@@ -239,7 +249,7 @@ def classify_path(path: str) -> set[str]:
             return {"reports"}
         if name in {"updater.py", "updatesource.py", "deltaupdate.py"}:
             return {"updater"}
-        if name in {"gui.py", "design.py", "icons.py", "theme.py"}:
+        if name in {"gui.py", "design.py", "icons.py", "theme.py", "brand.py"}:
             return {"ui"}
         if name == "__init__.py":
             return {"runtime", "workflow_packaging"}
