@@ -72,7 +72,7 @@ class TestDataExports:
         assert record["file"] == os.path.abspath(clip)
         assert record["config"]["max_decode_errors"] == 3
         assert "use_hwaccel" not in record["config"]
-        assert "ffmpeg version" in record["tool_versions"]["ffmpeg"]["version"]
+        assert record["tool_versions"]["ffmpeg"].startswith("ffmpeg version")
         assert record["scan_started"] and record["scan_finished"]
         assert {c["name"] for c in record["checks"]} >= {"File Integrity", "CFR Check"}
         rows = list(csv.DictReader(open(csv_path, encoding="utf-8-sig")))

@@ -216,6 +216,31 @@ class TestSampledWindows:
 
 
 # ---------------------------------------------------------------------------
+# M2 lives in test_v090_engine.py (TestEveryAudioTrack); dead channels too.
+# L4: exports carry tool versions, not install paths
+# ---------------------------------------------------------------------------
+
+class TestExportPaths:
+    def test_media_path_kept_tool_paths_dropped(self, media, tmp_path):
+        from frameguard.report import export_results_csv, export_results_json
+        from frameguard.tools import get_ffmpeg_path, get_ffprobe_path
+        clip = media.get("clean.mp4", lambda p: make_clip(p + ".mp4", duration=3))
+        result = _scan(clip)
+        json_text = open(export_results_json([result], str(tmp_path / "r.json")),
+                         encoding="utf-8").read()
+        csv_text = open(export_results_csv([result], str(tmp_path / "r.csv")),
+                        encoding="utf-8-sig").read()
+        record = json.loads(json_text)["results"][0]
+        assert record["file"] == os.path.abspath(clip)
+        assert set(record["tool_versions"]) == {"ffmpeg", "ffprobe"}
+        assert all(v.startswith(("ffmpeg version", "ffprobe version"))
+                   for v in record["tool_versions"].values())
+        for tool in (get_ffmpeg_path(), get_ffprobe_path()):
+            assert tool not in json_text and tool not in csv_text
+            assert os.path.dirname(tool) not in json_text
+
+
+# ---------------------------------------------------------------------------
 # L5: rotated footage is an orientation mismatch, not "smaller"
 # ---------------------------------------------------------------------------
 
