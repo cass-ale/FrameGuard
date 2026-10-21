@@ -349,6 +349,18 @@ def _resource_path(relative_path: str) -> str:
 
 
 _ASSET_DIR = _resource_path("assets")
+def _preset_rejection_reason(filepath: str) -> str:
+    """Why a preset was refused, naming every bad or unknown key."""
+    from frameguard.presets import PresetValidationError, import_preset
+    try:
+        import_preset(filepath, raise_errors=True)
+    except PresetValidationError as error:
+        return str(error)
+    except (OSError, ValueError) as error:
+        return f"Could not read the preset: {error}"
+    return "Not a valid FrameGuard preset file."
+
+
 _THEMED_ICON_CACHE: dict = {}
 
 
@@ -683,7 +695,6 @@ def open_in_player(path: str) -> str:
 _UI_BACKED_CONFIG_KEYS = frozenset({
     "target_width", "target_height", "target_fps", "fps_tolerance",
     "min_bitrate_mbps", "audio_required", "silence_duration",
-    "use_hwaccel", "segment_enabled", "segment_count",
 })
 
 # Upper bound on results kept in memory / rendered in the table.
@@ -3315,43 +3326,13 @@ class SettingsPanel(QWidget):
         self._main_layout.addWidget(audio_box)
 
         # --- Deep Scan ---
-        scan_box = self._make_group("Deep Scan")
+        scan_box = self._make_group("Verdicts")
         scan_layout = scan_box.layout()
 
-        self.hwaccel_cb = QCheckBox()
-        self._add_setting(
-            scan_layout,
-            key="deep_hardware_accel",
-            title="Hardware Acceleration",
-            control=self.hwaccel_cb,
-            description="Use GPU for faster decode when available",
-            resetter=lambda: self.hwaccel_cb.setChecked(bool(self._defaults.get("use_hwaccel", True)))
-        )
-
-        self.segmented_cb = QCheckBox()
-        self._add_setting(
-            scan_layout,
-            key="deep_segmented_scan",
-            title="Segmented Scan",
-            control=self.segmented_cb,
-            description="Split large files into parallel segments for faster scanning",
-            resetter=lambda: self.segmented_cb.setChecked(bool(self._defaults.get("segment_enabled", True)))
-        )
-
-        self.segment_count_slider, self.segment_count_value = self._make_int_slider(
-            min_v=2, max_v=16, tick=1, suffix=""
-        )
-        self.segment_count_slider.setAccessibleName("Deep scan segments")
-        self.segment_count_slider.setAccessibleDescription("Number of parallel segments the deep scan splits each file into")
-        self._add_setting(
-            scan_layout,
-            key="deep_segment_count",
-            title="Segment Count",
-            control=self._wrap_slider_with_value(self.segment_count_slider, self.segment_count_value),
-            description="Number of parallel segments (more = faster but uses more CPU)",
-            resetter=lambda: self._set_int_slider(self.segment_count_slider, int(self._defaults.get("segment_count", 4)))
-        )
-
+        # 0.9.0 removed Hardware Acceleration, Segmented Scan and Segment
+        # Count: the scan now always decodes once, in software (hardware
+        # decoders changed verdicts on damaged files). Their keys still
+        # round-trip through _preset_extras for 0.8.x presets.
         self.strict_cb = QCheckBox()
         self._add_setting(
             scan_layout,
@@ -3722,7 +3703,7 @@ class SettingsPanel(QWidget):
                     f"Loaded: {preset['name']}\n\nThis preset is now saved and will appear in the Scan page dropdown."
                 )
             else:
-                QMessageBox.warning(self, "Import Failed", "Invalid preset file format.")
+                QMessageBox.warning(self, "Import Failed", _preset_rejection_reason(filepath))
     
     def _apply_preset_config(self, config: dict):
         """Apply a preset's config values to the settings controls.
@@ -3756,14 +3737,8 @@ class SettingsPanel(QWidget):
         if "silence_duration" in config:
             self._set_float_slider(self.silence_slider, 1.0, 30.0, 0.5, float(config["silence_duration"]))
 
-        if "use_hwaccel" in config:
-            self.hwaccel_cb.setChecked(bool(config["use_hwaccel"]))
 
-        if "segment_enabled" in config:
-            self.segmented_cb.setChecked(bool(config["segment_enabled"]))
 
-        if "segment_count" in config:
-            self._set_int_slider(self.segment_count_slider, int(config["segment_count"]))
     
     def _open_presets_folder(self):
         """Open the presets directory in the file manager."""
@@ -3867,9 +3842,6 @@ class SettingsPanel(QWidget):
         d["silence_duration"] = self._get_float_slider(self.silence_slider, 0.5)
 
         # Deep scan
-        d["use_hwaccel"] = bool(self.hwaccel_cb.isChecked())
-        d["segment_enabled"] = bool(self.segmented_cb.isChecked())
-        d["segment_count"] = int(self.segment_count_slider.value())
 
         # Parameters carried by an imported preset that have no UI control yet
         # (accepted codecs/containers, sample rate, CFR). Applied first so an
@@ -3943,9 +3915,6 @@ class SettingsPanel(QWidget):
         )
 
         # Deep scan
-        self.hwaccel_cb.setChecked(bool(self._defaults.get("use_hwaccel", True)))
-        self.segmented_cb.setChecked(bool(self._defaults.get("segment_enabled", True)))
-        self._set_int_slider(self.segment_count_slider, int(self._defaults.get("segment_count", 4)))
         self.strict_cb.setChecked(False)
         self.reset_results_cb.setChecked(True)
 
@@ -5831,8 +5800,7 @@ class MainWindow(QMainWindow):
             self._report_idle_status(f"Preset loaded: {preset['name']}")
         else:
             self._report_idle_status(
-                f"Not a valid FrameGuard preset: {os.path.basename(filepath)}"
-            )
+                f"{os.path.basename(filepath)}: {_preset_rejection_reason(filepath)}")
 
     def _on_preset_imported(self, name: str, config: dict):
         """Handle a preset being imported from the settings panel."""
