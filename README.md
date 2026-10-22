@@ -142,7 +142,7 @@ a clean pass on the strength of a check that did not run.
 | Video | Video Codec, Codec Profile | Essential | Codec in the accepted list; profile, pixel format and level allowed by the spec, with the level checked against resolution × frame rate |
 | Video | Resolution | Essential | Matches the spec exactly (optionally allow larger frames); rotation is taken into account |
 | Video | Aspect Ratio | Essential | Display aspect, accounting for pixel aspect ratio; non-square pixels warn (fail when the spec requires square pixels) |
-| Video | Frame Rate | Essential | Exact rational match; an NTSC rate against its integer target (23.976 for 24) warns unless NTSC matching is allowed (optionally allow integer multiples) |
+| Video | Frame Rate | Essential | Exact rational match; an NTSC rate against its integer target (23.976 for 24) warns unless NTSC matching is allowed, and fails in Strict Mode (optionally allow integer multiples) |
 | Video | CFR Check | Essential | Measured from real frame timestamps; fails when more than 1% of intervals are irregular |
 | Video | Scan Type | Essential | Interlaced content fails when the spec requires progressive (the default) |
 | Video | Color / HDR | Essential | Bit depth and transfer (SDR, PQ, HLG), untagged colour, BT.601 on HD, PQ without mastering metadata or MaxCLL 0; enforced when the spec sets them |
@@ -154,7 +154,7 @@ a clean pass on the strength of a check that did not run.
 | Picture | Interlace Detection | Advisory | Combing in video declared progressive, and wrong field order; rolling credits are recognised |
 | Picture | Frame Count | Advisory | Frames against duration × frame rate |
 | Audio | Audio Stream, Codec, Channels, Sample Rate | Essential | Checked on **every** audio track; broadcast loudness targets require 48 kHz when enforced |
-| Audio | A/V Duration, A/V Sync Offset | Essential | Audio up to 2 frames short or 2 s long passes; start offset warns beyond ±5 ms and fails beyond 40 ms early / 60 ms late |
+| Audio | A/V Duration, A/V Sync Offset | Essential | Audio more than 2 frames short warns, more than 0.5 s short fails; up to 2 s longer passes; start offset warns beyond ±5 ms and fails beyond 40 ms early / 60 ms late |
 | Audio | Audio Silence, Dead Channel | Essential | Sustained silence per track and per channel (−70 dBFS); a silent primary track or a dead stereo channel fails, a blank extra track warns |
 | Audio | Audio Loudness, Audio True Peak, Audio Clipping | Reported by default | EBU R 128, ATSC A/85, Netflix, Streaming −14/−16 or custom targets; set enforcement to warn or fail. Ambisonic tracks are measured on the W channel |
 | Audio | Audio Dropouts, Phase, Dual Mono, DC Offset, Hum | Advisory | Short drops to digital silence (line-up idents ignored), out-of-phase L/R, identical channels, DC offset, 50/60 Hz hum |
@@ -317,9 +317,11 @@ See `PRESET_CONFIG_KEYS` in `src/frameguard/presets.py` for every accepted key a
 FrameGuard/
 ├── README.md                 # This file
 ├── LICENSE                   # MIT
+├── CHANGELOG.md              # Release history, generated from src/version.json
 ├── assets/                   # README media: banner, screenshots, demo GIF, sample report
 ├── src/
 │   ├── main.py               # Entry point (handles .fg paths from argv)
+│   ├── version.json          # App version and changelog text (release notes are built from it)
 │   ├── requirements.txt      # Runtime dependencies
 │   ├── requirements-dev.txt  # + pytest, pyflakes, pyinstaller
 │   ├── pytest.ini
