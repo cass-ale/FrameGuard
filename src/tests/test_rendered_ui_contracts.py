@@ -318,3 +318,16 @@ def test_unrealizable_window_states_are_skipped_not_audited():
     audit.skip("Clean Light-1000x700-scale-2", "too small")
     report = audit.report(2.0)
     assert report["summary"]["skipped"] == 1 and report["skipped"][0]["reason"] == "too small"
+
+
+def test_a_scale_that_checked_nothing_fails_the_matrix():
+    """Skipping unrealizable states must never turn into a silent pass."""
+    from tools_dev.gui_audit import SCALES, empty_scales, parse_scales
+
+    reports = [{"scale_factor": 1.0, "summary": {"states": 30}},
+               {"scale_factor": 1.5, "summary": {"states": 0, "skipped": 6}}]
+    assert empty_scales(reports) == [1.5]
+    assert parse_scales("all") == SCALES
+    assert parse_scales("1,1.25") == (1.0, 1.25)
+    with pytest.raises(ValueError):
+        parse_scales("3")

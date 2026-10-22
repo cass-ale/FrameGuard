@@ -95,6 +95,9 @@ def test_visual_evidence_uses_fresh_dpi_processes_and_preserves_failures():
     test_job = _job(TESTS_WORKFLOW, "test")
     assert "FRAMEGUARD_VISUAL_ARTIFACTS: visual-test-artifacts" in test_job
     assert "python tools_dev/gui_audit.py --matrix" in test_job
+    # Windows' native window is clamped to the runner desktop; only the
+    # scales it can hold are requested there (the matrix fails empty scales).
+    assert "--scales ${{ startsWith(matrix.runner, 'windows') && '1,1.25' || 'all' }}" in test_job
     assert "--json-dir gui-audit-artifacts" in test_job
     assert "--artifacts-dir gui-audit-artifacts/screenshots" in test_job
     assert test_job.index("python -m pytest --verbose") < test_job.index(

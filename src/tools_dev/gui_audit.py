@@ -569,7 +569,8 @@ def audit_state(root: QWidget, panel: QWidget, app: QApplication, audit: Audit,
     check_inline_styles(root, audit, state)
     check_focus_visibility(root, panel, app, audit, state)
     state_errors = audit.error_count - before
-    record = {"name": state, "errors": state_errors}
+    record = {"name": state, "errors": state_errors,
+              "realized_size": [root.width(), root.height()]}
     if state_errors and artifacts_dir is not None:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", state).strip("_")
@@ -766,7 +767,8 @@ def run_matrix(args: argparse.Namespace) -> int:
     artifact_root = Path(args.artifacts_dir) if args.artifacts_dir else json_dir / "screenshots"
     reports = []
     return_codes = []
-    for scale in SCALES:
+    scales = parse_scales(args.scales)
+    for scale in scales:
         tag = str(scale).replace(".", "_")
         report_path = json_dir / f"gui-audit-scale-{tag}.json"
         screenshot_dir = artifact_root / f"scale-{tag}"
@@ -794,10 +796,10 @@ def run_matrix(args: argparse.Namespace) -> int:
     combined = {
         "schema_version": 1,
         "tool": "FrameGuard rendered-state audit matrix",
-        "scales": list(SCALES),
+        "scales": list(scales),
         "reports": reports,
         "summary": {
-            "workers": len(SCALES),
+            "workers": len(scales),
             "completed_reports": len(reports),
             "errors": sum(report["summary"].get("errors", 0) for report in reports),
             "warnings": sum(report["summary"].get("warnings", 0) for report in reports),
@@ -807,11 +809,35 @@ def run_matrix(args: argparse.Namespace) -> int:
     combined_path = json_dir / "gui-audit-matrix.json"
     combined_path.write_text(json.dumps(combined, indent=2, sort_keys=True) + "\n",
                              encoding="utf-8")
-    if len(reports) != len(SCALES):
-        print(f"Audit matrix incomplete: {len(reports)} of {len(SCALES)} reports written",
+    if len(reports) != len(scales):
+        print(f"Audit matrix incomplete: {len(reports)} of {len(scales)} reports written",
               file=sys.stderr)
         return 2
+    empty = empty_scales(reports)
+    if empty:
+        # A scale whose every state was skipped checked nothing; passing it
+        # would be a silent pass. Ask for fewer scales instead (--scales).
+        print("Audit matrix checked nothing at scale(s) "
+              + ", ".join(f"{scale:g}" for scale in empty)
+              + ": every state was unrealizable on this display", file=sys.stderr)
+        return 3
     return 1 if any(code != 0 for code in return_codes) else 0
+
+
+def parse_scales(text: str) -> tuple:
+    """'all' or a comma-separated subset of SCALES."""
+    if not text or text == "all":
+        return SCALES
+    scales = tuple(float(item) for item in text.split(",") if item.strip())
+    unknown = [s for s in scales if s not in SCALES]
+    if unknown or not scales:
+        raise ValueError(f"unsupported scale(s) {unknown or text!r}; choose from {SCALES}")
+    return scales
+
+
+def empty_scales(reports: list) -> list:
+    """Scales whose report audited no state at all."""
+    return [r["scale_factor"] for r in reports if not r["summary"].get("states")]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -822,6 +848,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--scale", type=float,
                         default=float(os.environ.get("QT_SCALE_FACTOR", "1")))
+    parser.add_argument("--scales", default="all",
+                        help="matrix only: all or a comma-separated subset of "
+                             + ", ".join(f"{s:g}" for s in SCALES))
     parser.add_argument("--sizes", default="all",
                         help="all or a comma-separated WIDTHxHEIGHT list")
     parser.add_argument("--themes", choices=("key", "all"), default="key")

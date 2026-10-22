@@ -67,9 +67,15 @@ jobs:
 
       # Qt reads its scale factor before QApplication construction, so the
       # audit launcher creates one bounded subprocess per supported scale.
+      # Windows renders a real native window, which the OS keeps inside the
+      # runner's 1024x768 desktop: at 1.5x and 2x every audit size is clamped
+      # below the app's minimum window, so the matrix (which fails a scale
+      # that checks nothing) is asked for the scales that desktop can hold.
+      # macOS renders offscreen and audits every scale.
       - name: Audit rendered UI across supported DPI scales
         run: >-
           python tools_dev/gui_audit.py --matrix
+          --scales ${{ startsWith(matrix.runner, 'windows') && '1,1.25' || 'all' }}
           --json-dir gui-audit-artifacts
           --artifacts-dir gui-audit-artifacts/screenshots
 
