@@ -101,6 +101,11 @@ class Audit:
         self.findings: list[Finding] = []
         self._finding_keys: set[tuple[str, ...]] = set()
         self.states: list[dict] = []
+        self.skipped: list[dict] = []
+
+    def skip(self, state: str, reason: str) -> None:
+        """Record a requested state this display cannot realize."""
+        self.skipped.append({"name": state, "reason": reason})
 
     def add(self, severity: str, category: str, state: str,
             widget: str, message: str) -> None:
@@ -127,11 +132,13 @@ class Audit:
             "scale_factor": scale,
             "summary": {
                 "states": len(self.states),
+                "skipped": len(self.skipped),
                 "errors": counts["error"],
                 "warnings": counts["warning"],
                 "categories": dict(sorted(categories.items())),
             },
             "states": self.states,
+            "skipped": self.skipped,
             "findings": [asdict(f) for f in self.findings],
             "overlap_allowlist": [list(item) for item in OVERLAP_ALLOWLIST],
         }
@@ -632,6 +639,26 @@ def _parse_sizes(raw: str) -> tuple[tuple[int, int], ...]:
     return tuple(sizes)
 
 
+def unrealizable_reason(requested: tuple, realized: tuple, minimum: tuple):
+    """Why a requested window size is not a state any real display yields, or None.
+
+    With the native window frame (0.9.1), the OS keeps a window on its screen:
+    a 1000x700 logical window at 2x needs 2000x1400 physical pixels, so a
+    1024x768 CI desktop clamps it to about 512x375 logical - below the app's
+    own minimum, a size no supported display produces (Windows does not
+    offer 200% on a 1024x768 screen). The old frameless window simply
+    overflowed the screen, which is why such states used to render. A state
+    clamped but still at or above the minimum is real, and is audited.
+    """
+    req_w, req_h = requested
+    got_w, got_h = realized
+    min_w, min_h = minimum
+    if got_w < min(req_w, min_w) or got_h < min(req_h, min_h):
+        return (f"the screen fits only {got_w}x{got_h} logical px of the requested "
+                f"{req_w}x{req_h}, below the {min_w}x{min_h} minimum window")
+    return None
+
+
 def run_worker(args: argparse.Namespace) -> int:
     scale = float(args.scale)
     with tempfile.TemporaryDirectory(prefix="frameguard-gui-audit-") as temp:
@@ -679,6 +706,12 @@ def run_worker(args: argparse.Namespace) -> int:
             for width, height in sizes:
                 window.resize(width, height)
                 _settle(app)
+                reason = unrealizable_reason(
+                    (width, height), (window.width(), window.height()),
+                    (gui_module.MIN_WINDOW_W, gui_module.MIN_WINDOW_H))
+                if reason:
+                    audit.skip(f"{theme_name}-{width}x{height}-scale-{scale:g}", reason)
+                    continue
                 for index, panel_name in panels:
                     window._switch_panel(index)
                     _settle(app)
@@ -708,6 +741,8 @@ def _print_report(report: dict, max_per_category: int) -> None:
     print("=" * 76)
     print(f"FrameGuard rendered-state audit | scale {report['scale_factor']:g} | "
           f"{report['platform']} | {summary['states']} states")
+    for skipped in report.get("skipped", []):
+        print(f"[SKIPPED] {skipped['name']}: {skipped['reason']}")
     print("=" * 76)
     grouped: dict[tuple[str, str], list[dict]] = collections.defaultdict(list)
     for finding in report["findings"]:

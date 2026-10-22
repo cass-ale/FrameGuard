@@ -301,3 +301,20 @@ def test_render_failure_artifacts_include_repeat_diff_and_signatures(tmp_path):
     report = json.loads(paths["report"].read_text(encoding="utf-8"))
     assert report["distance"] > 0
     assert report["first"] != report["repeat"]
+
+
+def test_unrealizable_window_states_are_skipped_not_audited():
+    """A desktop too small for the requested logical size at a scale factor
+    (1024x768 CI desktop, 1000x700 at 2x) yields a state below the app's own
+    minimum; the audit records it as skipped instead of reporting clipping
+    that no supported display can show."""
+    from tools_dev.gui_audit import unrealizable_reason
+
+    assert unrealizable_reason((1000, 700), (512, 375), (760, 520))
+    assert unrealizable_reason((1000, 700), (1000, 700), (760, 520)) is None
+    # Clamped but still at least the minimum: a real state, audited.
+    assert unrealizable_reason((1920, 1080), (853, 640), (760, 520)) is None
+    audit = Audit()
+    audit.skip("Clean Light-1000x700-scale-2", "too small")
+    report = audit.report(2.0)
+    assert report["summary"]["skipped"] == 1 and report["skipped"][0]["reason"] == "too small"
