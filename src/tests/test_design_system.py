@@ -67,11 +67,13 @@ class TestTokens:
 
     def test_gutter_and_sidebar_do_not_jump_while_resizing(self):
         """0.9.1: stepped gutters (16/24/32 px) and a sidebar that narrowed at
-        1100 px made the page jump sideways mid-drag. Both are now constant."""
-        widths = range(760, 2561, 20)
-        assert len({D.page_margins(w) for w in widths}) == 1
+        1100 px made the page jump sideways mid-drag. The sidebar is constant
+        and the gutter eases by at most 1 px per 20 px of drag."""
+        widths = list(range(760, 2561, 20))
         assert len({D.sidebar_width(w) for w in widths}) == 1
-        assert D.page_margins(1000) % 8 == 0
+        steps = [abs(D.page_margins(b) - D.page_margins(a)) for a, b in zip(widths, widths[1:])]
+        assert max(steps) <= 1
+        assert D.page_margins(760) == D.SPACE_4 and D.page_margins(1920) == D.SPACE_5
 
 
 class TestThemeContrast:
@@ -753,8 +755,8 @@ class TestLayoutIntegrity:
         assert not offenders, "controls below 28px: " + ", ".join(offenders)
 
     def test_panel_gutters_hold_still_while_resizing(self, window, qapp):
-        """0.9.1: the gutter is one value at every width, so the page no longer
-        jumps sideways when a window edge is dragged across a breakpoint."""
+        """0.9.1: the gutter eases continuously instead of stepping, so the page
+        no longer jumps sideways when a window edge is dragged across a width."""
         from frameguard import gui as G
 
         window._switch_panel(G.PANEL_RESULTS)
@@ -764,4 +766,5 @@ class TestLayoutIntegrity:
         window._apply_responsive_layout(1920)
         wide = window.results_panel.layout().contentsMargins().left()
 
-        assert narrow == wide == D.page_margins(1280), f"gutter moved: {narrow} vs {wide}"
+        assert narrow == D.page_margins(1000) and wide == D.page_margins(1920), (narrow, wide)
+        assert wide - narrow <= D.SPACE_5 - D.SPACE_4, f"gutter jumped: {narrow} vs {wide}"

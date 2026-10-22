@@ -58,7 +58,9 @@ RADIUS_XL = 12
 RADIUS_PILL = 999
 
 # Layout tokens.
-SIDEBAR_W = 200
+# One sidebar width at every window size (see page_margins). 168 px is the
+# width the narrow layout already proved fits every label.
+SIDEBAR_W = 168
 SIDEBAR_W_COLLAPSED = 56
 ROW_H = 40
 SCROLLBAR_HIT_AREA = 14
@@ -87,15 +89,18 @@ MONO_FONT_CANDIDATES = {
 
 
 def page_margins(width: int) -> int:
-    """The outer page gutter: one value at every window width.
+    """The outer page gutter for a window width: 24 px, easing to 16 px on
+    narrow windows.
 
     0.8-0.9.0 stepped it 16 -> 24 -> 32 px at 1100 / 1400 px and narrowed the
     sidebar 200 -> 168 px at 1100 px, so dragging a window edge across those
-    widths made the whole page jump sideways by up to 48 px mid-drag. A fixed
-    gutter and sidebar keep everything anchored while resizing; the sidebar's
-    collapse button is the way to reclaim width on a small screen.
+    widths made the whole page jump sideways by up to 48 px mid-drag. The
+    sidebar is now one width and the gutter changes continuously, by at most
+    8 px across the 1000-1200 px band (1 px per 25 px of drag), so content
+    stays anchored while windows up to 1000 px keep the narrow layout's room.
     """
-    return SPACE_5
+    t = min(1.0, max(0.0, (width - 1000) / 200.0))
+    return int(round(SPACE_4 + (SPACE_5 - SPACE_4) * t))
 
 
 def sidebar_width(width: int) -> int:
