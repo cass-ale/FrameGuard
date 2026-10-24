@@ -1430,29 +1430,69 @@ def _trim_window_edges(window_gaps: list) -> list:
     return window_gaps[1:-1]
 
 
-def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
-    """(dominant interval, total intervals, irregular count, irregular samples).
+# Constant frame rate means every frame interval equals the nominal one up
+# to the container's timestamp resolution: each timestamp is k x interval
+# rounded to the stream's time base, so an interval can be off by at most
+# one tick (Matroska's 1 ms, 33/34 ms at 30 fps). An interval more than
+# CFR_TICK_SLACK ticks away (1 tick + float slop) is irregular - but never
+# less than CFR_MIN_SLACK_S (timestamps are read at microsecond precision)
+# and never more than CFR_INTERVAL_TOLERANCE of the interval (Oct 21 R5a).
+CFR_TICK_SLACK = 1.5
+CFR_MIN_SLACK_S = 0.0001
+CFR_INTERVAL_TOLERANCE = 0.25
 
-    The dominant interval is the most common gap between consecutive
-    presentation timestamps (rounded to 0.1 ms, which absorbs Matroska's
-    millisecond rounding of 33/34 ms). A gap more than half a frame away
-    from it is irregular: a dropped/held frame or a genuine rate change.
+
+def _nominal_interval(video: Optional[dict]) -> Optional[float]:
+    """1 / the stream's declared rational frame rate (r_frame_rate, else avg)."""
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        text = str((video or {}).get(key) or "")
+        num, _, den = text.partition("/")
+        try:
+            rate = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 1.0 <= rate <= 1000.0:
+            return 1.0 / rate
+    return None
+
+
+def _time_base_tick(video: Optional[dict]) -> Optional[float]:
+    num, _, den = str((video or {}).get("time_base") or "").partition("/")
+    try:
+        tick = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return tick if tick > 0 else None
+
+
+def _interval_stats(timing: FrameTiming, nominal: Optional[float] = None,
+                    tick: Optional[float] = None
+                    ) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
+    """(reference interval, total intervals, irregular count, irregular samples).
+
+    The reference is the stream's nominal interval (1 / its declared rational
+    rate) when that matches how the frames are actually spaced (the mean
+    interval within the tolerance), else the measured mean interval. A gap
+    more than the timestamp resolution allows away from it (see
+    CFR_TICK_SLACK) is irregular: jitter, a dropped/held frame or a rate
+    change. (0.9.1 took the
+    mode of 0.1 ms-rounded gaps, which jitter scatters: +-0.2-frame jitter
+    then read as a constant "24.4 fps".)
     """
     gaps = []
     for window in timing.windows:
         gaps.extend(_trim_window_edges([(b, b - a) for a, b in zip(window, window[1:])]))
-    if not gaps:
-        return None, 0, 0, []
-    counts = Counter(round(delta, 4) for _, delta in gaps if delta > 0)
-    if not counts:
+    positive = [d for _, d in gaps if d > 0]
+    if not positive:
         return None, len(gaps), len(gaps), gaps[:6]
-    bucket = counts.most_common(1)[0][0]
-    # Average the intervals near the most common one: Matroska stores 30 fps
-    # as alternating 33/34 ms, whose mean is the true 33.33 ms.
-    near = [d for _, d in gaps if abs(d - bucket) <= bucket / 4]
-    dominant = sum(near) / len(near)
-    irregular = [(t, d) for t, d in gaps if abs(d - dominant) > dominant / 2]
-    return dominant, len(gaps), len(irregular), irregular
+    mean = sum(positive) / len(positive)
+    reference = mean
+    if nominal and abs(mean - nominal) <= nominal * CFR_INTERVAL_TOLERANCE:
+        reference = nominal
+    slack = min(reference * CFR_INTERVAL_TOLERANCE,
+                max(CFR_MIN_SLACK_S, CFR_TICK_SLACK * tick if tick else CFR_MIN_SLACK_S))
+    irregular = [(t, d) for t, d in gaps if abs(d - reference) > slack]
+    return reference, len(gaps), len(irregular), irregular
 
 
 def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
@@ -1471,7 +1511,9 @@ def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
     if timing is None:
         result.add_not_verified("CFR Check", "packet timestamps could not be read.")
         return
-    dominant, total, irregular, samples = _interval_stats(timing)
+    video = _primary_video_stream(probe_data)
+    dominant, total, irregular, samples = _interval_stats(
+        timing, _nominal_interval(video), _time_base_tick(video))
     if dominant is None or total < 2:
         result.add_not_verified("CFR Check", f"too few frames to measure timing ({timing.packet_count} packets).")
         return

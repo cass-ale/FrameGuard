@@ -865,3 +865,34 @@ class TestBlackEdges:
         status, detail, _ = vc.black_entry(found, 10.0, self.cfg)
         assert status == "PASS" and "00:00:00.000" in detail and "00:00:09.500" in detail
 
+
+# ---------------------------------------------------------------------------
+# CFR: timestamps against the nominal rate
+# ---------------------------------------------------------------------------
+
+def _cfr(times, rate="30/1", time_base="1/1000"):
+    from frameguard import core
+    probe = {"streams": [{"index": 0, "codec_type": "video", "r_frame_rate": rate,
+                          "avg_frame_rate": rate, "time_base": time_base}], "format": {}}
+    result = core.QAResult("x.mkv")
+    core.check_cfr(probe, result, dict(DEFAULT_CONFIG), core.FrameTiming([list(times)], False, "all"))
+    return _row(result, "CFR Check"), result.metadata
+
+
+class TestCfrNominalRate:
+    def test_fifth_of_a_frame_jitter_is_not_constant(self):
+        """Review B12: +-0.2-frame sinusoidal jitter passed as 'CFR 24.399 fps'."""
+        row, meta = _cfr([(k + 0.2 * math.sin(k)) / 30 for k in range(300)])
+        assert row[1] != "PASS" and "30.000 fps" in row[2], row
+
+    def test_large_jitter_reports_the_nominal_rate(self):
+        row, _ = _cfr([(k + 0.4 * math.sin(k)) / 30 for k in range(300)])
+        assert row[1] == "FAIL" and "30.000 fps" in row[2] and "102" not in row[2], row
+
+    def test_millisecond_rounding_is_constant(self):
+        row, _ = _cfr([round(k / 30, 3) for k in range(300)])
+        assert row[1] == "PASS", row
+
+    def test_ntsc_rate(self):
+        row, _ = _cfr([k * 1001 / 30000 for k in range(300)], "30000/1001", "1/30000")
+        assert row[1] == "PASS" and "29.970" in row[2], row
