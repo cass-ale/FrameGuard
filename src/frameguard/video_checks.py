@@ -334,7 +334,7 @@ class VideoCheckConfig:
     black: bool = True
     black_duration: float = 0.3
     black_pix_th: float = 0.02
-    black_pic_th: float = 0.98
+    black_pic_th: float = 0.90
     black_short_frames: int = 3
     freeze: bool = True
     freeze_duration: float = 1.0
@@ -349,7 +349,7 @@ class VideoCheckConfig:
             black=bool(cfg.get("black_frames_enabled", True)),
             black_duration=float(cfg.get("black_detect_duration", 0.3)),
             black_pix_th=float(cfg.get("black_detect_pix_threshold", 0.02)),
-            black_pic_th=float(cfg.get("black_detect_picture_threshold", 0.98)),
+            black_pic_th=float(cfg.get("black_detect_picture_threshold", 0.90)),
             black_short_frames=int(cfg.get("black_short_min_frames", 3)),
             freeze=bool(cfg.get("freeze_frames_enabled", True)),
             freeze_duration=float(cfg.get("freeze_detect_duration", 1.0)),
@@ -702,7 +702,7 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+        names = ("mafd", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
                  "yavg", "gam_r", "gam_g", "gam_b") + tuple(_disp_name(d) for d in INTERLACE_DISPLACEMENTS)
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         if self.flash_enabled:
@@ -747,9 +747,21 @@ class VideoAnalysis:
         presentation time, which the other per-frame series are aligned to.
         """
         return [f"[0:{self.index}]split=2[vs_main][vs_fz]",
-                f"[vs_main]{black_filter(self.config)}[{out_label}]",
+                f"[vs_main]{self._black_chain()}[{out_label}]",
                 f"[vs_fz]scdet@fz=threshold=100,"
                 f"{_print('lavfi.scd.mafd', self.paths['mafd'])},nullsink"]
+
+    def _black_chain(self) -> str:
+        """blackdetect plus prints of its per-frame black_start / black_end marks.
+
+        The marks are the complete black-run record (the log can drop or
+        rename it), and the files existing proves the detector ran.
+        """
+        if not self.config.black:
+            return "null"
+        return ",".join([black_filter(self.config),
+                         _print("lavfi.black_start", self.paths["black_start"]),
+                         _print("lavfi.black_end", self.paths["black_end"])])
 
     def extra_graphs(self) -> List[Tuple[str, Optional[str]]]:
         """Separate filter graphs: (description, label to map to the null output).
@@ -1031,6 +1043,9 @@ class VideoAnalysis:
                           zip(fraction("gam_r"), fraction("gam_g"), fraction("gam_b"))]
         if self.needs_area_branch and (self.config.black or self.config.levels):
             series.yavg = sparse("yavg", YAVG_ABSENT, _to_float)
+        if self.config.black:
+            series.black_runs = black_runs(self.paths["black_start"], self.paths["black_end"],
+                                           cancel)
         if self.flash_reader is not None:
             try:
                 series.flash_stream = self.flash_reader.finish(cancel)
@@ -1071,6 +1086,29 @@ def read_print_entries(path: str, cancel: Optional[threading.Event] = None) -> L
     return entries
 
 
+def black_runs(start_path: str, end_path: str,
+               cancel: Optional[threading.Event] = None) -> Optional[List[Tuple[float, Optional[float]]]]:
+    """Black runs from blackdetect's per-frame marks, or None without the files.
+
+    blackdetect tags the first black frame of a run with lavfi.black_start
+    and the first frame after it with lavfi.black_end (with d=0, every run).
+    A run still open at the end has no end mark (None).
+    """
+    if not (os.path.exists(start_path) and os.path.exists(end_path)):
+        return None
+    starts = [e[2] for e in read_print_entries(start_path, cancel)]
+    ends = [e[2] for e in read_print_entries(end_path, cancel)]
+    runs: List[Tuple[float, Optional[float]]] = []
+    k = 0
+    for start in starts:
+        while k < len(ends) and ends[k] <= start:
+            k += 1
+        runs.append((start, ends[k] if k < len(ends) else None))
+        if k < len(ends):
+            k += 1
+    return runs
+
+
 def read_metadata_series(path: str) -> Tuple[List[float], List[str]]:
     """(pts_time per frame, value per frame) from a ``metadata=print`` file."""
     entries = read_print_entries(path)
@@ -1101,6 +1139,9 @@ class VideoSeries:
     flash: List[tuple] = field(default_factory=list)   # in-memory grid (tests, batch use)
     flash_stream: Optional["FlashAccumulator"] = None   # streamed grid (scans)
     flash_error: Optional[str] = None
+    # (start, end or None while open) black runs from blackdetect's frame
+    # marks; None when FFmpeg wrote no mark file (the detector did not run).
+    black_runs: Optional[List[Tuple[float, Optional[float]]]] = None
 
     def align(self) -> None:
         """Truncate every non-empty series to the shortest one.
@@ -2185,10 +2226,15 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
     if not config.black:
         result.add_skip(BLACK, "Switched off in the settings.")
         return []
-    if events is None:
-        # blackdetect reports through FFmpeg's log; when the bounded capture
-        # dropped evidence, a partial list could invent or hide black runs.
-        result.add_not_verified(BLACK, "FFmpeg's log overflowed, so the black-frame events are incomplete.")
+    if series.black_runs is not None:
+        # blackdetect's own frame marks: complete whatever happened to the log.
+        events = [(start, end if end is not None else duration) for start, end in series.black_runs]
+    elif events is None:
+        # No mark file and no usable log record (the bounded capture dropped
+        # evidence, or this FFmpeg logged in a form not recognised): a black
+        # run could have been missed, so the check is not verified.
+        result.add_not_verified(BLACK, "FFmpeg's black-frame report is missing or incomplete "
+                                       "(its log overflowed or used an unrecognised form).")
         return []
     findings = classify_black(events, duration, fps, config, series.times, series.yavg)
     if findings.segments:

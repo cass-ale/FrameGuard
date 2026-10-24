@@ -384,12 +384,14 @@ DEFAULT_CONFIG = {
     # Picture checks (video_checks.py). Black: a picture with at least
     # black_detect_picture_threshold of its pixels at or below the level
     # black_detect_pix_threshold (0.02 = Y <= 20 at 8-bit limited range) for
-    # black_detect_duration seconds; bursts from black_short_min_frames
+    # black_detect_duration seconds (the 0.90 share leaves room for a
+    # burnt-in timecode or a channel bug: Oct 21 recommendation R2b,
+    # Telestream VQ-101 practice); bursts from black_short_min_frames
     # frames up to that are reported only when cut in hard (0 disables).
     "black_frames_enabled": True,
     "black_detect_duration": 0.3,
     "black_detect_pix_threshold": 0.02,
-    "black_detect_picture_threshold": 0.98,
+    "black_detect_picture_threshold": 0.90,
     "black_short_min_frames": 3,
     # Freeze: a held picture at least this long (EBU QC 0044B example: 25 frames).
     "freeze_frames_enabled": True,
@@ -3011,9 +3013,20 @@ def _report_file_integrity(result: QAResult, plan: _ScanPlan, outcome: _ScanOutc
     result.add_pass("File Integrity", summary + ".")
 
 
-def _black_events(log_text: str, video_end: float) -> List[Tuple[float, float]]:
-    """(start, end) blackdetect runs, an open run closed at the decoded end."""
-    text = _close_open_regions(_lines_with_context(log_text, "blackdetect@v"), video_end)
+def _black_events(log_text: str, video_end: float) -> Optional[List[Tuple[float, float]]]:
+    """(start, end) blackdetect runs, an open run closed at the decoded end.
+
+    FFmpeg 8.1+ logs from the filter instance ("blackdetect@v"); up to 8.0
+    vf_blackdetect logged from its private context, named after the filter
+    class ("blackdetect"). Both are read. None when the log holds no record
+    of the detector at all (not even its configuration line, logged at
+    verbose level when it starts): the black check then did not run here.
+    """
+    lines = "\n".join(t for t in (_lines_with_context(log_text, "blackdetect@v"),
+                                   _lines_with_context(log_text, "blackdetect")) if t)
+    if not lines:
+        return None
+    text = _close_open_regions(lines, video_end)
     return [(start, start + duration) for start, duration in _pair_detect_events(text, "black")]
 
 

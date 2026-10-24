@@ -496,3 +496,56 @@ class TestTruncationTolerance:
     def test_audio_tolerance_is_absolute(self):
         assert _integrity(300, 300, audio=(3600.0, 3590.0))       # 10 s of audio missing
         assert not _integrity(300, 300, audio=(10.0, 9.95))       # AAC priming/padding
+
+
+# ---------------------------------------------------------------------------
+# Black Frames: 90 % area, both FFmpeg log forms, never PASS unmeasured
+# ---------------------------------------------------------------------------
+
+class TestBlackEvidence:
+    def test_default_area_is_ninety_percent(self):
+        assert DEFAULT_CONFIG["black_detect_picture_threshold"] == 0.90
+        assert vc.VideoCheckConfig.from_cfg({}).black_pic_th == 0.90
+
+    @pytest.mark.parametrize("context", ["blackdetect@v", "blackdetect"])
+    def test_both_log_forms_are_parsed(self, context):
+        """FFmpeg <= 8.0 logs from the filter's private context
+        ([blackdetect @ ...]); 8.1+ from the filter instance."""
+        from frameguard import core
+        log = (f"[{context} @ 0x6000] [verbose] black_min_duration:0 pixel_black_th:0.020000 "
+               f"picture_black_ratio_th:0.900000 alpha:0\n"
+               f"[{context} @ 0x6000] [info] black_start:2 black_end:2.6 black_duration:0.6\n")
+        assert core._black_events(log, 10.0) == [(2.0, 2.6)]
+
+    def test_no_detector_output_is_not_verified(self):
+        from frameguard import core
+        assert core._black_events("[h264 @ 0x1] [verbose] nothing here\n", 10.0) is None
+        result = core.QAResult("x.mp4")
+        config = vc.VideoCheckConfig.from_cfg(DEFAULT_CONFIG)
+        vc._report_black(result, config, None, 10.0, 30.0, vc.VideoSeries())
+        row = [c for c in result.checks if c[0] == vc.BLACK][0]
+        assert row[1] == "WARN" and "not verified" in row[2].lower(), row
+
+    def test_measurement_file_runs_win_over_the_log(self):
+        """Per-frame black runs from FFmpeg's metadata file are complete even
+        when the log lost them."""
+        from frameguard import core
+        result = core.QAResult("x.mp4")
+        config = vc.VideoCheckConfig.from_cfg(DEFAULT_CONFIG)
+        series = vc.VideoSeries(times=_times(300), black_runs=[(2.0, 2.6)])
+        vc._report_black(result, config, [], 10.0, 30.0, series)
+        row = [c for c in result.checks if c[0] == vc.BLACK][0]
+        assert row[1] == "WARN" and "00:00:02.000" in row[2], row
+
+
+@needs_ffmpeg
+class TestBlackScan:
+    def test_black_with_burnt_in_timecode_and_bug(self, tmp_path):
+        """1 s of black carrying a burnt-in timecode box and a channel bug
+        (~3 % of the picture not black): 0.9.1's 98 % rule missed it."""
+        vf = ("drawbox=c=black:t=fill:enable='between(t,2,3)',"
+              "drawbox=x=250:y=320:w=140:h=24:c=white@1:t=fill:enable='between(t,2,3)',"
+              "drawbox=x=560:y=20:w=60:h=40:c=0xC0C0C0:t=fill:enable='between(t,2,3)'")
+        path = _clip(tmp_path / "tc.mp4", vf)
+        row = _row(_scan(path), "Black Frames")
+        assert row[1] == "WARN" and "00:00:02.000" in row[2], row
