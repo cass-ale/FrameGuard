@@ -3228,7 +3228,7 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
             dead.append(_dead_channel_entry(label, track, ctx.dead_channels, ctx.track_silent,
                                             ctx.names, ctx.lfe))
         if plan.loudness:
-            entry = measured.get(position)
+            entry = audio_checks.track_measurement(measured, ctx)
             loudness.append(audio_checks.loudness_row(entry, ctx, cfg))
             true_peak.append(audio_checks.true_peak_row(
                 entry, ctx, cfg, audio_checks.track_sample_peak(evidence, ctx)))

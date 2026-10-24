@@ -496,7 +496,26 @@ def _hum_mix(names: Sequence[str], ambisonic: bool, lfe: frozenset = frozenset()
 METER_EBUR128 = "ebur128"
 METER_LOUDNORM = "loudnorm"
 METER_NONE = "none"
-LOUDNORM_MAX_CHANNELS = 6
+
+# BS.1770 channel weights as FFmpeg's ebur128 filter applies them
+# (libavfilter/af_ebur128.c, BACK_MASK): LFE and LFE2 0, every back, side,
+# top-back and surround-direct channel 1.41, everything else 1.0. The
+# fallback reproduces the primary meter so a file reads the same on every
+# platform. (BS.1770-5 weights by position instead: 1.41 only for 60-120
+# degrees azimuth, so it would weigh a back centre or 7.1's rear pair 1.0.)
+SURROUND_WEIGHT = 1.41
+_SURROUND_CHANNELS = frozenset({"BL", "BR", "BC", "SL", "SR", "TBL", "TBR", "TBC", "SDL", "SDR"})
+# loudnorm's meter (libavfilter/ebur128.c, ebur128_init_channel_map, taken
+# from libebur128) ignores the layout and weighs input channels by index:
+# 0 L, 1 R, 2 C (1.0), 3 unused, 4 Ls, 5 Rs (1.41), 6+ unused - with 4- and
+# 5-channel inputs special-cased as L R Ls Rs and L R C Ls Rs. So the track
+# is first remapped onto a 6-channel input: one source channel per weighted
+# input, its gain sqrt(G_channel / G_input) so each channel contributes
+# exactly G * mean square (the K-filter and the mean square are linear in
+# power). Channels cannot share an input (their cross term would count), so
+# a track with more than five non-LFE channels cannot be measured.
+_LOUDNORM_FRONT_INPUTS = (0, 1, 2)
+_LOUDNORM_SURROUND_INPUTS = (4, 5)
 
 _SIGNAL_STATS = "DC_offset+Peak_level+Flat_factor+Peak_count+RMS_level"
 FULL_SCALE_AMPLITUDE = 0.9999
@@ -692,12 +711,15 @@ def _main_chain(i: int, main: str, cfg: dict, meter: str, loudness: bool, ambiso
     """0.9.0's whole-track silence plus the BS.1770 meter, ending in [a<N>]."""
     chain = (f"{main}silencedetect@a{i}=n={float(cfg['silence_noise_db'])}dB"
              f":d={float(cfg['silence_duration'])}" + _record(f"silencedetect@a{i}", files))
-    if loudness and meter in (METER_EBUR128, METER_NONE):
+    if loudness:
         if meter == METER_EBUR128 and ambisonic:
             # W only: BS.1770-5 defines no scene-based method; summing B-format
             # components over-reads by ~3.5 LU (benchmark F13).
             chain += ",pan=mono|c0=c0"
-        # With METER_NONE the loudness is discarded, but the true peak is exact.
+        # Always on every channel as decoded: with METER_LOUDNORM or
+        # METER_NONE its loudness is discarded, but the true peak is exact on
+        # every build (true peak is taken before the K-weighting the arm64
+        # build gets wrong; verified there on 5.1 and 4.0 tones).
         chain += f",ebur128@a{i}=peak=true+sample:framelog=quiet"
     return chain + f"[a{i}]"
 
@@ -769,7 +791,8 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
     """Every audio branch for one track (see TrackGraphs)."""
     i = position
     source = f"[0:{int(track['index'])}]"
-    meter = loudness_meter(track, len(names), multichannel_meter, ambisonic) if loudness else METER_NONE
+    meter = (loudness_meter(track, len(names), multichannel_meter, ambisonic, names)
+             if loudness else METER_NONE)
     branches = _signal_branches(i, cfg)
     if check_enabled(cfg, DUAL_MONO) or check_enabled(cfg, PHASE):
         for j, (left, right, _) in enumerate(stereo_pairs(track, names, ambisonic)):
@@ -778,7 +801,8 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
                 f"astats@a{i}p{j}=measure_perchannel={_PAIR_STATS}:measure_overall=none")))
     if meter == METER_LOUDNORM:
         # loudnorm resamples to 192 kHz internally: keep it off the mapped output.
-        branches.append((f"a{i}l", f"loudnorm@a{i}=print_format=summary"))
+        # JSON prints the input loudness to 0.01 LU (the summary rounds to 0.1).
+        branches.append((f"a{i}l", f"{loudnorm_mapping(track, names)},loudnorm@a{i}=print_format=json"))
     if branches:
         main = f"[a{i}m]"
         summary = [f"{source}asplit={len(branches) + 1}{main}"
@@ -811,28 +835,63 @@ def track_filter_chains(position: int, track: dict, names: Sequence[str], cfg: d
     return graphs.summary + [chain for unit in graphs.units for chain in unit.chains]
 
 
+def channel_weight(name: str) -> float:
+    if name in LFE_NAMES:
+        return 0.0
+    return SURROUND_WEIGHT if name in _SURROUND_CHANNELS else 1.0
+
+
+def loudnorm_mapping(track: dict, names: Sequence[str]) -> Optional[str]:
+    """The filters that place a track's channels on loudnorm's weighted
+    inputs (see _LOUDNORM_FRONT_INPUTS), or None when they cannot be placed:
+    the layout is not signalled (no positions to weigh by) or more than five
+    channels carry weight."""
+    if not layout_signalled(track) or any(name.startswith("ch") for name in names):
+        return None
+    fronts = [k for k, n in enumerate(names) if channel_weight(n) == 1.0]
+    surrounds = [k for k, n in enumerate(names) if channel_weight(n) == SURROUND_WEIGHT]
+    if len(fronts) + len(surrounds) > len(_LOUDNORM_FRONT_INPUTS) + len(_LOUDNORM_SURROUND_INPUTS):
+        return None
+    front_inputs, surround_inputs = list(_LOUDNORM_FRONT_INPUTS), list(_LOUDNORM_SURROUND_INPUTS)
+    placed = []
+    for k in fronts:
+        placed.append((front_inputs.pop(0) if front_inputs else surround_inputs.pop(0), k))
+    for k in surrounds:
+        placed.append((surround_inputs.pop(0) if surround_inputs else front_inputs.pop(0), k))
+    terms = []
+    for slot, k in sorted(placed):
+        slot_weight = SURROUND_WEIGHT if slot in _LOUDNORM_SURROUND_INPUTS else 1.0
+        gain = math.sqrt(channel_weight(names[k]) / slot_weight)
+        terms.append(f"c{slot}=c{k}" if abs(gain - 1.0) < 1e-12 else f"c{slot}={gain:.9f}*c{k}")
+    # Double precision first: a gain above 1 must not clip integer samples.
+    return "aformat=sample_fmts=dbl,pan=5.1|" + "|".join(terms)
+
+
 def loudness_meter(track: dict, count: int, multichannel_meter: str,
-                   ambisonic: bool = False) -> str:
+                   ambisonic: bool = False, names: Optional[Sequence[str]] = None) -> str:
     """Which BS.1770 meter measures this track.
 
     ``ebur128`` for mono, stereo and ambisonic W. For three or more channels
     the caller passes what the bundled FFmpeg can do: the darwin-arm64 9.0.2
-    build's ebur128 K-weights >2-channel input wrongly (a 1 kHz -23 LUFS
-    5.1 reference reads -5.0 LUFS, +33 dB on pink noise; the x86_64 build
-    of the same release reads -23.0), so core self-tests the binary and
-    falls back to ``loudnorm``'s independent libebur128 meter, which is
-    correct for up to six channels but ignores channels 7+ (7.1 reads
-    without its side pair). Beyond six channels that leaves ``none``.
+    build's ebur128 K-weights >2-channel input wrongly (a 1 kHz -23 LUFS 3.0
+    reference reads -5.0 LUFS on that binary; the x86_64 build of the same
+    release reads -23.0), so core self-tests the binary and falls back to
+    ``loudnorm``'s independent libebur128 meter, with the track remapped by
+    layout (``loudnorm_mapping``). A track that cannot be remapped is
+    ``none``: its loudness is not verified (its true peak still is).
     """
     if count <= 2 or ambisonic:
         return METER_EBUR128
-    if multichannel_meter == METER_LOUDNORM and count > LOUDNORM_MAX_CHANNELS:
-        return METER_NONE
+    if multichannel_meter == METER_LOUDNORM:
+        names = list(names) if names is not None else channel_names(track, count)
+        if loudnorm_mapping(track, names) is None:
+            return METER_NONE
     return multichannel_meter
 
 
 _EVIDENCE_RE = re.compile(r"\[astats@a\d+[sp]\d* @ |\[loudnorm@a\d+ @ "
-                          r"|^Input (?:Integrated|True Peak|LRA|Threshold):")
+                          r"|^Input (?:Integrated|True Peak|LRA|Threshold):"
+                          r'|^\s*"input_(?:i|tp|lra|thresh)" :')
 # Detectors whose events are read from measurement files: their log lines
 # are diagnostics, not evidence (with thousands of dropouts they would
 # otherwise crowd the summaries out of the bounded capture).
@@ -941,38 +1000,65 @@ def parse_loudness(log_text: str) -> Dict[int, dict]:
 
 
 _LOUDNORM_RE = re.compile(r"\[loudnorm@a(\d+) @ [0-9A-Fa-fx]+\]")
+# Summary ("Input Integrated: -23.1 LUFS") and JSON ("input_i" : "-23.05") keys.
 _LOUDNORM_KEYS = {"Input Integrated": "integrated", "Input True Peak": "true_peak",
-                  "Input LRA": "lra"}
+                  "Input LRA": "lra", '"input_i"': "integrated", '"input_tp"': "true_peak",
+                  '"input_lra"': "lra"}
+_LOUDNORM_LAST = ("Input LRA", '"input_thresh"')
 
 
 def parse_loudnorm(log_text: str) -> Dict[int, dict]:
-    """Input I / true peak / LRA per ``loudnorm@a<N>`` summary (the
-    multichannel fallback meter; see ``loudness_meter``)."""
+    """Input I / true peak / LRA per ``loudnorm@a<N>`` report, summary or
+    JSON (the multichannel fallback meter; see ``loudness_meter``)."""
     results: Dict[int, dict] = {}
     current = None
     for line in log_text.splitlines():
         header = _LOUDNORM_RE.search(line)
         if header:
             current = int(header.group(1))
-            results[current] = {"meter": METER_LOUDNORM}
+            results.setdefault(current, {"meter": METER_LOUDNORM})
             continue
         if current is None:
             continue
         key, _, value = line.strip().partition(":")
+        key = key.strip()
         if key in _LOUDNORM_KEYS:
-            match = re.match(rf"\s*{_NUMBER}", value.replace("+", ""))
+            match = re.match(rf"\s*{_NUMBER}", value.replace("+", "").replace('"', "").strip())
             if match:
                 results[current][_LOUDNORM_KEYS[key]] = float(match.group(1))
-            if key == "Input LRA":
-                current = None
-    return results
+        if key in _LOUDNORM_LAST:
+            current = None
+    return {track: values for track, values in results.items() if len(values) > 1}
 
 
-def parse_meters(log_text: str) -> Dict[int, dict]:
-    """Loudness per track from whichever meter measured it."""
-    merged = {track: dict(values, meter=METER_EBUR128) for track, values in parse_loudness(log_text).items()}
-    merged.update(parse_loudnorm(log_text))
+def parse_meters(log_text: str) -> Dict[int, Dict[str, dict]]:
+    """Every meter's report per track: {track: {"ebur128": ..., "loudnorm": ...}}
+    (``track_measurement`` picks what each track's meter vouches for)."""
+    merged: Dict[int, Dict[str, dict]] = {}
+    for track, values in parse_loudness(log_text).items():
+        merged.setdefault(track, {})[METER_EBUR128] = values
+    for track, values in parse_loudnorm(log_text).items():
+        merged.setdefault(track, {})[METER_LOUDNORM] = values
     return merged
+
+
+def track_measurement(meters: Dict[int, Dict[str, dict]], ctx: "TrackContext") -> Optional[dict]:
+    """One track's loudness entry from what its meter vouches for.
+
+    Integrated loudness and LRA come only from the track's own meter: on a
+    ``loudnorm`` track the ebur128 loudness is the broken arm64 reading,
+    and a ``none`` track has no loudness at all. The true and sample peak
+    always come from ebur128 on every channel as decoded.
+    """
+    sources = meters.get(ctx.position) or {}
+    main = sources.get(METER_EBUR128) or {}
+    entry = {key: main[key] for key in ("true_peak", "sample_peak") if key in main}
+    loud = {METER_EBUR128: main, METER_LOUDNORM: sources.get(METER_LOUDNORM) or {}}.get(ctx.meter, {})
+    entry.update({key: loud[key] for key in ("integrated", "lra") if key in loud})
+    if not entry:
+        return None
+    entry["meter"] = ctx.meter
+    return entry
 
 
 # ---------------------------------------------------------------------------
@@ -1112,9 +1198,14 @@ def _loudness_caveat(ctx: TrackContext) -> Tuple[str, Optional[int]]:
 
 def _unmeasured_reason(ctx: TrackContext, what: str) -> str:
     if ctx.meter == METER_NONE and what == "loudness summary":
+        layout = str(ctx.track.get("channel_layout") or "").strip() or "unknown"
+        weighted = sum(1 for n in ctx.names if channel_weight(n) > 0)
+        why = ("the channel layout is not signalled, so the channels cannot be placed"
+               if not layout_signalled(ctx.track) or any(n.startswith("ch") for n in ctx.names)
+               else f"this {layout} track has {weighted} weighted channels and the fallback "
+                    f"meter takes five")
         return (f"loudness not measured: the bundled FFmpeg's ebur128 mis-measures audio with more "
-                f"than two channels and the fallback meter handles at most "
-                f"{LOUDNORM_MAX_CHANNELS} ({len(ctx.names)} here)")
+                f"than two channels, and {why} (true peak is still measured)")
     return f"{what} not reported by FFmpeg"
 
 

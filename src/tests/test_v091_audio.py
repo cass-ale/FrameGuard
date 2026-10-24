@@ -244,8 +244,11 @@ class TestLoudnessOnFiles:
         plan.multichannel_meter = core._multichannel_meter("ffmpeg", plan)
         assert plan.multichannel_meter == audio_checks.METER_LOUDNORM
         graph = _graph(core._build_scan_command("ffmpeg", "x.mov", plan, _cfg()))
-        assert "loudnorm@a0" in graph and "ebur128@a0" not in graph
-        # Beyond loudnorm's six channels only the (exact) true peak is kept.
+        # loudnorm measures the loudness (remapped by layout); ebur128 stays on
+        # every channel for the true peak, which is exact on every build.
+        assert "loudnorm@a0" in graph and "ebur128@a0" in graph
+        # 7.1 has seven weighted channels, more than loudnorm's five inputs:
+        # only the (exact) true peak is kept.
         assert "loudnorm@a1" not in graph and "ebur128@a1" in graph
 
     @pytest.mark.parametrize("mode,status", [("report", "PASS"), ("advisory", "WARN"), ("essential", "FAIL")])

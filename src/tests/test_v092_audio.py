@@ -183,3 +183,64 @@ class TestLfeOnFiles:
         clip = media.get("deadfc_3.1", lambda p: make_audio(p, exprs, layout="3.1"))
         row = _row(_scan(clip), "Dead Channel")
         assert row[1] == "WARN" and "FC" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# 5. Fallback loudness meter (loudnorm) placed by layout, not channel index (review B3)
+# ---------------------------------------------------------------------------
+
+MINUS_23 = 0.0707946           # 1 kHz at -23 dBFS: one channel at G = 1 reads -26.0 LUFS
+TONE_23 = tone(1000, MINUS_23)
+LOUD_LFE = "0.5*sin(2*PI*60*t)"
+
+
+@pytest.fixture
+def forced_fallback(monkeypatch):
+    """What the self-test caches on darwin-arm64 9.0.2 (its >2-channel
+    ebur128 is broken), forced so every platform tests the fallback."""
+    from frameguard.tools import get_ffmpeg_path
+    monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {get_ffmpeg_path(): False})
+
+
+@needs_ffmpeg
+class TestLayoutAwareFallbackMeter:
+    # Expected values follow FFmpeg's ebur128 filter (the primary meter on
+    # every other platform): LFE excluded, back/side/top-back channels
+    # weighted 1.41, everything else 1.0 (libavfilter/af_ebur128.c).
+    @pytest.mark.parametrize("layout,exprs,expected", [
+        ("2.1", [TONE_23, TONE_23, LOUD_LFE], -23.0),            # LFE excluded, not counted as C
+        ("4.0", ["0", "0", TONE_23, "0"], -26.0),                # FC at 1.0, not as a surround
+        ("3.0(back)", ["0", "0", TONE_23], -24.5),               # BC at 1.41, not as a centre
+        ("3.1.2", ["0", "0", "0", LOUD_LFE, TONE_23, "0"], -26.0),  # TFL at 1.0
+        ("quad", ["0", "0", TONE_23, "0"], -24.5),               # BL at 1.41
+        ("5.1", [TONE_23, TONE_23, "0", LOUD_LFE, "0", "0"], -23.0),
+    ])
+    def test_fallback_reads_what_ebur128_reads(self, media, forced_fallback, layout, exprs, expected):
+        clip = media.get(f"fb_{layout}", lambda p: make_audio(p, exprs, layout=layout))
+        result = _scan(clip, loudness_mode="essential", target_loudness_lufs=expected,
+                       loudness_profile="custom", loudness_tolerance_lu=0.5)
+        assert result.metadata["loudness_meter"] == "loudnorm", result.metadata
+        assert abs(result.metadata["integrated_loudness_lufs"] - expected) <= 0.1, result.metadata
+        assert _row(result, "Audio Loudness")[1] == "PASS", _row(result, "Audio Loudness")
+
+    @pytest.mark.parametrize("layout,count", [("6.0", 6), ("hexagonal", 6)])
+    def test_layouts_beyond_its_inputs_are_not_verified(self, media, forced_fallback, layout, count):
+        """Six non-LFE channels cannot be placed on loudnorm's five weighted
+        inputs: 0.9.1 dropped one and read a tone there as silence."""
+        exprs = ["0"] * count
+        exprs[-1] = TONE_23
+        clip = media.get(f"fb_{layout}", lambda p: make_audio(p, exprs, layout=layout))
+        row = _row(_scan(clip, loudness_mode="essential"), "Audio Loudness")
+        assert row[1] == "WARN" and core.NOT_VERIFIED_PREFIX in row[2] and layout in row[2], row
+
+    def test_unknown_layout_is_not_verified(self, media, forced_fallback):
+        clip = media.get("fb_unknown6", lambda p: make_mkv(p, [TONE_23] * 2 + ["0"] * 4, "6c"))
+        row = _row(_scan(clip, loudness_mode="essential", accepted_containers=[".mkv"]), "Audio Loudness")
+        assert row[1] == "WARN" and core.NOT_VERIFIED_PREFIX in row[2] and "not signalled" in row[2], row
+
+    def test_true_peak_still_covers_the_lfe(self, media, forced_fallback):
+        """The remap drops the LFE from the loudness sum; the true peak of
+        every channel still comes from ebur128 (exact on every build)."""
+        clip = media.get("fb_2.1", lambda p: make_audio(p, [TONE_23, TONE_23, LOUD_LFE], layout="2.1"))
+        result = _scan(clip, loudness_mode="essential")
+        assert abs(result.metadata["true_peak_dbtp"] - (-6.0)) <= 0.2, result.metadata
