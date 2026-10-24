@@ -33,7 +33,9 @@ def defect_clip(tmp_path_factory):
     out = tmp_path_factory.mktemp("media") / "defects.mp4"
     subprocess.run([
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=40",
+        "-f", "lavfi", "-i", "color=c=black:s=640x360:r=30:d=40,"
+        "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=40",
         "-filter_complex",
         "[0:v]drawbox=x=0:y=0:w=640:h=360:color=gray:t=fill:"
@@ -41,7 +43,8 @@ def defect_clip(tmp_path_factory):
         "[1:a]volume=enable='between(t,10,16)':volume=0[a]",
         "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M",
-        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-c:a", "aac", "-b:a", "128k", str(out),
+        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-c:a", "aac", "-b:a", "128k", str(out),
     ], check=True, capture_output=True)
     return str(out)
 
@@ -54,10 +57,13 @@ def clean_clip(tmp_path_factory):
     out = tmp_path_factory.mktemp("media") / "clean.mp4"
     subprocess.run([
         FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=40",
+        "-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=40,"
+        "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
         "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=40",
         "-c:v", "libx264", "-preset", "ultrafast", "-b:v", "2M",
-        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-c:a", "aac", "-b:a", "128k", str(out),
+        "-pix_fmt", "yuv420p", "-colorspace", "bt709", "-color_primaries", "bt709",
+        "-color_trc", "bt709", "-c:a", "aac", "-b:a", "128k", str(out),
     ], check=True, capture_output=True)
     return str(out)
 

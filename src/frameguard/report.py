@@ -1129,7 +1129,8 @@ def _black_freeze_spec(c: dict) -> str:
     black = (f"black ≥{c.get('black_detect_duration')} s at ≤{c.get('black_detect_pix_threshold')} "
              f"level on ≥{float(c.get('black_detect_picture_threshold') or 0) * 100:g}% of the picture"
              if c.get("black_frames_enabled", True) else "black off")
-    freeze = (f"freeze ≥{c.get('freeze_detect_duration')} s"
+    freeze = (f"freeze ≥{c.get('freeze_detect_duration')} s, title-card hold "
+              f"≤{c.get('freeze_hold_allowance', 3.0)} s"
               if c.get("freeze_frames_enabled", True) else "freeze off")
     return f"{black}; {freeze}"
 

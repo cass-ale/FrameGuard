@@ -19,10 +19,15 @@ needs_ffmpeg = pytest.mark.skipif(not FFMPEG, reason="FFmpeg not available")
 SIZE = "320x240"
 DURATION = 6
 
-# Real encoders and cameras signal at least the colour matrix; a fully
-# untagged clip is now (0.9.1) an advisory Color / HDR finding, so the clean
-# fixtures carry BT.709 like real deliverables do.
-_COLOUR_TAGS = ["-colorspace", "bt709"]
+# Clean deliverables signal their colour completely: an untagged clip
+# (0.9.1) and a partly tagged one (0.9.2: matrix only, x264's default when
+# only -colorspace is given) are advisory Color / HDR findings, so the clean
+# fixtures carry BT.709 primaries, transfer and matrix.
+_COLOUR_TAGS = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"]
+# FFmpeg 9 writes the primaries and transfer the frames carry, not the
+# encoder options, so the sources are tagged too.
+COLOUR_TAGGED = ("scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+                 "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
 _VIDEO_ENCODERS = {
     "h264": ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", *_COLOUR_TAGS],
     "hevc": ["-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
@@ -58,6 +63,9 @@ def make_clip(path, *, vcodec="h264", rate=30, duration=DURATION, size=SIZE,
     """
     path = str(path)
     source = video_source or f"testsrc2=s={size}:r={rate}:d={duration}"
+    sets_colour = any(k in str(a) for a in extra for k in ("colorprim", "color_primaries"))
+    if ";" not in source and "setparams" not in source and not sets_colour:
+        source += f",{COLOUR_TAGGED}"
     args = ["-f", "lavfi", "-i", source]
     maps = ["-map", "0:v"]
     filters = []
@@ -194,7 +202,7 @@ def make_open_gop_source(path, vcodec="h264", rate="30", duration=12):
     else:
         video = ["-c:v", "libx264", "-preset", "ultrafast",
                  "-x264-params", "keyint=45:min-keyint=45:open-gop=1:bframes=3:scenecut=0"]
-    ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={SIZE}:r={rate}:d={duration}",
+    ffmpeg("-f", "lavfi", "-i", f"testsrc2=s={SIZE}:r={rate}:d={duration},{COLOUR_TAGGED}",
            "-f", "lavfi", "-i", f"sine=f=440:sample_rate=48000:d={duration}",
            *video, "-pix_fmt", "yuv420p", *_COLOUR_TAGS, "-c:a", "aac", str(path))
     return str(path)

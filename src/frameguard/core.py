@@ -412,16 +412,22 @@ DEFAULT_CONFIG = {
     # Picture checks (video_checks.py). Black: a picture with at least
     # black_detect_picture_threshold of its pixels at or below the level
     # black_detect_pix_threshold (0.02 = Y <= 20 at 8-bit limited range) for
-    # black_detect_duration seconds; bursts from black_short_min_frames
+    # black_detect_duration seconds (the 0.90 share leaves room for a
+    # burnt-in timecode or a channel bug: Oct 21 recommendation R2b,
+    # Telestream VQ-101 practice); bursts from black_short_min_frames
     # frames up to that are reported only when cut in hard (0 disables).
     "black_frames_enabled": True,
     "black_detect_duration": 0.3,
     "black_detect_pix_threshold": 0.02,
-    "black_detect_picture_threshold": 0.98,
+    "black_detect_picture_threshold": 0.90,
     "black_short_min_frames": 3,
     # Freeze: a held picture at least this long (EBU QC 0044B example: 25 frames).
     "freeze_frames_enabled": True,
     "freeze_detect_duration": 1.0,
+    # A still shot that starts and ends on a cut (title or end card) is a
+    # deliberate hold, not a freeze, when held up to this long; longer
+    # identical stills are reported. A spec choice (0 = report every hold).
+    "freeze_hold_allowance": 3.0,
     # EBU R 103 v3.0 luma/RGB tolerance: off, report, advisory or essential
     # (essential is for broadcast delivery specs; camera originals routinely
     # exceed broadcast levels).
@@ -1480,29 +1486,69 @@ def _trim_window_edges(window_gaps: list) -> list:
     return window_gaps[1:-1]
 
 
-def _interval_stats(timing: FrameTiming) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
-    """(dominant interval, total intervals, irregular count, irregular samples).
+# Constant frame rate means every frame interval equals the nominal one up
+# to the container's timestamp resolution: each timestamp is k x interval
+# rounded to the stream's time base, so an interval can be off by at most
+# one tick (Matroska's 1 ms, 33/34 ms at 30 fps). An interval more than
+# CFR_TICK_SLACK ticks away (1 tick + float slop) is irregular - but never
+# less than CFR_MIN_SLACK_S (timestamps are read at microsecond precision)
+# and never more than CFR_INTERVAL_TOLERANCE of the interval (Oct 21 R5a).
+CFR_TICK_SLACK = 1.5
+CFR_MIN_SLACK_S = 0.0001
+CFR_INTERVAL_TOLERANCE = 0.25
 
-    The dominant interval is the most common gap between consecutive
-    presentation timestamps (rounded to 0.1 ms, which absorbs Matroska's
-    millisecond rounding of 33/34 ms). A gap more than half a frame away
-    from it is irregular: a dropped/held frame or a genuine rate change.
+
+def _nominal_interval(video: Optional[dict]) -> Optional[float]:
+    """1 / the stream's declared rational frame rate (r_frame_rate, else avg)."""
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        text = str((video or {}).get(key) or "")
+        num, _, den = text.partition("/")
+        try:
+            rate = float(num) / float(den or 1)
+        except (ValueError, ZeroDivisionError):
+            continue
+        if 1.0 <= rate <= 1000.0:
+            return 1.0 / rate
+    return None
+
+
+def _time_base_tick(video: Optional[dict]) -> Optional[float]:
+    num, _, den = str((video or {}).get("time_base") or "").partition("/")
+    try:
+        tick = float(num) / float(den)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return tick if tick > 0 else None
+
+
+def _interval_stats(timing: FrameTiming, nominal: Optional[float] = None,
+                    tick: Optional[float] = None
+                    ) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
+    """(reference interval, total intervals, irregular count, irregular samples).
+
+    The reference is the stream's nominal interval (1 / its declared rational
+    rate) when that matches how the frames are actually spaced (the mean
+    interval within the tolerance), else the measured mean interval. A gap
+    more than the timestamp resolution allows away from it (see
+    CFR_TICK_SLACK) is irregular: jitter, a dropped/held frame or a rate
+    change. (0.9.1 took the
+    mode of 0.1 ms-rounded gaps, which jitter scatters: +-0.2-frame jitter
+    then read as a constant "24.4 fps".)
     """
     gaps = []
     for window in timing.windows:
         gaps.extend(_trim_window_edges([(b, b - a) for a, b in zip(window, window[1:])]))
-    if not gaps:
-        return None, 0, 0, []
-    counts = Counter(round(delta, 4) for _, delta in gaps if delta > 0)
-    if not counts:
+    positive = [d for _, d in gaps if d > 0]
+    if not positive:
         return None, len(gaps), len(gaps), gaps[:6]
-    bucket = counts.most_common(1)[0][0]
-    # Average the intervals near the most common one: Matroska stores 30 fps
-    # as alternating 33/34 ms, whose mean is the true 33.33 ms.
-    near = [d for _, d in gaps if abs(d - bucket) <= bucket / 4]
-    dominant = sum(near) / len(near)
-    irregular = [(t, d) for t, d in gaps if abs(d - dominant) > dominant / 2]
-    return dominant, len(gaps), len(irregular), irregular
+    mean = sum(positive) / len(positive)
+    reference = mean
+    if nominal and abs(mean - nominal) <= nominal * CFR_INTERVAL_TOLERANCE:
+        reference = nominal
+    slack = min(reference * CFR_INTERVAL_TOLERANCE,
+                max(CFR_MIN_SLACK_S, CFR_TICK_SLACK * tick if tick else CFR_MIN_SLACK_S))
+    irregular = [(t, d) for t, d in gaps if abs(d - reference) > slack]
+    return reference, len(gaps), len(irregular), irregular
 
 
 def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
@@ -1521,7 +1567,9 @@ def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
     if timing is None:
         result.add_not_verified("CFR Check", "packet timestamps could not be read.")
         return
-    dominant, total, irregular, samples = _interval_stats(timing)
+    video = _primary_video_stream(probe_data)
+    dominant, total, irregular, samples = _interval_stats(
+        timing, _nominal_interval(video), _time_base_tick(video))
     if dominant is None or total < 2:
         result.add_not_verified("CFR Check", f"too few frames to measure timing ({timing.packet_count} packets).")
         return
@@ -1717,6 +1765,11 @@ def _colour_signalling_advisories(video: dict, first_frame: dict, transfer: str,
     if width >= 1280 and matrix in ("smpte170m", "bt470bg"):
         out.append(f"a BT.601 (SD) matrix is signalled on a {width}-wide HD picture; HD and UHD SDR use "
                    f"BT.709, so colours decode shifted if the tag is wrong")
+    raw_transfer = video.get("color_transfer") or first_frame.get("color_transfer") or ""
+    untagged = matrix in _UNSIGNALLED and primaries in _UNSIGNALLED and transfer == "unspecified"
+    if not untagged:
+        out += video_checks.colour_tag_advisories(
+            primaries, raw_transfer, matrix, report_partial=cfg.get("warn_untagged_color", True))
     if transfer in ("pq", "hlg") and depth is not None and depth < 10:
         out.append(f"{transfer.upper()} HDR is signalled on {depth}-bit video; ITU-R BT.2100 requires 10 or "
                    f"12 bits, so this is most likely SDR tagged as HDR")
@@ -2464,7 +2517,19 @@ MAX_ERROR_SAMPLES = 20
 # Above this many channels per track the per-channel split is skipped (and
 # reported as not verified) rather than building an enormous filter graph.
 MAX_CHANNEL_SPLIT = 32
-INTEGRITY_MIN_DECODED_RATIO = 0.98
+# Decoded coverage is judged with an absolute tolerance, never a share of
+# the length (0.9.1's 98 % let a 2-hour master lose 144 s). A complete file
+# decodes everything its header declares; the legitimate shortfalls are
+# bounded and do not grow with the length:
+# * video: the declared duration rounds the last frame, and a leading
+#   picture of an open GOP that references a GOP not in the file is skipped
+#   by the decoder: 2 frames, or 0.1 s where that is more (above 20 fps);
+# * audio: encoder priming and padding (AAC: 1024 + up to 1024 samples,
+#   43 ms at 48 kHz) are trimmed; 0.1 s covers them at 32 kHz.
+# A GOP is deliberately not allowed: frames lost before the first decodable
+# keyframe are missing pictures too.
+INTEGRITY_VIDEO_SLACK_FRAMES = 2
+INTEGRITY_SLACK_SECONDS = 0.1
 
 
 def _parse_log_line(line: str) -> Tuple[List[str], Optional[str], str]:
@@ -2495,6 +2560,8 @@ class _DecodeAccounting:
         self.stream_stats: Dict[int, dict] = {}
         self.corrupt_frames: Counter = Counter()
         self.corrupt_packets: Counter = Counter()
+        # Error-level records not on video_checks.BENIGN_DECODER_ERRORS.
+        self.error_messages = 0
         self.messages: List[str] = []
 
     def add(self, line: str) -> None:
@@ -2520,6 +2587,8 @@ class _DecodeAccounting:
             self._sample(contexts, message)
             return
         if level in _ERROR_LEVELS:
+            if not video_checks.is_benign_decoder_error(message):
+                self.error_messages += 1
             self._sample(contexts, message)
 
     @staticmethod
@@ -2540,11 +2609,21 @@ class _DecodeAccounting:
         return sum(s["errors"] for s in self.stream_stats.values())
 
     @property
-    def total_errors(self) -> int:
+    def accounted_errors(self) -> int:
         """Undecodable packets + frames the decoder flagged corrupt + packets
-        the demuxer flagged corrupt: all FFmpeg's own accounting."""
+        the demuxer flagged corrupt: FFmpeg's own accounting."""
         return (self.decode_failures + sum(self.corrupt_frames.values())
                 + sum(self.corrupt_packets.values()))
+
+    @property
+    def total_errors(self) -> int:
+        """FFmpeg's accounting, or the error records it printed when more.
+
+        Decoders conceal damage without failing the frame, so the accounting
+        can read 0 while the decoder reported errors; a failed frame usually
+        prints its own error too, so the larger of the two is taken rather
+        than the sum."""
+        return max(self.accounted_errors, self.error_messages)
 
     def decoder_unavailable(self) -> bool:
         return any(_DECODER_UNAVAILABLE_RE.search(m) for m in self.messages)
@@ -2964,9 +3043,9 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
               last_out_time: Optional[float]) -> Tuple[List[str], List[str], List[str]]:
     """(per-stream descriptions, shortfalls, streams whose completeness is unknown).
 
-    A stream is short when it decoded under 98% of what its own header
-    declares, with a small absolute slack (2 frames / 0.1 s) so a 1-second
-    clip that loses its last frame to an edit list is not called truncated.
+    A stream is short when it decoded less than its own header declares by
+    more than an absolute slack (INTEGRITY_VIDEO_SLACK_FRAMES frames /
+    INTEGRITY_SLACK_SECONDS; see there), whatever the programme length.
     A truncated copy keeps its original header, so this is the measurement
     that catches it: the old scan never compared decoded media with the
     probed duration.
@@ -2981,7 +3060,7 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
             unknown.append("video")
         else:
             described.append(f"{decoded_s:.2f}/{expected_s:.2f} s video (variable frame rate)")
-            if decoded_s < expected_s * INTEGRITY_MIN_DECODED_RATIO - 0.1:
+            if decoded_s < expected_s - INTEGRITY_SLACK_SECONDS:
                 short.append(f"decoding stopped at {decoded_s:.2f} of {expected_s:.2f} s "
                              f"({decoded_s / expected_s * 100:.0f}%)")
     elif plan.video is not None:
@@ -2993,7 +3072,10 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
             described.append(f"{decoded} video frames")
         else:
             described.append(f"{decoded}/{expected} video frames")
-            if decoded < expected * INTEGRITY_MIN_DECODED_RATIO - 2:
+            fps = plan.video_fps()
+            slack = max(INTEGRITY_VIDEO_SLACK_FRAMES,
+                        int(INTEGRITY_SLACK_SECONDS * fps) if fps > 0 else 0)
+            if decoded < expected - slack:
                 short.append(f"video decoded {decoded} of {expected} frames "
                              f"({decoded / expected * 100:.0f}%)")
     total = len(plan.audio)
@@ -3009,7 +3091,7 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
                 described.append(f"{decoded:.2f} s {name}")
             continue
         described.append(f"{decoded:.2f}/{expected:.2f} s {name}")
-        if decoded < expected * INTEGRITY_MIN_DECODED_RATIO - 0.1:
+        if decoded < expected - INTEGRITY_SLACK_SECONDS:
             short.append(f"{name} decoded {decoded:.2f} of {expected:.2f} s "
                          f"({decoded / expected * 100:.0f}%)")
     return described, short, unknown
@@ -3042,6 +3124,8 @@ def _report_file_integrity(result: QAResult, plan: _ScanPlan, outcome: _ScanOutc
             breakdown.append(f"{sum(accounting.corrupt_frames.values())} corrupt frame(s)")
         if accounting.corrupt_packets:
             breakdown.append(f"{sum(accounting.corrupt_packets.values())} corrupt packet(s)")
+        if accounting.error_messages > accounting.accounted_errors:
+            breakdown.append(f"{accounting.error_messages} decoder error message(s)")
         sample = "; ".join(accounting.messages[:3])
         problems.append(f"{errors} decoder error(s), max allowed {allowed} "
                         f"({', '.join(breakdown)})" + (f". First: {sample}" if sample else ""))
@@ -3060,9 +3144,20 @@ def _report_file_integrity(result: QAResult, plan: _ScanPlan, outcome: _ScanOutc
     result.add_pass("File Integrity", summary + ".")
 
 
-def _black_events(log_text: str, video_end: float) -> List[Tuple[float, float]]:
-    """(start, end) blackdetect runs, an open run closed at the decoded end."""
-    text = _close_open_regions(_lines_with_context(log_text, "blackdetect@v"), video_end)
+def _black_events(log_text: str, video_end: float) -> Optional[List[Tuple[float, float]]]:
+    """(start, end) blackdetect runs, an open run closed at the decoded end.
+
+    FFmpeg 8.1+ logs from the filter instance ("blackdetect@v"); up to 8.0
+    vf_blackdetect logged from its private context, named after the filter
+    class ("blackdetect"). Both are read. None when the log holds no record
+    of the detector at all (not even its configuration line, logged at
+    verbose level when it starts): the black check then did not run here.
+    """
+    lines = "\n".join(t for t in (_lines_with_context(log_text, "blackdetect@v"),
+                                   _lines_with_context(log_text, "blackdetect")) if t)
+    if not lines:
+        return None
+    text = _close_open_regions(lines, video_end)
     return [(start, start + duration) for start, duration in _pair_detect_events(text, "black")]
 
 

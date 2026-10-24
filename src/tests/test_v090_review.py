@@ -134,10 +134,13 @@ class TestLosslessTrims:
 def _hot_clip(path):
     """Camera-original loudness: about -3.6 LUFS with a true peak above 0 dBTP."""
     path += ".mp4"
-    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=4",
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=4,"
+           "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p,"
+        "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709",
            "-f", "lavfi", "-i", "sine=f=1000:sample_rate=48000:d=4,volume=8",
            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-           "-colorspace", "bt709", "-c:a", "aac", path)
+           "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+           "-c:a", "aac", path)
     return path
 
 
