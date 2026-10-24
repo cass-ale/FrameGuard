@@ -1069,6 +1069,22 @@ def _loudness_spec(c: dict) -> str:
             f"TP ≤ {c.get('true_peak_max_dbtp')} dBTP")
 
 
+def _audio_signal_spec(c: dict) -> str:
+    """The audio signal checks and their spec decisions (audio_checks)."""
+    def on(key):
+        return c.get(key, True)
+    parts = []
+    if on("audio_phase_check"):
+        parts.append(f"phase below {float(c.get('phase_correlation_min', -0.2)):g} correlation")
+    off = [label for key, label in (("audio_clipping_check", "clipping"), ("audio_dropout_check", "dropouts"),
+                                    ("audio_phase_check", "phase"), ("audio_dual_mono_check", "dual mono"),
+                                    ("audio_dc_offset_check", "DC offset"), ("audio_hum_check", "hum"))
+           if not on(key)]
+    if off:
+        parts.append("off: " + ", ".join(off))
+    return "; ".join(parts)
+
+
 def _conformance_spec_rows(c: dict) -> List[tuple]:
     """Spec rows for the 0.9.1 container / XR / conformance keys (container_checks.py)."""
     def listed(key):
@@ -1142,6 +1158,7 @@ def spec_rows(config: dict) -> List[tuple]:
         ("Silence", f"≤{c.get('silence_noise_db')} dB for ≥{c.get('silence_duration')} s; "
                     f"dead at {float(c.get('dead_channel_ratio') or 0) * 100:g}%"),
         ("Loudness", _loudness_spec(c)),
+        ("Audio checks", _audio_signal_spec(c)),
     ]
     return [(label, value) for label, value in rows if value not in (None, "")]
 

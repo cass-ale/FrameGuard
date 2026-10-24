@@ -330,3 +330,51 @@ class TestPhaseEndMarker:
         start = chain.index("out_phase_start")
         end = chain.index("out_phase_end")
         assert "mode=delete" not in chain[start:end], chain
+
+
+# ---------------------------------------------------------------------------
+# 7. Phase: whole-programme correlation and mono fold-down loss (REVIEW §2, held-out 100 % -> 50 %)
+# ---------------------------------------------------------------------------
+
+def _wide_stereo(inverted: bool):
+    """A shared source plus independent ambience per side, correlation
+    +0.37 (shared power 37 %): wide-stereo music. Inverting R gives -0.37."""
+    common = "0.1*(random(0)-0.5)"
+    left = f"if(eq(n,0),st(1,104729));{common}+0.1305*(random(1)-0.5)"
+    sign = "-" if inverted else ""
+    right = f"if(eq(n,0),st(2,1299709));{sign}({common}+0.1305*(random(2)-0.5))"
+    return [left, right]
+
+
+@needs_ffmpeg
+class TestPhaseInversionOfWideStereo:
+    def test_whole_file_inversion_of_wide_stereo_is_found(self, media):
+        """aphasemeter's per-sample measure of a -0.37 Pearson correlation
+        sits near -0.19 and never crossed -0.2, so 0.9.1 passed it."""
+        clip = media.get("wide_inverted", lambda p: make_audio(p, _wide_stereo(True), seconds=6))
+        row = _row(_scan(clip), "Audio Phase")
+        assert row[1] == "WARN" and row[3] == 85 and "polarity-inverted" in row[2], row
+        assert "correlation -0.3" in row[2] and "fold-down" in row[2] and "LU" in row[2], row
+
+    def test_the_same_music_in_phase_passes(self, media):
+        clip = media.get("wide_inphase", lambda p: make_audio(p, _wide_stereo(False), seconds=6))
+        row = _row(_scan(clip), "Audio Phase")
+        assert row[1] == "PASS" and "correlation +0.3" in row[2], row
+
+    def test_threshold_is_a_setting(self, media):
+        clip = media.get("wide_inverted", lambda p: make_audio(p, _wide_stereo(True), seconds=6))
+        assert _row(_scan(clip, phase_correlation_min=-0.5), "Audio Phase")[1] == "PASS"
+
+    def test_default_threshold_is_a_one_lu_fold_down_loss(self):
+        threshold = DEFAULT_CONFIG["phase_correlation_min"]
+        assert audio_checks.fold_down_change_lu(threshold) == pytest.approx(-1.0, abs=0.05)
+
+    def test_threshold_has_a_settings_control_and_a_pdf_line(self, qapp):
+        from frameguard.gui import SettingsPanel
+        from frameguard.report import spec_rows
+        panel = SettingsPanel()
+        assert panel.get_config_overrides()["phase_correlation_min"] == -0.2
+        panel._apply_preset_config({**panel.get_config_overrides(), "phase_correlation_min": -0.3})
+        assert panel.get_config_overrides()["phase_correlation_min"] == -0.3
+        rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG, phase_correlation_min=-0.3))))
+        assert "phase below -0.3" in rows["Audio checks"]

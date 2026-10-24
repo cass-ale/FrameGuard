@@ -27,8 +27,11 @@ Measurements and the standard each threshold comes from:
   material) inside otherwise active audio.
 * Clipping: runs of >= 3 identical samples at the channel's peak, the
   "successive samples of equal value" rule of Qualify AQ-105.
-* Phase: sustained L/R correlation below -0.2 (Qualify AQ-102 publishes the
-  -1..+1 scale but no default; -0.2 is the benchmark's inferred value).
+* Phase: L/R correlation below ``phase_correlation_min`` (default -0.2)
+  over the whole track, or sustained for >= 1 s. A mono fold-down L+R
+  changes level by 10*log10(1 + r) LU against uncorrelated summation, so
+  -0.2 is where the fold-down loses 1 LU, EBU R 128's widest permitted
+  deviation (see PHASE_RATIONALE).
 * Dual mono: L-R residual below -90 dBFS (Qualify AQ-103), or a Pearson
   correlation of at least 0.999 for lossy tracks whose residual is coding
   noise.
@@ -175,6 +178,20 @@ CLIP_BELOW_FS_MEAN_RUN = 2.5
 DUAL_MONO_RESIDUAL_DB = -90.0
 DUAL_MONO_MIN_CORRELATION = 0.999
 PHASE_INVERTED_SHARE = 0.5    # out of phase for half the active programme
+# PHASE_RATIONALE. Inverting one channel maps the L/R correlation r to -r
+# exactly. Natural stereo - panned or coincident sources, spaced pairs
+# (positively correlated at low frequencies), decorrelated reverb - has a
+# long-term correlation of 0 or more, so a programme that stays clearly
+# negative was inverted or built from anti-phase processing. How negative
+# matters by its consequence: a mono fold-down L+R carries
+# E[L^2] + E[R^2] + 2E[LR], i.e. 10*log10(1 + r) LU against the same
+# channels summed in power (uncorrelated material, and what BS.1770 adds for
+# the stereo programme). The default threshold -0.2 is a fold-down loss of
+# 1 LU (r = 10^-0.1 - 1 = -0.206): the widest deviation EBU R 128 permits
+# (+-1 LU where the target cannot be met exactly), so a mono listener hears
+# the programme outside any tolerance R 128 allows. Wide-stereo music at
+# +0.37 inverted reads -0.37, a 2.0 LU loss. The value is a setting
+# (phase_correlation_min).
 HUM_FREQUENCIES = (50, 60)
 HUM_RATE = 1000
 HUM_BAND_HZ = 2               # each band: three cascaded 2 Hz-wide biquads
@@ -1486,6 +1503,28 @@ def _pearson(rms_db: Sequence[float]) -> Optional[float]:
     return max(-1.0, min(1.0, (total - side) / (4.0 * math.sqrt(left * right))))
 
 
+def fold_down_change_lu(correlation: float) -> float:
+    """Level change of a mono fold-down L+R against power summation, for
+    equal-level channels with this correlation (PHASE_RATIONALE)."""
+    return 10 * math.log10(max(1e-12, 1.0 + correlation))
+
+
+def _fold_down_lu(evidence: ScanEvidence, ctx: TrackContext, j: int) -> Optional[float]:
+    """Measured fold-down change of pair ``j``: 10*log10(P(L+R) / (P(L)+P(R)))
+    = 10*log10(2 P(L+R) / (P(L+R) + P(L-R))), exact at any level balance."""
+    pair = parse_astats(evidence.log_text, f"astats@a{ctx.position}p{j}")
+    if len(pair) < 2:
+        return None
+    total, side = (pair[k].get("rms_db") for k in (0, 1))
+    if total is None or side is None:
+        return None
+    p_total = 10 ** (total / 10.0) if math.isfinite(total) else 0.0
+    p_side = 10 ** (side / 10.0) if math.isfinite(side) else 0.0
+    if p_total + p_side <= 0:
+        return None
+    return 10 * math.log10(max(1e-12, 2 * p_total / (p_total + p_side)))
+
+
 def _pair_stats(evidence: ScanEvidence, ctx: TrackContext, j: int, left: int,
                 right: int) -> Tuple[Optional[float], Optional[float]]:
     """(Pearson correlation, L-R residual peak dBFS) of one L/R pair."""
@@ -1553,6 +1592,19 @@ def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
         active = _active_seconds(ctx, evidence, (left, right)) or ctx.duration
         total = sum(d for _, d in events)
         corr_text = f"correlation {correlation:+.2f}" if correlation is not None else "correlation n/a"
+        fold = _fold_down_lu(evidence, ctx, j)
+        fold_text = (f"; a mono fold-down loses {-fold:.1f} LU against uncorrelated summation"
+                     if fold is not None and fold < 0 else "")
+        if not events and correlation is not None and correlation < threshold:
+            # A whole-programme inversion of wide stereo: aphasemeter's
+            # per-sample phase (2LR / (L^2 + R^2), averaged) of broadband
+            # content sits near half the Pearson value, so its windows can
+            # stay above the threshold while the programme is inverted.
+            flagged = True
+            confidence = min(confidence, 85)
+            texts.append(f"{pair_name} {corr_text} over the whole track (below {threshold:g}): one "
+                         f"channel is probably polarity-inverted{fold_text}")
+            continue
         if not events:
             texts.append(f"{pair_name} {corr_text}, never below {threshold:g} for "
                          f"{_number(cfg, 'phase_min_duration'):g} s or more")
@@ -1563,7 +1615,7 @@ def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
             confidence = min(confidence, 85)
             texts.append(f"{pair_name} {corr_text}, below {threshold:g} for {total:.1f}s "
                          f"({share * 100:.0f}% of the active audio): one channel is probably "
-                         f"polarity-inverted; a mono fold-down will cancel")
+                         f"polarity-inverted{fold_text}")
         else:
             confidence = min(confidence, LOW_CONFIDENCE)
             texts.append(f"{pair_name} {corr_text}; sustained correlation below {threshold:g} at "
