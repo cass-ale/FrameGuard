@@ -142,6 +142,10 @@ DEFAULT_CONFIG = {
     "audio_dropout_check": True,
     "audio_phase_check": True,
     "audio_dual_mono_check": True,
+    # Dual mono is a per-specification decision (EBU QC item 0124B sets it
+    # per spec): False (default) warns on identical L/R, True accepts it -
+    # mono voice-over or archive material delivered on a stereo pair.
+    "dual_mono_allowed": False,
     "audio_dc_offset_check": True,
     "audio_hum_check": True,
     "dropout_noise_db": -90.0,
@@ -1702,6 +1706,8 @@ def dual_mono_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
             texts.append(f"{pair_name} distinct (correlation {corr_text})")
     if not texts:
         return "SKIP", _with_label(ctx.label, "No live stereo pair to analyse."), 100
+    if flagged and cfg.get("dual_mono_allowed", False):
+        return "PASS", _with_label(ctx.label, "; ".join(texts) + " (dual mono allowed by this spec)."), 100
     suffix = ". Intended for a stereo deliverable?" if flagged else "."
     return ("WARN" if flagged else "PASS"), _with_label(ctx.label, "; ".join(texts) + suffix), confidence
 

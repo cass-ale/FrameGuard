@@ -461,3 +461,31 @@ class TestHumFrequencyAndHarmonics:
         clip = media.get("pure50", lambda p: make_audio(p, exprs, seconds=6))
         row = _row(_scan(clip), "Audio Hum")
         assert row[1] == "PASS" and "harmonic" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# 11. Dual mono allowed is a spec decision (held-out h08, review B11)
+# ---------------------------------------------------------------------------
+
+@needs_ffmpeg
+class TestDualMonoAllowed:
+    def test_mono_vo_in_stereo_passes_when_the_spec_allows_it(self, media):
+        clip = media.get("vo_dualmono", lambda p: make_audio(p, [tone(220)] * 2))
+        row = _row(_scan(clip, dual_mono_allowed=True), "Dual Mono")
+        assert row[1] == "PASS" and "dual mono allowed" in row[2], row
+
+    def test_default_still_warns(self, media):
+        assert DEFAULT_CONFIG["dual_mono_allowed"] is False
+        clip = media.get("vo_dualmono", lambda p: make_audio(p, [tone(220)] * 2))
+        assert _row(_scan(clip), "Dual Mono")[1] == "WARN"
+
+    def test_setting_has_a_control_and_a_pdf_line(self, qapp):
+        from frameguard import presets
+        from frameguard.gui import SettingsPanel
+        from frameguard.report import spec_rows
+        assert presets.validate_preset_config({"dual_mono_allowed": True}) == {"dual_mono_allowed": True}
+        panel = SettingsPanel()
+        panel._apply_preset_config({**panel.get_config_overrides(), "dual_mono_allowed": True})
+        assert panel.get_config_overrides()["dual_mono_allowed"] is True
+        rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG, dual_mono_allowed=True))))
+        assert "dual mono allowed" in rows["Audio checks"]

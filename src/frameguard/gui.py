@@ -740,7 +740,7 @@ _UI_BACKED_CONFIG_KEYS = frozenset({
     "warn_untagged_color", "spatial_audio",
     "loudness_profile", "audio_clipping_check", "audio_dropout_check",
     "audio_phase_check", "audio_dual_mono_check", "audio_dc_offset_check",
-    "audio_hum_check", "phase_correlation_min", "dialogue_gated_loudness",
+    "audio_hum_check", "phase_correlation_min", "dialogue_gated_loudness", "dual_mono_allowed",
     "black_frames_enabled", "freeze_frames_enabled", "signal_levels_mode",
     "flash_check_enabled", "interlace_check_enabled",
 })
@@ -3877,6 +3877,8 @@ class SettingsPanel(QWidget):
          ((-0.1, "-0.1"), (-0.2, "-0.2"), (-0.3, "-0.3"), (-0.5, "-0.5"))),
         ("audio", "audio_dual_mono_check", "bool", "Dual Mono",
          "Warn when a stereo track carries the same signal on both channels", None),
+        ("audio", "dual_mono_allowed", "bool", "Allow Dual Mono",
+         "Accept the same signal on both channels, as for mono voice-over delivered in stereo", None),
         ("audio", "audio_dc_offset_check", "bool", "DC Offset", "Warn on a DC offset above -50 dBFS", None),
         ("audio", "audio_hum_check", "bool", "Hum", "Warn on a steady 50 / 60 Hz mains hum", None),
         ("picture", "black_frames_enabled", "bool", "Black Frames",
