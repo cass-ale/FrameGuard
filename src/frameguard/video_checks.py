@@ -17,7 +17,7 @@ picture measurements to that one pass and turns them into verdict rows:
   field-order disagreement with the stream's metadata.
 
 Measurements leave FFmpeg as small per-frame text files (``metadata``
-``file=``) and one raw 16x9 grid stream, written to a private temporary
+``file=``) and one raw linear-light grid stream, written to a private temporary
 directory. Keeping them out of stderr means they never compete with decoder
 errors for the bounded log capture, and threaded filters cannot interleave
 their lines mid-record.
@@ -90,9 +90,16 @@ INTERLACE_MAX_WIDTH = 320
 # Pictures smaller than this are not analysed for levels/flash.
 MIN_ANALYSIS_DIMENSION = 32
 
-# BT.1702-3 is applied on a 16x9 grid: 144 blocks, so "more than 25 % of the
-# screen" is more than 36 blocks.
+# BT.1702-3 flashes are judged per region on a 16x9 grid of linear light
+# (144 blocks). A block's value is the mean light its area emits (light is
+# linearised before it is block-averaged), and partly covered blocks are
+# weighted by their covered share (see FlashAccumulator.events), so the 25 %
+# area rule is not block-quantised.
 FLASH_GRID = (16, 9)
+# Linear light is computed on a copy with this many samples per block side
+# before block averaging: only those samples mix gamma-coded values, so an
+# edge mis-weights at most one 1/8-block strip (see _area_chains).
+FLASH_SUBSAMPLES = 8
 
 # ---------------------------------------------------------------------------
 # Thresholds (each cites where it comes from)
@@ -120,13 +127,17 @@ RANGE_PC_BAND_LO = (14, 19)    # pc: a pile-up here is limited-range black clipp
 RANGE_PC_BAND_HI = (231, 237)  # pc: a pile-up here is limited-range white clipping
 RANGE_PC_EXTREMES_SHARE = 0.0001  # pc: above this share, full-range codes are in use
 
-# BT.1702-3 Annex 1: a flash is a pair of opposing changes of at least
-# 20 cd/m2 where the darker state is below 160 cd/m2, on an SDR display
-# assumed to peak at 200 cd/m2; hazardous when more than three flashes fall
-# within any one second over more than 25 % of the screen. BT.1702 gives no
-# numeric red definition; the WCAG 2.2 one (R/(R+G+B) >= 0.8 and a change of
-# (R-G-B) x 320 of at least 20, linear RGB) is used, as the reference
-# implementation in the benchmark did.
+# ITU-R BT.1702-3 Annex 1, Guideline 1: a flash is a pair of opposing
+# changes in luminance of 20 cd/m2 or more where the darker image is below
+# 160 cd/m2 (Notes 2-3: SDR peak white displayed at 200 cd/m2). A sequence is
+# not permitted when "the combined area of flashes occurring concurrently
+# occupies more than 25% of the displayed screen area" and there are "more
+# than three flashes (i.e. six changes in luminance) within any one-second
+# period". "Irrespective of luminance, a transition to or from a saturated
+# red is also potentially harmful"; BT.1702-3 gives no numeric red
+# definition (Annex 3 leaves it to further study), so the WCAG 2.2 one is
+# used: R/(R+G+B) >= 0.8 and a change of (R-G-B) x 320 of at least 20, on
+# linear RGB 0..1 with negative values set to 0.
 FLASH_PEAK_CD = 200.0
 FLASH_DELTA_CD = 20.0
 FLASH_DARK_CD = 160.0
@@ -686,11 +697,16 @@ class VideoAnalysis:
         if self.flash_enabled:
             linear = _flash_linear_expression(info)
             cols, rows = FLASH_GRID
-            # Linear light is block-averaged on a 64x36 copy: the colour
-            # conversion then costs nothing, and a block of the 16x9 grid
-            # still averages 16 linear samples.
+            # Area-preserving: light is linearised on a copy with
+            # FLASH_SUBSAMPLES samples per block side *before* it is
+            # block-averaged, so a block's value is the mean light its area
+            # emits (averaging gamma-coded values would under-read a partly
+            # covered block: half white reads 19 %, not 50 %). Gamma values
+            # mix only within one of those samples, i.e. in a strip of at
+            # most 1/8 of a block along an edge.
+            sub = FLASH_SUBSAMPLES
             chains.append(
-                f"[ar_flash]scale=w={cols * 4}:h={rows * 4}:flags=area,"
+                f"[ar_flash]scale=w={cols * sub}:h={rows * sub}:flags=area,"
                 f"scale=in_color_matrix={info.matrix}:in_range={rng}:out_range=pc,"
                 f"format=gbrp,lutrgb=r='{linear}':g='{linear}':b='{linear}',"
                 f"scale={cols}:{rows}:flags=area[vs_flash]")
@@ -762,7 +778,7 @@ class VideoAnalysis:
     def extra_outputs(self) -> List[str]:
         """Arguments for the raw flash-grid output (after the main output).
 
-        The grid (432 bytes a frame) is written in short segments that the
+        The grid (FlashAccumulator.FRAME_BYTES a frame) is written in short segments that the
         reader thread folds into a FlashAccumulator and deletes while FFmpeg
         is still decoding, so it never accumulates on disk. Timestamps are
         passed through untouched: one grid per decoded frame, in order.
@@ -1426,67 +1442,10 @@ class _ZigZag:
         return 0
 
 
-def _transitions(values: Sequence[float], delta: float, dark_limit: Optional[float] = None,
-                 saturated: Optional[Sequence[bool]] = None) -> List[Tuple[int, int]]:
-    """(frame index, +1 rising / -1 falling) for every completed swing (see _ZigZag)."""
-    detector = _ZigZag(delta, dark_limit, red=saturated is not None)
-    out = []
-    for i, value in enumerate(values):
-        direction = detector.push(value, bool(saturated[i]) if saturated is not None else False)
-        if direction:
-            out.append((i, direction))
-    return out
-
-
-def _hazard_spans(marks: Sequence[Tuple[int, int]], times: Sequence[float],
-                  window: float) -> List[Tuple[int, int]]:
-    """(first, last) frame spans with more than three flashes within ``window``.
-
-    More than three flashes is more than six transitions: seven
-    transitions spanning less than a second. At exactly 3 Hz seven
-    transitions span exactly one second, so the BT.1702 limit itself is not
-    flagged.
-    """
-    need = FLASH_MAX_TRANSITIONS + 1
-    spans = []
-    for k in range(len(marks) - need + 1):
-        first, last = marks[k][0], marks[k + need - 1][0]
-        if times[last] - times[first] < window:
-            spans.append((first, last))
-    return spans
-
-
-def _flash_transitions(kind: str, grid, frames: Sequence[int],
-                       blocks: Sequence[int]) -> List[Tuple[int, int]]:
-    """Transitions of one flash rule for the mean of ``blocks`` over ``frames``.
-
-    ``kind`` "general": luminance Y = 0.2126 R + 0.7152 G + 0.0722 B of the
-    linear grid scaled to the 200 cd/m2 peak, swings of 20 cd/m2 with the
-    darker state below 160 cd/m2. "red": (R - G - B) x 320 on linear values
-    0..1, swings of 20 where one end is saturated red (R/(R+G+B) >= 0.8).
-    ``grid[i]`` is frame i's (G, B, R) planes. Returned indices are
-    positions within ``frames``.
-    """
-    n = float(len(blocks))
-    values, saturated = [], []
-    for i in frames:
-        g = sum(grid[i][0][b] for b in blocks) / n
-        bl = sum(grid[i][1][b] for b in blocks) / n
-        r = sum(grid[i][2][b] for b in blocks) / n
-        if kind == "general":
-            values.append(FLASH_PEAK_CD / 255.0 * (0.2126 * r + 0.7152 * g + 0.0722 * bl))
-        else:
-            values.append(max(0.0, (r - g - bl) / 255.0) * 320.0)
-            saturated.append(r > 0 and r >= FLASH_RED_RATIO * (r + g + bl))
-    if kind == "general":
-        return _transitions(values, FLASH_DELTA_CD, FLASH_DARK_CD)
-    return _transitions(values, FLASH_RED_DELTA, None, saturated)
-
-
 _FLASH_KINDS = ("general", "red")
-# Per-byte terms of the single-block series, computed exactly as
-# _flash_transitions computes them for one block (same products, same
-# addition order), so streaming and batch values are bit-identical.
+# Per-byte terms of a block's rule quantity, computed once: luminance in
+# cd/m2 (Y = 0.2126 R + 0.7152 G + 0.0722 B of linear light, scaled to the
+# 200 cd/m2 SDR peak) and the WCAG saturated-red measure (R - G - B) x 320.
 _LUM_R = [0.2126 * v for v in range(256)]
 _LUM_G = [0.7152 * v for v in range(256)]
 _LUM_B = [0.0722 * v for v in range(256)]
@@ -1494,29 +1453,34 @@ _LUM_SCALE = FLASH_PEAK_CD / 255.0
 _RED = [max(0.0, v / 255.0) * 320.0 for v in range(-510, 256)]
 
 
-class FlashAccumulator:
-    """BT.1702-3 flash counting over a stream of 16x9 linear-light grids.
+def _rule_value(kind: str, r: int, g: int, b: int) -> float:
+    """The quantity ``kind``'s rule swings on, for one block's linear bytes."""
+    if kind == "general":
+        return _LUM_SCALE * (_LUM_R[r] + _LUM_G[g] + _LUM_B[b])
+    return _RED[r - g - b + 510]
 
-    The grid arrives in chunks while FFmpeg decodes (one 432-byte gbrp
-    frame per video frame). Every block's swings are detected on the fly;
-    the raw grid is kept only where the final decision can need it, so
+
+class FlashAccumulator:
+    """BT.1702-3 flash counting over a stream of linear-light grids.
+
+    The grid (FLASH_GRID blocks, one gbrp frame per video frame) arrives in
+    chunks while FFmpeg decodes. Every block's swings are detected on the
+    fly; the raw grid is kept only where the final decision can need it, so
     memory and disk stay small for any length of programme.
 
     What is kept, and why it is enough for an exact result (identical to
     judging the whole series at once):
 
-    * A block is hazardous over 7 consecutive swings spanning less than one
-      second. In frames that is at most ``span_frames`` (two seconds' worth
-      at the stream rate, leaving room for timing jitter), so swings are
-      committed only when seven of them fall within ``span_frames`` - a
-      superset of every hazardous run.
-    * The concurrency check (assess_flash step 2) needs the raw grid from
-      ``lead`` frames before a flagged run to its end. A frame can only be
-      flagged where more than 25 % of the blocks have a committed run over
-      it; those frames, and the ``lead`` frames before them, are retained.
-
-    Exact spans, flagged runs and events are computed in events() with the
-    real frame times.
+    * A block flashes hazardously over 7 consecutive swings spanning less
+      than one second. In frames that is at most ``span_frames`` (two
+      seconds' worth at the stream rate, leaving room for timing jitter),
+      so swings are committed only when seven of them fall within
+      ``span_frames`` - a superset of every hazardous run.
+    * The area decision (events) needs each flashing block's swing size to
+      weight partly covered blocks, i.e. the raw grid on frames where the
+      flashing blocks could cover more than 25 % of the screen. Weights never
+      exceed 1, so those are frames where more than 25 % of the blocks have
+      a committed run over them; only they are retained.
     """
 
     PLANE = FLASH_GRID[0] * FLASH_GRID[1]
@@ -1525,7 +1489,6 @@ class FlashAccumulator:
     def __init__(self, fps: float):
         rate = fps if 0 < fps < 1000 else 0.0
         self.span_frames = int(math.ceil(2.0 * rate)) + 2 if rate else 482
-        self.lead = max(1, int(round(rate))) if rate else 240
         blocks = self.PLANE
         self.detectors = {
             "general": [_ZigZag(FLASH_DELTA_CD, FLASH_DARK_CD) for _ in range(blocks)],
@@ -1596,14 +1559,11 @@ class FlashAccumulator:
                 running = self.coverage_running[kind] + self.coverage_delta[kind].pop(frame, 0)
                 self.coverage_running[kind] = running
                 flagged = flagged or running > threshold
-            if flagged:
-                for keep in range(max(0, frame - self.lead), frame + 1):
-                    if keep not in self.retained:
-                        self.retained[keep] = self._row(keep)
+            if flagged and frame not in self.retained:
+                self.retained[frame] = self._row(frame)
         self.final_through = max(self.final_through, through)
-        oldest_needed = self.final_through + 1 - self.lead
         while self.recent_rows and (self.recent_rows[0][0]
-                                    + len(self.recent_rows[0][1]) // self.FRAME_BYTES) <= oldest_needed:
+                                    + len(self.recent_rows[0][1]) // self.FRAME_BYTES) <= self.final_through + 1:
             self.recent_rows.popleft()
 
     def _row(self, frame: int) -> bytes:
@@ -1619,25 +1579,66 @@ class FlashAccumulator:
         self.recent_rows.clear()
 
     # -- decision --------------------------------------------------------------
-    def _grid(self, frame: int) -> Tuple[bytes, bytes, bytes]:
-        row = self.retained[frame]
+    def _amplitudes(self, kind: str, frames: range, blocks: Sequence[int]) -> Dict[int, float]:
+        """Swing size (max - min of the rule quantity) of each block over ``frames``."""
         plane = self.PLANE
-        return row[:plane], row[plane:2 * plane], row[2 * plane:]
+        low = {b: math.inf for b in blocks}
+        high = {b: -math.inf for b in blocks}
+        for f in frames:
+            row = self.retained[f]
+            for b in blocks:
+                value = _rule_value(kind, row[2 * plane + b], row[b], row[plane + b])
+                if value < low[b]:
+                    low[b] = value
+                if value > high[b]:
+                    high[b] = value
+        return {b: high[b] - low[b] for b in blocks}
+
+    def _coverage_weights(self, amplitude: Dict[int, float]) -> Dict[int, float]:
+        """Share of each flashing block covered by the flash (area-preserving).
+
+        A block partly covered by a flashing area of uniform swing S swings
+        by (covered share) x S, because the grid holds mean linear light. Its
+        coverage is therefore its own swing over the swing of its fully
+        covered neighbours - taken as the largest swing among itself and its
+        eight neighbours that also flash. Inside a flashing area that is 1;
+        along its edge it is the covered share. A block with no larger
+        neighbour counts whole (a flash smaller than a block is overstated,
+        never missed).
+        """
+        cols, rows = FLASH_GRID
+        weights = {}
+        for b, amp in amplitude.items():
+            x, y = b % cols, b // cols
+            reference = amp
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    nx, ny = x + dx, y + dy
+                    if 0 <= nx < cols and 0 <= ny < rows:
+                        reference = max(reference, amplitude.get(ny * cols + nx, 0.0))
+            weights[b] = min(1.0, amp / reference) if reference > 0 else 1.0
+        return weights
 
     def events(self, times: Sequence[float], fps: float,
                cancel: Optional["threading.Event"] = None) -> List[FlashEvent]:
-        """Flash events with the real frame times (assess_flash's decision)."""
+        """Flash events with the real frame times.
+
+        Per rule (general, red): a block flashes at frame f while f lies
+        within a run of seven of its swings spanning less than one second
+        (more than three flashes). "Flashes occurring concurrently" are the
+        blocks flashing at the same frame, whatever their phase - antiphase
+        halves, an inverting checkerboard or a turning windmill flash
+        concurrently over the whole screen although the screen's mean light
+        never changes. A frame is hazardous when the coverage-weighted area
+        of its flashing blocks exceeds 25 % of the screen.
+        """
         frames = min(self.frames, len(times))
         if frames < FLASH_MAX_TRANSITIONS + 1:
             return []
         times = times[:frames]
         period = _frame_period(fps, times)
         window = 1.0 - 0.5 * period
-        lead = max(1, int(round(1.0 / period)))
-        if lead > self.lead:
-            raise LookupError("frame rate above the streaming buffer's assumption")
         blocks = self.PLANE
-        grid = _RetainedGrid(self)
         events: List[FlashEvent] = []
         for kind in _FLASH_KINDS:
             hazard: Dict[int, List[int]] = {}
@@ -1648,27 +1649,30 @@ class FlashAccumulator:
                         members = hazard.setdefault(f, [])
                         if not members or members[-1] != b:
                             members.append(b)
-            flagged = sorted(f for f, members in hazard.items() if len(members) > FLASH_AREA * blocks)
-            for first, last in _consecutive_runs(flagged):
+            candidates = sorted(f for f, members in hazard.items()
+                                if len(members) > FLASH_AREA * blocks)
+            for first, last in _consecutive_runs(candidates):
+                check_cancel(cancel)
                 members = sorted({b for f in range(first, last + 1) for b in hazard[f]})
-                lo = max(0, first - lead)
-                local_times = times[lo:last + 1]
-                marks = _flash_transitions(kind, grid, range(lo, last + 1), members)
-                spans = _hazard_spans(marks, local_times, window)
-                if not spans:
-                    continue
-                start = local_times[spans[0][0]]
-                end = local_times[spans[-1][1]] + period
-                area = max(len(hazard[f]) for f in range(first, last + 1)) / blocks
-                events.append(FlashEvent(start, end, area, kind))
+                weights = self._coverage_weights(
+                    self._amplitudes(kind, range(first, last + 1), members))
+                areas = [sum(weights[b] for b in hazard[f]) / blocks
+                         for f in range(first, last + 1)]
+                flagged = [first + k for k, area in enumerate(areas) if area > FLASH_AREA]
+                for run_first, run_last in _consecutive_runs(flagged):
+                    peak = max(areas[run_first - first:run_last - first + 1])
+                    events.append(FlashEvent(times[run_first], times[run_last] + period, peak, kind))
         return sorted(events, key=lambda e: e.start)
 
     def _exact_spans(self, kind: str, block: int, times: Sequence[float], frames: int,
                      window: float) -> List[Tuple[int, int]]:
-        """_hazard_spans over the block's swings, from the committed ones.
+        """(first, last) frames of each run of seven consecutive swings < 1 s.
 
-        Every hazardous run of seven consecutive swings was committed whole,
-        so only runs whose sequence numbers are consecutive are judged.
+        More than three flashes is more than six transitions: seven
+        transitions spanning less than a second. At exactly 3 Hz seven
+        transitions span exactly one second, so the BT.1702 limit itself is
+        not flagged. Every such run was committed whole, so only runs whose
+        sequence numbers are consecutive are judged.
         """
         committed = self.committed[kind][block]
         if len(committed) < FLASH_MAX_TRANSITIONS + 1:
@@ -1685,16 +1689,6 @@ class FlashAccumulator:
         return spans
 
 
-class _RetainedGrid:
-    """grid[i] view over the frames a FlashAccumulator retained."""
-
-    def __init__(self, accumulator: FlashAccumulator):
-        self.accumulator = accumulator
-
-    def __getitem__(self, frame: int) -> Tuple[bytes, bytes, bytes]:
-        return self.accumulator._grid(frame)
-
-
 def _consecutive_runs(frames: Sequence[int]) -> List[Tuple[int, int]]:
     """(first, last) runs of consecutive integers in a sorted list."""
     runs: List[Tuple[int, int]] = []
@@ -1708,23 +1702,21 @@ def _consecutive_runs(frames: Sequence[int]) -> List[Tuple[int, int]]:
 
 def assess_flash(series: VideoSeries, fps: float,
                  cancel: Optional["threading.Event"] = None) -> List[FlashEvent]:
-    """BT.1702-3 general and red flash counting on a 16x9 grid of linear light.
+    """ITU-R BT.1702-3 general and red flash screening, per screen region.
 
-    1. Per block, the rule's quantity (luminance Y = 0.2126 R + 0.7152 G +
-       0.0722 B of BT.1886 display light at a 200 cd/m2 peak, or the WCAG
-       saturated-red measure) is turned into transitions; a block is
-       hazardous while seven transitions (more than three flashes) fall
-       within one second.
-    2. Where more than 25 % of the blocks are hazardous at once, the flash
-       must also be *concurrent*: the mean of those blocks has to flash by
-       itself. Blocks flashing in phase reinforce; a camera panning past
-       lights or a shaking frame makes blocks brighten and darken at
-       different moments, which cancels in the mean (real 4K camera footage
-       otherwise produced false hazards).
+    Each block of the linear-light grid is a region. Its rule quantity
+    (luminance of BT.1886 display light at a 200 cd/m2 peak, or the WCAG
+    saturated-red measure) is turned into transitions (see _ZigZag), and a
+    region flashes hazardously while seven transitions (more than three
+    flashes) fall within one second. The flashing regions' coverage-weighted
+    area must exceed 25 % of the screen at the same moment (see
+    FlashAccumulator.events). Phase is deliberately not considered: the
+    Recommendation's area rule is about flashes occurring concurrently, and
+    regions flashing in antiphase do.
 
     The scan streams the grid into ``series.flash_stream`` while FFmpeg
     runs; a series built in memory (``series.flash``) is fed here.
-    Advisory only: BT.1702 compliance is certified with a Harding FPA class
+    Screening only: BT.1702 compliance is certified with a Harding FPA class
     analyser.
     """
     accumulator = series.flash_stream

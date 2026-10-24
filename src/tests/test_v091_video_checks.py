@@ -183,8 +183,10 @@ class TestLevels:
 
 
 def _flash_series(hz, frames=150, area_blocks=144, level=255):
+    """``area_blocks`` of 144 (the 0.9.1 16x9 grid) flash: a share of the screen."""
     cols, rows = vc.FLASH_GRID
     blocks = cols * rows
+    area_blocks = round(area_blocks * blocks / 144)
     grid = []
     period = FPS / hz
     for i in range(frames):
@@ -558,7 +560,7 @@ class TestStreamingAndCancel:
 
     def test_quiet_grid_keeps_nothing(self):
         accumulator = vc.FlashAccumulator(FPS)
-        accumulator.feed(bytes(432) * 600)
+        accumulator.feed(bytes(vc.FlashAccumulator.FRAME_BYTES) * 600)
         accumulator.finish()
         assert accumulator.retained == {} and accumulator.events(_times(600), FPS) == []
 
@@ -593,7 +595,7 @@ class TestStreamingAndCancel:
         folder.mkdir()
         reader = vc._FlashSegmentReader(str(folder), FPS, None)
         reader.start()
-        segment = bytes(432) * 150
+        segment = bytes(vc.FlashAccumulator.FRAME_BYTES) * 150
 
         def write(number):
             with open(reader._segment(number), "wb") as handle:
