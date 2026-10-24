@@ -246,7 +246,6 @@ CHECK_SEVERITY_WEIGHTS = {
     "Flash Risk": 32,
     "Audio Silence": 30,
     "Audio Codec": 25,
-    "Audio Loudness": 25,
     "Frame Rate": 20,
     "Codec Profile": 65,
     "A/V Sync Offset": 60,

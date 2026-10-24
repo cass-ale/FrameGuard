@@ -69,3 +69,26 @@ class TestMostlySilentShortFile:
         clip = media.get("pause8", lambda p: make_audio(
             p, [gap, gap.replace("440", "554.37")], seconds=8))
         assert _row(_scan(clip), "Audio Silence")[1] == "WARN"
+
+
+# ---------------------------------------------------------------------------
+# 3. Severity weights follow delivery rejection risk (REVIEW §4: weights cut)
+# ---------------------------------------------------------------------------
+
+class TestAudioSeverityWeights:
+    W = core.CHECK_SEVERITY_WEIGHTS
+
+    def test_published_limits_outrank_content_advisories(self):
+        w = self.W
+        assert w["Audio Loudness"] >= w["Audio True Peak"] >= w["Audio Clipping"]
+        assert w["Audio Clipping"] > w["Audio Dropouts"] > w["Audio Phase"]
+        assert w["Audio Phase"] > max(w["Dual Mono"], w["Audio Hum"]) >= w["DC Offset"]
+
+    def test_a_loudness_rejection_outranks_a_codec_or_rate_note(self):
+        assert core.check_severity("Audio Loudness", "FAIL") > core.check_severity("Audio Codec", "FAIL")
+        assert core.check_severity("Audio Loudness", "FAIL") > core.check_severity("Frame Rate", "FAIL")
+        # ...but an undecodable file still comes first.
+        assert core.check_severity("File Integrity", "FAIL") > core.check_severity("Audio Loudness", "FAIL")
+
+    def test_loudness_weight_is_owned_by_the_audio_module(self):
+        assert audio_checks.SEVERITY_WEIGHTS["Audio Loudness"] == self.W["Audio Loudness"]

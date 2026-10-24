@@ -46,6 +46,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 # Check names, classification and configuration
 # ---------------------------------------------------------------------------
 
+LOUDNESS = "Audio Loudness"   # reported by core; its weight lives here
 TRUE_PEAK = "Audio True Peak"
 CLIPPING = "Audio Clipping"
 DROPOUTS = "Audio Dropouts"
@@ -63,14 +64,34 @@ HUM = "Audio Hum"
 ESSENTIAL_CHECKS = frozenset({TRUE_PEAK, CLIPPING})
 ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM})
 
+# Severity weights (core.check_severity: weight x confidence, WARN at half)
+# rank a row by the risk that the defect gets the delivery rejected, on
+# core's scale (File Integrity 90: unplayable; Resolution 70: an
+# unconditional spec rejection; Bitrate 60; Dead Channel 40):
+# * Loudness 70: a measured miss of a published, mandatory limit. Broadcast
+#   and streaming QC reject it outright (EBU R 128 / DPP AS-11 technical QC,
+#   ATSC A/85 under the US CALM Act, Netflix's mix specification), and the
+#   fix is a re-render - the same tier as a wrong resolution.
+# * True peak 65: the same specifications and the same rejection, but fixed
+#   by a limiter pass without re-mixing, so just below loudness.
+# * Clipping 60: Qualify AQ-105 and DPP reject full-scale clipping and it is
+#   unrecoverable, but a few clipped runs are often a QC note, not a reject.
+# * Dropouts 40 and phase 35: audible faults that QC rejects when they are
+#   real, judged here from content (advisory), so at Dead Channel's level.
+#   A polarity inversion loses content only on a mono fold-down.
+# * Dual mono 20 and hum 20: spec- and content-dependent (EBU QC 0124B
+#   makes dual mono a per-specification limit); reported, rarely rejected.
+# * DC offset 15: inaudible and removed by any high-pass; no delivery
+#   specification rejects it on its own.
 SEVERITY_WEIGHTS = {
-    TRUE_PEAK: 30,
-    CLIPPING: 45,
-    DROPOUTS: 35,
-    PHASE: 30,
-    DUAL_MONO: 15,
+    LOUDNESS: 70,
+    TRUE_PEAK: 65,
+    CLIPPING: 60,
+    DROPOUTS: 40,
+    PHASE: 35,
+    DUAL_MONO: 20,
+    HUM: 20,
     DC_OFFSET: 15,
-    HUM: 15,
 }
 
 PLAIN_SUMMARIES = {
