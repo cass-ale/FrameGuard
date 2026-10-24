@@ -390,3 +390,15 @@ class TestHalfSphereGeometry:
         hard, soft, _ = cc.xr_metadata_findings(
             {"width": 4096, "height": 2048}, "half_equirectangular", "mono", None, {})
         assert any("180°" in text for text in soft), soft
+
+
+# ---------------------------------------------------------------------------
+# 4. An unread moov is Not verified everywhere it matters (B7, B8)
+# ---------------------------------------------------------------------------
+
+class TestUnreadMoov:
+    def test_moov_over_the_cap_is_not_a_structure_pass(self, media, monkeypatch):
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        check = _row(_scan(_clean(media)), "Container Structure")
+        assert _not_verified(check) and "moov" in check[2], check
+        assert "every box and sample" not in check[2], check

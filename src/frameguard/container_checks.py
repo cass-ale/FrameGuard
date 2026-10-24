@@ -410,6 +410,7 @@ class Structure:
     tracks: List[TrackInfo] = field(default_factory=list)
     parsed: bool = False
     error: str = ""
+    moov_unread: str = ""     # why a moov that exists was not parsed
 
     @property
     def fragmented(self) -> bool:
@@ -760,7 +761,8 @@ def _first_sample_past(offset: int, first: int, count: int, file_size: int,
 def _read_moov(stream, box: Box, structure: Structure) -> None:
     payload_size = box.size - box.header
     if payload_size > MAX_MOOV_BYTES:
-        structure.notes.append(f"the moov index is {payload_size / 1048576:.0f} MB; it was not inspected")
+        structure.moov_unread = (f"the moov index is {payload_size:,} bytes, above the "
+                                 f"{MAX_MOOV_BYTES:,}-byte inspection limit, so it was not read")
         return
     stream.seek(box.offset)
     data = stream.read(box.size)
@@ -934,7 +936,12 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
         result.add_skip(name, f"{structure.family} file: box-level checks apply to MP4/MOV."
                         if structure.family != "unknown" else "Not an MP4/MOV file: box-level checks do not apply.")
         return
+    if structure.moov_unread and not structure.damage:
+        result.add_not_verified(name, structure.moov_unread + "; box tables and samples were not checked.")
+        return
     problems, notes = list(structure.damage), []
+    if structure.moov_unread:
+        notes.append(structure.moov_unread)
     problems += _missing_media_text(structure)
     if structure.moov_count == 0 and not structure.fragmented and not structure.damage:
         problems.append("no moov index box: players cannot open the file")
