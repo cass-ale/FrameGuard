@@ -396,9 +396,44 @@ class TestHalfSphereGeometry:
 # 4. An unread moov is Not verified everywhere it matters (B7, B8)
 # ---------------------------------------------------------------------------
 
+def _foa_v2(media, tmp_path, name):
+    """Spherical V2 mono equirect with a 4-channel AAC track and a valid SA3D box."""
+    from container_fixtures import add_to_sample_entry, sa3d, st3d, sv3d
+
+    def build(path):
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x160:r=30:d=2", "-f", "lavfi", "-i", "sine=f=440:d=2",
+               "-filter_complex", "[1:a]pan=4.0|c0=c0|c1=0.5*c0|c2=0*c0|c3=0.8*c0[a]", "-map", "0:v",
+               "-map", "[a]", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", path)
+        return path
+    path = _copy(media.get("foa.mp4", build), tmp_path / name)
+    add_to_sample_entry(path, b"vide", st3d(0), sv3d())
+    return add_to_sample_entry(path, b"soun", sa3d(4))
+
+
 class TestUnreadMoov:
     def test_moov_over_the_cap_is_not_a_structure_pass(self, media, monkeypatch):
         monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
         check = _row(_scan(_clean(media)), "Container Structure")
         assert _not_verified(check) and "moov" in check[2], check
         assert "every box and sample" not in check[2], check
+
+    def test_box_level_xr_and_spatial_audio_are_not_verified(self, media, tmp_path, monkeypatch):
+        path = _foa_v2(media, tmp_path, "foa_v2.mp4")
+        spec = dict(target_width=320, target_height=160, required_projection="equirectangular",
+                    spatial_audio="required", accepted_audio_codecs=["aac"])
+        clean = _scan(path, **spec)
+        assert _row(clean, "Spatial Audio")[1] == "PASS", _row(clean, "Spatial Audio")
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        result = _scan(path, **spec)
+        spatial = _row(result, "Spatial Audio")
+        assert _not_verified(spatial), spatial          # was a false FAIL: "no track carries a valid SA3D"
+        xr = _row(result, "XR Metadata")
+        assert xr[1] != "PASS" and "not verified" in xr[2].lower(), xr
+
+    def test_timecode_track_is_not_verified(self, media, tmp_path, monkeypatch):
+        mov = tmp_path / "tc.mov"
+        ffmpeg("-i", _clean(media), "-c", "copy", "-timecode", "01:00:00:00", str(mov))
+        assert _row(_scan(mov), "Timecode")[1] == "PASS"
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        check = _row(_scan(mov), "Timecode")
+        assert _not_verified(check), check

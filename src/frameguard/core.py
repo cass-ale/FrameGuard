@@ -1761,6 +1761,12 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
     hard, soft, notes = container_checks.xr_metadata_findings(
         video, projection, stereo, structure, cfg, grabber, _stream_duration(video) or _probed_duration(probe_data))
     problems += hard
+    # The V1/V2 generations, per-eye bounds and pose come from the box reader;
+    # when it could not read the moov they are unverified, never passed.
+    unread = container_checks.unread_reason(structure) if (projection or want_projection not in ("any", "none")
+                                                           or want_stereo != "any") else ""
+    if unread and (problems or soft):
+        notes.append(f"box-level spherical metadata not verified: {unread}")
     note = f" ({'; '.join(notes)})" if notes else ""
     if problems:
         result.add_fail("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(problems + soft) + "." + note)
@@ -1768,6 +1774,9 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
         content_only = all("content check" in text for text in soft)
         result.add_warn("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(soft) + "." + note,
                         confidence=60 if content_only else 80)
+    elif unread:
+        result.add_not_verified("XR Metadata", f"{found}; box-level spherical metadata (V1/V2, bounds, "
+                                               f"pose) could not be read: {unread}." + note)
     else:
         enforced = want_projection != "any" or want_stereo != "any"
         result.add_pass("XR Metadata", f"{found[0].upper()}{found[1:]}"

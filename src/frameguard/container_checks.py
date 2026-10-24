@@ -839,6 +839,18 @@ def read_structure(path: str) -> Structure:
     return structure
 
 
+def unread_reason(structure: Optional[Structure]) -> str:
+    """Why the box-level view of an MP4/MOV is missing ("" when it was read,
+    or the file is not ISO-BMFF so box-level checks do not apply)."""
+    if structure is None or structure.family != "ISO-BMFF":
+        return ""
+    if structure.error:
+        return f"the file's box structure could not be read ({structure.error})"
+    if not structure.parsed:
+        return structure.moov_unread or "the file has no readable moov index"
+    return ""
+
+
 def sample_offsets(track: TrackInfo, wanted: List[int]) -> Dict[int, Tuple[int, int]]:
     """{sample index: (file offset, size)} for the zero-based indices in ``wanted``."""
     targets = sorted(set(i for i in wanted if 0 <= i < track.sample_count))
@@ -1511,6 +1523,17 @@ def _gop_report(path: str, track: TrackInfo, fps: int) -> Tuple[Optional[str], O
     return start, None, len(found)
 
 
+def _probe_shows_timecode(probe_data: dict) -> bool:
+    """ffprobe lists a QuickTime timecode track as a 'tmcd' data stream and
+    the start timecode as a ``timecode`` tag."""
+    for stream in (probe_data or {}).get("streams", []) or []:
+        if str(stream.get("codec_tag_string") or "").lower() == "tmcd":
+            return True
+        if (stream.get("tags") or {}).get("timecode"):
+            return True
+    return bool(((probe_data or {}).get("format") or {}).get("tags", {}).get("timecode"))
+
+
 def check_timecode(path: str, structure: Structure, probe_data: dict, result, cfg: dict) -> None:
     """Timecode continuity in a QuickTime tmcd track and in MPEG-2 GOP headers.
 
@@ -1519,9 +1542,13 @@ def check_timecode(path: str, structure: Structure, probe_data: dict, result, cf
     the file (an edit or a recorder restart) breaks conform and EDL
     relinking, so it is reported as advisory.
     """
-    if structure.family != "ISO-BMFF" or not structure.parsed:
+    if structure.family != "ISO-BMFF":
         return
     core = _core()
+    if not structure.parsed:
+        if _probe_shows_timecode(probe_data):
+            result.add_not_verified(TIMECODE, f"{unread_reason(structure)}; the timecode track was not read.")
+        return
     video = core._primary_video_stream(probe_data) or {}
     problems, notes = [], []
     try:
@@ -1769,6 +1796,11 @@ def check_spatial_audio(structure: Optional[Structure], probe_data: dict, result
             result.add_fail(name, "This spec requires spatial (ambisonic) audio; the file has no audio.")
         else:
             result.add_skip(name, "No audio stream.")
+        return
+    unread = unread_reason(structure)
+    if unread and (required or xr):
+        # ffmpeg does not expose SA3D: without the box view it cannot be judged.
+        result.add_not_verified(name, f"{unread}; SA3D ambisonic metadata could not be read.")
         return
     strict = required or _xr_enforced(cfg)
     entries = []
