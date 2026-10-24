@@ -27,8 +27,9 @@ import os
 import re
 import struct
 import subprocess
+import sys
+from array import array
 from dataclasses import dataclass, field
-from itertools import accumulate
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,18 @@ from typing import Dict, List, Optional, Tuple
 MAX_TOP_LEVEL_BOXES = 200_000
 MAX_MOOV_BYTES = 256 * 1024 * 1024
 MAX_BOX_DEPTH = 16
+# Boxes parsed inside one moov. A track is ~20 boxes, so 100 000 is several
+# thousand tracks; a moov of 8-byte boxes stops here instead of building a
+# Python object per 8 bytes (review B3: 524 k boxes, 131 MiB).
+MAX_MOOV_BOXES = 100_000
+# Entries read from one sample table (stts/stsc/stsz/stco/co64/stss). Four
+# million is 18.5 h of 60 fps video or 23 h of 48 kHz AAC frames in one
+# track; tables are kept as packed arrays (4-8 bytes per entry), so the
+# reader's memory is bounded by the bytes present, never by declared counts.
+MAX_TABLE_ENTRIES = 4_000_000
+# Edits kept per track: every edit is a splice, so a few thousand is already
+# a cut list no player handles; the rest are noted, not modelled.
+MAX_EDITS = 4096
 MAX_TIMECODE_SAMPLES = 100_000
 MAX_GOP_HEADERS = 20_000
 SNIFF_BYTES = 65_536
@@ -272,14 +285,25 @@ _STRICT_BOXES = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts"}
 SPHERICAL_V1_UUID = bytes.fromhex("ffcc8263f8554a938814587a02521fdd")
 
 
-@dataclass
 class Box:
-    type: bytes
-    offset: int          # absolute file offset of the box header
-    size: int            # declared size including the header
-    header: int          # 8 or 16
-    payload: bytes = b""  # only for boxes inside moov
-    children: List["Box"] = field(default_factory=list)
+    """One box. Inside moov the payload is a view into the single moov read,
+    sliced on demand: a box costs one small object, never a copy (review B3)."""
+    __slots__ = ("type", "offset", "size", "header", "_data", "_start", "children")
+
+    def __init__(self, kind: bytes, offset: int, size: int, header: int, data=b"", start: int = 0):
+        self.type = kind
+        self.offset = offset      # absolute file offset of the box header
+        self.size = size          # declared size including the header
+        self.header = header      # 8 or 16
+        self._data = data         # the enclosing buffer (boxes inside moov only)
+        self._start = start
+        self.children: List["Box"] = ()
+
+    @property
+    def payload(self):
+        if not self._data:
+            return b""
+        return self._data[self._start:self._start + self.size - self.header]
 
     @property
     def name(self) -> str:
@@ -336,12 +360,13 @@ class TrackInfo:
     entries: List[SampleEntry] = field(default_factory=list)
     stts: List[Tuple[int, int]] = field(default_factory=list)
     ctts: List[Tuple[int, int]] = field(default_factory=list)
-    sync_samples: Optional[List[int]] = None
+    sync_samples: Optional[array] = None
     sample_count: int = 0
     max_sample_end: int = 0
     first_missing_sample: Optional[int] = None
     table_problem: str = ""
     v1_xml: str = ""
+    tables_skipped: str = ""    # a table above MAX_TABLE_ENTRIES (not checked)
     _chunk_offsets: Tuple[int, ...] = ()
     _stsc: List[Tuple[int, int, int]] = field(default_factory=list)
     _sizes: Tuple[int, ...] = ()
@@ -408,6 +433,7 @@ class Structure:
     has_mvex: bool = False
     movie_timescale: int = 0
     tracks: List[TrackInfo] = field(default_factory=list)
+    boxes_parsed: int = 0
     parsed: bool = False
     error: str = ""
     moov_unread: str = ""     # why a moov that exists was not parsed
@@ -468,19 +494,30 @@ def _parse_children(data: bytes, start: int, end: int, base: int, depth: int,
     pos = start
     strict = parent in _STRICT_BOXES
     while pos + 8 <= end:
+        if structure.boxes_parsed >= MAX_MOOV_BOXES:
+            structure.moov_unread = (f"the moov index holds more than {MAX_MOOV_BOXES:,} boxes, so it was not "
+                                     f"read in full")
+            break
         size, kind = struct.unpack(">I4s", data[pos:pos + 8])
         header = 8
         if size == 1 and pos + 16 <= end:
             size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
             header = 16
         elif size == 0:
-            size = end - pos
+            # ISO/IEC 14496-12 §4.2: "extends to the end of the file" is
+            # allowed only for the last top-level box. Inside a sample entry
+            # QuickTime tolerates a 4-byte zero terminator: stop quietly there.
+            if strict:
+                structure.damage.append(f"box inside '{parent.decode('latin-1')}' at offset {base + pos} "
+                                        f"has size 0, which is allowed only for the last top-level box")
+            break
         if size < header or pos + size > end or not _plausible_type(kind):
             if strict:
                 structure.damage.append(f"box inside '{parent.decode('latin-1')}' at offset {base + pos} "
                                         f"overruns its parent or is not a valid box")
             break
-        box = Box(kind, base + pos, size, header, data[pos + header:pos + size])
+        box = Box(kind, base + pos, size, header, data, pos + header)
+        structure.boxes_parsed += 1
         if depth < MAX_BOX_DEPTH:
             _expand(box, data, pos, depth, parent, handler, structure)
         out.append(box)
@@ -524,12 +561,43 @@ def _fullbox(payload: bytes) -> Tuple[int, bytes]:
     return (payload[0] if payload else 0), payload[4:]
 
 
-def _u32_array(body: bytes, count: int, offset: int = 0, wide: bool = False) -> Optional[Tuple[int, ...]]:
+_U32 = next(code for code in "IL" if array(code).itemsize == 4)
+_U64 = next(code for code in "QL" if array(code).itemsize == 8)
+
+
+def _u32_array(body: bytes, count: int, offset: int = 0, wide: bool = False) -> Optional[array]:
+    """``count`` big-endian 32-bit (or 64-bit) values as a packed array, or
+    None when the body holds fewer bytes than the count declares (so a
+    declared count can never allocate more than the bytes present)."""
     width = 8 if wide else 4
     need = offset + count * width
     if count < 0 or need > len(body):
         return None
-    return struct.unpack(f">{count}{'Q' if wide else 'I'}", body[offset:need])
+    values = array(_U64 if wide else _U32)
+    values.frombytes(body[offset:need])
+    if sys.byteorder == "little":
+        values.byteswap()
+    return values
+
+
+class _Runs:
+    """A run-length table (stts, stsc) as packed columns; iterates as tuples."""
+    __slots__ = ("columns",)
+
+    def __init__(self, values: array, width: int):
+        self.columns = [values[i::width] for i in range(width)]
+
+    def __iter__(self):
+        return zip(*self.columns)
+
+    def __len__(self) -> int:
+        return len(self.columns[0])
+
+    def __bool__(self) -> bool:
+        return len(self.columns[0]) > 0
+
+    def __getitem__(self, index: int) -> tuple:
+        return tuple(column[index] for column in self.columns)
 
 
 def _parse_sv3d(box: Box) -> dict:
@@ -600,7 +668,7 @@ def _read_track(trak: Box, structure: Structure) -> TrackInfo:
             track.track_id = struct.unpack(">I", body[id_at:id_at + 4])[0]
     hdlr = trak.child(b"mdia", b"hdlr")
     if hdlr is not None and len(hdlr.payload) >= 12:
-        track.handler = hdlr.payload[8:12].decode("latin-1")
+        track.handler = bytes(hdlr.payload[8:12]).decode("latin-1")
     mdhd = trak.child(b"mdia", b"mdhd")
     if mdhd is not None:
         version, body = _fullbox(mdhd.payload)
@@ -612,8 +680,9 @@ def _read_track(trak: Box, structure: Structure) -> TrackInfo:
     if elst is not None:
         track.edits = _read_edits(elst, structure)
     for child in trak.all(b"uuid"):
-        if child.payload[:16] == SPHERICAL_V1_UUID:
-            track.v1_xml = child.payload[16:].decode("utf-8", "replace")
+        if bytes(child.payload[:16]) == SPHERICAL_V1_UUID:
+            # The XML is a few hundred bytes; a hostile one is read only this far.
+            track.v1_xml = bytes(child.payload[16:16 + 65536]).decode("utf-8", "replace")
     stbl = trak.child(b"mdia", b"minf", b"stbl")
     if stbl is not None:
         _read_sample_tables(track, stbl)
@@ -633,6 +702,10 @@ def _read_edits(elst: Box, structure: Structure) -> List[Edit]:
         structure.damage.append(f"edit list at offset {elst.offset} declares {count} entries but holds "
                                 f"{(len(body) - 4) // width}")
         count = (len(body) - 4) // width
+    if count > MAX_EDITS:
+        structure.notes.append(f"edit list at offset {elst.offset} has {count:,} entries; the first "
+                               f"{MAX_EDITS:,} were judged")
+        count = MAX_EDITS
     edits = []
     for i in range(count):
         at = 4 + i * width
@@ -644,16 +717,27 @@ def _read_edits(elst: Box, structure: Structure) -> List[Edit]:
     return edits
 
 
+def _table_count(track: TrackInfo, name: str, body, per_entry: int = 1) -> int:
+    """Declared entry count of a FullBox table, or -1 when it is above
+    MAX_TABLE_ENTRIES (recorded on the track as not checked)."""
+    count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
+    if count > MAX_TABLE_ENTRIES:
+        track.tables_skipped = (f"its {name} table declares {count:,} entries, above the "
+                                f"{MAX_TABLE_ENTRIES:,} FrameGuard checks")
+        return -1
+    return count * per_entry
+
+
 def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
     stts = stbl.child(b"stts")
     if stts is not None:
         _, body = _fullbox(stts.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        values = _u32_array(body, count * 2, 4)
-        if values is None:
+        count = _table_count(track, "time-to-sample", body, 2)
+        values = _u32_array(body, count, 4) if count >= 0 else None
+        if values is None and count >= 0:
             track.table_problem = "time-to-sample table is shorter than its entry count"
-        else:
-            track.stts = list(zip(values[0::2], values[1::2]))
+        elif values is not None:
+            track.stts = _Runs(values, 2)
     ctts = stbl.child(b"ctts")
     if ctts is not None:
         version, body = _fullbox(ctts.payload)
@@ -665,9 +749,8 @@ def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
     stss = stbl.child(b"stss")
     if stss is not None:
         _, body = _fullbox(stss.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        values = _u32_array(body, count, 4)
-        track.sync_samples = list(values) if values is not None else None
+        count = _table_count(track, "sync-sample", body)
+        track.sync_samples = _u32_array(body, count, 4) if count >= 0 else None
     stsz = stbl.child(b"stsz")
     if stsz is not None:
         _, body = _fullbox(stsz.payload)
@@ -676,6 +759,9 @@ def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
             track.sample_count = count
             if constant:
                 track._constant_size = constant
+            elif count > MAX_TABLE_ENTRIES:
+                track.tables_skipped = (f"its sample-size table declares {count:,} entries, above the "
+                                        f"{MAX_TABLE_ENTRIES:,} FrameGuard checks")
             else:
                 sizes = _u32_array(body, count, 8)
                 if sizes is None:
@@ -685,32 +771,47 @@ def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
     stsc = stbl.child(b"stsc")
     if stsc is not None:
         _, body = _fullbox(stsc.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        values = _u32_array(body, count * 3, 4)
-        if values is None:
+        count = _table_count(track, "sample-to-chunk", body, 3)
+        values = _u32_array(body, count, 4) if count >= 0 else None
+        if values is None and count >= 0:
             track.table_problem = "sample-to-chunk table is shorter than its entry count"
-        else:
-            track._stsc = list(zip(values[0::3], values[1::3], values[2::3]))
+        elif values is not None:
+            firsts = values[0::3]
+            # ISO/IEC 14496-12 §8.7.4: first_chunk starts at 1 and increases
+            # strictly. A table that does not cannot be walked in order; walking
+            # it anyway was quadratic (review B1: 60 KB, 43 s).
+            if firsts and (firsts[0] != 1 or any(b <= a for a, b in zip(firsts, firsts[1:]))):
+                track.table_problem = ("the sample-to-chunk table's first_chunk values do not increase "
+                                       "strictly from 1 (ISO/IEC 14496-12 §8.7.4)")
+            else:
+                track._stsc = _Runs(values, 3)
     for kind, wide in ((b"stco", False), (b"co64", True)):
         box = stbl.child(kind)
         if box is None:
             continue
         _, body = _fullbox(box.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        offsets = _u32_array(body, count, 4, wide)
-        if offsets is None:
+        count = _table_count(track, "chunk-offset", body)
+        offsets = _u32_array(body, count, 4, wide) if count >= 0 else None
+        if offsets is None and count >= 0:
             track.table_problem = "chunk-offset table is shorter than its entry count"
-        else:
+        elif offsets is not None:
             track._chunk_offsets = offsets
 
 
 def _chunk_layout(track: TrackInfo):
-    """Yield (chunk_offset, first_sample_index, samples_in_chunk) per chunk."""
+    """Yield (chunk_offset, first_sample_index, samples_in_chunk) per chunk.
+
+    stsc is validated strictly increasing, so the walk visits each chunk
+    once: at most len(chunk offsets) iterations whatever the run count.
+    """
     runs = track._stsc
     offsets = track._chunk_offsets
     sample = 0
+    total = len(runs)
     for i, (first_chunk, per_chunk, _) in enumerate(runs):
-        last_chunk = runs[i + 1][0] - 1 if i + 1 < len(runs) else len(offsets)
+        last_chunk = runs[i + 1][0] - 1 if i + 1 < total else len(offsets)
+        if first_chunk > len(offsets):
+            return
         for chunk in range(max(first_chunk, 1), min(last_chunk, len(offsets)) + 1):
             yield offsets[chunk - 1], sample, per_chunk
             sample += per_chunk
@@ -721,37 +822,37 @@ def _locate_samples(track: TrackInfo, file_size: int) -> None:
 
     Iterates chunks, not samples: a PCM track stores one "sample" per audio
     frame (48 000 a second), so a per-sample loop over a long camera file
-    would cost seconds.
+    would cost seconds. Each sample size is summed once (chunks come in
+    sample order), so the cost is linear in the tables.
     """
     if not track._chunk_offsets or not track._stsc or not track.sample_count:
         return
-    prefix = None
+    sizes = None
     if not track._constant_size:
         if len(track._sizes) != track.sample_count:
             return
-        prefix = (0,) + tuple(accumulate(track._sizes))
+        sizes = memoryview(track._sizes) if isinstance(track._sizes, array) else track._sizes   # slices: no copy
     mapped = 0
     for offset, first, count in _chunk_layout(track):
         count = min(count, track.sample_count - first)
         if count <= 0:
             break
         mapped = first + count
-        if prefix is None:
-            span = count * track._constant_size
-        else:
-            span = prefix[first + count] - prefix[first]
+        span = count * track._constant_size if sizes is None else sum(sizes[first:first + count])
         end = offset + span
         track.max_sample_end = max(track.max_sample_end, end)
         if end > file_size and track.first_missing_sample is None:
-            track.first_missing_sample = _first_sample_past(offset, first, count, file_size, track, prefix)
+            track.first_missing_sample = _first_sample_past(offset, first, count, file_size, track)
     if mapped < track.sample_count and not track.table_problem:
         track.table_problem = (f"the chunk tables place {mapped} of {track.sample_count} samples")
 
 
-def _first_sample_past(offset: int, first: int, count: int, file_size: int,
-                       track: TrackInfo, prefix) -> int:
+def _first_sample_past(offset: int, first: int, count: int, file_size: int, track: TrackInfo) -> int:
+    if track._constant_size:
+        inside = max(0, file_size - offset) // track._constant_size
+        return first + min(count, inside)
     for k in range(count):
-        size = track._constant_size if prefix is None else track._sizes[first + k]
+        size = track._sizes[first + k]
         if offset + size > file_size:
             return first + k
         offset += size
@@ -765,8 +866,12 @@ def _read_moov(stream, box: Box, structure: Structure) -> None:
                                  f"{MAX_MOOV_BYTES:,}-byte inspection limit, so it was not read")
         return
     stream.seek(box.offset)
-    data = stream.read(box.size)
+    # One read of the moov; every box payload is a view into it, so nesting
+    # never copies (review B3: 16 MiB nested 15 deep peaked at 272 MiB).
+    data = memoryview(stream.read(box.size))
     box.children = _parse_children(data, box.header, len(data), box.offset, 1, b"moov", "", structure)
+    if structure.moov_unread:
+        return
     mvhd = box.child(b"mvhd")
     if mvhd is not None:
         version, body = _fullbox(mvhd.payload)
@@ -775,8 +880,11 @@ def _read_moov(stream, box: Box, structure: Structure) -> None:
             structure.movie_timescale = struct.unpack(">I", body[at:at + 4])[0]
     structure.has_mvex = box.child(b"mvex") is not None
     for trak in box.all(b"trak"):
+        if structure.moov_unread:
+            return
         handler_box = trak.child(b"mdia", b"hdlr")
-        handler = handler_box.payload[8:12].decode("latin-1") if handler_box and len(handler_box.payload) >= 12 else ""
+        handler = (bytes(handler_box.payload[8:12]).decode("latin-1")
+                   if handler_box and len(handler_box.payload) >= 12 else "")
         if handler:
             _reparse_stsd_with_handler(trak, handler, structure)
         track = _read_track(trak, structure)
@@ -799,7 +907,8 @@ def _reparse_stsd_with_handler(trak: Box, handler: str, structure: Structure) ->
             structure.damage.append(f"sample description at offset {stsd.offset + stsd.header + pos} "
                                     f"overruns its stsd box")
             break
-        entry = Box(kind, stsd.offset + stsd.header + pos, size, 8, payload[pos + 8:pos + size])
+        entry = Box(kind, stsd.offset + stsd.header + pos, size, 8, payload, pos + 8)
+        structure.boxes_parsed += 1
         skip = _entry_header_size(handler, entry.payload)
         if skip is not None and skip <= len(entry.payload):
             entry.children = _parse_children(entry.payload, skip, len(entry.payload),
@@ -852,7 +961,12 @@ def unread_reason(structure: Optional[Structure]) -> str:
 
 
 def sample_offsets(track: TrackInfo, wanted: List[int]) -> Dict[int, Tuple[int, int]]:
-    """{sample index: (file offset, size)} for the zero-based indices in ``wanted``."""
+    """{sample index: (file offset, size)} for the zero-based indices in ``wanted``.
+
+    One running offset per chunk: each sample size is added at most once
+    (review B2: summing from the chunk start per wanted sample was
+    O(targets x chunk length), 20 s for a 0.7 MB timecode track).
+    """
     targets = sorted(set(i for i in wanted if 0 <= i < track.sample_count))
     found: Dict[int, Tuple[int, int]] = {}
     if not targets or not track._chunk_offsets:
@@ -863,17 +977,18 @@ def sample_offsets(track: TrackInfo, wanted: List[int]) -> Dict[int, Tuple[int, 
     pending = iter(targets)
     target = next(pending, None)
     for offset, first, count in _chunk_layout(track):
+        at, index = offset, first
         while target is not None and target < first + count:
             if target < first:
                 target = next(pending, None)
                 continue
             if track._constant_size:
-                at = offset + (target - first) * track._constant_size
-                size = track._constant_size
+                found[target] = (offset + (target - first) * track._constant_size, track._constant_size)
             else:
-                at = offset + sum(sizes[first:target])
-                size = sizes[target]
-            found[target] = (at, size)
+                while index < target:
+                    at += sizes[index]
+                    index += 1
+                found[target] = (at, sizes[target])
             target = next(pending, None)
         if target is None:
             break
@@ -951,7 +1066,7 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
     if structure.moov_unread and not structure.damage:
         result.add_not_verified(name, structure.moov_unread + "; box tables and samples were not checked.")
         return
-    problems, notes = list(structure.damage), []
+    problems, notes, unchecked = list(structure.damage), [], []
     if structure.moov_unread:
         notes.append(structure.moov_unread)
     problems += _missing_media_text(structure)
@@ -965,6 +1080,8 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
                             f"(a splice of differently encoded media)")
         if track.is_av and track.table_problem:
             problems.append(f"{track.handler} track {track.track_id}: {track.table_problem}")
+        if track.is_av and track.tables_skipped:
+            unchecked.append(f"{track.handler} track {track.track_id}: {track.tables_skipped}")
     if structure.moov_offset is not None and structure.first_mdat_offset is not None:
         if structure.moov_offset > structure.first_mdat_offset:
             text = "index (moov) after the media data, not fast-start"
@@ -984,7 +1101,9 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
     result.set_metadata("faststart", structure.moov_offset is not None and structure.first_mdat_offset is not None
                         and structure.moov_offset < structure.first_mdat_offset)
     if problems:
-        result.add_warn(name, _sentence(problems + notes))
+        result.add_warn(name, _sentence(problems + unchecked + notes))
+    elif unchecked:
+        result.add_not_verified(name, _sentence(unchecked + ["its samples were not located"] + notes))
     else:
         tracks = sum(1 for t in structure.tracks if t.is_av)
         result.add_pass(name, _sentence([f"ISO-BMFF, {tracks} audio/video track(s), every box and sample "
@@ -1497,7 +1616,7 @@ def _tmcd_report(path: str, track: TrackInfo) -> Tuple[Optional[str], Optional[s
 
 def _gop_report(path: str, track: TrackInfo, fps: int) -> Tuple[Optional[str], Optional[str], int]:
     """MPEG-2 GOP-header timecode (ISO/IEC 13818-2 §6.2.2.6) at every sync sample."""
-    sync = track.sync_samples or list(range(1, track.sample_count + 1))
+    sync = track.sync_samples or range(1, min(track.sample_count, MAX_GOP_HEADERS) + 1)
     indices = [n - 1 for n in sync[:MAX_GOP_HEADERS]]
     where = sample_offsets(track, indices)
     found: List[Tuple[int, int, bool]] = []
