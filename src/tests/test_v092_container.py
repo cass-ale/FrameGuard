@@ -578,15 +578,17 @@ class TestQuestMonoPresets:
 # 7. FFmpeg version gate
 # ---------------------------------------------------------------------------
 
-def _fake_ffmpeg(directory, version: str) -> str:
-    """An ffmpeg that reports ``version`` for -version and runs the real one
-    otherwise, so the gate is tested without installing old builds."""
+def _fake_ffmpeg(directory, version: str, libavfilter: str = "") -> str:
+    """An ffmpeg that reports ``version`` (and a libavfilter line) for
+    -version and runs the real one otherwise, so the gate is tested without
+    installing old builds."""
     from media_fixtures import FFMPEG
     path = os.path.join(str(directory), "ffmpeg")
+    lib = f'; echo "libavfilter    {libavfilter} / {libavfilter}"' if libavfilter else ""
     with open(path, "w") as handle:
         handle.write("#!/bin/sh\n"
                      f'if [ "$1" = "-version" ]; then echo "ffmpeg version {version} Copyright (c) the FFmpeg '
-                     f'developers"; exit 0; fi\nexec "{FFMPEG}" "$@"\n')
+                     f'developers"{lib}; exit 0; fi\nexec "{FFMPEG}" "$@"\n')
     os.chmod(path, 0o755)
     return path
 
@@ -606,7 +608,6 @@ class TestFFmpegVersionGate:
         ("ffmpeg version 8.0.1 Copyright (c) 2000-2025", False),
         ("ffmpeg version 9.0.2-https://www.martin-riedl.de Copyright", True),
         ("ffmpeg version n9.1 Copyright", True),
-        ("ffmpeg version N-118000-g1234abcd Copyright", True),     # git build: current
     ])
     def test_banner_against_the_minimum(self, banner, ok):
         from frameguard import tools
@@ -914,3 +915,60 @@ class TestRetiredDefaultsMigrate:
         assert any("silence_noise_db" in n for n in config["preset_adjustments"]), config
         panel.save_settings()
         assert int(QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value("scan/config_format")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Round 2, bug 11: version gate for git builds, the tested floor, the cache
+# ---------------------------------------------------------------------------
+
+class TestVersionGateRound2:
+    @pytest.mark.parametrize("banner,ok", [
+        ("ffmpeg version N-118000-g1234abcd Copyright\nlibavfilter    10.  4.100 / 10.  4.100", False),
+        ("ffmpeg version N-121000-g9abcdef Copyright\nlibavfilter    12.  3.100 / 12.  3.100", True),
+        ("ffmpeg version 2024-11-03-git-df00705e00-full_build-www.gyan.dev Copyright\n"
+         "libavfilter    10.  6.101 / 10.  6.101", False),
+        ("ffmpeg version 2026-09-30-git-0123456789-full_build-www.gyan.dev Copyright\n"
+         "libavfilter    12.  1.100 / 12.  1.100", True),
+        ("ffmpeg version N-118000-g1234abcd Copyright", False),     # no version to compare: not passed
+        ("Usage: wrapper", True),                                   # not an FFmpeg banner: nothing to judge
+    ])
+    def test_git_builds_are_judged_by_their_libavfilter_base(self, banner, ok):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem(banner)
+        assert (problem is None) == ok, problem
+
+    def test_a_two_part_release_number_is_padded(self, monkeypatch):
+        """9.0.0 reports itself as 'ffmpeg version 9.0'; (9, 0) < (9, 0, 0) as tuples."""
+        from frameguard import tools
+        monkeypatch.setattr(tools, "FFMPEG_MIN_VERSION", (9, 0, 0))
+        assert tools.ffmpeg_banner_problem("ffmpeg version 9.0 Copyright") is None
+        assert tools.ffmpeg_banner_problem("ffmpeg version 8.1 Copyright")
+
+    def test_below_the_floor_says_it_is_the_tested_floor(self):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem("ffmpeg version 9.0.1 Copyright")
+        assert "9.0.1" in problem and "tested" in problem, problem
+
+    def test_the_cached_gate_answers_without_reprobing(self, monkeypatch, tmp_path):
+        from frameguard import tools
+        fake = tmp_path / "ffmpeg"
+        fake.write_text("x")
+        calls = []
+
+        def probe(path):
+            calls.append(path)
+            return "ffmpeg version 8.0.1 Copyright\nlibavfilter    11.  4.100 / 11.  4.100"
+        monkeypatch.setattr(tools, "_ffmpeg_version_text", probe)
+        monkeypatch.setattr(tools, "_gate_cache", {})
+        first = tools.ffmpeg_version_problem(str(fake))
+        second = tools.ffmpeg_version_problem(str(fake))
+        assert first and second == first and len(calls) == 1, (first, second, calls)
+
+    @needs_posix
+    def test_an_old_git_build_is_refused_in_a_scan(self, media, tmp_path, monkeypatch):
+        from frameguard import core
+        fake = _fake_ffmpeg(tmp_path, "N-110000-gabcdef0", libavfilter=" 9. 12.100")
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
+        result = _scan(_clean(media), quick=False)
+        integrity = _row(result, "File Integrity")
+        assert _not_verified(integrity) and "libavfilter" in integrity[2], integrity

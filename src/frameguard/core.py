@@ -95,6 +95,7 @@ try:
         get_ffmpeg_path, get_ffprobe_path, get_mediainfo_path,
     )
     from frameguard.tools import banner_version as tools_banner_version
+    from frameguard.tools import libavfilter_line as tools_libavfilter_line
     from frameguard.tools import ffmpeg_banner_problem as _ffmpeg_banner_problem
     from frameguard.tools import _ffmpeg_cache_key as _tool_identity
     _HAS_TOOLS_MODULE = True
@@ -103,6 +104,9 @@ except ImportError:
 
     def tools_banner_version(banner):
         return None
+
+    def tools_libavfilter_line(text):
+        return ""
 
     def _ffmpeg_banner_problem(banner):
         return None
@@ -1015,16 +1019,20 @@ def get_tool_versions() -> Dict[str, Dict[str, Optional[str]]]:
             return dict(_tool_version_cache[key])
     versions = {}
     for name, path in paths:
-        version = None
+        version, libavfilter = None, ""
         if path:
             try:
                 proc = subprocess.run([path, "-version"], capture_output=True, text=True,
                                       timeout=10, env=_get_clean_env(), **_subprocess_kwargs())
                 if proc.returncode == 0 and proc.stdout:
                     version = proc.stdout.splitlines()[0].strip()
+                    # Places a git build (no release number) for the version gate.
+                    libavfilter = tools_libavfilter_line(proc.stdout)
             except (subprocess.TimeoutExpired, OSError, TypeError) as exc:
                 version = f"unavailable ({type(exc).__name__})"
         versions[name] = {"path": path, "version": version}
+        if version and libavfilter:
+            versions[name]["libavfilter"] = libavfilter
     with _tool_version_lock:
         _tool_version_cache[key] = versions
     return dict(versions)
@@ -3498,8 +3506,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         return
     # The banner this scan recorded (get_tool_versions re-probes a binary
     # whose identity changed), judged against tools.FFMPEG_MIN_VERSION.
-    banner = ((result.tool_versions or get_tool_versions()).get("ffmpeg") or {}).get("version")
-    too_old = _ffmpeg_banner_problem(banner)
+    recorded = (result.tool_versions or get_tool_versions()).get("ffmpeg") or {}
+    banner = recorded.get("version")
+    too_old = _ffmpeg_banner_problem("\n".join(filter(None, (banner, recorded.get("libavfilter")))))
     if too_old:
         result.set_metadata("ffmpeg_below_minimum", tools_banner_version(banner) or "unknown")
         _mark_not_verified(result, plan.frame_check_names(), too_old + ".")
