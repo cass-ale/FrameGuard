@@ -673,3 +673,36 @@ class TestRightLeftStereo:
         check = _row(_scan(path, target_width=640, target_height=320, audio_required=False), "XR Metadata")
         assert "side_by_side" in check[2] and "right eye" in check[2], check
         assert "does not fit" not in check[2], check
+
+
+def _iso_audio_v1_file(path, brand: bytes, quicktime_layout: bool):
+    """A minimal moov whose audio sample entry is version 1 with an SA3D child."""
+    import struct as _s
+    from container_fixtures import box, full_box, sa3d
+    head = bytes(6) + _s.pack(">H", 1) + _s.pack(">H", 1) + bytes(6) + _s.pack(">HH", 4, 16) + bytes(4) \
+        + _s.pack(">I", 48000 << 16)
+    if quicktime_layout:
+        head += bytes(16)     # QuickTime SoundDescription v1: four extra 32-bit fields
+    entry = box(b"mp4a", head + sa3d(4))
+    stsd = full_box(b"stsd", 0, 0, _s.pack(">I", 1) + entry)
+    hdlr = full_box(b"hdlr", 0, 0, bytes(4) + b"soun" + bytes(13))
+    mdhd = full_box(b"mdhd", 0, 0, _s.pack(">IIII", 0, 0, 48000, 48000) + bytes(4))
+    tkhd = full_box(b"tkhd", 0, 0, _s.pack(">III", 0, 0, 1) + bytes(68))
+    trak = box(b"trak", tkhd + box(b"mdia", mdhd + hdlr + box(b"minf", box(b"stbl", stsd))))
+    mvhd = full_box(b"mvhd", 0, 0, _s.pack(">IIII", 0, 0, 1000, 1000) + bytes(80))
+    data = box(b"ftyp", brand + bytes(4) + brand) + box(b"moov", mvhd + trak)
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return str(path)
+
+
+class TestAudioSampleEntryV1:
+    def test_sa3d_in_an_iso_v1_audio_entry_is_found(self, tmp_path):
+        """B14: ISO AudioSampleEntryV1 keeps the 28-byte layout; the QuickTime
+        v1 44-byte skip missed SA3D in it."""
+        structure = cc.read_structure(_iso_audio_v1_file(tmp_path / "iso.mp4", b"isom", False))
+        assert structure.tracks[0].entries[0].sa3d is not None, structure.tracks[0].entries
+
+    def test_quicktime_v1_audio_entry_still_reads(self, tmp_path):
+        structure = cc.read_structure(_iso_audio_v1_file(tmp_path / "qt.mov", b"qt  ", True))
+        assert structure.tracks[0].entries[0].sa3d is not None, structure.tracks[0].entries

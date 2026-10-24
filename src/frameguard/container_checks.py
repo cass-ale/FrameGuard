@@ -525,17 +525,36 @@ def _parse_children(data: bytes, start: int, end: int, base: int, depth: int,
     return out
 
 
-def _audio_entry_header(payload: bytes) -> int:
-    """Bytes before an audio sample entry's child boxes (QuickTime v0/v1/v2)."""
+def _audio_entry_header(payload: bytes, quicktime: bool = True) -> int:
+    """Bytes before an audio sample entry's child boxes.
+
+    Version 1 differs by family: a QuickTime SoundDescription v1 adds four
+    32-bit fields (44 bytes); an ISO/IEC 14496-12 AudioSampleEntryV1 keeps
+    the 28-byte layout. The brand decides, and when the chosen offset does
+    not start a plausible box but the other does, the other is used (QuickTime
+    v1 entries also appear in files with ISO brands).
+    """
     version = struct.unpack(">H", payload[8:10])[0] if len(payload) >= 10 else 0
-    return {0: 28, 1: 44, 2: 64}.get(version, 28)
+    if version != 1:
+        return {0: 28, 2: 64}.get(version, 28)
+    first, second = (44, 28) if quicktime else (28, 44)
+    if not _starts_box(payload, first) and _starts_box(payload, second):
+        return second
+    return first
 
 
-def _entry_header_size(handler: str, payload: bytes) -> Optional[int]:
+def _starts_box(payload, at: int) -> bool:
+    if at + 8 > len(payload):
+        return False
+    size, kind = struct.unpack(">I4s", payload[at:at + 8])
+    return size >= 8 and at + size <= len(payload) and _plausible_type(kind)
+
+
+def _entry_header_size(handler: str, payload: bytes, quicktime: bool = True) -> Optional[int]:
     if handler == "vide":
         return 78
     if handler == "soun":
-        return _audio_entry_header(payload)
+        return _audio_entry_header(payload, quicktime)
     if handler == "tmcd":
         return 26
     return None
@@ -909,7 +928,8 @@ def _reparse_stsd_with_handler(trak: Box, handler: str, structure: Structure) ->
             break
         entry = Box(kind, stsd.offset + stsd.header + pos, size, 8, payload, pos + 8)
         structure.boxes_parsed += 1
-        skip = _entry_header_size(handler, entry.payload)
+        # No ftyp at all is a classic QuickTime movie (ISO files must start with one).
+        skip = _entry_header_size(handler, entry.payload, quicktime=structure.brand in ("qt", ""))
         if skip is not None and skip <= len(entry.payload):
             entry.children = _parse_children(entry.payload, skip, len(entry.payload),
                                              entry.offset + 8, 2, kind, handler, structure)
