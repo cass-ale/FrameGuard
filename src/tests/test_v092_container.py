@@ -360,3 +360,33 @@ class TestStereoContentCheck:
         monkeypatch.setattr(cc.FrameGrabber, "gray", spy)
         _scan(path, target_width=768, target_height=384, **XR_SPEC)
         assert len(seen) == 3 and len(set(seen)) == 3, seen
+
+
+# ---------------------------------------------------------------------------
+# 3b. 180 deg per-eye geometry (B9)
+# ---------------------------------------------------------------------------
+
+QUARTER = 1 << 30   # 0.25 in the 0.32 fixed point of equi bounds
+
+
+class TestHalfSphereGeometry:
+    def _vr180(self, media, tmp_path, name, size, mode):
+        from container_fixtures import add_to_sample_entry, st3d, sv3d
+        clip = media.get(f"vr180_{size}.mp4", lambda p: make_clip(p, duration=2, size=size) or p)
+        path = _copy(clip, tmp_path / name)
+        return add_to_sample_entry(path, b"vide", st3d(mode), sv3d(bounds=(0, 0, QUARTER, QUARTER)))
+
+    def test_180_with_2to1_eyes_is_flagged(self, media, tmp_path):
+        path = self._vr180(media, tmp_path, "vr180_bad.mp4", "320x160", 0)
+        check = _row(_scan(path, target_width=320, target_height=160, audio_required=False), "XR Metadata")
+        assert check[1] == "WARN" and "180°" in check[2] and "1:1" in check[2], check
+
+    def test_180_side_by_side_square_eyes_passes(self, media, tmp_path):
+        path = self._vr180(media, tmp_path, "vr180_ok.mp4", "640x320", 2)
+        check = _row(_scan(path, target_width=640, target_height=320, audio_required=False), "XR Metadata")
+        assert check[1] == "PASS" and "tiled" in check[2], check
+
+    def test_half_equirect_projection_is_judged_as_180(self):
+        hard, soft, _ = cc.xr_metadata_findings(
+            {"width": 4096, "height": 2048}, "half_equirectangular", "mono", None, {})
+        assert any("180°" in text for text in soft), soft

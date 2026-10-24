@@ -1929,8 +1929,8 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
     if v2 and any(abs(a) > 1e-6 for a in v2.get("pose", ())):
         yaw, pitch, roll = v2["pose"]
         notes.append(f"initial view yaw {yaw:g}°, pitch {pitch:g}°, roll {roll:g}°")
-    if projection == "equirectangular":
-        _equirect_geometry(video, stereo, v2, cfg, flag, hard, notes)
+    if projection in _EQUIRECT_PROJECTIONS:
+        _equirect_geometry(video, projection, stereo, v2, cfg, flag, hard, notes)
     if projection or enforced:
         content, content_note = _content_layout_finding(video, stereo, grabber, duration)
         if content:
@@ -1940,14 +1940,26 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
     return hard, soft, notes
 
 
-def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], cfg: dict,
+# ffprobe names V2 'equi' with non-zero bounds (every 180° file) "tiled
+# equirectangular"; FFmpeg 7.1+ names Apple's 180° 'hequ' "half
+# equirectangular". All three are equirect pictures whose per-eye shape
+# follows from the covered field of view.
+_EQUIRECT_PROJECTIONS = ("equirectangular", "tiled_equirectangular", "half_equirectangular")
+
+
+def _equirect_geometry(video: dict, projection: str, stereo: Optional[str], v2: Optional[dict], cfg: dict,
                        flag, hard: List[str], notes: List[str]) -> None:
+    """Per-eye aspect against the field of view the projection covers: a
+    full sphere is 2:1 per eye, a 180° hemisphere 1:1 (Meta Media Studio
+    360/180 requirements; Spherical Video V2 RFC equi bounds)."""
     core = _core()
     width = core._safe_int(video.get("width"), 0) or 0
     height = core._safe_int(video.get("height"), 0) or 0
     if not width or not height:
         return
     top, bottom, left, right = _bounds(video, v2)
+    if projection == "half_equirectangular" and not any((top, bottom, left, right)):
+        left = right = 0.25      # 'hequ' is 180° x 180° by definition
     span_h, span_v = 360.0 * (1 - left - right), 180.0 * (1 - top - bottom)
     if span_h <= 0 or span_v <= 0:
         flag("the equirectangular bounds leave no picture")
@@ -1974,8 +1986,9 @@ def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], c
         elif layout == "side_by_side" and abs(ratio * 2 / expected - 1) <= 0.01:
             notes.append(f"half-width side-by-side (each eye squeezed to {eye_w:.0f}x{eye_h:.0f})")
         else:
+            shown = f"{expected:g}" if abs(expected - round(expected)) < 0.005 else f"{expected:.2f}"
             flag(f"{width}x{height} does not fit an equirectangular {layout.replace('_', '-')} picture: "
-                 f"each eye is {ratio:.2f}:1, a {cover} equirect is {expected:.2f}:1")
+                 f"each eye is {ratio:.2f}:1, a {cover} equirect is {shown}:1")
     if layout == "side_by_side" and span_h >= 359.9:
         flag("360° stereo is tagged side-by-side; Meta Quest and YouTube take 360° stereo only as top-bottom")
 
