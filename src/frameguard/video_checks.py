@@ -197,18 +197,37 @@ FLASH_AREA = 0.25
 FLASH_RED_RATIO = 0.8
 FLASH_RED_DELTA = 20.0
 
-# Freeze (see detect_freezes()). scdet MAFD is the mean absolute difference
-# to the previous frame in % of full scale over all planes. Frozen frames
-# measured <= 0.03 (median) on ProRes, CRF and CBR long-GOP H.264/HEVC;
-# 48,000 frames of real 4K camera footage never went below 0.026 and only
-# 0.05 % of them below 0.42, never for a run; moving synthetic content sits
-# at 1-25.
-FREEZE_STILL_MAFD = 0.20
-FREEZE_BLIP_MAFD = 1.5
+# Freeze (see detect_freezes()). A frozen picture is consecutive frames that
+# are identical in content and not creative intent (MovieLabs QC vocabulary,
+# DUPLICATE-FRAMES "also known as Freeze Frame"; EBU QC freeze item: the
+# duration is a spec choice, freeze_detect_duration). Measurements:
+# * scdet MAFD: mean |difference| to the previous frame over all planes at
+#   full resolution, in % of full scale;
+# * structural change: the same on a copy area-averaged at least 16x per
+#   side (the analysis copy reduced FREEZE_COPY_FACTOR more), where
+#   independent temporal grain shrinks by the side factor while moving
+#   picture structure, down to objects of ~1/30 of the picture, survives.
+FREEZE_COPY_FACTOR = 4
+FREEZE_STILL_MAFD = 0.20          # still, when no structural series exists
+FREEZE_BLIP_MAFD = 1.5            # long-GOP refresh of a frozen picture
 FREEZE_MAX_BLIP_FRAMES = 8
-FREEZE_RELATIVE_DROP = 0.15
-FREEZE_IDENTICAL_MAFD = 0.004
-FREEZE_CONTEXT_SECONDS = 2.0
+FREEZE_IDENTICAL_MAFD = 0.004     # bit-identical up to encoder rounding
+# Structurally still: the change on the averaged copy is no more than grain
+# explains. White grain shrinks by the averaging side factor k; real grain is
+# spatially correlated over up to ~4 px, so 4/k of the full-resolution change
+# is allowed, plus a floor of 1/20 code (0.02 %) for the copy's rounding.
+FREEZE_GRAIN_CORRELATION = 4.0
+FREEZE_STRUCTURAL_FLOOR = 0.02
+# A scene change, as FFmpeg's scdet decides it with its documented default
+# threshold (10): score = min(MAFD, |MAFD - previous MAFD|) >= 10.
+FREEZE_CUT_SCORE = 10.0
+# A freeze stops the picture dead: motion runs right up to the frozen frame.
+# Real motion decelerates over several frames (inertia), so each of the
+# FREEZE_LEAD_FRAMES frames before the run must still be moving, at least
+# FREEZE_MOVING_FACTOR times the run's own stillness limit (a shot easing to
+# a stop crosses the limit gradually: its last moving frames sit just above).
+FREEZE_LEAD_FRAMES = 3
+FREEZE_MOVING_FACTOR = 2.0
 
 # The flash grid is written in segments of this length and consumed while
 # FFmpeg decodes: at most about three segments (~0.8 MB at 60 fps) exist at
@@ -438,6 +457,7 @@ class VideoCheckConfig:
     black_short_frames: int = 3
     freeze: bool = True
     freeze_duration: float = 1.0
+    freeze_hold: float = 3.0
     levels_mode: str = "advisory"
     flash: bool = True
     interlace: bool = True
@@ -453,6 +473,7 @@ class VideoCheckConfig:
             black_short_frames=int(cfg.get("black_short_min_frames", 3)),
             freeze=bool(cfg.get("freeze_frames_enabled", True)),
             freeze_duration=float(cfg.get("freeze_detect_duration", 1.0)),
+            freeze_hold=float(cfg.get("freeze_hold_allowance", 3.0)),
             levels_mode=mode if mode in LEVELS_MODES else "advisory",
             flash=bool(cfg.get("flash_check_enabled", True)),
             interlace=bool(cfg.get("interlace_check_enabled", True)),
@@ -802,7 +823,7 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+        names = ("mafd", "struct", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
                  "yavg", "gam_r", "gam_g", "gam_b") + tuple(_disp_name(d) for d in INTERLACE_DISPLACEMENTS)
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         if self.flash_enabled:
@@ -826,7 +847,14 @@ class VideoAnalysis:
     def needs_area_branch(self) -> bool:
         """Flash and the black short-tier mean luma share one reduced copy."""
         c = self.config
-        return self.info.analysable and (c.levels or c.flash or c.black)
+        return self.info.analysable and (c.levels or c.flash or c.black or c.freeze)
+
+    @property
+    def structural_side_factor(self) -> float:
+        """Source pixels per side of one sample of the structural-change copy."""
+        width = self.info.width
+        copy = max(2, min(ANALYSIS_MAX_WIDTH, (width // (2 * ANALYSIS_MIN_FACTOR)) * 2))
+        return width / max(1, copy // FREEZE_COPY_FACTOR)
 
     @property
     def needs_levels_branch(self) -> bool:
@@ -987,7 +1015,7 @@ class VideoAnalysis:
         info, c = self.info, self.config
         rng = info.range_name
         uses = []
-        if c.black or c.levels:
+        if c.black or c.levels or c.freeze:
             uses.append("mean")
         if self.flash_enabled:
             uses.append("flash")
@@ -996,12 +1024,20 @@ class VideoAnalysis:
             f"[0:{self.index}]scale=w='max(2,min({ANALYSIS_MAX_WIDTH},trunc(iw/{2 * ANALYSIS_MIN_FACTOR})*2))'"
             f":h=-2:flags=area:in_range={rng}:out_range={rng},format=yuv444p,"
             f"split={len(uses)}{labels}"]
-        if c.black or c.levels:
+        if c.black or c.levels or c.freeze:
             # Without the flash output this branch is the graph's output.
             tail = "nullsink" if self.flash_enabled else "null[vs_area]"
             limit = f"{mean_luma_limit(self.config, info.full_range):.3f}"
+            # The freeze check's structural change: |difference| to the
+            # previous frame on this copy (at least 32x averaged per side).
             chains.append(
-                f"[ar_mean]scale=w='max(1,trunc(iw/8))':h='max(1,trunc(ih/8))':flags=area,"
+                f"[ar_mean]scale=w='max(1,trunc(iw/{FREEZE_COPY_FACTOR}))':"
+                f"h='max(1,trunc(ih/{FREEZE_COPY_FACTOR}))':flags=area,split=2[ar_mean_y][ar_mean_d]")
+            chains.append(
+                "[ar_mean_d]tblend=all_mode=difference,signalstats,"
+                f"{_print('lavfi.signalstats.YAVG', self.paths['struct'])},nullsink")
+            chains.append(
+                f"[ar_mean_y]scale=w='max(1,trunc(iw/2))':h='max(1,trunc(ih/2))':flags=area,"
                 f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'], limit, 'less')},"
                 f"{tail}")
         if self.flash_enabled:
@@ -1141,8 +1177,11 @@ class VideoAnalysis:
             # R, G and B violations, so it can only under-report.
             series.gam = [max(r, g, b) for r, g, b in
                           zip(fraction("gam_r"), fraction("gam_g"), fraction("gam_b"))]
-        if self.needs_area_branch and (self.config.black or self.config.levels):
+        if self.needs_area_branch and (self.config.black or self.config.levels or self.config.freeze):
             series.yavg = sparse("yavg", YAVG_ABSENT, _to_float)
+            # tblend's frame k (k >= 1) carries frame k's pts: matched by pts,
+            # in % of full scale like scdet's MAFD.
+            series.structural = sparse("struct", None, lambda v: _to_float(v, 0.0) / 2.55, by_pts, 1)
         if self.config.black:
             series.black_runs = black_runs(self.paths["black_start"], self.paths["black_end"],
                                            cancel)
@@ -1236,6 +1275,7 @@ class VideoSeries:
     band1: List[float] = field(default_factory=list)
     band2: List[float] = field(default_factory=list)
     yavg: List[float] = field(default_factory=list)
+    structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
     flash: List[tuple] = field(default_factory=list)   # in-memory grid (tests, batch use)
     flash_stream: Optional["FlashAccumulator"] = None   # streamed grid (scans)
     flash_error: Optional[str] = None
@@ -1251,7 +1291,7 @@ class VideoSeries:
         common prefix is the part every branch measured.
         """
         names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
-                 "gam", "band1", "band2", "yavg", "flash")
+                 "gam", "band1", "band2", "yavg", "structural", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1435,38 +1475,34 @@ def black_entry(findings: BlackFindings, duration: float,
 
 @dataclass
 class FreezeFindings:
-    holds: List[Interval]           # mid-programme freezes to report
-    edge_holds: List[Interval]      # static pictures touching the head or tail
+    holds: List[Interval]           # freezes to report
+    edge_holds: List[Interval]      # static pictures at the head (slates)
     black_holds: int = 0            # candidates that were black (Black Frames' job)
     edge_dominant: bool = False     # a head/tail hold covers half the file
+    composed: List[Interval] = field(default_factory=list)  # held shots within the allowance
 
 
-def _still_runs(mafd: Sequence[float]) -> List[Tuple[int, int]]:
-    """Runs of near-identical frames, bridging long-GOP refresh blips.
+def _still_runs(still: Sequence[bool], mafd: Sequence[float]) -> List[Tuple[int, int]]:
+    """Runs of still frames, bridging long-GOP refresh blips.
 
-    ``mafd[i]`` is the mean absolute difference between frame i and i-1. A
-    digitally frozen picture re-encoded by a long-GOP encoder is not bit
-    identical: every I-frame re-codes it, which shows as one to three frames
-    of small change (measured up to 1.0 % MAFD on 10 Mbit/s CBR H.264 and
-    HEVC), and a starved CBR encoder spends the first few frames refining
-    the picture (six frames of 0.2-0.4 % at 3 Mbit/s). FFmpeg's
-    freezedetect compares against the first frozen frame, so each refresh
-    restarted its timer and freezes shorter than about two GOPs were never
-    reported. Here up to FREEZE_MAX_BLIP_FRAMES consecutive moderate-change
-    frames (below FREEZE_BLIP_MAFD, far under real motion) do not end a run.
-    Returns (first, last) indices into ``mafd``; the frozen picture itself
-    starts one frame earlier.
+    ``still[i]`` says frame i shows no change from frame i-1. A digitally
+    frozen picture re-encoded by a long-GOP encoder is not bit identical:
+    every I-frame re-codes it, which shows as one to three frames of small
+    change (measured up to 1.0 % MAFD on 10 Mbit/s CBR H.264 and HEVC), and a
+    starved CBR encoder spends the first few frames refining the picture.
+    Up to FREEZE_MAX_BLIP_FRAMES consecutive moderate-change frames (below
+    FREEZE_BLIP_MAFD, far under real motion) do not end a run. Returns
+    (first, last) indices; the frozen picture itself starts one frame earlier.
     """
     runs: List[Tuple[int, int]] = []
     start = last = None
     blips = 0
-    for i in range(1, len(mafd)):
-        value = mafd[i]
-        if value < FREEZE_STILL_MAFD:
+    for i in range(1, min(len(still), len(mafd))):
+        if still[i]:
             if start is None:
                 start = i
             last, blips = i, 0
-        elif start is not None and value < FREEZE_BLIP_MAFD and blips < FREEZE_MAX_BLIP_FRAMES:
+        elif start is not None and mafd[i] < FREEZE_BLIP_MAFD and blips < FREEZE_MAX_BLIP_FRAMES:
             blips += 1
         else:
             if start is not None:
@@ -1486,74 +1522,115 @@ def _overlap(interval: Interval, others: Sequence[Interval]) -> float:
     return covered
 
 
+def structural_limit(mafd: float, side_factor: float) -> float:
+    """Largest structural change grain alone explains (see FREEZE_GRAIN_CORRELATION)."""
+    return FREEZE_STRUCTURAL_FLOOR + mafd * FREEZE_GRAIN_CORRELATION / max(side_factor, 1.0)
+
+
+def _cut(mafd: Sequence[float], i: int) -> bool:
+    """True when frame i is a scene change (scdet's score at its default threshold)."""
+    if i <= 0 or i >= len(mafd):
+        return False
+    return min(mafd[i], abs(mafd[i] - mafd[i - 1])) >= FREEZE_CUT_SCORE
+
+
 def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
                    min_duration: float, duration: float,
-                   black: Sequence[Interval] = ()) -> FreezeFindings:
-    """Frozen-picture runs that real low-motion footage does not produce.
+                   black: Sequence[Interval] = (),
+                   structural: Optional[Sequence[Optional[float]]] = None,
+                   side_factor: float = 16.0,
+                   hold_allowance: float = 0.0) -> FreezeFindings:
+    """Frozen pictures, told apart from held shots and quiet scenes.
 
-    A candidate run of still frames (see _still_runs) at least
-    ``min_duration`` long is a freeze when its median frame difference is
-    either essentially zero (bit-identical frames: <= FREEZE_IDENTICAL_MAFD)
-    or below FREEZE_RELATIVE_DROP of the activity in the two seconds around
-    it. Absolute thresholds alone cannot work: a dark, quiet scene changes
-    less per frame (0.1-0.4 code mean difference) than a CBR encoder's
-    refinement noise on a frozen picture, and FFmpeg's freezedetect fired
-    on such scenes (0.9.0 flagged a night scene as a 4 s freeze). A freeze
-    inserted into a programme is a sudden collapse of activity; a quiet
-    scene is quiet throughout.
-
-    The frame difference is measured at full resolution because sensor
-    grain is what keeps real static shots above the still threshold: 52
-    real 4K camera clips never produced a candidate run, while a 480-pixel
-    copy averaged the grain away and produced a false 2.2 s freeze.
-    Runs mostly covered by black are dropped (EBU QC 0044B / Telestream
-    VQ-105 "ignore black"): Black Frames reports those.
+    1. Still frames: no structural change beyond what grain explains
+       (structural_limit), so a freeze under finishing grain is still
+       found; without the structural series, MAFD under FREEZE_STILL_MAFD.
+       Runs bridge long-GOP refresh blips (_still_runs) and must last
+       ``min_duration``.
+    2. A run that starts on a cut and ends on a cut (or at the end) is a
+       composed shot - a title card, an end card, a locked-off or quiet
+       scene - not a freeze: by definition a freeze is not creative intent.
+       Such a shot counts as a freeze only when its frames are identical
+       (FREEZE_IDENTICAL_MAFD) and it is held longer than
+       ``hold_allowance`` (a spec setting: a long identical still is worth
+       checking).
+    3. Any other run is a freeze when the picture stopped dead in mid-shot:
+       motion runs up to it (FREEZE_LEAD_FRAMES), or its frames are
+       identical. A shot that slows to a standstill is not.
+    4. Runs at the very head are slates (unless they cover half the file);
+       a run reaching the end is judged like any other, so a render that
+       ran out of media and froze its last seconds is reported.
+    Runs mostly covered by black are left to Black Frames.
     """
     period = _frame_period(fps, times)
-    context = max(1, int(round(FREEZE_CONTEXT_SECONDS / period)))
     holds: List[Interval] = []
     edges: List[Interval] = []
+    composed: List[Interval] = []
     black_holds = 0
     edge_dominant = False
     count = min(len(mafd), len(times))
-    for first, last in _still_runs(mafd[:count]):
+    structure = list(structural[:count]) if structural is not None else None
+    if structure is not None and len(structure) < count:
+        structure += [None] * (count - len(structure))
+
+    def limit(i: int) -> float:
+        return structural_limit(mafd[i], side_factor)
+
+    def still(i: int) -> bool:
+        if structure is not None and structure[i] is not None:
+            return structure[i] <= limit(i)
+        return mafd[i] < FREEZE_STILL_MAFD
+
+    flags = [still(i) for i in range(count)]
+    for first, last in _still_runs(flags, mafd[:count]):
         frozen_from = first - 1
         span = _interval_of(times, frozen_from, last, period)
         if span[1] < min_duration - period * 0.5:
             continue
-        run = list(mafd[first:last + 1])
-        around = list(mafd[max(1, frozen_from - context):frozen_from]) + \
-            list(mafd[last + 2:last + 2 + context])
-        level = statistics.median(run)
-        reference = statistics.median(around) if len(around) >= context // 4 + 1 else None
-        if not (level <= FREEZE_IDENTICAL_MAFD
-                or (reference is not None and level <= FREEZE_RELATIVE_DROP * reference)):
-            continue
         if black and _overlap(span, black) >= 0.5 * span[1]:
             black_holds += 1
             continue
-        touches_edge = frozen_from <= 1 or last >= count - 2
-        if touches_edge and not (duration > 0 and span[1] >= 0.5 * duration):
+        identical = statistics.median(mafd[first:last + 1]) <= FREEZE_IDENTICAL_MAFD
+        at_head = frozen_from <= 0
+        at_tail = last >= count - 2
+        covers_half = duration > 0 and span[1] >= 0.5 * duration
+        if at_head and not covers_half:
             edges.append(span)
-        else:
+            continue
+        enters_on_cut = at_head or _cut(mafd, frozen_from)
+        leaves_on_cut = at_tail or _cut(mafd, last + 1)
+        if enters_on_cut and leaves_on_cut and not covers_half:
+            if identical and span[1] > hold_allowance + period * 0.5:
+                holds.append(span)
+            else:
+                composed.append(span)
+            continue
+        lead = range(max(1, frozen_from - FREEZE_LEAD_FRAMES + 1), frozen_from + 1)
+        abrupt = bool(lead) and all(not flags[i] for i in lead)
+        if abrupt and structure is not None and all(structure[i] is not None for i in lead):
+            stillness = statistics.median(limit(i) for i in range(first, last + 1))
+            abrupt = statistics.median(structure[i] for i in lead) >= FREEZE_MOVING_FACTOR * stillness
+        if abrupt or identical:
             holds.append(span)
-            if touches_edge:
+            if covers_half and (at_head or at_tail):
                 edge_dominant = True
-    return FreezeFindings(holds, edges, black_holds, edge_dominant)
+    return FreezeFindings(holds, edges, black_holds, edge_dominant, composed)
 
 
 def freeze_entry(findings: FreezeFindings, duration: float,
                  cfg: VideoCheckConfig) -> Tuple[str, str, int]:
     """(status, detail, confidence) for the Freeze Frames row."""
-    edge_note = ""
+    notes = ""
     if findings.edge_holds:
-        edge_note = (f" Static picture at the head/tail treated as slate or end card: "
-                     f"{event_list(findings.edge_holds)}.")
+        notes += f" Static picture at the head treated as a slate: {event_list(findings.edge_holds)}."
+    if findings.composed:
+        notes += (f" Held shot(s) starting and ending on a cut, within the {cfg.freeze_hold:g}s "
+                  f"hold allowance or not identical: {event_list(findings.composed)}.")
     if not findings.holds:
-        return "PASS", f"No freezes ≥{cfg.freeze_duration:g}s detected.{edge_note}", 100
+        return "PASS", f"No freezes ≥{cfg.freeze_duration:g}s detected.{notes}", 100
     total = sum(d for _, d in findings.holds)
     detail = (f"{len(findings.holds)} frozen picture(s) ≥{cfg.freeze_duration:g}s, "
-              f"total {total:.1f}s. At: {event_list(findings.holds)}.{edge_note}")
+              f"total {total:.1f}s. At: {event_list(findings.holds)}.{notes}")
     if (duration > 0 and total > duration * 0.1 and total >= 4.0
             and not findings.edge_dominant):
         return "FAIL", detail, 90
@@ -2308,7 +2385,8 @@ def report_video(result, config: VideoCheckConfig, video: dict, fps: float, *,
         cancel = analysis.cancel if analysis is not None else None
         black = _report_black(result, config, black_events, video_end, fps, series)
         check_cancel(cancel)
-        _report_freeze(result, config, series, video_end, fps, black, decoded_frames, reason)
+        _report_freeze(result, config, series, video_end, fps, black, decoded_frames, reason,
+                       analysis)
         check_cancel(cancel)
         _report_levels(result, config, series, analysis, fps, decoded_frames, reason)
         _report_flash(result, config, series, analysis, fps, decoded_frames, reason, cancel)
@@ -2348,15 +2426,18 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
     return [(start, end - start) for start, end in events]
 
 
-def _report_freeze(result, config, series, duration, fps, black, decoded, reason) -> None:
+def _report_freeze(result, config, series, duration, fps, black, decoded, reason,
+                   analysis=None) -> None:
     if not config.freeze:
         result.add_skip(FREEZE, "Switched off in the settings.")
         return
     if decoded and not series.mafd:
         result.add_not_verified(FREEZE, reason)
         return
+    side = analysis.structural_side_factor if analysis is not None else 16.0
     findings = detect_freezes(series.mafd, series.times, fps, config.freeze_duration,
-                              duration, black)
+                              duration, black, structural=series.structural or None,
+                              side_factor=side, hold_allowance=config.freeze_hold)
     if findings.holds:
         result.set_metadata("freeze_frame_count", len(findings.holds))
         result.set_metadata("freeze_frame_total_seconds",

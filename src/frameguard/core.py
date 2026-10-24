@@ -396,6 +396,10 @@ DEFAULT_CONFIG = {
     # Freeze: a held picture at least this long (EBU QC 0044B example: 25 frames).
     "freeze_frames_enabled": True,
     "freeze_detect_duration": 1.0,
+    # A still shot that starts and ends on a cut (title or end card) is a
+    # deliberate hold, not a freeze, when held up to this long; longer
+    # identical stills are reported. A spec choice (0 = report every hold).
+    "freeze_hold_allowance": 3.0,
     # EBU R 103 v3.0 luma/RGB tolerance: off, report, advisory or essential
     # (essential is for broadcast delivery specs; camera originals routinely
     # exceed broadcast levels).

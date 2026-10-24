@@ -682,3 +682,144 @@ class TestColourTags:
                              dict(DEFAULT_CONFIG, warn_untagged_color=False))
         assert _row(result, "Color / HDR")[1] == "PASS"
 
+
+# ---------------------------------------------------------------------------
+# Freeze: structural stillness, abrupt stop, composed holds, tail freezes
+# ---------------------------------------------------------------------------
+
+def _freeze_case(segments, fps=FPS):
+    """mafd / structural series from (frames, mafd, structural) segments; a
+    segment with mafd 'cut' is a single scene-change frame."""
+    mafd, structural = [], []
+    for frames, m, s in segments:
+        if m == "cut":
+            mafd.append(40.0)
+            structural.append(30.0)
+            continue
+        for k in range(frames):
+            wobble = 1.0 + 0.1 * ((k * 7) % 5 - 2)
+            mafd.append(m * wobble)
+            structural.append(s * wobble)
+    mafd[0] = 0.0
+    return mafd, structural, _times(len(mafd), fps)
+
+
+def _freezes(segments, hold=3.0, minimum=1.0):
+    mafd, structural, times = _freeze_case(segments)
+    duration = len(times) / FPS
+    found = vc.detect_freezes(mafd, times, FPS, minimum, duration, structural=structural,
+                              hold_allowance=hold)
+    return found, vc.freeze_entry(found, duration, vc.VideoCheckConfig(freeze_hold=hold))
+
+
+BUSY = (2.6, 2.0)            # moving picture: full-res and structural change
+GRAINY_STILL = (0.15, 0.003)  # nothing moves; temporal grain only
+IDENTICAL = (0.0, 0.0)
+
+
+class TestFreezeRules:
+    def test_title_card_hold_within_the_allowance(self):
+        found, (status, detail, _) = _freezes([(90, *BUSY), (1, "cut", 0), (45, *IDENTICAL),
+                                               (1, "cut", 0), (90, *BUSY)])
+        assert found.holds == [] and status == "PASS" and "hold" in detail.lower()
+
+    def test_hold_allowance_is_a_setting(self):
+        found, (status, _, _) = _freezes([(90, *BUSY), (1, "cut", 0), (45, *IDENTICAL),
+                                          (1, "cut", 0), (90, *BUSY)], hold=1.0)
+        assert found.holds and status == "WARN"
+
+    def test_freeze_under_grain_mid_shot(self):
+        """Finishing grain over a frozen picture: full-res change stays at
+        grain level, picture structure stops dead mid-motion."""
+        found, (status, _, _) = _freezes([(90, *BUSY), (60, *GRAINY_STILL), (90, *BUSY)])
+        assert len(found.holds) == 1 and status == "WARN"
+        assert found.holds[0][1] == pytest.approx(60 / FPS, abs=0.1)
+
+    def test_quiet_night_shot_between_busy_shots_is_not_a_freeze(self):
+        found, (status, _, _) = _freezes([(90, *BUSY), (1, "cut", 0), (90, 0.2, 0.01),
+                                          (1, "cut", 0), (90, *BUSY)])
+        assert found.holds == [] and status == "PASS"
+
+    def test_gradual_stop_is_not_a_freeze(self):
+        # Grain stays; motion (and so the structural change) eases out over
+        # a second (15 % less each frame).
+        segments = [(90, *BUSY)] + [(1, 0.15 + 2.45 * 0.85 ** k, 0.003 + 2.0 * 0.85 ** k)
+                                    for k in range(1, 31)]
+        segments += [(60, *GRAINY_STILL), (60, *BUSY)]
+        found, _ = _freezes(segments)
+        assert found.holds == []
+
+    def test_freeze_running_to_the_end_is_reported(self):
+        """The render ran out of media: the last 2.5 s are frozen mid-shot."""
+        found, (status, detail, _) = _freezes([(150, *BUSY), (75, *IDENTICAL)])
+        assert found.holds and status == "WARN" and "end card" not in detail
+
+    def test_end_card_after_a_cut_is_a_hold(self):
+        found, (status, _, _) = _freezes([(150, *BUSY), (1, "cut", 0), (60, *IDENTICAL)])
+        assert found.holds == [] and status == "PASS"
+
+
+def _hold_allowance_setting():
+    from frameguard import presets
+    assert DEFAULT_CONFIG["freeze_hold_allowance"] == 3.0
+    assert presets.validate_preset_config({"freeze_hold_allowance": 0})["freeze_hold_allowance"] == 0
+    with pytest.raises(presets.PresetValidationError):
+        presets.validate_preset_config({"freeze_hold_allowance": -1})
+
+
+def test_hold_allowance_setting_follows_the_preset_pattern():
+    _hold_allowance_setting()
+
+
+@needs_ffmpeg
+class TestFreezeScan:
+    def test_title_card_hold_passes(self, tmp_path):
+        """A 1.5 s static title card cut into moving footage (review: 0.9.1
+        tripped its 1 s freeze threshold)."""
+        graph = (f"testsrc2=s={SIZE}:r=30:d=6,{GRAIN},format=yuv420p[v];"
+                 "color=c=0x202060:s=640x360:r=30:d=6,format=yuv420p,"
+                 "drawbox=x=170:y=150:w=300:h=60:c=white:t=fill[card];"
+                 "[v][card]overlay=enable='between(t,2,3.5)'")
+        path = str(tmp_path / "card.mp4")
+        ffmpeg("-filter_complex", graph, *X264, "-an", path)
+        row = _row(_scan(path), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    def test_freeze_under_finishing_grain(self, tmp_path):
+        source = (f"testsrc2=s={SIZE}:r=30:d=8,split[a][b];"
+                  "[a][b]freezeframes=first=60:last=135:replace=60,noise=alls=10:allf=t")
+        path = _clip(tmp_path / "grainfreeze.mp4", source=source)
+        row = _row(_scan(path), "Freeze Frames")
+        assert row[1] == "WARN" and "00:00:02.000" in row[2], row
+
+    def test_freeze_at_the_very_end(self, tmp_path):
+        source = (f"testsrc2=s={SIZE}:r=30:d=8,{GRAIN},split[a][b];"
+                  "[a][b]freezeframes=first=165:last=239:replace=165")
+        path = _clip(tmp_path / "tail.mp4", source=source)
+        row = _row(_scan(path), "Freeze Frames")
+        assert row[1] == "WARN" and "end card" not in row[2], row
+
+    def test_still_grainy_shot_between_busy_shots_passes(self, tmp_path, still):
+        """A locked-off, dark, grainy shot cut between two moving shots."""
+        busy = f"testsrc2=s={SIZE}:r=30:d=3,{GRAIN},format=yuv420p"
+        quiet = (f"movie='{still}',loop=-1:1,fps=30,trim=duration=3,setpts=PTS-STARTPTS,"
+                 "crop=640:360:600:300,eq=brightness=-0.3:contrast=0.4,noise=alls=4:allf=t,"
+                 "format=yuv420p")
+        graph = f"{busy}[a];{quiet}[b];{busy}[c];[a][b][c]concat=n=3:v=1:a=0"
+        path = str(tmp_path / "night.mp4")
+        ffmpeg("-filter_complex", graph, *X264, "-an", path)
+        row = _row(_scan(path), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+
+def test_hold_allowance_has_a_settings_control(qapp):
+    from frameguard.gui import SettingsPanel
+    panel = SettingsPanel()
+    assert panel.get_config_overrides()["freeze_hold_allowance"] == 3.0
+    panel._apply_preset_config({**panel.get_config_overrides(), "freeze_hold_allowance": 5.0})
+    assert panel.get_config_overrides()["freeze_hold_allowance"] == 5.0
+
+
+def test_hold_allowance_is_listed_in_the_pdf_spec():
+    from frameguard import report
+    assert "hold ≤3.0 s" in report._black_freeze_spec(dict(DEFAULT_CONFIG))
