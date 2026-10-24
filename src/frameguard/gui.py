@@ -740,7 +740,7 @@ _UI_BACKED_CONFIG_KEYS = frozenset({
     "warn_untagged_color", "spatial_audio",
     "loudness_profile", "audio_clipping_check", "audio_dropout_check",
     "audio_phase_check", "audio_dual_mono_check", "audio_dc_offset_check",
-    "audio_hum_check", "phase_correlation_min",
+    "audio_hum_check", "phase_correlation_min", "dialogue_gated_loudness",
     "black_frames_enabled", "freeze_frames_enabled", "signal_levels_mode",
     "flash_check_enabled", "interlace_check_enabled",
 })
@@ -3855,6 +3855,10 @@ class SettingsPanel(QWidget):
           ("streaming", "Streaming -14 (±1, -1 dBTP)"),
           ("streaming_16", "Streaming -16 (±1, -1 dBTP)"),
           ("custom", "Custom (preset values)"))),
+        ("audio", "dialogue_gated_loudness", "choice", "Dialogue-Gated Target",
+         "FrameGuard cannot gate dialogue, so a dialogue-gated target (Netflix) is judged on "
+         "programme loudness: warn only, or enforce it",
+         (("advisory", "Warn only"), ("enforce", "Enforce"))),
         ("audio", "loudness_mode", "choice", "Loudness Enforcement",
          "Report only measures loudness, true peak and clipping without judging them (camera "
          "originals rarely meet broadcast targets). Warn or Fail compare them, and the broadcast "

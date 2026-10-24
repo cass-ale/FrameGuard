@@ -18,7 +18,7 @@ from typing import List
 from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
-from frameguard import __version__
+from frameguard import __version__, audio_checks
 from frameguard.core import QAResult
 from frameguard.theme import get_theme, ThemeColors
 
@@ -1065,8 +1065,14 @@ def _loudness_spec(c: dict) -> str:
         return "not measured"
     if mode == "report":
         return "measured and reported, not enforced"
-    return (f"{mode}: {c.get('target_loudness_lufs')} ± {c.get('loudness_tolerance_lu')} LUFS, "
-            f"TP ≤ {c.get('true_peak_max_dbtp')} dBTP")
+    profile = audio_checks.resolve_profile(c)
+    text = (f"{mode}: {profile.label} {profile.target:g} ± {profile.tolerance:g} LUFS, "
+            f"TP ≤ {profile.true_peak_max:g} dBTP")
+    if profile.dialogue_gated:
+        judged = ("enforced on programme loudness" if c.get("dialogue_gated_loudness") == "enforce"
+                  else "programme loudness, warn only")
+        text += f" (dialogue-gated target: {judged})"
+    return text
 
 
 def _audio_signal_spec(c: dict) -> str:

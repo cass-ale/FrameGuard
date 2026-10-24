@@ -378,3 +378,47 @@ class TestPhaseInversionOfWideStereo:
         assert panel.get_config_overrides()["phase_correlation_min"] == -0.3
         rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG, phase_correlation_min=-0.3))))
         assert "phase below -0.3" in rows["Audio checks"]
+
+
+# ---------------------------------------------------------------------------
+# 9. Netflix (dialogue-gated) target judged on programme loudness is advisory (review B7)
+# ---------------------------------------------------------------------------
+
+class TestDialogueGatedTarget:
+    def _row(self, integrated, **cfg):
+        from test_v091_audio import _cfg, _ctx
+        return audio_checks.loudness_row({"integrated": integrated, "lra": 8.0}, _ctx(),
+                                         _cfg(loudness_mode="essential", loudness_profile="netflix", **cfg))
+
+    def test_a_loud_full_mix_is_not_a_confident_fail(self):
+        """Dialogue stem at -28.9 (on spec), full mix -17.9: 0.9.1 gave FAIL 95,
+        a MISMATCH, for a compliant mix."""
+        status, text, confidence = self._row(-17.9)
+        assert status == "WARN" and confidence <= audio_checks.LOW_CONFIDENCE, (status, confidence)
+        assert "not dialogue-gated" in text and "estimate" in text, text
+
+    def test_quiet_full_mix_is_advisory_too(self):
+        status, _, confidence = self._row(-35.0)
+        assert status == "WARN" and confidence <= audio_checks.LOW_CONFIDENCE
+
+    def test_on_target_passes(self):
+        assert self._row(-27.5)[0] == "PASS"
+
+    def test_a_spec_that_judges_programme_loudness_can_enforce_it(self):
+        assert DEFAULT_CONFIG["dialogue_gated_loudness"] == "advisory"
+        status, _, confidence = self._row(-17.9, dialogue_gated_loudness="enforce")
+        assert status == "FAIL" and confidence == 95
+
+    def test_setting_is_validated_and_has_a_control(self, qapp):
+        from frameguard import presets
+        from frameguard.gui import SettingsPanel
+        assert presets.validate_preset_config({"dialogue_gated_loudness": "Enforce"}) == \
+            {"dialogue_gated_loudness": "enforce"}
+        with pytest.raises(presets.PresetValidationError):
+            presets.validate_preset_config({"dialogue_gated_loudness": "sometimes"})
+        panel = SettingsPanel()
+        assert panel.get_config_overrides()["dialogue_gated_loudness"] == "advisory"
+        from frameguard.report import spec_rows
+        rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG, loudness_mode="essential",
+                                                        loudness_profile="netflix"))))
+        assert "Netflix -27" in rows["Loudness"] and "warn only" in rows["Loudness"], rows["Loudness"]

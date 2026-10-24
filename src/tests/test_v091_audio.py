@@ -155,10 +155,14 @@ class TestLoudnessRules:
     def test_netflix_says_it_is_not_dialogue_gated(self):
         row = audio_checks.loudness_row({"integrated": -24.0}, _ctx(),
                                         _cfg(loudness_mode="essential", loudness_profile="netflix"))
-        assert row[0] == "FAIL" and "not dialogue-gated" in row[1]
-        assert row[2] < 70  # a near miss on the full mix is not proof of a dialogue miss
-        far = audio_checks.loudness_row({"integrated": -15.0}, _ctx(),
-                                        _cfg(loudness_mode="essential", loudness_profile="netflix"))
+        assert row[0] == "WARN" and "not dialogue-gated" in row[1]
+        assert row[2] < 70  # programme loudness only estimates the dialogue level (0.9.2)
+        # A spec that judges programme loudness keeps 0.9.1's tiers.
+        enforce = _cfg(loudness_mode="essential", loudness_profile="netflix",
+                       dialogue_gated_loudness="enforce")
+        near = audio_checks.loudness_row({"integrated": -24.0}, _ctx(), enforce)
+        assert near[0] == "FAIL" and near[2] < 70  # a near miss on the full mix is not proof
+        far = audio_checks.loudness_row({"integrated": -15.0}, _ctx(), enforce)
         assert far[2] >= 70
 
     def test_silent_track_is_left_to_audio_silence(self):

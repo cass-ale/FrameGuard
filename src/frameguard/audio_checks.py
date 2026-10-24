@@ -121,12 +121,20 @@ CHECK_SWITCHES = {
 LOUDNESS_PROFILE_CHOICES = (
     "ebu_r128", "atsc_a85", "netflix", "streaming", "streaming_16", "custom",
 )
+# How a dialogue-gated target (Netflix) is judged without a dialogue gate:
+# "advisory" (default) warns at low confidence, never FAILs, because
+# programme loudness is not dialogue loudness in either direction (an action
+# mix reads several LU above its dialogue; long quiet scenes read below it);
+# "enforce" judges programme loudness like any other profile, for a spec
+# that accepts full-mix loudness.
+DIALOGUE_GATED_CHOICES = ("advisory", "enforce")
 
 DEFAULT_CONFIG = {
     # Delivery profile for Audio Loudness / Audio True Peak (and, when the
     # profile is enforced, the 48 kHz sample rate). "custom" uses
     # target_loudness_lufs / loudness_tolerance_lu / true_peak_max_dbtp.
     "loudness_profile": "ebu_r128",
+    "dialogue_gated_loudness": "advisory",
     # Per-channel silence: Qualify's documented default.
     "channel_silence_noise_db": -70.0,
     "audio_clipping_check": True,
@@ -156,7 +164,8 @@ VALUE_RANGES = {
     "hum_min_db": (-120.0, 0.0),
 }
 INTEGER_KEYS = frozenset({"clipping_min_events"})
-ENUM_CHOICES = {"loudness_profile": LOUDNESS_PROFILE_CHOICES}
+ENUM_CHOICES = {"loudness_profile": LOUDNESS_PROFILE_CHOICES,
+                "dialogue_gated_loudness": DIALOGUE_GATED_CHOICES}
 PRESET_KEYS = tuple(DEFAULT_CONFIG)
 # Keys that define a custom loudness target. A preset written by 0.9.0 sets
 # them without naming a profile; it must keep meaning "custom".
@@ -284,7 +293,8 @@ _PROFILES = {
                                 "ATSC A/85 §5.2.1, §6"),
     # Netflix Sound Mix Specifications: -27 LKFS dialogue-gated (BS.1770-1)
     # +-2 LU, -2 dBTP. FFmpeg has no dialogue gate, so FrameGuard measures
-    # programme loudness and says so.
+    # programme loudness, says so, and by default only warns
+    # (dialogue_gated_loudness).
     "netflix": LoudnessProfile("netflix", "Netflix", -27.0, 2.0, -2.0, True, 48000,
                                "Netflix Sound Mix Specifications"),
     # Spotify for Artists (-14 LUFS, -1 dBTP); tolerance +-1 LU inferred.
@@ -1320,8 +1330,17 @@ def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
     if integrated <= -69.9:
         return "SKIP", _with_label(ctx.label, "No measurable programme loudness: the track is silent "
                                               "(see Audio Silence)."), 100
-    method = "programme loudness (not dialogue-gated)" if profile.dialogue_gated else "integrated"
+    estimate = profile.dialogue_gated and cfg.get("dialogue_gated_loudness", "advisory") != "enforce"
+    if estimate:
+        method = ("programme loudness (not dialogue-gated: FrameGuard has no dialogue gate, so this "
+                  "only estimates the dialogue level; confirm with a dialogue-gated meter)")
+    elif profile.dialogue_gated:
+        method = "programme loudness (not dialogue-gated; judged as programme loudness by this spec)"
+    else:
+        method = "integrated"
     caveat, cap = caveat_override or _loudness_caveat(ctx)
+    if estimate:
+        cap = LOW_CONFIDENCE if cap is None else min(cap, LOW_CONFIDENCE)
     measured_text = f"{integrated:.1f} LUFS {method}{lra_text}{caveat}"
     limit_text = f"{profile.label} target {profile.target:g} ± {profile.tolerance:g} LU"
     if mode == "report":
