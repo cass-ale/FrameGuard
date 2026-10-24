@@ -78,7 +78,7 @@ from frameguard.core import (
 )
 from frameguard.worker import ScanWorker
 from frameguard.presets import (
-    export_preset, list_available_presets,
+    export_preset, list_available_presets, migrate_retired_defaults, PRESET_FORMAT_VERSION,
     save_imported_preset, is_preset_file, FG_EXTENSION,
     get_presets_dir, get_user_presets_dir
 )
@@ -3783,6 +3783,7 @@ class SettingsPanel(QWidget):
         """
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         settings.setValue("scan/config", json.dumps(self.get_config_overrides()))
+        settings.setValue("scan/config_format", PRESET_FORMAT_VERSION)
         settings.setValue("scan/strict", self.strict_cb.isChecked())
         settings.setValue("scan/reset_results", self.reset_results_cb.isChecked())
         settings.setValue("scan/advanced_mode", bool(getattr(self, "_advanced_mode", False)))
@@ -3797,6 +3798,9 @@ class SettingsPanel(QWidget):
             except (json.JSONDecodeError, TypeError):
                 config = None
             if isinstance(config, dict):
+                # Settings saved before 0.9.2 carry its retired defaults
+                # (e.g. silence at -50 dBFS from an imported 0.9.1 preset).
+                migrate_retired_defaults(config, settings.value("scan/config_format", 0))
                 # normalize drops any key the current engine no longer reads,
                 # so an old saved blob can never reintroduce the key mismatch.
                 self._apply_preset_config(config)

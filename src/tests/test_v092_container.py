@@ -860,3 +860,57 @@ class TestOldPresetsLoad:
         again = presets.import_preset(stored["path"], raise_errors=True)
         assert again["config"]["av_offset_max_early_ms"] == 1000
         assert any("av_offset_max_early_ms" in n for n in again["config"]["preset_adjustments"]), again
+
+
+class TestRetiredDefaultsMigrate:
+    """Round 2, bug 7b: 0.9.1's export writes every key, so a 0.9.1 preset
+    carries silence_noise_db=-50 (the room-tone MISMATCH, 0.9.1 bug 3) and
+    black_detect_picture_threshold=0.98 although its author chose neither."""
+
+    def test_0_9_1_defaults_become_0_9_2_defaults(self, tmp_path):
+        from frameguard import presets
+        old = _write_091_preset(tmp_path / "full.fg", {"silence_noise_db": -50, "black_detect_picture_threshold": 0.98,
+                                                       "target_fps": 25})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["silence_noise_db"] == DEFAULT_CONFIG["silence_noise_db"] == -70
+        assert preset["config"]["black_detect_picture_threshold"] == DEFAULT_CONFIG["black_detect_picture_threshold"]
+        assert preset["config"]["target_fps"] == 25
+        notes = " ".join(preset["notices"])
+        assert "silence_noise_db -50 -> -70" in notes and "black_detect_picture_threshold" in notes, notes
+
+    def test_a_value_the_author_chose_is_kept(self, tmp_path):
+        from frameguard import presets
+        old = _write_091_preset(tmp_path / "chosen.fg", {"silence_noise_db": -60})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["silence_noise_db"] == -60 and not preset["notices"], preset
+
+    def test_a_0_9_2_preset_is_not_migrated(self, tmp_path):
+        from frameguard import presets
+        import json
+        written = presets.export_preset("new", {"silence_noise_db": -50}, str(tmp_path / "new.fg"))
+        assert json.load(open(written))["format_version"] == presets.PRESET_FORMAT_VERSION == 3
+        preset = presets.import_preset(written, raise_errors=True)
+        assert preset["config"]["silence_noise_db"] == -50 and not preset["notices"], preset
+
+    def test_migration_is_listed_in_the_pdf(self, tmp_path):
+        from frameguard import presets
+        from frameguard.report import spec_rows
+        preset = presets.import_preset(_write_091_preset(tmp_path / "f.fg", {"silence_noise_db": -50}))
+        rows = dict(spec_rows(dict(DEFAULT_CONFIG, **preset["config"])))
+        assert "silence_noise_db -50 -> -70" in rows["Preset adjusted on import"], rows
+
+    def test_settings_saved_before_0_9_2_migrate_too(self, qapp):
+        from PySide6.QtCore import QSettings
+        from frameguard import gui
+        import json
+        store = QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP)
+        store.setValue("scan/config", json.dumps({"silence_noise_db": -50, "target_fps": 25.0}))
+        store.remove("scan/config_format")
+        store.sync()
+        panel = gui.SettingsPanel()
+        panel.restore_settings()
+        config = panel.get_config_overrides()
+        assert config["silence_noise_db"] == -70, config
+        assert any("silence_noise_db" in n for n in config["preset_adjustments"]), config
+        panel.save_settings()
+        assert int(QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value("scan/config_format")) == 3

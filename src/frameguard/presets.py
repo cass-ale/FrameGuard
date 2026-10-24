@@ -25,8 +25,9 @@ from typing import Optional, Dict, List
 
 from frameguard import audio_checks
 
-# Preset file format
-PRESET_FORMAT_VERSION = 2
+# Preset file format. 3 = written with FrameGuard 0.9.2's defaults (files
+# of format 1-2 predate them and have retired defaults migrated on import).
+PRESET_FORMAT_VERSION = 3
 FG_EXTENSION = ".fg"
 LEGACY_EXTENSION = ".json"
 MAX_PRESET_BYTES = 1_000_000
@@ -184,6 +185,38 @@ def validate_preset_config(config: dict) -> dict:
         raise PresetValidationError(problems, unknown)
     _lenient_adjustments(out)
     return audio_checks.normalize_custom_profile(out)
+
+
+# Defaults FrameGuard 0.9.1 wrote into every exported preset (its export
+# fills each key) that 0.9.2 replaced: track silence at -70 dBFS instead of
+# -50 (quiet room tone read as "no audio", 0.9.1 review bug 3) and black at
+# 90 % of the picture instead of 98 % (burnt-in timecode hid black). A file
+# older than format 3 holding exactly the old default never chose it; it
+# gets the current default, recorded.
+RETIRED_DEFAULTS_0_9_1 = {
+    "silence_noise_db": -50,
+    "black_detect_picture_threshold": 0.98,
+}
+
+
+def migrate_retired_defaults(config: dict, format_version) -> List[str]:
+    """In place: replace 0.9.1 defaults in a pre-0.9.2 preset, recorded."""
+    from frameguard.core import DEFAULT_CONFIG
+    try:
+        version = int(format_version or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= 3:
+        return []
+    notes = []
+    for key, old in RETIRED_DEFAULTS_0_9_1.items():
+        new = DEFAULT_CONFIG.get(key)
+        if key in config and config[key] == old and new != old:
+            config[key] = new
+            notes.append(f"{key} {old:g} -> {new:g} (the FrameGuard 0.9.1 default, replaced in 0.9.2)")
+    if notes:
+        config["preset_adjustments"] = list(config.get("preset_adjustments") or []) + notes
+    return notes
 
 
 # Ranges 0.9.2 narrowed. A value inside the 0.9.1 range was valid in a 0.9.1
@@ -627,6 +660,7 @@ def import_preset(filepath: str, raise_errors: bool = False) -> Optional[Dict]:
                 raise PresetValidationError(["file has no 'config' object"], [])
             return None
         config = validate_preset_config(data["config"])
+        migrate_retired_defaults(config, data.get("format_version", 0))
         if not config:
             raise PresetValidationError(["config contains no scan settings"], [])
         previous = list(data["config"].get("preset_adjustments") or []) \
