@@ -74,11 +74,55 @@ EXTENSION_FAMILY = {
 }
 
 
+# MPEG transport stream framings (sync byte 0x47 at a fixed period): ISO/IEC
+# 13818-1 §2.4.3.2 188-byte packets; BDAV/M2TS 192 bytes (a 4-byte arrival
+# timestamp before each 188-byte packet); 204 bytes (188 + 16 Reed-Solomon
+# parity, DVB/ISDB transmission captures). Demuxers resynchronise on the sync
+# byte, so a TS with stray leading bytes still plays and must still be named.
+_TS_PACKET_SIZES = (188, 192, 204)
+# Sync bytes that must line up before a period counts. Five aligned 0x47
+# bytes in random data have probability 256**-5 (~1e-12) per candidate
+# offset, so over the 65 536-byte sniff window a false TS is ~1e-7.
+_TS_SYNC_RUN = 5
+_ASF_GUID = bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c")
+
+
+def _ts_sync(head: bytes) -> Optional[Tuple[int, int]]:
+    """(packet size, offset of the first packet) of an MPEG-TS, else None."""
+    for start in range(0, len(head)):
+        if head[start] != 0x47:
+            continue
+        for size in _TS_PACKET_SIZES:
+            last = start + size * (_TS_SYNC_RUN - 1)
+            if last >= len(head):
+                continue
+            if all(head[start + size * k] == 0x47 for k in range(1, _TS_SYNC_RUN)):
+                # M2TS carries its sync 4 bytes into each 192-byte packet.
+                return size, start - 4 if size == 192 and start >= 4 else start
+    return None
+
+
+def _ts_detail(size: int, first: int) -> str:
+    kind = {188: "188-byte packets", 192: "192-byte (M2TS) packets",
+            204: "204-byte (188 + Reed-Solomon) packets"}[size]
+    return kind + (f", {first} junk byte(s) before the first packet" if first else "")
+
+
+def _program_stream(head: bytes) -> bool:
+    """MPEG-2 program stream: a pack header (00 00 01 BA, ISO/IEC 13818-1
+    §2.5.3.3) at the start, followed by another pack or a system/PES header."""
+    if head[:4] != b"\x00\x00\x01\xba" or len(head) < 14:
+        return False
+    # MPEG-2 packs start '01' in the next byte; MPEG-1 packs '0010'.
+    return (head[4] >> 6) == 0b01 or (head[4] >> 4) == 0b0010
+
+
 def sniff_container(path: str) -> Tuple[str, str]:
     """(family, detail) from the file's own signature, independent of its name.
 
-    Families: ISO-BMFF, Matroska, MPEG-TS, MXF, AVI or unknown. Raises OSError
-    only when the file cannot be opened (the caller already checked it exists).
+    Families: ISO-BMFF, Matroska, MPEG-TS, MPEG-PS, MXF, AVI, FLV, Ogg, ASF,
+    WAV or unknown. Raises OSError only when the file cannot be opened (the
+    caller already checked it exists).
     """
     with open(path, "rb") as stream:
         head = stream.read(SNIFF_BYTES)
@@ -90,15 +134,49 @@ def sniff_container(path: str) -> Tuple[str, str]:
     if head[:4] == b"\x1a\x45\xdf\xa3":
         doctype = "webm" if b"webm" in head[:64] else "matroska"
         return "Matroska", f"DocType {doctype}"
-    if len(head) > 376 and head[0] == 0x47 and head[188] == 0x47 and head[376] == 0x47:
-        return "MPEG-TS", "188-byte packets"
-    if len(head) > 388 and head[4] == 0x47 and head[196] == 0x47 and head[388] == 0x47:
-        return "MPEG-TS", "192-byte (M2TS) packets"
-    if _MXF_PARTITION_KEY in head:
-        return "MXF", ""
+    if head[:3] == b"FLV" and len(head) >= 9 and head[3] == 1:
+        return "FLV", ""
+    if head[:4] == b"OggS":
+        return "Ogg", ""
+    if head[:16] == _ASF_GUID:
+        return "ASF", ""
     if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
         return "AVI", ""
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "WAV", ""
+    if _program_stream(head):
+        return "MPEG-PS", ""
+    if _MXF_PARTITION_KEY in head:
+        return "MXF", ""
+    sync = _ts_sync(head)
+    if sync is not None:
+        return "MPEG-TS", _ts_detail(*sync)
+    first = _loose_first_box(head)
+    if first:
+        return "ISO-BMFF", f"first box '{first}'"
     return "unknown", ""
+
+
+def _loose_first_box(head: bytes) -> str:
+    """The first box type of an MP4/MOV that opens with a box outside
+    _ISO_FIRST_BOXES (QuickTime allows any top-level atom), else "".
+
+    Requires two consecutive well-formed box headers inside the sniff window
+    (printable four-cc, size >= 8) so arbitrary bytes do not pass; the box
+    walker then judges the whole structure.
+    """
+    pos, seen = 0, []
+    while len(seen) < 2 and pos + 8 <= len(head):
+        size, kind = struct.unpack(">I4s", head[pos:pos + 8])
+        if not _plausible_type(kind) or kind == b"\x20\x20\x20\x20":
+            return ""
+        if size == 1 and pos + 16 <= len(head):
+            size = struct.unpack(">Q", head[pos + 8:pos + 16])[0]
+        if size < 8:
+            return ""
+        seen.append(kind.decode("latin-1"))
+        pos += size
+    return seen[0] if len(seen) == 2 else ""
 
 
 def extension_mismatch(path: str, ext: str) -> Optional[str]:
@@ -107,8 +185,8 @@ def extension_mismatch(path: str, ext: str) -> Optional[str]:
     A Matroska or MPEG-TS file renamed ``.mp4`` used to pass Container Format
     because only the extension was read. Players and platforms that trust
     the extension (Quest, many ingest services) reject such files. An
-    unrecognised signature is not judged here: ffprobe and the decode pass
-    decide whether such a file is readable at all.
+    unrecognised signature is judged after ffprobe has read the file
+    (container_format_verdict).
     """
     expected = EXTENSION_FAMILY.get(ext.lower())
     if expected is None:
@@ -122,6 +200,64 @@ def extension_mismatch(path: str, ext: str) -> Optional[str]:
     shown = f"{family} ({detail})" if detail else family
     return (f"The file is {shown} but is named '{ext}', which promises {expected}. "
             f"Rename or remux it; players that trust the extension will refuse it.")
+
+
+# ffprobe ``format_name`` (comma-separated demuxer aliases) -> family.
+_PROBE_FAMILIES = {
+    "mov": "ISO-BMFF", "mp4": "ISO-BMFF", "m4a": "ISO-BMFF", "3gp": "ISO-BMFF", "3g2": "ISO-BMFF",
+    "mj2": "ISO-BMFF", "matroska": "Matroska", "webm": "Matroska", "mpegts": "MPEG-TS",
+    "mpeg": "MPEG-PS", "mxf": "MXF", "avi": "AVI", "flv": "FLV", "ogg": "Ogg", "asf": "ASF",
+    "wav": "WAV",
+}
+
+
+def probe_family(probe_data: Optional[dict]) -> Tuple[Optional[str], str]:
+    """(family, ffprobe format_name) of what ffprobe's demuxer read; family is
+    the raw format name for formats outside the table (e.g. ``h264`` for a
+    raw elementary stream) and None when ffprobe reported no format."""
+    name = str(((probe_data or {}).get("format") or {}).get("format_name") or "").strip()
+    if not name:
+        return None, ""
+    for alias in name.split(","):
+        family = _PROBE_FAMILIES.get(alias.strip().lower())
+        if family:
+            return family, name
+    return name, name
+
+
+def container_format_verdict(path: str, ext: str, probe_data: Optional[dict]) -> Tuple[str, str]:
+    """("PASS" | "FAIL" | "NOT_VERIFIED", detail) for Container Format once
+    ffprobe has read the file (or failed to: ``probe_data`` None).
+
+    The file's own signature (sniff_container) and the demuxer ffprobe chose
+    are two independent identifications; the extension's promise must agree
+    with both. An unrecognised signature is never a pass: either ffprobe
+    names a different format (FAIL), or nothing confirms the container
+    (Not verified). A signature that differs from the extension already
+    failed in extension_mismatch.
+    """
+    expected = EXTENSION_FAMILY.get(ext.lower())
+    try:
+        sniffed, detail = sniff_container(path)
+    except OSError as exc:
+        return "NOT_VERIFIED", f"the file could not be read to verify its container ({type(exc).__name__})."
+    probed, format_name = probe_family(probe_data)
+    if expected is None:
+        return "PASS", ""
+    if probed is not None and probed != expected:
+        what = f"FFprobe reads it as '{format_name}'" + (
+            f" ({probed})" if probed != format_name else "")
+        return "FAIL", (f"The file is named '{ext}', which promises {expected}, but {what}. "
+                        f"Rename or remux it; players that trust the extension will refuse it.")
+    if sniffed == "unknown":
+        if probe_data is None:
+            return "NOT_VERIFIED", (f"no {expected} signature was found and FFprobe could not read the "
+                                    f"file, so its container is unconfirmed.")
+        return "NOT_VERIFIED", (f"no {expected} signature at the start of the file; FFprobe reads it as "
+                                f"'{format_name or 'unknown'}', but the container structure is unconfirmed.")
+    if probe_data is None:
+        return "NOT_VERIFIED", f"the file carries a {sniffed} signature but FFprobe could not read it."
+    return "PASS", detail
 
 
 # ---------------------------------------------------------------------------

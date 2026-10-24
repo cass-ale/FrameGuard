@@ -1130,7 +1130,22 @@ def check_container_format(filepath: str, result: QAResult, cfg: dict):
     if mismatch:
         result.add_fail("Container Format", mismatch)
         return
-    result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
+    # The PASS waits for ffprobe's identification (confirm_container_format).
+
+
+def confirm_container_format(filepath: str, probe_data: Optional[dict], result: QAResult) -> None:
+    """Container Format row once ffprobe has (or has not) read the file: the
+    signature and ffprobe's demuxer must both agree with the extension
+    (container_checks.container_format_verdict)."""
+    ext = os.path.splitext(filepath)[1].lower()
+    status, detail = container_checks.container_format_verdict(filepath, ext, probe_data)
+    if status == "FAIL":
+        result.add_fail("Container Format", detail)
+    elif status == "NOT_VERIFIED":
+        result.add_not_verified("Container Format", detail)
+    else:
+        size = _format_size(os.path.getsize(filepath) / (1024 * 1024))
+        result.add_pass("Container Format", f"{size}, container: {ext}" + (f" ({detail})" if detail else ""))
 
 
 def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
@@ -3538,6 +3553,11 @@ def run_qa_checks(filepath: str, cfg: dict = None,
             return result
 
         probe_data = run_ffprobe(filepath, process_owner, cancel_event)
+        if cancel_event and cancel_event.is_set():
+            return result
+        confirm_container_format(filepath, probe_data, result)
+        if not result.passed:
+            return result
         if probe_data is None:
             result.add_fail("FFprobe", "FFprobe failed to read the file. "
                            "Possible causes: file is corrupt, codec not supported by installed FFmpeg, "
