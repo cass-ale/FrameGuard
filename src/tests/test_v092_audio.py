@@ -252,8 +252,12 @@ class TestLayoutAwareFallbackMeter:
 # ---------------------------------------------------------------------------
 
 # fs/4 at 45 degrees: samples sit at A * 0.707, the true peak is A. A = 1.07
-# gives +0.6 dBTP with a -2.4 dBFS sample peak (EBU Tech 3341 case 16 shape).
-INTERSAMPLE_OVER = "1.07*sin(2*PI*12000*t+PI/4)"
+# gives +0.6 dBTP with a -2.4 dBFS sample peak (EBU Tech 3341 case 16 shape),
+# with Tech 3341's 10 ms raised-cosine fade at both ends of the 4 s clip (an
+# abrupt start is a real transient above the steady peak).
+TAPER_4S = ("(if(lt(t,0.01),0.5-0.5*cos(PI*t/0.01),1))"
+            "*(if(gt(t,3.99),0.5-0.5*cos(PI*(4-t)/0.01),1))")
+INTERSAMPLE_OVER = f"1.07*sin(2*PI*12000*t+PI/4)*{TAPER_4S}"
 
 
 def _foa_with_head_locked(path, exprs):
@@ -267,12 +271,11 @@ class TestAmbisonicPeaksAndHeadLocked:
     def test_true_peak_is_taken_on_every_component(self, media):
         """An inter-sample over on X: 0.9.1 measured W alone and passed it."""
         from media_fixtures import inject_spherical
-        clip = media.get("foa_over_x", lambda p: inject_spherical(make_audio(
+        clip = media.get("foa_over_x_tapered", lambda p: inject_spherical(make_audio(
             p, [TONE_23, "0", "0", INTERSAMPLE_OVER], layout="4.0")))
         result = _scan(clip, loudness_mode="essential")
-        # Tech 3341 allows -0.4 dB; the darwin-arm64 build over-reads 12 kHz
-        # (+1.2 here), so only the lower bound is asserted.
-        assert result.metadata["true_peak_dbtp"] >= 0.6 - 0.4, result.metadata
+        # Tech 3341: +0.2 / -0.4 dB.
+        assert 0.6 - 0.4 <= result.metadata["true_peak_dbtp"] <= 0.6 + 0.2, result.metadata
         row = _row(result, "Audio True Peak")
         assert row[1] == "FAIL" and row[3] >= 70, row
         # Loudness is still the W-channel reading (-26.0 for a -23 dBFS W tone).
@@ -293,7 +296,7 @@ class TestAmbisonicPeaksAndHeadLocked:
         assert "HL-L/HL-R" in _row(result, "Dual Mono")[2]
 
     def test_head_locked_over_fails_true_peak(self, media):
-        clip = media.get("foa_hl_over", lambda p: _foa_with_head_locked(
+        clip = media.get("foa_hl_over_tapered", lambda p: _foa_with_head_locked(
             p, [TONE_23, "0", "0", "0", INTERSAMPLE_OVER, tone(1000, MINUS_23)]))
         row = _row(_scan(clip, loudness_mode="essential"), "Audio True Peak")
         assert row[1] == "FAIL", row
@@ -581,16 +584,21 @@ class TestMeterSelfTest:
         plan = core._ScanPlan({"streams": tracks}, dict(DEFAULT_CONFIG))
         assert core._multichannel_meter("ffmpeg", plan) == audio_checks.METER_NONE
 
-    def test_true_peak_over_read_widens_the_low_confidence_band(self):
-        """A build whose true peak over-reads its Tech 3341-shaped self-test by
-        1.0 dB cannot call a 0.5 dB over a confident FAIL."""
-        test = audio_checks.MeterSelfTest(ebur128_multichannel=True, loudnorm=True, true_peak_error_db=1.0)
+    def test_a_meter_that_fails_true_peak_is_not_verified_unless_the_samples_prove_it(self):
+        """A build whose true peak misses its Tech 3341 self-test cannot vouch
+        for a reading; a sample peak over the limit still proves a FAIL (the
+        true peak is never below the sample peak)."""
+        test = audio_checks.MeterSelfTest(ebur128_multichannel=True, loudnorm=True, true_peak_error_db=-1.0)
         ctx = audio_checks.TrackContext(position=0, track={"channel_layout": "stereo"}, names=["FL", "FR"],
                                         label="", duration=60.0, meter_self_test=test)
         cfg = dict(DEFAULT_CONFIG, loudness_mode="essential")
-        status, text, confidence = audio_checks.true_peak_row({"true_peak": -0.5}, ctx, cfg)
-        assert status == "FAIL" and confidence == audio_checks.LOW_CONFIDENCE and "over-reads" in text
-        assert audio_checks.true_peak_row({"true_peak": 1.0}, ctx, cfg)[2] == 95
+        status, text, _ = audio_checks.true_peak_row({"true_peak": -2.0, "sample_peak": -2.5}, ctx, cfg)
+        assert status == "WARN" and core.NOT_VERIFIED_PREFIX in text and "self-test" in text
+        status, _, confidence = audio_checks.true_peak_row({"true_peak": -0.5, "sample_peak": -0.4}, ctx, cfg)
+        assert status == "FAIL" and confidence == 95
+        good = audio_checks.MeterSelfTest(ebur128_multichannel=True, loudnorm=True, true_peak_error_db=0.0)
+        ctx.meter_self_test = good
+        assert audio_checks.true_peak_row({"true_peak": -0.4, "sample_peak": -0.4}, ctx, cfg)[2] == 95
 
     def test_fallback_readings_near_a_limit_are_low_confidence(self):
         """loudnorm's meter read EBU Tech 3341 case 5 0.14 LU low on this
@@ -603,18 +611,40 @@ class TestMeterSelfTest:
 
     @needs_ffmpeg
     def test_real_self_test_on_this_build(self, monkeypatch):
+        """End to end on the bundled binary. The true-peak sines carry EBU Tech
+        3341's 10 ms fade-in and fade-out: without it the onset transient read
+        +1.02 dB on every build and was wrongly blamed on the meter."""
         import platform
         from frameguard.tools import get_ffmpeg_path
         monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
-        monkeypatch.setattr(core, "_METER_SELF_TEST", {}, raising=False)
+        monkeypatch.setattr(core, "_METER_SELF_TEST", {})
         path = get_ffmpeg_path()
         verdict = core._ebur128_multichannel_ok(path)
         test = core._METER_SELF_TEST[path]
         assert test.loudnorm is True     # the remapped fallback reads case 6 within +-0.1 LU
+        assert abs(test.true_peak_error_db) <= 0.2, test
+        assert test.true_peak_ok
         if "darwin-arm64" in path and platform.machine() == "arm64":
-            # The bundled arm64 9.0.2: broken >2-channel K-weighting, and a
-            # true peak that over-reads 12-16 kHz by about 1 dB.
-            assert verdict is False and test.true_peak_error_db > 0.2
+            assert verdict is False      # the bundled arm64 9.0.2: broken >2-channel K-weighting
+
+    def test_self_test_sines_are_tapered(self):
+        command = " ".join(audio_checks.meter_self_test_command("ffmpeg"))
+        assert command.count("afade=t=in:d=0.01") == 2 and command.count("afade=t=out") == 2, command
+
+
+@needs_ffmpeg
+class TestTruePeakEnforcementAsIn091:
+    def test_clean_file_0_6_db_over_the_limit_is_a_mismatch(self, media):
+        """A -23 LUFS 1 kHz programme with 10 ms bursts whose samples reach
+        -0.4 dBFS: 0.6 dB over R 128's -1 dBTP. 0.9.1 said MISMATCH; the
+        untapered self-test widened the band and 0.9.2 said PASS_WITH_WARNINGS."""
+        burst = "if(lt(mod(t,1),0.01),0.955,0.0707946)*sin(2*PI*1000*t)"
+        clip = media.get("tp_bursts", lambda p: make_audio(p, [burst, burst]))
+        result = _scan(clip, loudness_mode="essential", loudness_profile="ebu_r128")
+        row = _row(result, "Audio True Peak")
+        assert row[1] == "FAIL" and row[3] == 95, row
+        assert result.status == "MISMATCH"
+        assert "over-reads" not in row[2]
 
 
 # ---------------------------------------------------------------------------
