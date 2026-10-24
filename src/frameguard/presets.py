@@ -83,6 +83,9 @@ PRESET_CONFIG_KEYS = (
     "allow_trim_edit_lists",
     "max_audio_tracks",
     "disabled_checks",
+    # What FrameGuard changed when it loaded this preset (a record, not a
+    # setting): kept with the stored copy and listed in the PDF spec table.
+    "preset_adjustments",
     # Picture checks (video_checks.py, 0.9.1).
     "black_frames_enabled",
     "black_detect_duration",
@@ -156,6 +159,10 @@ def validate_preset_config(config: dict) -> dict:
     wrote without anyone being told. Every problem is now collected and the
     preset is rejected with the full list. Retired and machine-local keys are
     ignored, not rejected, so older presets still load.
+
+    Values FrameGuard 0.9.1 accepted are never refused (_lenient_adjustments):
+    a value 0.9.2 narrowed is clamped, a contradiction is resolved towards the
+    stricter value, and every change is recorded in ``preset_adjustments``.
     """
     if not isinstance(config, dict):
         raise PresetValidationError(["config block is not an object"], [])
@@ -167,15 +174,54 @@ def validate_preset_config(config: dict) -> dict:
                 unknown.append(str(raw_key))
             continue
         coerced, problem = _coerce_preset_value(key, value)
+        if problem and key in _RANGES_0_9_1:
+            coerced, problem = _coerce_number(key, value, 0.0, _RANGES_0_9_1[key])
         if problem:
             problems.append(f"{raw_key}={value!r} ({problem})")
         else:
             out[key] = coerced
-    for _keys, problem in _cross_field_problems(out):
-        problems.append(problem)
     if problems or unknown:
         raise PresetValidationError(problems, unknown)
+    _lenient_adjustments(out)
     return audio_checks.normalize_custom_profile(out)
+
+
+# Ranges 0.9.2 narrowed. A value inside the 0.9.1 range was valid in a 0.9.1
+# preset; it is clamped to the 0.9.2 range (and recorded), never refused.
+_RANGES_0_9_1 = {
+    "av_offset_max_early_ms": (0.0, 10000.0),
+    "av_offset_max_late_ms": (0.0, 10000.0),
+}
+
+
+def _lenient_adjustments(config: dict) -> List[str]:
+    """Resolve, in place, what 0.9.1 accepted but 0.9.2 judges contradictory,
+    and record each change in ``config["preset_adjustments"]``.
+
+    * a value inside its 0.9.1 range but outside 0.9.2's is clamped;
+    * an A/V warning threshold above a FAIL threshold is lowered to it (the
+      engine never lifts a FAIL threshold, so the warning band ends there);
+    * a decoder ceiling below the target size or rate is kept (dropping it
+      would loosen the spec) and recorded: no file at the target can pass.
+    """
+    notes = []
+    for key, (low, high) in _RANGES_0_9_1.items():
+        value = config.get(key)
+        new_low, new_high = _PRESET_VALUE_RANGES[key]
+        if value is not None and low <= value <= high and not new_low <= value <= new_high:
+            clamped = min(max(value, new_low), new_high)
+            config[key] = int(clamped) if float(clamped).is_integer() else clamped
+            notes.append(f"{key} {value:g} -> {clamped:g} (FrameGuard 0.9.2 caps it at {new_high:g})")
+    for keys, problem in _cross_field_problems(config):
+        if keys[0] == "av_offset_warn_ms":
+            limit = config[keys[1]]
+            notes.append(f"av_offset_warn_ms {config['av_offset_warn_ms']:g} -> {limit:g} ({problem})")
+            config["av_offset_warn_ms"] = limit
+        else:
+            notes.append(f"{keys[0]} kept: {problem}")
+    if notes:
+        config["preset_adjustments"] = list(config.get("preset_adjustments") or []) + notes
+    return notes
 
 
 def _cross_field_problems(config: dict) -> List[tuple]:
@@ -226,10 +272,13 @@ def normalize_preset_config(config: dict) -> dict:
         coerced, problem = _coerce_preset_value(key, value)
         if not problem:
             out[key] = coerced
-    # A contradiction drops the value that would loosen the spec (the warning
-    # threshold, the decoder ceiling), never the FAIL threshold.
-    for keys, _problem in _cross_field_problems(out):
-        out.pop(keys[0], None)
+        elif key in _RANGES_0_9_1:
+            # A 0.9.1-valid value 0.9.2 narrowed: keep it for clamping below.
+            number, _ = _coerce_number(key, value, 0.0, _RANGES_0_9_1[key])
+            if number is not None:
+                out[key] = number
+    # Contradictions resolve towards the stricter value, never the looser.
+    _lenient_adjustments(out)
     return audio_checks.normalize_custom_profile(out)
 
 
@@ -280,7 +329,7 @@ _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_co
                         "allowed_video_profiles", "allowed_pix_fmts")
 # Lists that may legitimately be empty (an empty acceptance list would fail
 # every file, but an empty disabled-check list just runs every check).
-_EMPTY_OK_LIST_KEYS = frozenset({"disabled_checks"})
+_EMPTY_OK_LIST_KEYS = frozenset({"disabled_checks", "preset_adjustments"})
 # Only these are genuinely whole numbers. Everything else numeric accepts a
 # fraction even when its default happens to be written as an int.
 _INTEGER_PRESET_KEYS = frozenset({
@@ -343,7 +392,7 @@ def _coerce_preset_value(key: str, value):
     return None, "unsupported type"
 
 
-def _coerce_number(key: str, value, default):
+def _coerce_number(key: str, value, default, bounds=None):
     if isinstance(value, bool):
         return None, "must be a number"
     try:
@@ -352,7 +401,7 @@ def _coerce_number(key: str, value, default):
         return None, "must be a number"
     if not math.isfinite(number):
         return None, "must be a finite number"
-    low, high = _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
+    low, high = bounds or _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
     if not low <= number <= high:
         return None, f"out of range {low:g}..{high:g}"
     if key in _INTEGER_PRESET_KEYS:
@@ -372,6 +421,9 @@ def _coerce_list(key: str, value):
         return None, "every entry must be non-empty text"
     if key == "disabled_checks":
         return _coerce_check_names(items)
+    if key == "preset_adjustments":
+        # A record shown in the PDF: bounded so a hand-edited file cannot flood it.
+        return [item[:300] for item in items[-32:]], None
     if not items and key not in _EMPTY_OK_LIST_KEYS:
         # An empty acceptance list fails every file.
         return None, "must not be empty"
@@ -577,12 +629,16 @@ def import_preset(filepath: str, raise_errors: bool = False) -> Optional[Dict]:
         config = validate_preset_config(data["config"])
         if not config:
             raise PresetValidationError(["config contains no scan settings"], [])
+        previous = list(data["config"].get("preset_adjustments") or []) \
+            if isinstance(data["config"].get("preset_adjustments"), list) else []
         return {
             "name": str(data.get("name") or Path(filepath).stem),
             "config": config,
             "description": data.get("description", ""),
             "format_version": data.get("format_version", 0),
             "source_path": filepath,
+            # What this import changed (earlier imports' records stay in config).
+            "notices": [n for n in config.get("preset_adjustments", []) if n not in previous],
         }
     except PresetValidationError:
         if raise_errors:

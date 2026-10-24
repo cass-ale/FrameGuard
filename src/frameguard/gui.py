@@ -3613,9 +3613,11 @@ class SettingsPanel(QWidget):
                 self._apply_preset_config(preset["config"])
                 # Notify parent to add this preset to the dropdown
                 self.preset_imported.emit(preset["name"], preset["config"])
+                adjusted = "".join(f"\n{note}" for note in preset.get("notices") or [])
                 QMessageBox.information(
                     self, "Preset Imported",
                     f"Loaded: {preset['name']}\n\nThis preset is now saved and will appear in the Scan page dropdown."
+                    + (f"\n\nAdjusted on import:{adjusted}" if adjusted else "")
                 )
             else:
                 QMessageBox.warning(self, "Import Failed", _preset_rejection_reason(filepath))

@@ -398,6 +398,9 @@ DEFAULT_CONFIG = {
     "max_audio_tracks": 0,
     # Optional container/XR checks a spec may switch off by name.
     "disabled_checks": [],
+    # What FrameGuard changed when it loaded the preset (a record for the PDF,
+    # never read by a check).
+    "preset_adjustments": [],
 
     # File integrity (full software decode)
     "max_decode_errors": 0,

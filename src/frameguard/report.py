@@ -1118,6 +1118,8 @@ def _conformance_spec_rows(c: dict) -> List[tuple]:
         flags.append("spatial audio required")
     if flags:
         rows.append(("Also required", ", ".join(flags)))
+    if c.get("preset_adjustments"):
+        rows.append(("Preset adjusted on import", "; ".join(c["preset_adjustments"])))
     if c.get("disabled_checks"):
         rows.append(("Checks switched off", ", ".join(
             f"{name} (essential: not verified)" if name in ESSENTIAL_CHECKS else name

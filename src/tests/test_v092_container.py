@@ -452,31 +452,43 @@ class TestUnreadMoov:
 # ---------------------------------------------------------------------------
 
 class TestPresetCrossFields:
-    @pytest.mark.parametrize("config", [
-        {"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40},       # review repro
-        {"av_offset_warn_ms": 70, "av_offset_max_late_ms": 60},
-        {"av_offset_max_late_ms": 5000},                                 # beyond the sane cap
-        {"max_frame_pixels": 1000, "target_width": 3840, "target_height": 2160},
-        {"max_pixel_rate": 1_000_000, "target_width": 1920, "target_height": 1080, "target_fps": 30},
+    @pytest.mark.parametrize("config,key,value", [
+        ({"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40}, "av_offset_warn_ms", 40),   # review repro
+        ({"av_offset_warn_ms": 70, "av_offset_max_late_ms": 60}, "av_offset_warn_ms", 60),
+        ({"av_offset_max_late_ms": 5000}, "av_offset_max_late_ms", 1000),                       # above the cap
+        ({"max_frame_pixels": 1000, "target_width": 3840, "target_height": 2160}, "max_frame_pixels", 1000),
+        ({"max_pixel_rate": 1_000_000, "target_width": 1920, "target_height": 1080, "target_fps": 30},
+         "max_pixel_rate", 1_000_000),
     ])
-    def test_contradictory_presets_are_rejected(self, config):
+    def test_contradictory_presets_load_adjusted_with_a_recorded_notice(self, config, key, value):
+        """Round 2, bug 7: 0.9.1 loaded these; refusing them broke 'old presets
+        still load'. The loosening value is clamped (a contradiction that
+        loosens nothing is kept) and every change is recorded."""
         from frameguard import presets
-        with pytest.raises(presets.PresetValidationError):
-            presets.validate_preset_config(config)
+        out = presets.validate_preset_config(config)
+        assert out[key] == value, out
+        assert out["preset_adjustments"] and key in out["preset_adjustments"][0], out
+
+    def test_values_0_9_1_also_refused_are_still_refused(self):
+        from frameguard import presets
+        for bad in ({"av_offset_max_late_ms": 20000}, {"av_offset_warn_ms": "loud"}, {"no_such_key": 1}):
+            with pytest.raises(presets.PresetValidationError):
+                presets.validate_preset_config(bad)
 
     def test_consistent_presets_still_load(self):
         from frameguard import presets
         from frameguard.core import PRESETS, preset_config
-        assert presets.validate_preset_config({"av_offset_warn_ms": 5, "av_offset_max_early_ms": 40,
-                                               "av_offset_max_late_ms": 60})
+        out = presets.validate_preset_config({"av_offset_warn_ms": 5, "av_offset_max_early_ms": 40,
+                                              "av_offset_max_late_ms": 60})
+        assert "preset_adjustments" not in out, out
         for key in PRESETS:
-            presets.validate_preset_config(preset_config(key))
+            assert "preset_adjustments" not in presets.validate_preset_config(preset_config(key)), key
 
-    def test_saved_settings_drop_a_contradiction_instead_of_loosening(self):
+    def test_saved_settings_adjust_a_contradiction_instead_of_loosening(self):
         from frameguard import presets
         out = presets.normalize_preset_config({"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40,
                                                "target_fps": 25})
-        assert out == {"av_offset_max_early_ms": 40, "target_fps": 25}, out
+        assert out["av_offset_warn_ms"] == 40 and out["av_offset_max_early_ms"] == 40, out
 
     def test_engine_never_lifts_the_fail_threshold_to_the_warn_threshold(self):
         check, _ = _sync_row(_sync_probe(-0.045, padding=1024), av_offset_warn_ms=500,
@@ -805,3 +817,46 @@ class TestAacPrimingDefault:
     def test_signalled_priming_stays_exact(self):
         assert _sync_row(_sync_probe(-0.030, padding=1024))[0][1] == "WARN"
         assert _sync_row(_sync_probe(0.003, padding=1024))[0][1] == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Round 2, bug 7: 0.9.1 presets load leniently, with every change recorded
+# ---------------------------------------------------------------------------
+
+def _write_091_preset(path, config):
+    """A preset as FrameGuard 0.9.1 wrote it (format_version 2)."""
+    import json
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"format_version": 2, "type": "frameguard_preset", "name": os.path.basename(str(path)),
+                   "description": "", "config": config}, handle)
+    return str(path)
+
+
+class TestOldPresetsLoad:
+    @pytest.mark.parametrize("config,expected", [
+        ({"av_offset_max_early_ms": 2000.0}, {"av_offset_max_early_ms": 1000}),
+        ({"av_offset_warn_ms": 50.0, "av_offset_max_early_ms": 40.0}, {"av_offset_warn_ms": 40}),
+        ({"target_width": 7680, "target_height": 3840, "max_frame_pixels": 8192 * 2160},
+         {"max_frame_pixels": 8192 * 2160}),
+    ], ids=["early2000", "warn_gt_fail", "decoder_ceiling"])
+    def test_the_three_kinds_0_9_2_refused_now_load(self, tmp_path, config, expected):
+        from frameguard import presets
+        preset = presets.import_preset(_write_091_preset(tmp_path / "old.fg", config), raise_errors=True)
+        for key, value in expected.items():
+            assert preset["config"][key] == value, preset
+        assert preset["notices"] and preset["notices"] == preset["config"]["preset_adjustments"], preset
+
+    def test_adjustments_reach_the_pdf_spec_table(self, tmp_path):
+        from frameguard import presets
+        from frameguard.report import spec_rows
+        preset = presets.import_preset(_write_091_preset(tmp_path / "old.fg", {"av_offset_max_early_ms": 2000}))
+        rows = dict(spec_rows(dict(DEFAULT_CONFIG, **preset["config"])))
+        assert "av_offset_max_early_ms" in rows["Preset adjusted on import"], rows
+
+    def test_the_stored_copy_keeps_the_record(self, tmp_path):
+        from frameguard import presets
+        stored = presets.save_imported_preset(_write_091_preset(tmp_path / "old.fg",
+                                                                {"av_offset_max_early_ms": 2000}))
+        again = presets.import_preset(stored["path"], raise_errors=True)
+        assert again["config"]["av_offset_max_early_ms"] == 1000
+        assert any("av_offset_max_early_ms" in n for n in again["config"]["preset_adjustments"]), again
