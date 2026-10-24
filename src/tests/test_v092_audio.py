@@ -676,3 +676,56 @@ class TestAmbisonicNormalization:
         row = _row(_scan(clip, loudness_mode="essential", loudness_profile="custom",
                          target_loudness_lufs=-24.5, loudness_tolerance_lu=2.0), "Audio Loudness")
         assert row[1] == "PASS" and "FuMa" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# 13. No summary from FFmpeg -> "Not verified", never PASS (review B6)
+# ---------------------------------------------------------------------------
+
+# FFmpeg 6.x names filter instances by their id alone ("[a0 @ 0x...]"), so
+# every summary regex misses; any build can also simply print none.
+_OLD_CONTEXT_RE = __import__("re").compile(r"\[[a-z0-9_]+@(a\d+[a-z]*\d*) @ ")
+
+
+def _old_style(log_text: str) -> str:
+    return _OLD_CONTEXT_RE.sub(lambda m: f"[{m.group(1)} @ ", log_text)
+
+
+AUDIO_ROWS = ("Audio Loudness", "Audio True Peak", "Audio Clipping", "Audio Phase", "Dual Mono",
+              "DC Offset")
+
+
+@needs_ffmpeg
+class TestMissingSummariesAreNotVerified:
+    @pytest.fixture
+    def old_ffmpeg_logs(self, monkeypatch):
+        real = core._run_scan_process
+
+        def rewritten(*args, **kwargs):
+            outcome = real(*args, **kwargs)
+            if outcome is not None:
+                outcome.log_text = _old_style(outcome.log_text)
+            return outcome
+        monkeypatch.setattr(core, "_run_scan_process", rewritten)
+
+    @pytest.mark.parametrize("mode", ["report", "essential"])
+    def test_every_summary_row_is_not_verified(self, media, old_ffmpeg_logs, mode):
+        """0.9.1 on FFmpeg 6.0: Loudness and True Peak were SKIP, and Dual Mono
+        read PASS "not measured" (the review's B6); Phase passed too."""
+        clip = media.get("vo_dualmono", lambda p: make_audio(p, [tone(220)] * 2))
+        result = _scan(clip, loudness_mode=mode)
+        for name in AUDIO_ROWS:
+            row = _row(result, name)
+            assert row[1] == "WARN" and core.NOT_VERIFIED_PREFIX in row[2], row
+
+    def test_rewrite_matches_what_ffmpeg_6_prints(self):
+        assert _old_style("[ebur128@a0 @ 0x1] [info] Summary:") == "[a0 @ 0x1] [info] Summary:"
+        assert _old_style("[astats@a3p1 @ 0x2] [info] Channel: 1") == "[a3p1 @ 0x2] [info] Channel: 1"
+
+    def test_missing_head_locked_summary_is_named(self):
+        ctx = audio_checks.TrackContext(position=0, track={"channel_layout": "ambisonic 1+stereo"},
+                                        names=["W", "Y", "Z", "X", "HL-L", "HL-R"], label="",
+                                        duration=60.0, ambisonic=True)
+        row = audio_checks.loudness_row({"integrated": -26.0, "true_peak": -10.0}, ctx,
+                                        dict(DEFAULT_CONFIG, loudness_mode="essential"))
+        assert row[0] == "WARN" and "head-locked stereo" in row[1] and "Not verified" in row[1], row

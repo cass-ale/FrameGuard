@@ -1424,14 +1424,20 @@ def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
     mode = cfg.get("loudness_mode", "report")
     if not measured or "integrated" not in measured or ctx.meter == METER_NONE:
         reason = _unmeasured_reason(ctx, "loudness summary")
-        if mode == "report":
+        if mode == "report" and ctx.meter == METER_NONE:
+            # A known limit of the bundled meter, and report mode judges nothing.
             return "SKIP", _with_label(ctx.label, reason[0].upper() + reason[1:] + "."), 100
+        # FFmpeg printed no summary (an incompatible build, or a filter that
+        # never ran): never a PASS or a silent SKIP.
         return "WARN", _with_label(ctx.label, f"Not verified: {reason}."), 100
     row = _programme_row(measured, ctx, cfg)
     if ctx.ambisonic and not ctx.sn3d_signalled:
         row = _unsignalled_normalization_row(row, measured, ctx, cfg)
     head_locked = measured.get("head_locked")
     if not head_locked:
+        if ctx.ambisonic and ctx.names[-2:] == ["HL-L", "HL-R"]:
+            return ("WARN", f"{row[1].rstrip('.')}; head-locked stereo: Not verified: its loudness "
+                            f"summary was not reported by FFmpeg.", 100)
         return row
     # The head-locked pair as its own stereo programme (exact BS.1770), but
     # advisory: the listener hears it mixed with the ambisonic render.
@@ -1538,10 +1544,7 @@ def true_peak_row(measured: Optional[dict], ctx: TrackContext, cfg: dict,
     mode = cfg.get("loudness_mode", "report")
     profile = resolve_profile(cfg)
     if not measured or "true_peak" not in measured:
-        reason = _unmeasured_reason(ctx, "true peak")
-        if mode == "report":
-            return "SKIP", _with_label(ctx.label, reason[0].upper() + reason[1:] + "."), 100
-        return "WARN", _with_label(ctx.label, f"Not verified: {reason}."), 100
+        return "WARN", _with_label(ctx.label, f"Not verified: {_unmeasured_reason(ctx, 'true peak')}."), 100
     peak = measured["true_peak"]
     sample = measured.get("sample_peak", sample_peak)
     if not math.isfinite(peak):
@@ -1772,12 +1775,18 @@ def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
                   if len(ctx.names) >= 2 else "single-channel track")
         return "SKIP", _with_label(ctx.label, f"Not applicable ({reason})."), 100
     threshold = _number(cfg, "phase_correlation_min")
-    texts, flagged, confidence = [], False, 100
+    texts, flagged, confidence, unverified = [], False, 100, False
     for j, (left, right, pair_name) in enumerate(pairs):
         if not _pair_usable(ctx, left, right):
             continue
         correlation, _ = _pair_stats(evidence, ctx, j, left, right)
         events = phase_events(evidence, ctx, j)
+        if correlation is None and not events:
+            # The whole-programme rule needs the pair statistics.
+            unverified = True
+            texts.append(f"{pair_name}: FFmpeg reported no L/R statistics, so the whole-track "
+                         f"correlation was not measured")
+            continue
         active = _active_seconds(ctx, evidence, (left, right)) or ctx.duration
         total = sum(d for _, d in events)
         corr_text = f"correlation {correlation:+.2f}" if correlation is not None else "correlation n/a"
@@ -1811,6 +1820,8 @@ def phase_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
                          f"{_event_list(events)}")
     if not texts:
         return "SKIP", _with_label(ctx.label, "No live stereo pair to analyse."), 100
+    if unverified and not flagged:
+        return "WARN", _with_label(ctx.label, "Not verified: " + "; ".join(texts) + "."), 100
     return ("WARN" if flagged else "PASS"), _with_label(ctx.label, "; ".join(texts) + "."), confidence
 
 
@@ -1818,13 +1829,14 @@ def dual_mono_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
     pairs = stereo_pairs(ctx.track, ctx.names, ctx.ambisonic)
     if not pairs:
         return "SKIP", _with_label(ctx.label, "Not applicable (no L/R pair)."), 100
-    texts, flagged, confidence = [], False, 100
+    texts, flagged, confidence, unverified = [], False, 100, False
     for j, (left, right, pair_name) in enumerate(pairs):
         if not _pair_usable(ctx, left, right):
             continue
         correlation, residual = _pair_stats(evidence, ctx, j, left, right)
         if residual is None and correlation is None:
-            texts.append(f"{pair_name} not measured")
+            unverified = True
+            texts.append(f"{pair_name}: FFmpeg reported no L/R statistics")
             continue
         if residual is not None and residual < DUAL_MONO_RESIDUAL_DB:
             flagged = True
@@ -1842,6 +1854,8 @@ def dual_mono_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
             texts.append(f"{pair_name} distinct (correlation {corr_text})")
     if not texts:
         return "SKIP", _with_label(ctx.label, "No live stereo pair to analyse."), 100
+    if unverified and not flagged:
+        return "WARN", _with_label(ctx.label, "Not verified: " + "; ".join(texts) + "."), 100
     if flagged and cfg.get("dual_mono_allowed", False):
         return "PASS", _with_label(ctx.label, "; ".join(texts) + " (dual mono allowed by this spec)."), 100
     suffix = ". Intended for a stereo deliverable?" if flagged else "."
