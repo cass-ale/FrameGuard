@@ -305,6 +305,7 @@ STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
 LOUDNESS_MODES = ("off", "report", "advisory", "essential")
 # "required" fails a file without a consistent SA3D ambisonic track.
 SPATIAL_AUDIO_CHOICES = ("any", "required")
+AAC_PRIMING_CHOICES = container_checks.AAC_PRIMING_CHOICES
 SIGNAL_LEVELS_MODES = video_checks.LEVELS_MODES
 
 DEFAULT_CONFIG = {
@@ -426,6 +427,10 @@ DEFAULT_CONFIG = {
     "av_offset_warn_ms": 5.0,
     "av_offset_max_early_ms": 40.0,
     "av_offset_max_late_ms": 60.0,
+    # AAC encoder priming for audio whose container does not signal it
+    # (MPEG-TS; MP4 without an edit list): "unknown" judges every priming an
+    # encoder may use (0-2112 samples), or the deliverer's encoder's count.
+    "aac_priming": "unknown",
 
     # Timeouts
     "timeout_base_seconds": 120,

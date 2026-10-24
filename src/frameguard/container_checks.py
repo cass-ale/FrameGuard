@@ -1096,58 +1096,104 @@ def check_edit_lists(structure: Structure, result, cfg: dict) -> None:
 # A/V Sync Offset (ESSENTIAL)
 # ---------------------------------------------------------------------------
 
-# Largest AAC encoder delay in common use: 2112 samples (Apple/QuickTime
-# AAC-LC; FFmpeg's encoder uses 1024). HE-AAC doubles it at the output rate.
+# AAC encoder delay (priming) is not defined by ISO/IEC 14496-3; encoders in
+# use prime 1024 (FFmpeg's native encoder, its initial_padding) to 2112
+# samples (Apple AAC-LC, Apple Technical Note TN2258). HE-AAC (SBR) runs the
+# core at half rate, so the same core priming is twice as many output
+# samples. When a container does not signal the priming, the programme sound
+# begins anywhere from the track start up to this much later.
 AAC_MAX_PRIMING_SAMPLES = 2112
+# ``aac_priming``: what a spec knows about its encoder. "unknown" judges the
+# whole 0..AAC_MAX_PRIMING_SAMPLES range; a sample count (the deliverer's
+# encoder) makes unsignalled priming exact.
+AAC_PRIMING_CHOICES = ("unknown", 1024, 2112)
 
 
-def _unsignalled_priming(track: dict) -> float:
-    """Seconds of AAC encoder priming the container does not signal (upper bound), else 0.
+def _edit_list_priming(structure: Optional["Structure"], track: dict) -> Optional[float]:
+    """Seconds of stored audio (priming, or a trim's lead-in) the audio track's own MP4/MOV edit list hides, else None.
 
-    An MP4/MOV edit list (or a Matroska CodecDelay) tells the player to drop
-    the priming, and ffprobe then reports it as ``initial_padding`` with the
-    start time already at the first real sample. Without that signal (MPEG-TS
-    always; an MP4 written without an edit list) the decoder plays the
-    priming, so the sound starts 1024-2112 samples after the track does.
+    The first media edit's ``media_time`` is the decoder delay a muxer tells
+    the player to skip (ISO/IEC 14496-12 §8.6.6; Apple's AAC priming
+    convention), so an edit list states the priming exactly even where
+    ffprobe reports ``initial_padding=0`` (FFmpeg 6/7 for edit-listed MP4).
+    None when there is no box-level view, no such track or no edit list.
+    """
+    if structure is None or not structure.parsed:
+        return None
+    found = structure.track_by_id(stream_track_id(track) or -1)
+    if found is None or found.handler != "soun" or not found.edits or not found.timescale:
+        return None
+    media = next((e for e in found.edits if e.media_time >= 0), None)
+    if media is None:
+        return None
+    hidden = media.media_time / found.timescale
+    # Any hidden lead-in starts the presentation after the stored start, so
+    # the priming (stored first) is skipped with it: a lossless trim's edit
+    # (hiding more than AUDIO_PRIMING_MAX_S) signals it as surely as an
+    # encoder's priming edit.
+    return hidden if hidden > 0 else None
+
+
+def _unsignalled_priming(track: dict, structure: Optional["Structure"] = None,
+                         cfg_priming="unknown") -> Tuple[float, bool]:
+    """(priming seconds the container does not signal, exact?) for one audio track.
+
+    (0, True) when nothing is unsignalled; (upper bound, False) when the
+    encoder is unknown; (the spec's ``aac_priming``, True) when it is set.
+
+    An MP4/MOV edit list (or a Matroska CodecDelay, an iTunSMPB tag) tells
+    the player to drop the priming; ffprobe then reports it as
+    ``initial_padding`` or the box reader finds it in the audio edit list,
+    and the start time is already at the first real sample. Without that
+    signal (MPEG-TS always; an MP4 written without an edit list) the decoder
+    plays the priming, so the sound starts 0 to this many seconds after the
+    track does.
     """
     core = _core()
     if str(track.get("codec_name") or "").lower() != "aac":
-        return 0.0
+        return 0.0, True
     if (core._safe_int(track.get("initial_padding"), 0) or 0) > 0:
-        return 0.0
+        return 0.0, True
+    if _edit_list_priming(structure, track) is not None:
+        return 0.0, True
     rate = core._safe_int(track.get("sample_rate"), 0) or 0
     if rate <= 0:
-        return 0.0
-    he = "he" in str(track.get("profile") or "").lower()
-    return AAC_MAX_PRIMING_SAMPLES * (2 if he else 1) / rate
+        return 0.0, True
+    scale = 2 if "he" in str(track.get("profile") or "").lower() else 1
+    known = cfg_priming if isinstance(cfg_priming, int) and not isinstance(cfg_priming, bool) else None
+    if known:
+        return known * scale / rate, True
+    return AAC_MAX_PRIMING_SAMPLES * scale / rate, False
 
 
-def _judged_offset(raw: float, priming: float) -> float:
-    """The programme offset closest to zero that the unknown priming allows.
+def _offset_range(track: dict, video_start: float, structure: Optional["Structure"] = None,
+                  cfg_priming="unknown") -> Tuple[float, float, float, float, bool]:
+    """(lowest, highest possible programme offset, raw start difference,
+    unsignalled priming, priming known?) in seconds.
 
-    The sound begins between ``raw`` and ``raw + priming`` after the picture;
-    choosing the value nearest zero means only an offset that is certain
-    whatever encoder made the AAC can fail (FrameGuard's no-false-FAIL rule).
+    The programme sound begins between ``raw`` and ``raw + priming`` after
+    the picture when the priming is unknown, exactly ``raw + priming`` when
+    the spec states its encoder's priming, and at ``raw`` when signalled.
     """
-    if priming <= 0 or raw >= 0:
-        return raw
-    return min(0.0, raw + priming)
-
-
-def _audio_offset(track: dict, video_start: float) -> Tuple[float, float, str]:
-    """(judged offset s, raw start difference s, note) of one audio track against the picture."""
     core = _core()
     start = core._safe_float(track.get("start_time"), 0.0) or 0.0
     raw = start - video_start
-    priming = _unsignalled_priming(track)
-    judged = _judged_offset(raw, priming)
-    note = ""
-    if priming and abs(judged - raw) > 0.0005 and abs(judged) <= 0.0005:
-        note = f"; the track's {abs(raw) * 1000:.0f} ms early start is AAC encoder priming"
-    elif priming and abs(judged - raw) > 0.0005:
-        note = (f"; the track starts {abs(raw) * 1000:.0f} ms before the picture, but its AAC encoder "
-                f"priming (up to {priming * 1000:.0f} ms, not signalled by the container) plays first")
-    return judged, raw, note
+    priming, exact = _unsignalled_priming(track, structure, cfg_priming)
+    if exact:
+        return raw + priming, raw + priming, raw, priming, True
+    return raw, raw + priming, raw, priming, False
+
+
+def _range_status(low_ms: float, high_ms: float, warn_ms: float, max_early: float,
+                  max_late: float) -> str:
+    """PASS only if every possible offset is within the file tolerance; FAIL
+    only if every possible offset is beyond the R37 limit on one side;
+    otherwise WARN (the offset may be out of tolerance)."""
+    if -warn_ms <= low_ms and high_ms <= warn_ms:
+        return "PASS"
+    if high_ms < -max_early or low_ms > max_late:
+        return "FAIL"
+    return "WARN"
 
 
 # Program-stream formats whose per-stream durations ffprobe can only estimate.
@@ -1252,7 +1298,11 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     ``av_offset_max_late_ms``). R37 is a chain budget, not a file
     tolerance, which is why it bounds the FAIL and not the WARN. AAC whose
     encoder priming is not signalled (MPEG-TS; MP4 without an edit list) is
-    judged at the most favourable priming (_judged_offset). Sync inside the
+    judged over the whole range of priming it may carry (_offset_range):
+    PASS needs every possible offset within the file tolerance, FAIL needs
+    every possible offset beyond R37, anything else WARNs. A spec that knows
+    its encoder sets ``aac_priming`` (1024 FFmpeg, 2112 Apple TN2258) and the
+    offset becomes exact. Sync inside the
     essence (a lip-sync error baked into picture or sound) is not measurable
     from metadata.
     """
@@ -1267,32 +1317,65 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     max_early = max(warn_ms, float(cfg.get("av_offset_max_early_ms", 40.0)))
     max_late = max(warn_ms, float(cfg.get("av_offset_max_late_ms", 60.0)))
     v_start = core._safe_float(video.get("start_time"), 0.0) or 0.0
-    entries, worst = [], 0.0
+    entries, worst, worst_range = [], 0.0, None
     for position, track in enumerate(tracks):
         label = core._track_label(position, track, len(tracks))
-        judged, raw, priming_note = _audio_offset(track, v_start)
-        offset = judged * 1000
-        worst = offset if abs(offset) > abs(worst) else worst
-        direction = "after" if offset > 0 else "before"
+        low, high, raw, priming, exact = _offset_range(track, v_start, structure,
+                                                       cfg.get("aac_priming", "unknown"))
+        low_ms, high_ms = low * 1000, high * 1000
+        # The offset nearest zero that the range allows (0 when it straddles).
+        nearest = 0.0 if low_ms <= 0 <= high_ms else (low_ms if abs(low_ms) < abs(high_ms) else high_ms)
+        if abs(nearest) > abs(worst) or worst_range is None:
+            worst, worst_range = nearest, [round(low_ms, 1), round(high_ms, 1)]
+        status = _range_status(low_ms, high_ms, warn_ms, max_early, max_late)
         cause = (_empty_edit_note(structure, video, "video") + _empty_edit_note(structure, track, "audio")
                  + _no_edit_list_note(structure, video, raw))
-        if abs(offset) <= warn_ms:
-            entries.append(("PASS", core._with_track(label, f"Audio and video start together ({offset:+.1f} ms"
-                                                            f"{priming_note}; container timing only)")))
+        known = (f"; the track starts {_signed_ms_text(raw * 1000)}, then plays this spec's "
+                 f"{priming * 1000:.0f} ms AAC encoder priming" if priming and exact else "")
+        if priming and not exact:
+            text = (f"Sound starts {_range_text(low_ms, high_ms)} the picture{cause}: the track starts "
+                    f"{_signed_ms_text(raw * 1000)} and its AAC encoder priming (up to {priming * 1000:.0f} ms) "
+                    f"is not signalled by the container, so the programme sound begins somewhere in that range")
+        elif abs(low_ms) <= warn_ms:
+            entries.append(("PASS", core._with_track(label, f"Audio and video start together ({low_ms:+.1f} ms"
+                                                            f"{known}; container timing only)")))
             continue
-        limit = max_late if offset > 0 else max_early
-        text = (f"Sound starts {abs(offset):.0f} ms {direction} the picture{cause}{priming_note} "
-                f"(file limit ±{warn_ms:g} ms, DPP v5 §2.8")
-        if abs(offset) <= limit:
-            entries.append(("WARN", core._with_track(label, text + f"; within the {limit:g} ms EBU R37 "
-                                                                   f"chain budget)")))
         else:
-            entries.append(("FAIL", core._with_track(label, text + f"; beyond the {limit:g} ms EBU R37 allows "
-                                                                   f"a whole broadcast chain)")))
+            direction = "after" if low_ms > 0 else "before"
+            text = f"Sound starts {abs(low_ms):.0f} ms {direction} the picture{cause}{known}"
+        limits = (f"file limit ±{warn_ms:g} ms, DPP v5 §2.8; EBU R37 allows {max_early:g} ms early / "
+                  f"{max_late:g} ms late for a whole broadcast chain")
+        if status == "PASS":
+            entries.append(("PASS", core._with_track(label, f"{text} (within ±{warn_ms:g} ms; container "
+                                                            f"timing only)")))
+        elif status == "WARN":
+            entries.append(("WARN", core._with_track(label, f"{text} ({limits})")))
+        else:
+            entries.append(("FAIL", core._with_track(label, f"{text}, beyond EBU R37 ({limits})")))
     result.set_metadata("av_start_offset_ms", round(worst, 1))
+    result.set_metadata("av_start_offset_range_ms", worst_range)
     statuses = {s for s, _ in entries}
     confidence = 85 if "FAIL" in statuses else 60 if "WARN" in statuses else 100
     core._add_aggregate(result, name, entries, confidence)
+
+
+def _signed_ms_text(value_ms: float) -> str:
+    if abs(value_ms) < 0.5:
+        return "with the picture"
+    return f"{abs(value_ms):.0f} ms {'after' if value_ms > 0 else 'before'} it"
+
+
+def _range_text(low_ms: float, high_ms: float) -> str:
+    """'between 61 and 17 ms before', 'between 21 ms before and 23 ms after'."""
+    def side(v):
+        return "after" if v > 0 else "before"
+    if abs(low_ms) < 0.5:
+        return f"between 0 and {abs(high_ms):.0f} ms after"
+    if abs(high_ms) < 0.5:
+        return f"between {abs(low_ms):.0f} ms before and 0 ms after"
+    if (low_ms > 0) == (high_ms > 0):
+        return f"between {abs(low_ms):.0f} and {abs(high_ms):.0f} ms {side(low_ms)}"
+    return f"between {abs(low_ms):.0f} ms before and {abs(high_ms):.0f} ms after"
 
 
 # ---------------------------------------------------------------------------

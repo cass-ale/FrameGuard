@@ -70,6 +70,7 @@ PRESET_CONFIG_KEYS = (
     "av_offset_warn_ms",
     "av_offset_max_early_ms",
     "av_offset_max_late_ms",
+    "aac_priming",
     "allow_display_rotation",
     "spatial_audio",
     "require_square_pixels",
@@ -258,6 +259,7 @@ def _enum_choices(key: str):
         "required_stereo_mode": core.STEREO_CHOICES,
         "loudness_mode": core.LOUDNESS_MODES,
         "spatial_audio": core.SPATIAL_AUDIO_CHOICES,
+        "aac_priming": core.AAC_PRIMING_CHOICES,
         **audio_checks.ENUM_CHOICES,
         "signal_levels_mode": core.SIGNAL_LEVELS_MODES,
     }.get(key)

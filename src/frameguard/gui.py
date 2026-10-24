@@ -737,7 +737,7 @@ _UI_BACKED_CONFIG_KEYS = frozenset({
     "allow_larger_resolution", "allow_fps_multiples", "require_progressive",
     "min_audio_sample_rate", "loudness_mode", "max_decode_errors",
     "allow_ntsc_rate_match", "require_square_pixels", "require_faststart",
-    "warn_untagged_color", "spatial_audio",
+    "warn_untagged_color", "spatial_audio", "aac_priming",
     "loudness_profile", "audio_clipping_check", "audio_dropout_check",
     "audio_phase_check", "audio_dual_mono_check", "audio_dc_offset_check",
     "audio_hum_check",
@@ -3840,6 +3840,11 @@ class SettingsPanel(QWidget):
         ("delivery", "spatial_audio", "choice", "Spatial Audio",
          "Require an ambisonic track with valid spatial (SA3D) metadata for 360 deliverables",
          (("any", "Not required"), ("required", "Required"))),
+        ("delivery", "aac_priming", "choice", "AAC Encoder Priming",
+         "Priming of the AAC encoder, used to judge the A/V start offset where the container "
+         "does not signal it (MPEG-TS, MP4 without an edit list)",
+         (("unknown", "Unknown (judge 0-2112 samples)"), (1024, "1024 samples (FFmpeg)"),
+          (2112, "2112 samples (Apple)"))),
         ("delivery", "warn_untagged_color", "bool", "Warn on Untagged Colour",
          "Warn when a file carries no colour primaries, transfer or matrix tags, so players "
          "have to guess", None),

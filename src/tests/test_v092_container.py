@@ -135,3 +135,144 @@ class TestContainerSniff:
         for path in (_clean(media), mkv, ts):
             check = _row(_scan(path), "Container Format")
             assert check[1] == "PASS", (path, check)
+
+
+# ---------------------------------------------------------------------------
+# 2. A/V Sync Offset: unsignalled AAC priming is judged over its whole range (B5)
+# ---------------------------------------------------------------------------
+
+def _moov_last(media):
+    return media.get("moovlast.mp4", lambda p: make_clip(p, duration=2) or p)
+
+
+def _video_delayed(media, milliseconds):
+    """Sound ``milliseconds`` early: an empty edit delays the picture (the
+    audio track keeps its encoder-priming edit)."""
+    from container_fixtures import set_edit_list
+
+    def build(path):
+        with open(_moov_last(media), "rb") as src, open(path, "wb") as dst:
+            dst.write(src.read())
+        structure = cc.read_structure(path)
+        edit = structure.tracks_of("vide")[0].edits[0]
+        lead = round(milliseconds * structure.movie_timescale / 1000)
+        set_edit_list(path, b"vide", [(lead, -1, 1), (edit.segment_duration, edit.media_time, 1)])
+        return path
+    return media.get(f"video_late_{milliseconds}.mp4", build)
+
+
+def _sync_probe(audio_start, profile="LC", padding=0, video_start=0.0):
+    return {"format": {"format_name": "mpegts"},
+            "streams": [
+                {"index": 0, "codec_type": "video", "codec_name": "h264", "start_time": str(video_start)},
+                {"index": 1, "codec_type": "audio", "codec_name": "aac", "profile": profile,
+                 "sample_rate": "48000", "channels": 2, "initial_padding": padding,
+                 "start_time": str(audio_start)}]}
+
+
+class _Rows:
+    def __init__(self):
+        self.checks, self.metadata = [], {}
+
+    def add_pass(self, name, detail="", confidence=100):
+        self.checks.append((name, "PASS", detail, confidence))
+
+    def add_warn(self, name, detail="", confidence=100):
+        self.checks.append((name, "WARN", detail, confidence))
+
+    def add_fail(self, name, detail="", confidence=100):
+        self.checks.append((name, "FAIL", detail, confidence))
+
+    def add_skip(self, name, detail="", confidence=100):
+        self.checks.append((name, "SKIP", detail, confidence))
+
+    def add_not_verified(self, name, reason, by_choice=False):
+        self.checks.append((name, "WARN", "Not verified: " + reason, 100))
+
+    def set_metadata(self, key, value):
+        self.metadata[key] = value
+
+
+def _sync_row(probe, structure=None, **cfg):
+    rows = _Rows()
+    cc.check_av_sync_offset(structure, probe, rows, _cfg(**cfg))
+    return rows.checks[0], rows.metadata
+
+
+class TestAacPrimingRange:
+    def test_transport_stream_sound_early_beyond_its_priming_is_not_a_pass(self, media, tmp_path):
+        """FFmpeg's TS audio starts one AAC frame (21 ms) early; 20 ms more
+        lead used to be absorbed by the 44 ms 'most favourable' window."""
+        early = tmp_path / "early.ts"
+        ffmpeg("-i", _clean(media), "-itsoffset", "-0.020", "-i", _clean(media), "-map", "0:v",
+               "-map", "1:a", "-c", "copy", "-f", "mpegts", str(early))
+        check = _row(_scan(early, accepted_containers=[".ts"]), "A/V Sync Offset")
+        assert check[1] == "WARN", check
+        assert "priming" in check[2] and "not signalled" in check[2], check
+        known = _row(_scan(early, accepted_containers=[".ts"], aac_priming=1024), "A/V Sync Offset")
+        assert known[1] == "WARN" and "20 ms before" in known[2], known
+
+    def test_known_encoder_priming_makes_the_offset_exact(self):
+        assert _sync_row(_sync_probe(-1024 / 48000), aac_priming=1024)[0][1] == "PASS"
+        assert _sync_row(_sync_probe(-1024 / 48000), aac_priming=2112)[0][1] == "WARN"
+        he, _ = _sync_row(_sync_probe(-2 * 2112 / 48000, profile="HE-AAC"), aac_priming=2112)
+        assert he[1] == "PASS", he
+
+    def test_priming_setting_follows_the_preset_pattern(self):
+        from frameguard import presets
+        from frameguard.report import spec_rows
+        assert DEFAULT_CONFIG["aac_priming"] == "unknown"
+        assert presets.validate_preset_config({"aac_priming": "1024"}) == {"aac_priming": 1024}
+        with pytest.raises(presets.PresetValidationError):
+            presets.validate_preset_config({"aac_priming": 999})
+        assert presets.normalize_preset_config({"av_offset_warn_ms": 5}) == {"av_offset_warn_ms": 5}
+        rows = dict(spec_rows(dict(DEFAULT_CONFIG)))
+        assert "0-2112 samples" in rows["A/V start offset"], rows
+
+    def test_he_aac_window_no_longer_hides_88_ms(self):
+        check, meta = _sync_row(_sync_probe(-0.088, profile="HE-AAC"))
+        assert check[1] == "WARN" and "88" in check[2], check
+        assert meta["av_start_offset_range_ms"] == [-88.0, 0.0], meta
+
+    def test_whole_range_beyond_r37_fails_and_whole_range_late_fails(self):
+        assert _sync_row(_sync_probe(-0.090))[0][1] == "FAIL"     # -90 .. -46 ms: all beyond 40 early
+        assert _sync_row(_sync_probe(0.070))[0][1] == "FAIL"      # priming only makes late later
+        assert _sync_row(_sync_probe(-0.060))[0][1] == "WARN"     # -60 .. -16 ms straddles the limit
+
+    def test_priming_is_read_from_the_audio_edit_list(self, media, monkeypatch):
+        """ffprobe 6/7 report initial_padding=0 for an edit-listed AAC MP4;
+        the audio track's own edit (media_time = priming) signals it."""
+        from frameguard import core
+        real = core.run_ffprobe
+
+        def no_padding(*args, **kwargs):
+            data = real(*args, **kwargs)
+            for stream in data["streams"]:
+                stream.pop("initial_padding", None)
+            return data
+        monkeypatch.setattr(core, "run_ffprobe", no_padding)
+        check = _row(_scan(_video_delayed(media, 35)), "A/V Sync Offset")
+        assert check[1] == "WARN" and "35 ms before" in check[2], check
+        assert _row(_scan(_clean(media)), "A/V Sync Offset")[1] == "PASS"
+
+    def test_a_trims_audio_edit_also_signals_the_priming(self, media, monkeypatch):
+        """FFmpeg 8 reports initial_padding=0 for a stream-copy trim; the audio
+        edit that hides the trimmed lead-in hides the priming with it."""
+        from frameguard import core
+        from media_fixtures import stream_copy_trim
+        real = core.run_ffprobe
+
+        def no_padding(*args, **kwargs):
+            data = real(*args, **kwargs)
+            for stream in data["streams"]:
+                stream.pop("initial_padding", None)
+            return data
+        source = media.get("trim_src.mp4", lambda p: make_clip(p, duration=6) or p)
+        trimmed = media.get("trimmed.mp4", lambda p: stream_copy_trim(source, p, 1.37, 3))
+        monkeypatch.setattr(core, "run_ffprobe", no_padding)
+        check = _row(_scan(trimmed), "A/V Sync Offset")
+        assert "not signalled" not in check[2], check
+
+    def test_signalled_priming_is_exact(self):
+        check, _ = _sync_row(_sync_probe(0.0, padding=1024))
+        assert check[1] == "PASS", check

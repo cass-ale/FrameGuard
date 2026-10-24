@@ -212,10 +212,15 @@ class TestAVSyncOffset:
         assert check[1] == "WARN", check
 
     def test_mpegts_aac_priming_is_not_an_offset(self, media, tmp_path):
+        """MPEG-TS cannot signal priming: with the encoder known (FFmpeg,
+        1024 samples) the start is exact; unknown, the whole 0-2112 sample
+        range is judged and the ±5 ms tolerance cannot be confirmed (0.9.2, B5)."""
         ts = tmp_path / "prime.ts"
         ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", str(ts))
-        check = _row(_scan(ts, accepted_containers=[".ts"]), "A/V Sync Offset")
+        check = _row(_scan(ts, accepted_containers=[".ts"], aac_priming=1024), "A/V Sync Offset")
         assert check[1] == "PASS", check
+        unknown = _row(_scan(ts, accepted_containers=[".ts"]), "A/V Sync Offset")
+        assert unknown[1] == "WARN" and "not signalled" in unknown[2], unknown
 
     def _bframe_encode(self, path, *extra, audio=("-c:a", "aac")):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=3", "-f", "lavfi",
@@ -236,7 +241,8 @@ class TestAVSyncOffset:
 
     def test_ffmpeg_transport_stream_with_bframes_passes(self, tmp_path):
         ts = self._bframe_encode(tmp_path / "bf.ts")
-        check = _row(_scan(ts, target_fps=25.0, accepted_containers=[".ts"]), "A/V Sync Offset")
+        check = _row(_scan(ts, target_fps=25.0, accepted_containers=[".ts"], aac_priming=1024),
+                     "A/V Sync Offset")
         assert check[1] == "PASS", check
 
     def test_with_edit_list_is_clean(self, tmp_path):
@@ -254,7 +260,8 @@ class TestTransportStreamEnds:
         make_clip(mp4, duration=seconds, extra=("-movflags", "+faststart"))
         ts = tmp_path / f"c{seconds}.ts"
         ffmpeg("-i", str(mp4), "-c", "copy", str(ts))
-        result = run_qa_checks(str(ts), cfg=_cfg(accepted_containers=[".ts"]), strict=True)
+        # FFmpeg-encoded AAC: TS cannot signal its 1024-sample priming (0.9.2, B5).
+        result = run_qa_checks(str(ts), cfg=_cfg(accepted_containers=[".ts"], aac_priming=1024), strict=True)
         result.finalize()
         assert _row(result, "A/V Duration")[1] == "PASS", _row(result, "A/V Duration")
         assert _row(result, "Frame Count")[1] == "SKIP"
