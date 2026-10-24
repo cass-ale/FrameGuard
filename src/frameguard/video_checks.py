@@ -1356,9 +1356,10 @@ def _interval_of(times: Sequence[float], first: int, last: int, period: float) -
 
 @dataclass
 class BlackFindings:
-    segments: List[Interval]        # >= black_detect_duration, edge-trimmed
+    segments: List[Interval]        # >= black_detect_duration
     bursts: List[Tuple[float, int]]  # (start, frames) hard-cut short bursts
     ignored_bursts: int              # short runs judged fades or strobes
+    edge_segments: List[Interval] = field(default_factory=list)  # lead-in / run-out black
 
 
 def _mean_luma_at(times: Sequence[float], yavg: Sequence[float], t: float) -> Optional[float]:
@@ -1397,8 +1398,10 @@ def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: 
     ``black_detect_pix_threshold`` level (Y <= 20 at 8-bit limited range by
     default; FFmpeg scales the level for full range and higher bit depths).
 
-    * The first and last second are excluded: fades from and to black at the
-      head and tail are normal.
+    * Black that opens the file (from its first frame) or closes it (to its
+      last frame) is a lead-in or run-out: fades from and to black there are
+      normal. Up to BLACK_EDGE_ALLOWANCE of it is noted, not judged; black
+      that starts after the picture has appeared is judged wherever it is.
     * A run of at least ``black_detect_duration`` is a black segment.
     * A run of ``black_short_min_frames`` frames up to that duration is a
       short burst - the classic edit gap - and is reported only when it is
@@ -1413,9 +1416,17 @@ def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: 
     bursts: List[Tuple[float, int]] = []
     ignored = 0
     edge = BLACK_EDGE_ALLOWANCE if duration > 3 * BLACK_EDGE_ALLOWANCE else 0.0
+    edges: List[Interval] = []
+    first_time = times[0] if times else 0.0
     for position, (start, length) in enumerate(runs):
-        begin = max(start, edge)
-        finish = min(start + length, duration - edge) if edge else start + length
+        begin, finish = start, start + length
+        if edge and start <= first_time + period * 0.5:         # opens the file
+            begin = min(finish, max(start, edge))
+            edges.append((start, begin - start))
+        if edge and finish >= duration - period * 0.5:           # closes the file
+            cut = max(begin, min(finish, duration - edge))
+            edges.append((cut, finish - cut))
+            finish = cut
         if finish - begin <= period * 0.5:
             continue
         if finish - begin >= cfg.black_duration - 1e-6:
@@ -1441,17 +1452,19 @@ def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: 
             bursts.append((start, frames))
         else:
             ignored += 1
-    return BlackFindings(segments, bursts, ignored)
+    return BlackFindings(segments, bursts, ignored, [e for e in edges if e[1] > period * 0.5])
 
 
 def black_entry(findings: BlackFindings, duration: float,
                 cfg: VideoCheckConfig) -> Tuple[str, str, int]:
     """(status, detail, confidence) for the Black Frames row."""
     level = f"≥{cfg.black_pic_th * 100:g}% of the picture at black level"
+    edge_note = (f" Lead-in/run-out black within the {BLACK_EDGE_ALLOWANCE:g}s allowance: "
+                 f"{event_list(findings.edge_segments)}." if findings.edge_segments else "")
     if not findings.segments and not findings.bursts:
         note = (f" ({findings.ignored_bursts} brief dip(s)/flash(es) to black ignored)"
                 if findings.ignored_bursts else "")
-        return "PASS", f"No black segments detected{note}.", 100
+        return "PASS", f"No black segments detected{note}.{edge_note}", 100
     parts = []
     status, confidence = "WARN", 55
     if findings.segments:
@@ -1467,7 +1480,7 @@ def black_entry(findings: BlackFindings, duration: float,
         more = f", +{len(findings.bursts) - 6} more" if len(findings.bursts) > 6 else ""
         parts.append(f"{len(findings.bursts)} short black burst(s) cut in hard "
                      f"(possible edit gap): {shown}{more}")
-    return status, ". ".join(parts) + ".", confidence
+    return status, ". ".join(parts) + "." + edge_note, confidence
 
 
 # ---------------------------------------------------------------------------

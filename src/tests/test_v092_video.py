@@ -850,3 +850,18 @@ class TestBlackEditGaps:
             yavg[i] = float(v)
         found = vc.classify_black([(4.0, 4.0 + 5 / FPS)], 10.0, FPS, self.cfg, _times(300), yavg)
         assert found.bursts == [] and found.ignored_bursts == 1
+
+class TestBlackEdges:
+    cfg = vc.VideoCheckConfig()
+
+    def test_black_inside_the_first_second_after_picture_is_reported(self):
+        """0.6 s of black starting at 0.2 s: picture, then black - not a lead-in."""
+        found = vc.classify_black([(0.2, 0.8)], 10.0, FPS, self.cfg)
+        assert found.segments == [(0.2, pytest.approx(0.6))]
+
+    def test_head_and_tail_black_is_noted_not_dropped(self):
+        found = vc.classify_black([(0.0, 0.6), (9.5, 10.0)], 10.0, FPS, self.cfg)
+        assert found.segments == [] and found.edge_segments
+        status, detail, _ = vc.black_entry(found, 10.0, self.cfg)
+        assert status == "PASS" and "00:00:00.000" in detail and "00:00:09.500" in detail
+
