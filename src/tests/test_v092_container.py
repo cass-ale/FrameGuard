@@ -276,3 +276,87 @@ class TestAacPrimingRange:
     def test_signalled_priming_is_exact(self):
         check, _ = _sync_row(_sync_probe(0.0, padding=1024))
         assert check[1] == "PASS", check
+
+
+# ---------------------------------------------------------------------------
+# 3. Stereo layout from the picture: disparity-independent, multi-frame (B6)
+# ---------------------------------------------------------------------------
+
+def _copy(src, dst):
+    with open(src, "rb") as a, open(dst, "wb") as b:
+        b.write(a.read())
+    return str(dst)
+
+
+def _tagged(path, mode):
+    from container_fixtures import add_to_sample_entry, st3d, sv3d
+    return add_to_sample_entry(path, b"vide", st3d(mode), sv3d())
+
+
+XR_SPEC = {"required_projection": "equirectangular", "audio_required": False}
+
+
+class TestStereoContentCheck:
+    """Validated on depth-varying stereo scenes (stereo_fixtures), not on a
+    picture stacked on itself: sky at infinity, a ground plane whose
+    disparity grows towards the viewer, occluding objects at their own
+    depths, sensor noise and a gain mismatch between the eyes."""
+
+    @pytest.mark.parametrize("disparity", [0, 1.5, 3, 4.5, 6, 7.5, 9, 12, 18])
+    def test_top_bottom_found_at_any_disparity(self, disparity):
+        import stereo_fixtures as sf
+        hits = 0
+        for seed in (11, 12):
+            frame = sf.top_bottom(sf.Scene(384, 192, seed, disparity), swapped=seed % 2 == 0, eye_height=96)
+            evidence = cc.stereo_layout_evidence([frame])
+            hits += bool(evidence and evidence[0])
+        assert hits == 2, disparity
+
+    @pytest.mark.parametrize("kind", ["mono", "reflection", "periodic"])
+    def test_mono_pictures_are_not_called_stereo(self, kind):
+        import stereo_fixtures as sf
+        for seed in (21, 22, 23):
+            scene = sf.Scene(384, 192, seed, 10)
+            frame = {"mono": lambda: sf.mono(scene), "reflection": lambda: sf.reflection(scene),
+                     "periodic": lambda: sf.periodic(384, 192, seed)}[kind]()
+            evidence = cc.stereo_layout_evidence([frame])
+            assert not (evidence and evidence[0]), (kind, seed, evidence)
+
+    def _encoded(self, media, name, pixels, width, height):
+        import stereo_fixtures as sf
+        return media.get(name, lambda p: sf.encode(pixels(), width, height, p))
+
+    @pytest.mark.parametrize("disparity", [9, 24])
+    def test_half_height_top_bottom_tagged_mono_warns(self, media, tmp_path, disparity):
+        """768x384 half-height TB (the Quest-critical mislabel geometry cannot
+        see): 9 source px = 4.5 grab px, where 0.9.1 never fired."""
+        import stereo_fixtures as sf
+        scene = sf.Scene(768, 384, 30 + disparity, disparity)
+        clip = self._encoded(media, f"tb_half_{disparity}.mp4", lambda: sf.top_bottom(scene, eye_height=192),
+                             768, 384)
+        path = _tagged(_copy(clip, tmp_path / "tb_mono.mp4"), 0)
+        check = _row(_scan(path, target_width=768, target_height=384, **XR_SPEC), "XR Metadata")
+        assert check[1] == "WARN" and "looks top-bottom" in check[2] and check[3] < 70, check
+
+    def test_natural_mono_equirect_is_quiet(self, media, tmp_path):
+        import stereo_fixtures as sf
+        scene = sf.Scene(768, 384, 41, 12)
+        clip = self._encoded(media, "mono_eq.mp4", lambda: sf.mono(scene), 768, 384)
+        path = _tagged(_copy(clip, tmp_path / "mono.mp4"), 0)
+        check = _row(_scan(path, target_width=768, target_height=384, **XR_SPEC), "XR Metadata")
+        assert check[1] == "PASS" and "looks top-bottom" not in check[2], check
+
+    def test_several_frames_are_compared(self, media, tmp_path, monkeypatch):
+        import stereo_fixtures as sf
+        scene = sf.Scene(768, 384, 51, 12)
+        clip = self._encoded(media, "mono_eq_51.mp4", lambda: sf.mono(scene), 768, 384)
+        path = _tagged(_copy(clip, tmp_path / "frames.mp4"), 0)
+        seen = []
+        real = cc.FrameGrabber.gray
+
+        def spy(self, index, at):
+            seen.append(at)
+            return real(self, index, at)
+        monkeypatch.setattr(cc.FrameGrabber, "gray", spy)
+        _scan(path, target_width=768, target_height=384, **XR_SPEC)
+        assert len(seen) == 3 and len(set(seen)) == 3, seen

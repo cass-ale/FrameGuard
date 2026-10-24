@@ -1985,10 +1985,30 @@ def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], c
 # ---------------------------------------------------------------------------
 
 LAYOUT_GRAB_SIZE = (384, 192)
-LAYOUT_SHIFT = 8          # horizontal disparity searched, in grab pixels
-LAYOUT_MATCH = 0.9        # top and bottom halves this alike are two views of one scene
-LAYOUT_MARGIN = 0.15      # ...and clearly more alike than the left/right halves
-LAYOUT_MIN_DETAIL = 2.0   # gradient RMS below this is a flat frame: no evidence
+# Frames compared (at 25, 50 and 75 % of the duration): one frame can be a
+# title card, a fade or a static sky; the verdict follows the majority.
+LAYOUT_FRAMES = 3
+LAYOUT_BLOCK = 12         # matching block, grab pixels (32 x 8 blocks per eye in a 384x96 eye)
+# Largest disparity searched, as a fraction of the eye width, either sign
+# (eyes may be swapped). Omnidirectional stereo with a 64 mm interpupillary
+# baseline gives an angular disparity of ~IPD / distance: 5 % of 360 deg
+# (18 deg) is an object 0.2 m from the lens, nearer than anyone can fuse.
+LAYOUT_MAX_DISPARITY = 0.05
+# Blocks with a grey-level standard deviation below this carry no
+# correspondence evidence: it is the size of 8-bit quantisation plus the
+# texture an H.264/HEVC encode keeps in flat sky or walls.
+LAYOUT_MIN_TEXTURE = 3.0
+LAYOUT_MIN_BLOCKS = 16    # textured blocks a frame needs to count (1/16 of the eye)
+# Decision per frame, on the median over textured blocks of each block's best
+# normalised cross-correlation within the disparity range. Two views of one
+# scene: a block and its counterpart in the other eye correlate at 0.6 or
+# better in most blocks (occlusions and encoding noise pull some down, the
+# median ignores them). Unrelated texture also produces a best-of-39-shifts
+# correlation well above zero, so the same search is repeated against rows
+# half an eye lower (control): a stacked second view matches its own rows
+# and not the control rows, while two unrelated halves match both equally.
+LAYOUT_MATCH = 0.6
+LAYOUT_MARGIN = 0.25
 
 
 class FrameGrabber:
@@ -2051,91 +2071,156 @@ class FrameGrabber:
         return [float(b) for b in data]
 
 
-def _gradient(pixels: List[float], width: int, height: int) -> List[float]:
-    """|dx| + |dy| removes smooth ramps that make unrelated halves correlate."""
-    out = [0.0] * (width * height)
-    for y in range(1, height):
-        row, above = y * width, (y - 1) * width
-        for x in range(1, width):
-            i = row + x
-            out[i] = abs(pixels[i] - pixels[i - 1]) + abs(pixels[i] - pixels[above + x])
+def _padded_rows(pixels: List[float], width: int, first_row: int, rows: int, pad: int) -> List[List[float]]:
+    """Rows of one eye, each wrapped by ``pad`` pixels on both sides (an
+    equirect picture is continuous across its left and right edges)."""
+    out = []
+    for y in range(first_row, first_row + rows):
+        row = pixels[y * width:(y + 1) * width]
+        out.append(row[width - pad:] + row + row[:pad])
     return out
 
 
-def _ncc(a: List[float], b: List[float]) -> float:
-    n = len(a)
-    if n == 0:
-        return 0.0
-    ma, mb = sum(a) / n, sum(b) / n
-    da = [v - ma for v in a]
-    db = [v - mb for v in b]
-    den = math.sqrt(sum(v * v for v in da) * sum(v * v for v in db))
-    return sum(x * y for x, y in zip(da, db)) / den if den else 0.0
+def _prefix(values: List[float]) -> Tuple[List[float], List[float]]:
+    sums, squares, s1, s2 = [0.0], [0.0], 0.0, 0.0
+    for v in values:
+        s1 += v
+        s2 += v * v
+        sums.append(s1)
+        squares.append(s2)
+    return sums, squares
 
 
-def _half_similarity(grad: List[float], width: int, height: int, split: str) -> float:
-    """Best NCC between the two halves over +-LAYOUT_SHIFT px of horizontal disparity."""
-    if split == "top_bottom":
-        rows = height // 2
-        first = [grad[y * width:(y + 1) * width] for y in range(rows)]
-        second = [grad[(y + rows) * width:(y + rows + 1) * width] for y in range(rows)]
-        cols = width
-    else:
-        cols = width // 2
-        first = [grad[y * width:y * width + cols] for y in range(height)]
-        second = [grad[y * width + cols:y * width + 2 * cols] for y in range(height)]
+def _best_match(a_rows: List[List[float]], a_energy: float, candidates: List[List[float]],
+                prefixes, x: int, pad: int, block: int) -> float:
+    """Best NCC of the mean-removed block ``a_rows`` against ``candidates`` rows
+    over every horizontal shift in [-pad, pad]."""
+    from operator import mul
+    n = block * len(a_rows)
     best = -1.0
-    for shift in range(-LAYOUT_SHIFT, LAYOUT_SHIFT + 1, 2):
-        lo, hi = max(0, shift), cols + min(0, shift)
-        a = [v for row in first for v in row[lo:hi]]
-        b = [v for row in second for v in row[lo - shift:hi - shift]]
-        best = max(best, _ncc(a, b))
+    for shift in range(-pad, pad + 1):
+        lo = x + pad + shift
+        hi = lo + block
+        dot = 0.0
+        s1 = s2 = 0.0
+        for a_row, c_row, (sums, squares) in zip(a_rows, candidates, prefixes):
+            dot += sum(map(mul, a_row, c_row[lo:hi]))
+            s1 += sums[hi] - sums[lo]
+            s2 += squares[hi] - squares[lo]
+        var = s2 - s1 * s1 / n
+        if var <= 1e-6:
+            continue
+        ncc = dot / math.sqrt(a_energy * var)
+        if ncc > best:
+            best = ncc
     return best
 
 
-def stereo_layout_scores(pixels: List[float]) -> Optional[Tuple[float, float]]:
-    """(top/bottom similarity, left/right similarity) of one grey frame, or None if flat."""
-    width, height = LAYOUT_GRAB_SIZE
-    grad = _gradient(pixels, width, height)
-    rms = math.sqrt(sum(v * v for v in grad) / len(grad))
-    if rms < LAYOUT_MIN_DETAIL:
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def stereo_layout_scores(pixels: List[float], size: Tuple[int, int] = LAYOUT_GRAB_SIZE
+                         ) -> Optional[Tuple[float, float, int]]:
+    """(top/bottom match, control match, textured blocks) of one grey frame, or None.
+
+    Each textured block of the top half is searched in the bottom half
+    along the same rows, over every horizontal disparity within
+    LAYOUT_MAX_DISPARITY at 1-px steps, and keeps its best normalised
+    cross-correlation; the control repeats the search half an eye lower.
+    Block-wise matching follows depth-varying disparity (every block finds
+    its own shift), which a single global shift cannot. None when fewer than
+    LAYOUT_MIN_BLOCKS blocks are textured (a flat or blank frame).
+    """
+    width, height = size
+    eye = height // 2
+    block = LAYOUT_BLOCK
+    pad = max(1, int(round(width * LAYOUT_MAX_DISPARITY)))
+    top = _padded_rows(pixels, width, 0, eye, 0)
+    bottom = _padded_rows(pixels, width, eye, eye, pad)
+    prefixes = [_prefix(row) for row in bottom]
+    bands = eye // block
+    matched, control = [], []
+    for band in range(bands):
+        y = band * block
+        aligned_rows = list(range(y, y + block))
+        control_rows = [(r + eye // 2) % eye for r in aligned_rows]
+        for x in range(0, width - block + 1, block):
+            values = [v for r in aligned_rows for v in top[r][x:x + block]]
+            mean = sum(values) / len(values)
+            energy = sum((v - mean) ** 2 for v in values)
+            if math.sqrt(energy / len(values)) < LAYOUT_MIN_TEXTURE:
+                continue
+            a_rows = [[v - mean for v in top[r][x:x + block]] for r in aligned_rows]
+            matched.append(_best_match(a_rows, energy, [bottom[r] for r in aligned_rows],
+                                       [prefixes[r] for r in aligned_rows], x, pad, block))
+            control.append(_best_match(a_rows, energy, [bottom[r] for r in control_rows],
+                                       [prefixes[r] for r in control_rows], x, pad, block))
+    if len(matched) < LAYOUT_MIN_BLOCKS:
         return None
-    return (_half_similarity(grad, width, height, "top_bottom"),
-            _half_similarity(grad, width, height, "side_by_side"))
+    return _median(matched), _median(control), len(matched)
+
+
+def stereo_layout_evidence(frames: List[List[float]], size: Tuple[int, int] = LAYOUT_GRAB_SIZE
+                           ) -> Optional[Tuple[bool, float, float, int]]:
+    """(looks top-bottom, median match, median control, frames judged) over
+    several grabbed frames, or None when no frame carries enough texture.
+    A frame looks top-bottom when its match reaches LAYOUT_MATCH and beats
+    the control by LAYOUT_MARGIN; the file does when most judged frames do."""
+    scores = [s for s in (stereo_layout_scores(f, size) for f in frames) if s is not None]
+    if not scores:
+        return None
+    votes = sum(1 for m, c, _ in scores if m >= LAYOUT_MATCH and m - c >= LAYOUT_MARGIN)
+    return (2 * votes > len(scores), _median([m for m, _, _ in scores]),
+            _median([c for _, c, _ in scores]), len(scores))
+
+
+def _grab_times(duration: Optional[float]) -> List[float]:
+    if not duration or duration <= 1:
+        return [0.0]
+    return [duration * (k + 1) / (LAYOUT_FRAMES + 1) for k in range(LAYOUT_FRAMES)]
 
 
 def _content_layout_finding(video: dict, stereo: Optional[str], grabber: Optional[FrameGrabber],
                             duration: Optional[float]) -> Tuple[str, str]:
     """A warning when a spherical picture tagged mono (or side-by-side) looks top-bottom.
 
-    Gradient-domain NCC of the two half-frames over a small disparity search
-    (container benchmark prototype). Measured on synthetic stitches: true
-    top-bottom 0.95-0.97, mono equirect 0.06-0.80. Only the top-bottom claim
-    is made, the Quest-critical mislabel: a mono picture whose left and right
-    halves look alike is common (horizontally periodic scenes), so a
-    side-by-side claim would be unreliable. Thresholds are validated on
-    synthetic content only, so this is advisory (confidence 60), never a
-    failure, and costs one keyframe decode on spherical files only.
+    Block-wise normalised cross-correlation between the top and bottom
+    halves over a 1-px disparity search, with a row-misaligned control and a
+    majority over LAYOUT_FRAMES frames (stereo_layout_evidence); the
+    constants are derived in their comments, not fitted to a corpus. Only
+    the top-bottom claim is made, the Quest-critical mislabel: a mono
+    picture whose left and right halves look alike is common (horizontally
+    periodic scenes), so a side-by-side claim would be unreliable. Content
+    evidence is advisory (confidence 60), never a failure, and costs three
+    keyframe decodes on spherical files only.
 
     Returns (finding, note): a frame that cannot be grabbed is a note that
     this one sub-check was not verified, never an error.
     """
     if grabber is None or "index" not in video or stereo == "top_bottom":
         return "", ""
-    at = duration / 2 if duration and duration > 1 else 0.0
-    pixels = grabber.gray(int(video["index"]), at)
-    if pixels is None:
-        reason = grabber.problem
+    frames, reason = [], ""
+    for at in _grab_times(duration):
+        pixels = grabber.gray(int(video["index"]), at)
+        if pixels is None:
+            reason = reason or grabber.problem
+            if not grabber.problem:     # cancelled
+                return "", ""
+            continue
+        frames.append(pixels)
+    if not frames:
         return "", (f"picture layout content check not verified: {reason}" if reason else "")
-    found = stereo_layout_scores(pixels)
-    if found is None:
+    found = stereo_layout_evidence(frames)
+    if found is None or not found[0]:
         return "", ""
-    tb, sbs = found
-    if tb < LAYOUT_MATCH or tb - sbs < LAYOUT_MARGIN:
-        return "", ""
+    _, match, control, judged = found
     layout = (stereo or "mono").replace("_", "-")
-    return (f"the picture looks top-bottom stereo (top and bottom halves match at {tb:.2f}, left/right "
-            f"{sbs:.2f}) but the metadata says {layout}; check the layout tag (content check, advisory)"), ""
+    return (f"the picture looks top-bottom stereo (top and bottom halves match at {match:.2f} against "
+            f"{control:.2f} for misaligned rows, {judged} frame(s)) but the metadata says {layout}; "
+            f"check the layout tag (content check, advisory)"), ""
 
 
 # ---------------------------------------------------------------------------
