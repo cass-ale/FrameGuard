@@ -155,10 +155,14 @@ class TestLoudnessRules:
     def test_netflix_says_it_is_not_dialogue_gated(self):
         row = audio_checks.loudness_row({"integrated": -24.0}, _ctx(),
                                         _cfg(loudness_mode="essential", loudness_profile="netflix"))
-        assert row[0] == "FAIL" and "not dialogue-gated" in row[1]
-        assert row[2] < 70  # a near miss on the full mix is not proof of a dialogue miss
-        far = audio_checks.loudness_row({"integrated": -15.0}, _ctx(),
-                                        _cfg(loudness_mode="essential", loudness_profile="netflix"))
+        assert row[0] == "WARN" and "not dialogue-gated" in row[1]
+        assert row[2] < 70  # programme loudness only estimates the dialogue level (0.9.2)
+        # A spec that judges programme loudness keeps 0.9.1's tiers.
+        enforce = _cfg(loudness_mode="essential", loudness_profile="netflix",
+                       dialogue_gated_loudness="enforce")
+        near = audio_checks.loudness_row({"integrated": -24.0}, _ctx(), enforce)
+        assert near[0] == "FAIL" and near[2] < 70  # a near miss on the full mix is not proof
+        far = audio_checks.loudness_row({"integrated": -15.0}, _ctx(), enforce)
         assert far[2] >= 70
 
     def test_silent_track_is_left_to_audio_silence(self):
@@ -234,7 +238,10 @@ class TestLoudnessOnFiles:
         result = _scan(clip, loudness_mode="essential")
         assert abs(result.metadata["integrated_loudness_lufs"] + 26.0) <= 0.15, result.metadata
         row = _row(result, "Audio Loudness")
-        assert row[1] == "WARN" and row[3] < 70 and "W-channel loudness" in row[2], row
+        # Never a FAIL. Without SA3D the normalization is unsignalled and a
+        # FuMa W would read -23.0, inside the target: not verified (0.9.2).
+        assert row[1] == "WARN" and "W-channel loudness" in row[2], row
+        assert row[3] < 70 or core.NOT_VERIFIED_PREFIX in row[2], row
 
     def test_self_test_detects_a_broken_meter(self, monkeypatch):
         monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {"ffmpeg": False})
@@ -244,8 +251,11 @@ class TestLoudnessOnFiles:
         plan.multichannel_meter = core._multichannel_meter("ffmpeg", plan)
         assert plan.multichannel_meter == audio_checks.METER_LOUDNORM
         graph = _graph(core._build_scan_command("ffmpeg", "x.mov", plan, _cfg()))
-        assert "loudnorm@a0" in graph and "ebur128@a0" not in graph
-        # Beyond loudnorm's six channels only the (exact) true peak is kept.
+        # loudnorm measures the loudness (remapped by layout); ebur128 stays on
+        # every channel for the true peak, which is exact on every build.
+        assert "loudnorm@a0" in graph and "ebur128@a0" in graph
+        # 7.1 has seven weighted channels, more than loudnorm's five inputs:
+        # only the (exact) true peak is kept.
         assert "loudnorm@a1" not in graph and "ebur128@a1" in graph
 
     @pytest.mark.parametrize("mode,status", [("report", "PASS"), ("advisory", "WARN"), ("essential", "FAIL")])
@@ -321,8 +331,10 @@ class TestDropouts:
         assert _row(_scan(clip), "Audio Dropouts")[1] == "PASS"
 
     def test_long_gap_is_silence_not_a_dropout(self, media):
-        gap = f"if(between(t,0.8,3.2),0,{tone(440)})"
-        clip = media.get("droplong", lambda p: make_audio(p, [gap, gap.replace("440", "554.37")]))
+        # 2.5 s of 6 s: a silence, but under half the track (more than half FAILs).
+        gap = f"if(between(t,1.5,4),0,{tone(440)})"
+        clip = media.get("droplong6", lambda p: make_audio(p, [gap, gap.replace("440", "554.37")],
+                                                           seconds=6))
         result = _scan(clip)
         assert _row(result, "Audio Dropouts")[1] == "PASS"
         assert _row(result, "Audio Silence")[1] == "WARN"
