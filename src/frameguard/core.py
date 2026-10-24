@@ -3154,11 +3154,13 @@ def _audio_evidence(log_text: str, files: Optional["audio_checks.MeasurementFile
 
 
 def _record_loudness_metadata(result: QAResult, entry: Optional[dict], cfg: dict) -> None:
+    """The primary track's measurements. Only values its meter vouches for
+    (audio_checks.track_measurement): a track whose loudness could not be
+    measured exports its true peak and meter "none", no loudness."""
     if not entry:
         return
-    result.set_metadata("integrated_loudness_lufs", entry.get("integrated"))
-    result.set_metadata("true_peak_dbtp", entry.get("true_peak"))
-    for source, key in (("lra", "loudness_range_lu"), ("sample_peak", "sample_peak_dbfs"),
+    for source, key in (("integrated", "integrated_loudness_lufs"), ("true_peak", "true_peak_dbtp"),
+                        ("lra", "loudness_range_lu"), ("sample_peak", "sample_peak_dbfs"),
                         ("meter", "loudness_meter")):
         if entry.get(source) is not None:
             result.set_metadata(key, entry[source])
@@ -3235,7 +3237,7 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
             loudness.append(audio_checks.loudness_row(entry, ctx, cfg))
             true_peak.append(audio_checks.true_peak_row(
                 entry, ctx, cfg, audio_checks.track_sample_peak(evidence, ctx)))
-            if position == 0 and evidence.log_complete:
+            if position == primary and evidence.log_complete:
                 _record_loudness_metadata(result, entry, cfg)
     if files_problem:
         _mark_not_verified(result, ["Audio Silence", "Dead Channel"], files_problem)

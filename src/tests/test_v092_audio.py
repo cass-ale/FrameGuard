@@ -489,3 +489,39 @@ class TestDualMonoAllowed:
         assert panel.get_config_overrides()["dual_mono_allowed"] is True
         rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG, dual_mono_allowed=True))))
         assert "dual mono allowed" in rows["Audio checks"]
+
+
+# ---------------------------------------------------------------------------
+# 12a. Exported loudness metadata: no distrusted value, primary track (review B8)
+# ---------------------------------------------------------------------------
+
+def _two_tracks(path, first, second):
+    """Tiny video plus two stereo PCM tracks; the SECOND is the default."""
+    from media_fixtures import ffmpeg
+    path = str(path) + ".mov"
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x64:r=10:d=4",
+           "-f", "lavfi", "-i", f"aevalsrc=exprs='{first}|{first}':s=48000:d=4",
+           "-f", "lavfi", "-i", f"aevalsrc=exprs='{second}|{second}':s=48000:d=4",
+           "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast",
+           "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", "-disposition:a:0", "0",
+           "-disposition:a:1", "default", "-t", "4", path)
+    return path
+
+
+@needs_ffmpeg
+class TestLoudnessMetadata:
+    def test_unmeasured_track_exports_no_loudness(self, media, forced_fallback):
+        """7.1 cannot be placed on the fallback's inputs: the row says "not
+        measured", and the export must not carry the distrusted ebur128 value."""
+        exprs = [TONE_23, TONE_23, "0", LOUD_LFE, "0", "0", "0", "0"]
+        clip = media.get("fb_7.1", lambda p: make_audio(p, exprs, layout="7.1"))
+        result = _scan(clip, loudness_mode="essential")
+        assert "integrated_loudness_lufs" not in result.metadata, result.metadata
+        assert "loudness_range_lu" not in result.metadata
+        assert result.metadata["loudness_meter"] == "none"
+        assert result.metadata["true_peak_dbtp"] is not None
+
+    def test_metadata_describes_the_default_track(self, media):
+        clip = media.get("two_tracks", lambda p: _two_tracks(p, tone(1000, MINUS_23 / 3), TONE_23))
+        result = _scan(clip, loudness_mode="essential")
+        assert abs(result.metadata["integrated_loudness_lufs"] + 23.0) <= 0.1, result.metadata
