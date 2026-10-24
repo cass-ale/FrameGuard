@@ -13,7 +13,9 @@ picture measurements to that one pass and turns them into verdict rows:
   full/limited range plausibility test.
 * **Flash Risk** - an ITU-R BT.1702-3 general/red flash counter (advisory
   only; certification needs a Harding FPA class analyser).
-* **Interlace Detection** - ``idet`` combing in progressive-flagged video and
+* **Interlace Detection** - woven fields (``idet`` at its documented
+  defaults, confirmed by field-order steadiness and a vertical field
+  displacement test) and 3:2 pulldown in progressive-flagged video, and
   field-order disagreement with the stream's metadata.
 
 Measurements leave FFmpeg as small per-frame text files (``metadata``
@@ -84,8 +86,10 @@ CANCEL_CHECK_EVERY = 8192
 ANALYSIS_MAX_WIDTH = 480
 ANALYSIS_MIN_FACTOR = 4
 # Interlace analysis keeps every line (fields must stay separate) but
-# point-samples columns: combing is a vertical-frequency artefact, and 320
-# columns classify the benchmark's woven clips exactly as full width does.
+# point-samples columns: idet compares each line with the lines above and
+# below it, a purely vertical operation, so dropping columns only thins the
+# sample (320 columns still give idet >= 100,000 comparisons a frame at
+# 720 lines; natural woven and telecined pans read 97-100 % at 320 columns).
 INTERLACE_MAX_WIDTH = 320
 # Pictures smaller than this are not analysed for levels/flash.
 MIN_ANALYSIS_DIMENSION = 32
@@ -175,28 +179,42 @@ BLACK_ISOLATION_SECONDS = 1.0
 BLACK_HARD_CUT_CODES = 24.0
 BLACK_EDGE_ALLOWANCE = 1.0
 
-# Interlace: share of frames idet's multi-frame detector calls interlaced in
-# a one-second window, on a stream that declares itself progressive. idet's
-# interlace threshold is raised from 1.04 to 1.5: at the default, clean
-# graphics with thin moving horizontal lines (testsrc2, hard-cut mixes) read
-# as 17-83 % interlaced; at 1.5 they read 0 % while woven 60p content still
-# reads 98-100 % (and a 2 s woven section 25 % of a 10 s clip).
-IDET_OPTIONS = "intl_thres=1.5"
-# A vertical scroll (end credits) moving an integer number of lines per
-# frame is, field by field, a valid interlaced sequence: idet reads it as
-# 99 % TFF/BFF although no frame is combed. Such motion leaves every
-# column's mean unchanged while the row profile slides, so a combed window
-# is discounted when column-profile change is under this share of the total
-# profile change (measured: credit rolls 0.001-0.034; woven interlaced
-# clips 0.175-0.74 - natural, graphics and vertically tilting content).
-INTERLACE_VERTICAL_SHARE = 0.08
-# Profile change (mean |delta| in 8-bit codes) below which motion is too
-# small to judge; such frames are not counted either way.
-INTERLACE_MOTION_FLOOR = 0.02
+# Interlace (see assess_interlace). idet runs with FFmpeg's documented
+# defaults (intl_thres 1.04, prog_thres 1.5, rep_thres 3.0; FFmpeg filters
+# documentation, "idet"): no threshold here is tuned to test media.
+# A section of a progressive-flagged stream is combed when more than half the
+# frames of a one-second window are called TFF/BFF by idet's multiple-frame
+# detector (Oct 21 recommendation R5b), for at least a second.
 INTERLACE_WINDOW_SHARE = 0.5
 INTERLACE_MIN_SECONDS = 1.0
+# An interlaced source has one temporal field order (fixed by the camera or
+# the encoder; it only changes at an edit), so idet's single-frame calls in
+# a woven section agree. Progressive pictures can still give idet a slight
+# asymmetry between its two cross-field comparisons (it needs only 4 %), but
+# its sign then follows the content and flips; such a section is not combed.
+# The same majority decides the field order of declared-interlaced streams.
 FIELD_ORDER_MAJORITY = 0.8
 FIELD_ORDER_MIN_FRAMES = 30
+# Vertical field displacement, judged on the row profile (the mean of each
+# line), so horizontal motion cannot affect it. In a progressive frame both
+# fields are sampled at the same instant: the bottom field is best predicted
+# from the top field interpolated at its own lines (displacement 0). In a
+# woven frame whose content moves vertically, the bottom field was sampled
+# half a frame later and is best predicted at an offset. A vertical scroll by
+# whole lines (end credits) can make idet call a progressive picture TFF/BFF,
+# while a woven scroll is combed; the displacement tells the two apart. The
+# winner must be better by idet's own progressive ratio (prog_thres 1.5);
+# otherwise the frame is undecided and idet's verdict stands.
+INTERLACE_DISPLACEMENTS = (-2, -1, 0, 1, 2)
+INTERLACE_DECISIVE_RATIO = 1.5
+# 3:2 pulldown, the film-to-30 frame/s transfer cadence: four film frames
+# become ten fields (3 + 2 + 3 + 2), so two of every five video frames repeat
+# a field of the frame before, top and bottom alternately, and idet's
+# repeated-field call recurs with a period of five frames.
+# A one-second window holding at least half of the expected repeats (two in
+# five) is a cadence window.
+TELECINE_PERIOD = 5
+TELECINE_REPEAT_SHARE = 0.4
 
 MATRICES = {
     # Kr-derived Y'CbCr -> R'G'B' coefficients: R = Y + a*Cr,
@@ -369,6 +387,28 @@ def _print(key: str, path: str, value: Optional[str] = None,
 def _select(key: str, value: str, function: str) -> str:
     """Pass only frames whose ``key`` matches (they keep their own pts)."""
     return f"metadata=mode=select:key={key}:value={value}:function={function}"
+
+
+def _disp_name(d: int) -> str:
+    return f"disp_{'m' if d < 0 else 'p'}{abs(d)}"
+
+
+def _displacement_kernel(d: int) -> str:
+    """7-tap column kernel: 2 x (line y - top field interpolated at y + d).
+
+    Taps are lines y-3..y+3; y is a bottom-field (odd) line. At an odd offset
+    the prediction is a top-field line itself; at an even offset it is the
+    mean of the two top-field lines around y + d. Doubling keeps every tap an
+    integer, so no rounding hides sub-code differences.
+    """
+    taps = [0] * 7
+    taps[3] += 2
+    if d % 2:
+        taps[3 + d] -= 2
+    else:
+        taps[3 + d - 1] -= 1
+        taps[3 + d + 1] -= 1
+    return " ".join(str(t) for t in taps)
 
 
 def _rgb_mask_expressions(info: PictureInfo,
@@ -559,8 +599,8 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "idet", "colmo", "rowmo", "luma", "band1", "band2", "yavg",
-                 "gam_r", "gam_g", "gam_b")
+        names = ("mafd", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+                 "yavg", "gam_r", "gam_g", "gam_b") + tuple(_disp_name(d) for d in INTERLACE_DISPLACEMENTS)
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         if self.flash_enabled:
             self.flash_reader = _FlashSegmentReader(self.directory, self.info.fps, self.cancel)
@@ -623,32 +663,40 @@ class VideoAnalysis:
         return graphs
 
     def _interlace_chains(self) -> List[str]:
-        """idet plus the column and row luma profiles' frame-to-frame change.
+        """idet labels plus the vertical field displacement of interlaced frames.
 
-        The profiles tell a vertical scroll (rows slide, columns unchanged)
-        from motion that can comb. Column means come from area reductions
-        of at most 16x per step (a single large reduction is not an exact
-        mean); tblend difference + signalstats gives mean |delta| per frame.
-
-        Only frames idet calls interlaced (TFF/BFF) are written: they are
-        the only ones the decision reads, and progressive footage then
-        writes nothing. The profiles are kept in step with idet's verdict
-        (tblend keeps the current frame's metadata) and matched by pts.
+        idet's multiple-frame, single-frame and repeated-field calls are
+        printed only where they say something (TFF/BFF, a repeated field):
+        progressive footage writes nothing. For frames the multiple-frame
+        detector calls interlaced, the row profile (each line's mean, from
+        area reductions of at most 20x per step) is compared with the top
+        field interpolated at the bottom field's lines, offset by each
+        candidate displacement d (see INTERLACE_DISPLACEMENTS): a column
+        convolution gives 2 x (bottom line - prediction) per line, the odd
+        lines are kept, and their mean |value| is printed per d.
         """
-        label = "lavfi.idet.multiple.current_frame"
-        interlaced = _select(label, "ff", "ends_with")
-        reduce16 = "scale=w={w}:h='max(1,trunc(ih/16))':flags=area"
-        return [
+        multi, single = "lavfi.idet.multiple.current_frame", "lavfi.idet.single.current_frame"
+        repeated = "lavfi.idet.repeated.current_frame"
+        prints = [_print(multi, self.paths["idet"], "ff", "ends_with"),
+                  _print(single, self.paths["idet1"], "ff", "ends_with"),
+                  _print(repeated, self.paths["rep_top"], "top", "same_str"),
+                  _print(repeated, self.paths["rep_bottom"], "bottom", "same_str")]
+        count = len(INTERLACE_DISPLACEMENTS)
+        labels = "".join(f"[il_d{k}]" for k in range(count))
+        chains = [
             f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
-            f"idet@il={IDET_OPTIONS},split=3[il_det][il_col][il_row]",
-            f"[il_det]{_print(label, self.paths['idet'], 'ff', 'ends_with')}[vs_il]",
-            f"[il_col]format=gray,{reduce16.format(w=64)},{reduce16.format(w=64)},"
-            f"scale=w=64:h=1:flags=area,tblend=all_mode=difference,signalstats,{interlaced},"
-            f"{_print('lavfi.signalstats.YAVG', self.paths['colmo'])},nullsink",
-            "[il_row]format=gray,scale=w='max(1,trunc(iw/16))':h=ih:flags=area,"
-            f"scale=w=1:h=ih:flags=area,tblend=all_mode=difference,signalstats,{interlaced},"
-            f"{_print('lavfi.signalstats.YAVG', self.paths['rowmo'])},nullsink",
+            "idet@il,split=2[il_det][il_prof]",
+            f"[il_det]{','.join(prints)}[vs_il]",
+            f"[il_prof]{_select(multi, 'ff', 'ends_with')},format=gray,"
+            "scale=w='max(1,trunc(iw/16))':h=ih:flags=area,scale=w=1:h=ih:flags=area,"
+            f"crop=w=1:h='trunc(ih/2)*2':x=0:y=0,split={count}{labels}",
         ]
+        for k, d in enumerate(INTERLACE_DISPLACEMENTS):
+            chains.append(
+                f"[il_d{k}]convolution=0m='{_displacement_kernel(d)}':0rdiv=1:0bias=128:"
+                "0mode=column,lutyuv=y='abs(val-128)',il=l=d,crop=w=1:h='ih/2':x=0:y='ih/2',"
+                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths[_disp_name(d)])},nullsink")
+        return chains
 
     def _area_chains(self) -> List[str]:
         """Levels, gamut, mean luma and flash from one area-averaged copy.
@@ -816,8 +864,13 @@ class VideoAnalysis:
 
         if self.needs_interlace_branch:
             series.idet = sparse("idet", "", str)
-            series.col_motion = sparse("colmo", None, lambda v: _to_float(v, None), by_pts, 1)
-            series.row_motion = sparse("rowmo", None, lambda v: _to_float(v, None), by_pts, 1)
+            series.idet_single = sparse("idet1", "", str)
+            top, bottom = sparse("rep_top", "", str), sparse("rep_bottom", "", str)
+            series.repeated = [t or b for t, b in zip(top, bottom)]
+            errors = [sparse(_disp_name(d), None, lambda v: _to_float(v, None), by_pts, 1)
+                      for d in INTERLACE_DISPLACEMENTS]
+            series.displacement = [field_displacement(dict(zip(INTERLACE_DISPLACEMENTS, values)))
+                                   for values in zip(*errors)]
         if self.needs_area_branch and self.config.levels:
             def fraction(name: str) -> List[float]:
                 return sparse(name, 0.0, lambda v: _to_float(v) / 255.0)
@@ -886,9 +939,10 @@ class VideoSeries:
     """Per-frame measurements, index-aligned to ``times``."""
     times: List[float] = field(default_factory=list)
     mafd: List[float] = field(default_factory=list)
-    idet: List[str] = field(default_factory=list)
-    col_motion: List[Optional[float]] = field(default_factory=list)
-    row_motion: List[Optional[float]] = field(default_factory=list)
+    idet: List[str] = field(default_factory=list)          # multiple-frame call
+    idet_single: List[str] = field(default_factory=list)   # single-frame call
+    repeated: List[str] = field(default_factory=list)      # "top"/"bottom"/""
+    displacement: List[str] = field(default_factory=list)  # "woven"/"progressive"/""
     luma: List[float] = field(default_factory=list)   # tv: outside R 103; pc: extremes used
     gam: List[float] = field(default_factory=list)       # outside under every candidate matrix
     band1: List[float] = field(default_factory=list)
@@ -905,8 +959,8 @@ class VideoSeries:
         length difference only arises when FFmpeg stopped mid-flush; the
         common prefix is the part every branch measured.
         """
-        names = ("times", "mafd", "idet", "col_motion", "row_motion", "luma", "gam",
-                 "band1", "band2", "yavg", "flash")
+        names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
+                 "gam", "band1", "band2", "yavg", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1747,98 +1801,141 @@ def flash_entry(events: Sequence[FlashEvent]) -> Tuple[str, str, int]:
 _FIELD_ORDER_NAMES = {"tt": "tff", "tb": "tff", "bb": "bff", "bt": "bff"}
 
 
+def field_displacement(errors: Dict[int, Optional[float]]) -> str:
+    """'woven', 'progressive' or '' from one frame's displacement errors.
+
+    ``errors[d]`` is the mean |bottom field - top field interpolated at an
+    offset of d lines| on the row profile (missing for frames idet did not
+    call interlaced). Woven: some offset d != 0 predicts the bottom field
+    INTERLACE_DECISIVE_RATIO times better than d = 0. Progressive: d = 0
+    wins by that ratio. Otherwise the profile cannot tell (horizontal
+    motion leaves it unchanged) and the frame is undecided.
+    """
+    if any(v is None for v in errors.values()) or 0 not in errors:
+        return ""
+    simultaneous = errors[0]
+    shifted = min(v for d, v in errors.items() if d != 0)
+    if shifted * INTERLACE_DECISIVE_RATIO <= simultaneous:
+        return "woven"
+    if simultaneous * INTERLACE_DECISIVE_RATIO <= shifted:
+        return "progressive"
+    return ""
+
+
 @dataclass
 class InterlaceFindings:
-    combed: List[Interval]           # sections idet calls interlaced
+    combed: List[Interval]           # woven sections in a progressive-flagged stream
     content_order: Optional[str]     # "tff"/"bff" when idet has a majority
     flagged_order: Optional[str]     # from the stream's field_order
     interlaced_share: float
-    scrolls: List[Interval] = field(default_factory=list)  # idet hits that are vertical scrolls
+    scrolls: List[Interval] = field(default_factory=list)   # progressive vertical scrolls
+    telecine: List[Interval] = field(default_factory=list)  # 3:2 pulldown cadence
+    unsteady: List[Interval] = field(default_factory=list)  # field order flips: not woven
 
 
-def _vertical_scroll(first: int, last: int, interlaced: Sequence[bool],
-                     col_motion: Sequence[Optional[float]],
-                     row_motion: Sequence[Optional[float]]) -> bool:
-    """True when the motion in frames first..last is a vertical translation.
+def _dense_sections(flags: Sequence[bool], times: Sequence[float], period: float,
+                    window: int, share: float) -> List[Interval]:
+    """Sections where some ``window``-frame window holding a flagged frame has
+    more than ``share`` of its frames flagged; sections closer than 0.5 s
+    merge, and only those of at least INTERLACE_MIN_SECONDS are kept."""
+    count = len(flags)
+    if count < window:
+        return []
+    cover = [0] * (count + 1)
+    running = sum(flags[:window])
+    for k in range(count - window + 1):
+        if k:
+            running += flags[k + window - 1] - flags[k - 1]
+        if running > share * window:
+            cover[k] += 1
+            cover[k + window] -= 1
+    dense, depth = [False] * count, 0
+    for j in range(count):
+        depth += cover[j]
+        dense[j] = depth > 0 and flags[j]
+    merged: List[Interval] = []
+    for first, last in frame_runs(dense, 1):
+        start, length = _interval_of(times, first, last, period)
+        if merged and start - sum(merged[-1]) <= 0.5:
+            merged[-1] = (merged[-1][0], start + length - merged[-1][0])
+        else:
+            merged.append((start, length))
+    min_frames = max(1, int(round(INTERLACE_MIN_SECONDS / period)))
+    return [m for m in merged if m[1] >= min_frames * period - 1e-6]
 
-    Judged on the frames idet calls interlaced (the only ones whose profile
-    change is recorded): measurable motion on at least half of them, with
-    the column-profile change under INTERLACE_VERTICAL_SHARE of the total.
-    """
-    shares = []
-    frames = 0
-    for k in range(first, min(last + 1, len(col_motion), len(row_motion), len(interlaced))):
-        if not interlaced[k]:
-            continue
-        frames += 1
-        col, row = col_motion[k], row_motion[k]
-        if col is None or row is None or col + row <= INTERLACE_MOTION_FLOOR:
-            continue
-        shares.append(col / (col + row))
-    if len(shares) < max(1, frames // 2):
-        return False
-    return statistics.median(shares) < INTERLACE_VERTICAL_SHARE
+
+def _telecine_flags(repeated: Sequence[str]) -> List[bool]:
+    """Frames whose repeated field recurs TELECINE_PERIOD frames away."""
+    count, step = len(repeated), TELECINE_PERIOD
+    return [bool(r) and ((k >= step and repeated[k - step] == r)
+                         or (k + step < count and repeated[k + step] == r))
+            for k, r in enumerate(repeated)]
+
+
+def _frame_range(times: Sequence[float], interval: Interval) -> Tuple[int, int]:
+    start, length = interval
+    first = bisect.bisect_left(times, start - 1e-6)
+    last = max(first, bisect.bisect_left(times, start + length - 1e-6) - 1)
+    return first, last
 
 
 def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
-                     field_order: str, col_motion: Sequence[Optional[float]] = (),
-                     row_motion: Sequence[Optional[float]] = ()) -> InterlaceFindings:
-    """Combing in progressive-flagged video; field order vs metadata.
+                     field_order: str, singles: Sequence[str] = (),
+                     repeated: Sequence[str] = (),
+                     displacement: Sequence[str] = ()) -> InterlaceFindings:
+    """Woven or telecined pictures in progressive-flagged video; field order.
 
-    Uses idet's multiple-frame classification (each frame judged with its
-    neighbours, steadier than single-frame). A section is combed when more
-    than half the frames in a one-second window are called TFF or BFF; at
-    least a second of such windows is required. A section whose motion is a
-    vertical translation (see INTERLACE_VERTICAL_SHARE) is set aside as a
-    scroll: whichever way its fields are paired, an integer-line vertical
-    move shows no feathering. Field order compares idet's TFF/BFF majority
-    with the declared order when the stream is interlaced.
+    ``labels``/``singles`` are idet's multiple- and single-frame calls,
+    ``repeated`` its repeated-field call, ``displacement`` the row-profile
+    verdict per frame (field_displacement).
+
+    * Combing: more than half the frames of a one-second window called
+      TFF/BFF by the multiple-frame detector, for a second or more.
+    * Sections are not woven when idet's single-frame calls in them flip
+      between TFF and BFF (no FIELD_ORDER_MAJORITY over all of them: one
+      source has one field order), or a section whose frames' fields are
+      measurably simultaneous (displacement 'progressive' on at
+      least FIELD_ORDER_MAJORITY of the decided frames) - a progressive
+      vertical scroll. A woven scroll shows a displacement and stays.
+    * Telecine: one-second windows where a repeated field recurs every five
+      frames in at least half of the 3:2 cadence's positions.
+    * Field order: idet's TFF/BFF majority against the declared order of an
+      interlaced stream.
     """
     count = min(len(labels), len(times))
     labels = [str(v).lower() for v in labels[:count]]
-    period = _frame_period(fps, times)
+    singles = [str(v).lower() for v in list(singles)[:count]] + [""] * (count - len(singles))
+    repeated = [str(v).lower() for v in list(repeated)[:count]] + [""] * (count - len(repeated))
+    displacement = list(displacement)[:count] + [""] * (count - len(displacement))
+    frame_times = list(times[:count])
+    period = _frame_period(fps, frame_times)
     window = max(1, int(round(1.0 / period)))
     interlaced = [v in ("tff", "bff") for v in labels]
     share = _share(interlaced)
     flagged = _FIELD_ORDER_NAMES.get(field_order)
     combed: List[Interval] = []
-    if flagged is None and count >= window:
-        # An interlaced frame is "dense" when some one-second window holding
-        # it is more than half interlaced; windows are unioned with a
-        # difference array (linear in the frame count).
-        cover = [0] * (count + 1)
-        running = sum(interlaced[:window])
-        for k in range(count - window + 1):
-            if k:
-                running += interlaced[k + window - 1] - interlaced[k - 1]
-            if running > INTERLACE_WINDOW_SHARE * window:
-                cover[k] += 1
-                cover[k + window] -= 1
-        dense, depth = [False] * count, 0
-        for j in range(count):
-            depth += cover[j]
-            dense[j] = depth > 0 and interlaced[j]
-        min_frames = max(1, int(round(INTERLACE_MIN_SECONDS / period)))
-        for first, last in frame_runs(dense, 1):
-            span = _interval_of(times, first, last, period)
-            combed.append(span)
-        merged: List[Interval] = []
-        for start, length in combed:
-            if merged and start - sum(merged[-1]) <= 0.5:
-                merged[-1] = (merged[-1][0], start + length - merged[-1][0])
-            else:
-                merged.append((start, length))
-        combed = [m for m in merged if m[1] >= min_frames * period - 1e-6]
     scrolls: List[Interval] = []
-    if combed and col_motion and row_motion:
-        kept = []
-        frame_times = list(times[:count])
-        for start, length in combed:
-            first = bisect.bisect_left(frame_times, start - 1e-6)
-            last = max(first, bisect.bisect_left(frame_times, start + length - 1e-6) - 1)
-            vertical = _vertical_scroll(first, last, interlaced, col_motion, row_motion)
-            (scrolls if vertical else kept).append((start, length))
-        combed = kept
+    unsteady: List[Interval] = []
+    telecine: List[Interval] = []
+    if flagged is None:
+        sections = _dense_sections(interlaced, frame_times, period, window, INTERLACE_WINDOW_SHARE)
+        ranges = [_frame_range(frame_times, section) for section in sections]
+        calls = [c for first, last in ranges for c in singles[first:last + 1]]
+        tff, bff = calls.count("tff"), calls.count("bff")
+        steady = not (tff + bff) or max(tff, bff) >= FIELD_ORDER_MAJORITY * (tff + bff)
+        for section, (first, last) in zip(sections, ranges):
+            if not steady:
+                unsteady.append(section)
+                continue
+            verdicts = displacement[first:last + 1]
+            progressive, woven = verdicts.count("progressive"), verdicts.count("woven")
+            if progressive and progressive >= FIELD_ORDER_MAJORITY * (progressive + woven):
+                scrolls.append(section)
+                continue
+            combed.append(section)
+        cadence = _telecine_flags(repeated)
+        telecine = _dense_sections(cadence, frame_times, period, window,
+                                   TELECINE_REPEAT_SHARE * 0.5)
     tff, bff = labels.count("tff"), labels.count("bff")
     content = None
     if tff + bff >= FIELD_ORDER_MIN_FRAMES:
@@ -1846,7 +1943,7 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
             content = "tff"
         elif bff >= FIELD_ORDER_MAJORITY * (tff + bff):
             content = "bff"
-    return InterlaceFindings(combed, content, flagged, share, scrolls)
+    return InterlaceFindings(combed, content, flagged, share, scrolls, telecine, unsteady)
 
 
 def interlace_entry(findings: InterlaceFindings) -> Tuple[str, str, int]:
@@ -1855,7 +1952,7 @@ def interlace_entry(findings: InterlaceFindings) -> Tuple[str, str, int]:
     The metadata Scan Type check already judges a stream declared
     interlaced, so this row never repeats that verdict: on interlaced
     streams it only checks the field order; on progressive ones it reports
-    combing the metadata does not admit to.
+    woven (combed) pictures and 3:2 pulldown the metadata does not admit to.
     """
     names = {"tff": "top field first", "bff": "bottom field first"}
     share = f"{findings.interlaced_share * 100:.0f}% of frames look interlaced"
@@ -1867,16 +1964,24 @@ def interlace_entry(findings: InterlaceFindings) -> Tuple[str, str, int]:
         seen = (f"; content agrees ({names[findings.content_order]})"
                 if findings.content_order else "")
         return "PASS", f"Declared {names[findings.flagged_order]}{seen} ({share}).", 100
-    if not findings.combed:
-        scroll = ""
-        if findings.scrolls:
-            scroll = (f"; frames that read as interlaced at {event_list(findings.scrolls)} are a "
-                      f"vertical scroll (e.g. rolling credits) with no combing")
-        return "PASS", f"No interlace combing found ({share}{scroll}).", 100
-    total = sum(d for _, d in findings.combed)
-    return ("WARN", f"Interlace combing in video declared progressive: {total:.1f}s at "
-            f"{event_list(findings.combed)} ({share}). Fine horizontal detail in "
-            f"graphics can mimic combing; check these sections.", 60)
+    problems = []
+    if findings.combed:
+        total = sum(d for _, d in findings.combed)
+        problems.append(f"Interlace combing (woven fields) in video declared progressive: "
+                        f"{total:.1f}s at {event_list(findings.combed)}")
+    if findings.telecine:
+        total = sum(d for _, d in findings.telecine)
+        problems.append(f"3:2 pulldown (telecine) cadence in video declared progressive: "
+                        f"{total:.1f}s at {event_list(findings.telecine)}")
+    if problems:
+        return "WARN", ". ".join(problems) + f" ({share}).", 70
+    notes = []
+    if findings.scrolls:
+        notes.append(f"progressive vertical scroll at {event_list(findings.scrolls)}")
+    if findings.unsteady:
+        notes.append(f"field order flips, not woven, at {event_list(findings.unsteady)}")
+    note = "; " + "; ".join(notes) if notes else ""
+    return "PASS", f"No interlace combing or pulldown found ({share}{note}).", 100
 
 
 # ---------------------------------------------------------------------------
@@ -2024,6 +2129,6 @@ def _report_interlace(result, config, series, analysis, video, fps, decoded, rea
         return
     field_order = str((video or {}).get("field_order") or "unknown").lower()
     findings = assess_interlace(series.idet, series.times, fps, field_order,
-                                series.col_motion, series.row_motion)
+                                series.idet_single, series.repeated, series.displacement)
     result.set_metadata("interlaced_frame_share", round(findings.interlaced_share, 3))
     _add(result, INTERLACE, *interlace_entry(findings))

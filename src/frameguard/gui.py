@@ -3883,7 +3883,8 @@ class SettingsPanel(QWidget):
          "Warn on more than three large flashes in a second. A screening aid, not a "
          "photosensitivity certificate (that needs a Harding FPA test)", None),
         ("picture", "interlace_check_enabled", "bool", "Interlace Detection",
-         "Warn on combing in video declared progressive and on a wrong field order", None),
+         "Warn on combing or 3:2 pulldown in video declared progressive and on a wrong "
+         "field order", None),
         ("verdicts", "max_decode_errors", "int", "Allowed Decode Errors",
          "Decoder errors tolerated before File Integrity fails (0 = none)", (0, 1_000_000)),
     )

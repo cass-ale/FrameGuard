@@ -239,3 +239,106 @@ class TestFlashScan:
     def test_three_hertz_borderline_passes(self, tmp_path):
         lum = "if(gte(T,1)*lt(T,4),if(lt(mod(N,10),5),235,16),16)"
         assert _row(_scan(self._geq(tmp_path, "three.mp4", lum)), "Flash Risk")[1] == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Interlace (idet documented defaults; field order; telecine; displacement)
+# ---------------------------------------------------------------------------
+
+class TestInterlaceRules:
+    def test_idet_runs_with_its_documented_defaults(self):
+        analysis = vc.VideoAnalysis({"index": 0, "width": 640, "height": 360,
+                                     "avg_frame_rate": "30/1"}, dict(DEFAULT_CONFIG))
+        analysis.paths = {name: f"/tmp/{name}.txt" for name in
+                          ("idet", "idet1", "rep_top", "rep_bottom")
+                          + tuple(vc._disp_name(d) for d in vc.INTERLACE_DISPLACEMENTS)}
+        graph = ";".join(analysis._interlace_chains())
+        assert "idet@il," in graph and "intl_thres" not in graph
+
+    def test_field_order_that_flips_is_not_woven(self):
+        """Progressive graphics give idet a slight, content-driven asymmetry
+        whose sign flips (testsrc2: TFF and BFF sections); one woven source has
+        one field order."""
+        labels = ["tff"] * 60 + ["progressive"] * 30 + ["bff"] * 60 + ["progressive"] * 30
+        found = vc.assess_interlace(labels, _times(180), FPS, "progressive", labels)
+        assert found.combed == [] and len(found.unsteady) == 2
+        assert vc.interlace_entry(found)[0] == "PASS"
+
+    def test_steady_field_order_is_woven(self):
+        labels = ["tff"] * 150
+        singles = ["tff"] * 20 + ["undetermined"] * 130     # smooth picture: few single calls
+        found = vc.assess_interlace(labels, _times(150), FPS, "progressive", singles)
+        assert found.combed and vc.interlace_entry(found)[0] == "WARN"
+
+    def test_three_two_cadence_is_telecine(self):
+        cycle = ["", "", "top", "", "bottom"]
+        repeated = cycle * 36
+        found = vc.assess_interlace(["progressive"] * 180, _times(180), FPS, "progressive",
+                                    repeated=repeated)
+        status, detail, _ = vc.interlace_entry(found)
+        assert found.telecine and status == "WARN" and "3:2 pulldown" in detail
+
+    def test_scattered_repeats_are_not_a_cadence(self):
+        repeated = ["top" if k in (7, 40, 77, 120) else "" for k in range(180)]
+        found = vc.assess_interlace(["progressive"] * 180, _times(180), FPS, "progressive",
+                                    repeated=repeated)
+        assert found.telecine == []
+
+
+def _texture(path):
+    """A natural-looking still: five octaves of noise, bicubic-upscaled and
+    blended (1/f-like spectrum), with no test-pattern structure."""
+    octaves = [f"color=gray:s={s}x{s * 9 // 16}:d=1,noise=alls=100:allf=0+u:all_seed={11 + k},"
+               f"scale=1920:1080:flags=bicubic,format=gray[o{k}]"
+               for k, s in enumerate((24, 64, 180, 480, 1440))]
+    mix = ("[o0][o1]blend=all_expr='A*0.45+B*0.55'[m1];[m1][o2]blend=all_expr='A*0.6+B*0.4'[m2];"
+           "[m2][o3]blend=all_expr='A*0.7+B*0.3'[m3];[m3][o4]blend=all_expr='A*0.8+B*0.2',"
+           "eq=contrast=1.6,format=gray")
+    ffmpeg("-filter_complex", ";".join(octaves) + ";" + mix, "-frames:v", "1", str(path))
+    return str(path).replace("\\", "/").replace(":", "\\\\:")
+
+
+def _pan(still, rate, seconds, px_per_s, grain=6):
+    """Camera-like pan: drift plus two-frequency handheld shake, temporal grain."""
+    x = f"'(iw-640)/2-{px_per_s * seconds / 2}+{px_per_s}*t+3*sin(2*PI*1.3*t)+1.5*sin(2*PI*3.1*t)'"
+    y = "'(ih-360)/2+3*sin(2*PI*0.9*t+1)'"
+    return (f"movie='{still}',loop=-1:1,fps={rate},trim=duration={seconds},setpts=PTS-STARTPTS,"
+            f"crop=640:360:{x}:{y},noise=alls={grain}:allf=t,format=yuv420p")
+
+
+@pytest.fixture(scope="module")
+def still(tmp_path_factory):
+    return _texture(tmp_path_factory.mktemp("tex") / "texture.png")
+
+
+@needs_ffmpeg
+class TestInterlaceScan:
+    def _encode(self, path, graph, extra=()):
+        ffmpeg("-filter_complex", graph, *X264, *extra, "-an", str(path))
+        return str(path)
+
+    @pytest.mark.parametrize("px_per_field", [0.75, 2, 6])
+    def test_natural_woven_pan_is_combed(self, tmp_path, still, px_per_field):
+        graph = _pan(still, 60, 4, px_per_field * 60) + ",tinterlace=mode=interleave_top,setfield=prog"
+        path = self._encode(tmp_path / "woven.mp4", graph, ["-r", "30"])
+        row = _row(_scan(path), "Interlace Detection")
+        assert row[1] == "WARN" and "combing" in row[2], row
+
+    def test_natural_telecine_is_flagged(self, tmp_path, still):
+        graph = (_pan(still, "24000/1001", 4, 120, grain=0)
+                 + ",telecine=pattern=23,noise=alls=6:allf=t,setfield=prog")
+        path = self._encode(tmp_path / "telecine.mp4", graph)
+        row = _row(_scan(path, target_fps=29.97, fps_tolerance=0.1), "Interlace Detection")
+        assert row[1] == "WARN" and "3:2 pulldown" in row[2], row
+
+    @pytest.mark.parametrize("px_per_s", [60, 300])
+    def test_natural_progressive_pan_passes(self, tmp_path, still, px_per_s):
+        path = self._encode(tmp_path / "prog.mp4", _pan(still, 30, 4, px_per_s))
+        assert _row(_scan(path), "Interlace Detection")[1] == "PASS"
+
+    def test_natural_field_order_mismatch(self, tmp_path, still):
+        graph = _pan(still, 60, 4, 240) + ",tinterlace=mode=interleave_top,setfield=bff"
+        path = self._encode(tmp_path / "bff.mp4", graph,
+                            ["-flags", "+ildct+ilme", "-x264-params", "bff=1", "-r", "30"])
+        row = _row(_scan(path, require_progressive=False), "Interlace Detection")
+        assert row[1] == "WARN" and "mismatch" in row[2], row

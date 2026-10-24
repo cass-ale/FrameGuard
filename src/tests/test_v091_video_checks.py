@@ -235,30 +235,32 @@ class TestInterlaceAssessment:
         assert status == "WARN" and "mismatch" in detail
 
     def test_vertical_scroll_is_not_combing(self):
+        """Fields measurably simultaneous (row-profile displacement 0): a
+        progressive vertical scroll, whatever idet calls it."""
         labels = ["bff"] * 240
-        col = [None] + [0.02] * 239          # columns unchanged
-        row = [None] + [6.0] * 239           # row profile slides
-        found = vc.assess_interlace(labels, _times(240), FPS, "progressive", col, row)
+        found = vc.assess_interlace(labels, _times(240), FPS, "progressive", labels,
+                                    displacement=["progressive"] * 240)
         assert found.combed == [] and found.scrolls
         status, detail, _ = vc.interlace_entry(found)
         assert status == "PASS" and "vertical scroll" in detail
 
-    def test_mixed_motion_keeps_combing(self):
+    def test_woven_scroll_keeps_combing(self):
         labels = ["tff"] * 240
-        found = vc.assess_interlace(labels, _times(240), FPS, "progressive",
-                                    [None] + [0.4] * 239, [None] + [1.5] * 239)
+        found = vc.assess_interlace(labels, _times(240), FPS, "progressive", labels,
+                                    displacement=["woven"] * 240)
         assert found.combed and not found.scrolls
 
-    def test_vertical_share_boundary(self):
-        share = vc.INTERLACE_VERTICAL_SHARE
-        def combed(col):
-            return vc.assess_interlace(["tff"] * 60, _times(60), FPS, "progressive",
-                                       [col] * 60, [1.0 - col] * 60).combed
-        assert combed(share * 1.05) and not combed(share * 0.95)
+    def test_displacement_decisive_ratio(self):
+        ratio = vc.INTERLACE_DECISIVE_RATIO
+        def verdict(shifted, simultaneous):
+            return vc.field_displacement({-2: 9.0, -1: shifted, 0: simultaneous, 1: 9.0, 2: 9.0})
+        assert verdict(1.0, ratio * 1.01) == "woven" and verdict(1.0, ratio * 0.99) == ""
+        assert verdict(ratio * 1.01, 1.0) == "progressive" and verdict(ratio * 0.99, 1.0) == ""
+        assert vc.field_displacement({-2: 1.0, -1: None, 0: 1.0, 1: 1.0, 2: 1.0}) == ""
 
     def test_no_measurable_motion_keeps_idet_verdict(self):
-        found = vc.assess_interlace(["tff"] * 60, _times(60), FPS, "progressive",
-                                    [0.0] * 60, [0.01] * 60)
+        found = vc.assess_interlace(["tff"] * 60, _times(60), FPS, "progressive", ["tff"] * 60,
+                                    displacement=[""] * 60)
         assert found.combed
 
     def test_declared_interlaced_matching_order_passes(self):
@@ -444,33 +446,38 @@ class TestRealScan:
         row = _row(_scan(path), "Interlace Detection")
         assert row[1] == "WARN" and "combing" in row[2], row
 
+    @staticmethod
+    def _credits(rate, speed, seconds=3):
+        """Rolling credits: band-limited glyph strokes on black, as character
+        generators render them (vertically filtered so no detail reaches the
+        line rate). Hard-edged 1-2 line strokes are under-sampled: a woven
+        roll and a progressive one then give identical frames."""
+        row = f"mod(Y+{speed}*N,40)"
+        band = f"max(0,min(1,min({row}-3.5,17.5-{row})/2.5))*between(X,120,520)*lt(mod(X,13),10)"
+        strokes = (f"min(1,max(0,1-pow(({row}-7.3)/3,2))+max(0,1-pow(({row}-14.7)/3,2))"
+                   f"+max(0,1.5-abs(mod(X,13)-3.4)))")
+        return (f"color=black:s={SIZE}:r={rate}:d={seconds},format=yuv420p,"
+                f"geq=lum='16+219*{band}*{strokes}':cb=128:cr=128")
+
     @pytest.mark.parametrize("speed", [1, 2, 3, 4])
     def test_credit_roll_is_not_interlaced(self, tmp_path, speed):
-        """Rolling credits: thin white strokes scrolling up on black. At an
-        integer number of lines per field idet reads them as 99 % interlaced
-        (the corpus hard negative); no frame is combed."""
-        row = f"mod(Y+{speed}*N,48)"
-        glyph = f"lt({row},14)*between(X,120,520)*lt(mod(X,9),6)"
-        stroke = (f"gt(lt({row},2)+between({row},6,7)+between({row},12,13)"
-                  f"+eq(mod(X,9),0)+eq(mod(X,9),5),0)")
-        source = f"color=black:s={SIZE}:r=30:d=3,format=yuv420p"
-        path = _clip(tmp_path / f"credits{speed}.mp4", source=source,
-                     vf=f"geq=lum='16+219*{glyph}*{stroke}':cb=128:cr=128")
+        """A progressive credit roll at whole lines per frame: at 2 lines per
+        frame idet reads it as interlaced; the fields are simultaneous."""
+        path = _clip(tmp_path / f"credits{speed}.mp4", source=self._credits(30, speed))
         row = _row(_scan(path), "Interlace Detection")
         assert row[1] == "PASS", row
         if speed == 2:   # one line per field: idet calls it interlaced
             assert "vertical scroll" in row[2], row
 
-    @pytest.mark.parametrize("pixels_per_second", [60, 110])
-    def test_overlay_credit_bar_roll_is_set_aside(self, tmp_path, pixels_per_second):
-        """The corpus recipe: a bar overlaid at y = H - t*speed (2 and 3.67
-        lines per frame). idet reads ~99 % interlaced; the row says why not."""
-        graph = ("color=white:s=400x6:r=30:d=4[s];color=black:s=640x360:r=30:d=4[b];"
-                 f"[b][s]overlay=x=120:y='H-mod(t*{pixels_per_second},H+20)',format=yuv420p")
-        path = str(tmp_path / f"roll{pixels_per_second}.mp4")
-        ffmpeg("-filter_complex", graph, *X264, "-an", path)
+    @pytest.mark.parametrize("speed", [1, 2])
+    def test_woven_credit_roll_is_combed(self, tmp_path, speed):
+        """Review B4: credits rendered at 60 fields/s and woven are combed;
+        0.9.1 certified them as 'a vertical scroll with no combing'."""
+        source = self._credits(60, speed) + ",tinterlace=mode=interleave_top,setfield=prog"
+        path = _clip(tmp_path / f"woven{speed}.mp4", "setfield=prog", source=source,
+                     extra=["-r", "30"])
         row = _row(_scan(path), "Interlace Detection")
-        assert row[1] == "PASS" and "vertical scroll" in row[2], row
+        assert row[1] == "WARN" and "combing" in row[2], row
 
     def test_woven_clip_with_vertical_tilt_is_still_combed(self, tmp_path):
         source = ("testsrc2=s=640x720:r=60:d=4,crop=640:360:0:'mod(n*3,360)',"
