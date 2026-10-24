@@ -521,16 +521,18 @@ class TestDualMonoAllowed:
 # 12a. Exported loudness metadata: no distrusted value, primary track (review B8)
 # ---------------------------------------------------------------------------
 
-def _two_tracks(path, first, second):
-    """Tiny video plus two stereo PCM tracks; the SECOND is the default."""
+def _two_tracks(path, first, second, default=1):
+    """Tiny video plus two stereo PCM tracks; track ``default`` (0-based,
+    the second by default) carries the default disposition."""
     from media_fixtures import ffmpeg
     path = str(path) + ".mov"
     ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x64:r=10:d=4",
            "-f", "lavfi", "-i", f"aevalsrc=exprs='{first}|{first}':s=48000:d=4",
            "-f", "lavfi", "-i", f"aevalsrc=exprs='{second}|{second}':s=48000:d=4",
            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast",
-           "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le", "-disposition:a:0", "0",
-           "-disposition:a:1", "default", "-t", "4", path)
+           "-pix_fmt", "yuv420p", "-c:a", "pcm_s24le",
+           "-disposition:a:0", "default" if default == 0 else "0",
+           "-disposition:a:1", "default" if default == 1 else "0", "-t", "4", path)
     return path
 
 
@@ -875,3 +877,343 @@ def test_audio_module_cites_no_benchmark_or_inferred_value():
     source = inspect.getsource(audio_checks).lower()
     for word in ("benchmark", "inferred", "corpus"):
         assert word not in source, word
+
+
+# ---------------------------------------------------------------------------
+# R3 mutation gate: rules each 0.9.2 commit claims, pinned at their boundaries
+# ---------------------------------------------------------------------------
+
+def _files_evidence(tmp_path, contents):
+    """ScanEvidence over measurement files written by the test: contents maps
+    an instance name to its file text."""
+    import os
+    os.makedirs(str(tmp_path), exist_ok=True)
+    files = audio_checks.MeasurementFiles(str(tmp_path))
+    for instance, text in contents.items():
+        with open(files.path(instance), "w", encoding="utf-8") as handle:
+            handle.write(text)
+    return audio_checks.ScanEvidence(log_text="", silence_events=lambda *a, **k: [], files=files)
+
+
+def _band_text(levels):
+    return "".join(f"frame:{k} pts:{k * 1000} pts_time:{k}\nlavfi.astats.1.RMS_level={v}\n"
+                   for k, v in enumerate(levels))
+
+
+def _hum_case(tmp_path, centre, near=-90.0, extra=None, freq=60):
+    """Hum band files: 60 Hz centre windows as given (2 settling windows are
+    prepended), every other band at -110 dBFS, near bands at ``near``."""
+    contents = {}
+    count = len(centre) + 2
+    for name, _, _ in audio_checks._hum_bands():
+        level = [-110.0] * count
+        if name == f"{freq}c":
+            level = [-110.0, -110.0] + list(centre)
+        elif name in (f"{freq}l", f"{freq}u"):
+            level = [near] * count
+        if extra and name in extra:
+            level = [extra[name]] * count
+        contents[f"astats@a0h{name}"] = _band_text(level)
+    return _files_evidence(tmp_path, contents)
+
+
+HUM_CTX = dict(position=0, track={"channel_layout": "stereo"}, names=["FL", "FR"], label="", duration=12.0)
+
+
+class TestHumRuleBoundaries:
+    def _row(self, evidence, **cfg):
+        return audio_checks.hum_row(evidence, audio_checks.TrackContext(**HUM_CTX), dict(DEFAULT_CONFIG, **cfg))
+
+    @pytest.mark.parametrize("near,status", [(-66.9, "WARN"), (-65.5, "PASS")])
+    def test_prominence_boundary_is_6_db(self, tmp_path, near, status):
+        assert self._row(_hum_case(tmp_path, [-60.0] * 10, near=near))[0] == status
+
+    @pytest.mark.parametrize("level,status", [(-64.5, "WARN"), (-65.5, "PASS")])
+    def test_floor_is_hum_min_db(self, tmp_path, level, status):
+        assert self._row(_hum_case(tmp_path, [level] * 10))[0] == status
+
+    def test_continuity_needs_nine_windows_in_ten(self, tmp_path):
+        one_off = [-60.0] * 9 + [-62.5]
+        assert self._row(_hum_case(tmp_path, one_off))[0] == "WARN"
+
+    def test_two_windows_outside_the_spread_are_a_note(self, tmp_path):
+        two_off = [-60.0] * 8 + [-62.5, -62.5]
+        status, text, _ = self._row(_hum_case(tmp_path, two_off))
+        assert status == "PASS" and "8 of 10" in text and "note" in text
+
+    def test_level_spread_is_2_db(self, tmp_path):
+        inside = [-60.0] * 8 + [-61.9, -58.1]
+        assert self._row(_hum_case(tmp_path, inside))[0] == "WARN"
+
+    def test_harmonics_are_reported_not_required(self, tmp_path):
+        bare = self._row(_hum_case(tmp_path, [-60.0] * 10))
+        assert bare[0] == "WARN" and "no harmonics" in bare[1] and bare[2] == audio_checks.LOW_CONFIDENCE
+        with_third = self._row(_hum_case(tmp_path / "h", [-60.0] * 10, extra={"60x3c": -70.0}))
+        assert "180 Hz at -70.0 dBFS" in with_third[1] and "120 Hz" not in with_third[1]
+        with_second = self._row(_hum_case(tmp_path / "h2", [-60.0] * 10, extra={"60x2c": -72.0}))
+        assert "120 Hz at -72.0 dBFS" in with_second[1]
+
+    def test_50_hz_is_judged_too(self, tmp_path):
+        row = self._row(_hum_case(tmp_path, [-60.0] * 10, freq=50))
+        assert row[0] == "WARN" and "50 Hz tone" in row[1]
+
+    def test_band_layout(self):
+        bands = {name: (centre, width) for name, centre, width in audio_checks._hum_bands()}
+        assert bands["60c"] == pytest.approx((60.0, 0.9))
+        assert bands["60u"][0] == pytest.approx(60 * 1.03) and bands["60l"][0] == pytest.approx(60 / 1.03)
+        assert bands["50x2c"] == pytest.approx((100.0, 1.5)) and bands["60x3c"][0] == pytest.approx(180.0)
+        assert len(bands) == 18
+
+    def test_settling_windows_are_dropped(self, tmp_path):
+        evidence = _files_evidence(tmp_path, {"astats@a0h60c": _band_text([-90, -80, -60, -60])})
+        assert audio_checks._band_windows(evidence, "astats@a0h60c") == [-60.0, -60.0]
+        evidence = _files_evidence(tmp_path / "one", {"astats@a0h60c": _band_text([-60])})
+        assert audio_checks._band_windows(evidence, "astats@a0h60c") == [-60.0]
+
+    @needs_ffmpeg
+    def test_a_tone_1_5_percent_off_is_not_hum(self, media):
+        exprs = [f"{_uniform_noise(-30, 1)}+0.01*sin(2*PI*60.9*t)",
+                 f"{_uniform_noise(-30, 2)}+0.01*sin(2*PI*60.9*t)"]
+        clip = media.get("hum_off_1p5", lambda p: make_audio(p, exprs, seconds=6))
+        assert _row(_scan(clip), "Audio Hum")[1] == "PASS"
+
+
+def _level_text(blocks, channels=2):
+    """astats@aNv file: blocks of (rms dBFS, peak dBFS) per 400 ms, the same on every channel
+    unless a block gives a list per channel."""
+    out = []
+    for k, block in enumerate(blocks):
+        out.append(f"frame:{k} pts:{k * 19200} pts_time:{k * 0.4:g}")
+        per_channel = block if isinstance(block, list) else [block] * channels
+        for c, (rms, peak) in enumerate(per_channel, 1):
+            out.append(f"lavfi.astats.{c}.RMS_level={rms}")
+            out.append(f"lavfi.astats.{c}.Peak_level={peak}")
+    return "\n".join(out) + "\n"
+
+
+LOUD, QUIET = (-26.0, -20.0), (-62.0, -57.0)
+
+
+class TestLowLevelRuleBoundaries:
+    def _row(self, tmp_path, blocks, names=("FL", "FR"), layout="stereo", **cfg):
+        evidence = _files_evidence(tmp_path, {"astats@a0v": _level_text(blocks, len(names))})
+        ctx = audio_checks.TrackContext(position=0, track={"channel_layout": layout}, names=list(names),
+                                        label="", duration=len(blocks) * 0.4)
+        return audio_checks.low_level_row(evidence, ctx, dict(DEFAULT_CONFIG, **cfg))
+
+    def test_five_blocks_are_two_seconds(self, tmp_path):
+        row = self._row(tmp_path, [LOUD] * 10 + [QUIET] * 5 + [LOUD] * 10)
+        assert row[0] == "WARN" and "00:00:04.000 (2.0s" in row[1], row
+
+    def test_four_blocks_are_too_short(self, tmp_path):
+        assert self._row(tmp_path, [LOUD] * 10 + [QUIET] * 4 + [LOUD] * 10)[0] == "PASS"
+
+    @pytest.mark.parametrize("rms,status", [(-43.5, "WARN"), (-42.5, "PASS")])
+    def test_twenty_db_under_the_gated_level(self, tmp_path, rms, status):
+        # Programme blocks at -26 dBFS per channel: gated level -23.0 dB (two channels).
+        assert self._row(tmp_path, [LOUD] * 10 + [(rms - 3.0, -45.0)] * 6 + [LOUD] * 10)[0] == status
+
+    @pytest.mark.parametrize("peak,status", [(-40.0, "WARN"), (-39.9, "PASS"), (-70.0, "PASS"), (-69.9, "WARN")])
+    def test_peak_window_between_silence_and_the_ceiling(self, tmp_path, peak, status):
+        assert self._row(tmp_path, [LOUD] * 10 + [(-75.0, peak)] * 6 + [LOUD] * 10)[0] == status
+
+    def test_stretch_touching_either_end_is_not_inside_the_programme(self, tmp_path):
+        assert self._row(tmp_path, [QUIET] * 6 + [LOUD] * 10)[0] == "PASS"
+        assert self._row(tmp_path, [LOUD] * 10 + [QUIET] * 6)[0] == "PASS"
+
+    def test_lfe_power_is_left_out(self, tmp_path):
+        """A loud LFE under a dead-air stretch of the other channels."""
+        names = ("FL", "FR", "FC", "LFE", "BL", "BR")
+        stretch = [QUIET, QUIET, QUIET, (-10.0, -5.0), QUIET, QUIET]
+        row = self._row(tmp_path, [LOUD] * 10 + [stretch] * 6 + [LOUD] * 10, names=names, layout="5.1")
+        assert row[0] == "WARN", row
+
+    def test_gate_is_bs1770_two_stage(self):
+        powers = [10 ** -2.0] * 4 + [10 ** -4.0] * 4 + [10 ** -8.0] * 4   # -20, -40, -80 dB
+        assert audio_checks._gated_level(powers) == pytest.approx(-20.0)  # -40 is > 10 dB under
+        assert audio_checks._gated_level([10 ** -8.0]) is None
+        assert audio_checks._gated_level([10 ** -2.0, 10 ** -2.5]) == pytest.approx(
+            10 * __import__("math").log10((10 ** -2.0 + 10 ** -2.5) / 2))
+
+    def test_silent_track_has_no_reference(self, tmp_path):
+        row = self._row(tmp_path, [(-100.0, -95.0)] * 10)
+        assert row[0] == "PASS" and "No programme level" in row[1]
+
+    def test_missing_file_is_not_verified(self, tmp_path):
+        evidence = _files_evidence(tmp_path, {})
+        ctx = audio_checks.TrackContext(**HUM_CTX)
+        with pytest.raises(audio_checks.EvidenceMissing):
+            audio_checks.low_level_row(evidence, ctx, dict(DEFAULT_CONFIG))
+
+    def test_more_than_five_stretches_are_summarised(self, tmp_path):
+        blocks = [LOUD] * 3
+        for _ in range(7):
+            blocks += [QUIET] * 6 + [LOUD] * 3
+        row = self._row(tmp_path, blocks)
+        assert "7 low-level" in row[1] and "+2 more" in row[1]
+
+
+class TestSelfTestAndMeterBoundaries:
+    @pytest.mark.parametrize("error,ok", [(0.0, True), (0.2, True), (0.25, False), (-0.4, True),
+                                          (-0.45, False)])
+    def test_true_peak_tolerance_is_tech_3341s(self, error, ok):
+        assert audio_checks.MeterSelfTest(True, True, error).true_peak_ok is ok
+        assert audio_checks.MeterSelfTest(True, True).true_peak_ok is True
+
+    def test_case_6_at_the_edge_of_its_tolerance_passes(self):
+        log = "\n".join([_ebur128_summary("ebur128@a0", -23.1), _loudnorm_json("loudnorm@a0", -22.9),
+                         _ebur128_summary("ebur128@a1", -18.0, -6.0)])
+        test = audio_checks.evaluate_meter_self_test(log)
+        assert test.ebur128_multichannel and test.loudnorm and test.true_peak_error_db == pytest.approx(0.02)
+        log = log.replace("-23.1 LUFS", "-23.2 LUFS")
+        assert audio_checks.evaluate_meter_self_test(log).ebur128_multichannel is False
+
+    def test_a_partial_self_test_log_says_nothing(self):
+        assert audio_checks.evaluate_meter_self_test(_ebur128_summary("ebur128@a0", -23.0)) is None
+
+    def test_partial_loudnorm_report_keeps_what_it_has(self):
+        log = "[loudnorm@a2 @ 0x2] [info] \nInput Integrated:    -23.1 LUFS\nInput LRA: 3.0 LU"
+        assert audio_checks.parse_loudnorm(log)[2]["integrated"] == -23.1
+        assert audio_checks.parse_loudnorm("[loudnorm@a2 @ 0x2] [info] \n") == {}
+
+    def test_default_track_is_not_ambisonic_for_the_meter_choice(self):
+        track = {"channel_layout": "7.1", "channels": 8}
+        assert audio_checks.loudness_meter(track, 8, audio_checks.METER_LOUDNORM) == audio_checks.METER_NONE
+        assert audio_checks.loudness_meter(track, 8, audio_checks.METER_LOUDNORM, True) == audio_checks.METER_EBUR128
+
+    def test_mapping_of_5_1(self):
+        names = audio_checks.channel_names({"channel_layout": "5.1"}, 6)
+        assert audio_checks.loudnorm_mapping({"channel_layout": "5.1"}, names) == \
+            "aformat=sample_fmts=dbl,pan=5.1|c0=c0|c1=c1|c2=c2|c4=c4|c5=c5"
+        quad = audio_checks.channel_names({"channel_layout": "4.0"}, 4)       # BC on a surround input
+        assert audio_checks.loudnorm_mapping({"channel_layout": "4.0"}, quad) == \
+            "aformat=sample_fmts=dbl,pan=5.1|c0=c0|c1=c1|c2=c2|c4=c3"
+        down, up = (1 / 1.41) ** 0.5, 1.41 ** 0.5
+        tops = audio_checks.channel_names({"channel_layout": "3.1.2"}, 6)     # 5 fronts: 2 on surround inputs
+        assert audio_checks.loudnorm_mapping({"channel_layout": "3.1.2"}, tops) == \
+            f"aformat=sample_fmts=dbl,pan=5.1|c0=c0|c1=c1|c2=c2|c4={down:.9f}*c4|c5={down:.9f}*c5"
+        track = {"channel_layout": "5 channels (FL+FR+BL+BR+BC)"}           # 3 surrounds: 1 on a front input
+        names = audio_checks.channel_names(track, 5)
+        assert audio_checks.loudnorm_mapping(track, names) == \
+            f"aformat=sample_fmts=dbl,pan=5.1|c0=c0|c1=c1|c2={up:.9f}*c4|c4=c2|c5=c3"
+        assert audio_checks.loudnorm_mapping({"channel_layout": "unknown"}, ["ch1", "ch2", "ch3"]) is None
+
+    def test_unmeasured_reason_counts_weighted_channels(self):
+        names = audio_checks.channel_names({"channel_layout": "7.1"}, 8)
+        ctx = audio_checks.TrackContext(position=0, track={"channel_layout": "7.1"}, names=names, label="",
+                                        duration=10.0, meter=audio_checks.METER_NONE)
+        assert "this 7.1 track has 7 weighted channels" in audio_checks._unmeasured_reason(ctx, "loudness summary")
+
+    def test_weights_are_the_documented_rejection_risk_scale(self):
+        assert audio_checks.SEVERITY_WEIGHTS == {
+            "Audio Loudness": 70, "Audio True Peak": 65, "Audio Clipping": 60, "Audio Dropouts": 40,
+            "Audio Phase": 35, "Dual Mono": 20, "Audio Hum": 20, "DC Offset": 15, "Low-Level Audio": 30}
+
+
+class TestAmbisonicSignalling:
+    BOX = {"ambisonic_type": 0, "order": 1, "ordering": 0, "normalization": 0, "head_locked_stereo": True}
+
+    def test_head_locked_from_the_layout_or_the_sa3d_flag(self):
+        named = {"channels": 6, "channel_layout": "ambisonic 1+stereo"}
+        aac = {"channels": 6, "channel_layout": "5.1"}
+        assert audio_checks.head_locked_positions([named], [None], [0]) == [0]
+        assert audio_checks.head_locked_positions([aac], [self.BOX], [0]) == [0]
+        assert audio_checks.head_locked_positions([aac], [dict(self.BOX, head_locked_stereo=False)], [0]) == []
+        assert audio_checks.head_locked_positions([{"channels": 5, "channel_layout": "5.0"}], [self.BOX], [0]) == []
+        assert audio_checks.head_locked_positions([aac], [self.BOX], [1]) == []
+
+    def test_sn3d_from_the_layout_or_the_sa3d_box(self):
+        aac = {"channels": 4, "channel_layout": "4.0"}
+        assert audio_checks.sn3d_positions([aac], [self.BOX], [0]) == [0]
+        assert audio_checks.sn3d_positions([aac], [dict(self.BOX, normalization=1)], [0]) == []
+        assert audio_checks.sn3d_positions([aac], [dict(self.BOX, ordering=1)], [0]) == []
+        assert audio_checks.sn3d_positions([aac], [{"error": "short box"}], [0]) == []
+        assert audio_checks.sn3d_positions([{"channels": 4, "channel_layout": "ambisonic 1"}], [None], [0]) == [0]
+        assert audio_checks.sn3d_positions([aac], [None], [0]) == []
+
+    def test_second_order_names(self):
+        names = audio_checks.channel_names({"channel_layout": "ambisonic 2"}, 9, ambisonic=True)
+        assert names == ["W", "Y", "Z", "X", "ACN4", "ACN5", "ACN6", "ACN7", "ACN8"]
+        hl = audio_checks.channel_names({"channel_layout": "5.1"}, 6, ambisonic=True, head_locked=True)
+        assert hl[-2:] == ["HL-L", "HL-R"]
+
+    def test_fuma_reading_is_three_db_up(self):
+        assert audio_checks.FUMA_W_OFFSET_DB == pytest.approx(3.0103, abs=1e-4)
+
+
+class TestRecorderAndPhaseDetails:
+    def test_recorders_strip_by_default(self):
+        files = audio_checks.MeasurementFiles("/tmp")
+        assert audio_checks._record("x", files).endswith(",ametadata=mode=delete")
+        assert "mode=delete" not in audio_checks._record("x", files, strip=False)
+        assert audio_checks._record("x", None) == ""
+
+    def test_exact_inversion_reports_its_fold_down_loss(self, tmp_path):
+        """R = -L: L+R is digital silence, the fold-down loses everything."""
+        log = "\n".join(["[astats@a0p0 @ 0x1] [info] Channel: 1", "[astats@a0p0 @ 0x1] [info] RMS level dB: -inf",
+                         "[astats@a0p0 @ 0x1] [info] Channel: 2", "[astats@a0p0 @ 0x1] [info] RMS level dB: -14.0"])
+        evidence = audio_checks.ScanEvidence(log_text=log, silence_events=lambda *a, **k: [])
+        ctx = audio_checks.TrackContext(**HUM_CTX)
+        assert audio_checks._fold_down_lu(evidence, ctx, 0) <= -100
+        log2 = log.replace("RMS level dB: -inf", "RMS level dB: -18.0")
+        evidence2 = audio_checks.ScanEvidence(log_text=log2, silence_events=lambda *a, **k: [])
+        expected = 10 * __import__("math").log10(2 * 10 ** -1.8 / (10 ** -1.8 + 10 ** -1.4))
+        assert audio_checks._fold_down_lu(evidence2, ctx, 0) == pytest.approx(expected)
+
+    @needs_ffmpeg
+    def test_wide_inversion_states_its_loss(self, media):
+        clip = media.get("wide_inverted", lambda p: make_audio(p, _wide_stereo(True), seconds=6))
+        assert "loses 2.0 LU" in _row(_scan(clip), "Audio Phase")[2]
+
+    @needs_ffmpeg
+    def test_a_mostly_antiphase_but_net_positive_track_has_no_loss_text(self, media):
+        """Anti-phase for 4 of 6 s, quieter than the in-phase 2 s: share 67 %,
+        net correlation +0.1, so no fold-down loss to state."""
+        left = "if(lt(t,2),0.156,0.1)*(random(0)-0.5)"
+        right = "if(lt(t,2),0.156,-0.1)*(random(0)-0.5)"
+        clip = media.get("antiphase_net_positive", lambda p: make_audio(p, [left, right], seconds=6))
+        row = _row(_scan(clip), "Audio Phase")
+        assert "polarity-inverted" in row[2] and "fold-down loses" not in row[2], row
+
+
+@needs_ffmpeg
+class TestChannelAndTrackDetails:
+    def test_lfe_silent_for_a_while_is_not_a_channel_silence(self, media):
+        lfe = f"if(between(t,0.5,3.5),0,{tone(60, 0.2)})"
+        clip = media.get("lfe_gap_5.1", lambda p: make_audio(
+            p, [tone(440), tone(554), tone(659), lfe, tone(740), tone(831)], layout="5.1"))
+        assert _row(_scan(clip), "Audio Silence")[1] == "PASS"
+
+    def test_glits_shaped_gaps_in_programme_are_dropouts(self, media):
+        """L once, R twice 0.5 s apart, but in noise programme, not a tone."""
+        left = f"if(between(t,2,2.25),0,{NOISE})"
+        right = f"if(between(t,2.5,2.75)+between(t,3,3.25),0,{NOISE.replace('0.1', '0.09')})"
+        clip = media.get("glits_in_noise", lambda p: make_audio(p, [left, right], seconds=5))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "line-up ident" not in row[2], row
+
+    def test_a_partner_dropout_overlapping_an_ident_gap_disqualifies_it(self, media):
+        tone400 = "0.1259*sin(2*PI*400*t)"
+        left = f"if(between(t,2,2.25),0,{tone400})"
+        right = f"if(between(t,1.9,2.1)+between(t,2.5,2.75)+between(t,3,3.25),0,{tone400})"
+        clip = media.get("glits_overlap", lambda p: make_audio(p, [left, right], seconds=5))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "FL" in row[2], row
+
+    def test_metadata_follows_the_default_track_when_it_is_first(self, media):
+        clip = media.get("two_tracks_first_default", lambda p: _two_tracks(
+            p, TONE_23, tone(1000, MINUS_23 / 3), default=0))
+        result = _scan(clip, loudness_mode="essential")
+        assert abs(result.metadata["integrated_loudness_lufs"] + 23.0) <= 0.1, result.metadata
+
+
+class TestTrackSilenceShare:
+    CFG = dict(DEFAULT_CONFIG)
+
+    @pytest.mark.parametrize("silent,status", [(4.4, "WARN"), (5.6, "FAIL")])
+    def test_more_than_half_fails(self, silent, status):
+        status_got, _ = core._track_silence_entry("", [(1.0, silent)], 10.0, self.CFG)
+        assert status_got == status
+
+    def test_unknown_duration_never_fails_on_share(self):
+        assert core._track_silence_entry("", [(1.0, 3.0)], 0.0, self.CFG)[0] == "WARN"
