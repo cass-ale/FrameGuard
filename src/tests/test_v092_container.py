@@ -640,3 +640,22 @@ class TestMissingMediaText:
         track.stts = [(100, 33)]
         text = cc._missing_media_text(cc.Structure(family="ISO-BMFF", tracks=[track]))[0]
         assert "-" not in text.split("(")[1], text
+
+
+def _matrix_stream(a, b, c, d, rotation):
+    text = (f"\n00000000: {a:12d} {b:12d}           0\n00000001: {c:12d} {d:12d}           0\n"
+            f"00000002:            0            0  1073741824\n")
+    return {"side_data_list": [{"side_data_type": "Display Matrix", "displaymatrix": text, "rotation": rotation}]}
+
+
+class TestDisplayTransform:
+    def test_a_horizontal_flip_is_a_mirror_not_a_rotation(self):
+        """B11: ffprobe reports rotation -180 for an hflip matrix; that is a mirror only."""
+        assert cc.display_transform(_matrix_stream(-65536, 0, 0, 65536, -180)) == (0, True)
+
+    def test_a_vertical_flip_is_an_upside_down_mirror(self):
+        """ffprobe reports rotation 0 for a vflip matrix: it is rotated 180 degrees and mirrored."""
+        assert cc.display_transform(_matrix_stream(65536, 0, 0, -65536, 0)) == (180, True)
+
+    def test_unflipped_rotation_is_unchanged(self):
+        assert cc.display_transform(_matrix_stream(0, 65536, -65536, 0, -90)) == (-90, False)

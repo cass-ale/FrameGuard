@@ -2006,7 +2006,12 @@ def display_transform(video: dict) -> Tuple[int, bool]:
     """(rotation degrees, mirrored) from the stream's display matrix.
 
     A negative determinant of the 2x2 part means the picture is flipped,
-    which a rotation angle alone cannot express.
+    which a rotation angle alone cannot express. A flipped matrix is read
+    as "mirrored left to right, then rotated": FFmpeg's rotation for it is
+    taken from the flipped matrix as is (an hflip reads -180, a vflip 0), so
+    the angle is recomputed with the mirror removed (an hflip is a mirror
+    only; a vflip is a mirror rotated 180 degrees), with FFmpeg's sign
+    convention (av_display_rotation_get).
     """
     rotation = _core()._stream_rotation_degrees(video)
     mirrored = False
@@ -2017,7 +2022,13 @@ def display_transform(video: dict) -> Tuple[int, bool]:
         rows = [[int(v) for v in re.findall(r"-?\d+", line.split(":", 1)[1])]
                 for line in str(text).strip().splitlines() if ":" in line]
         if len(rows) >= 2 and len(rows[0]) >= 2 and len(rows[1]) >= 2:
-            mirrored = rows[0][0] * rows[1][1] - rows[0][1] * rows[1][0] < 0
+            a, b = rows[0][0], rows[0][1]
+            c, d = rows[1][0], rows[1][1]
+            mirrored = a * d - b * c < 0
+            if mirrored:
+                angle = -math.degrees(math.atan2(b, -a))
+                rotation = int(round(angle)) % 360
+                rotation = rotation - 360 if rotation > 180 else rotation
     return rotation, mirrored
 
 
