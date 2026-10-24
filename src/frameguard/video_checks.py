@@ -234,15 +234,19 @@ FREEZE_MOVING_FACTOR = 2.0
 # once, whatever the programme length.
 FLASH_SEGMENT_SECONDS = 5
 
-# Mean luma (8-bit analysis copy) read back for frames not written: the
-# series only records frames dark enough to matter (see mean_luma_limit).
+# Mean luma (8-bit analysis copy) read back for a frame FFmpeg did not write.
 YAVG_ABSENT = 255.0
 
 # Black: the short tier reports a burst only when it is isolated (not part
 # of a strobe; the Flash check covers those) and cut hard into black on
-# both sides (a dip to black fades through dark frames instead).
+# both sides. A cut changes the picture in one frame; a dip to black fades
+# through several. So on each side the neighbouring frame must differ from
+# the black by at least BLACK_STEP_CODES (frame means move by well under a
+# code with grain or coding noise; a cut from a night grade at Y 25 to black
+# steps 5+), and the frame beyond it must be within half that step of it
+# (no ramp). Judged relative to the scene, so dark scenes count too.
 BLACK_ISOLATION_SECONDS = 1.0
-BLACK_HARD_CUT_CODES = 24.0
+BLACK_STEP_CODES = 2.0
 BLACK_EDGE_ALLOWANCE = 1.0
 
 # Interlace (see assess_interlace). idet runs with FFmpeg's documented
@@ -698,20 +702,6 @@ def black_filter(config: VideoCheckConfig) -> str:
     return f"blackdetect@v=d=0:pix_th={config.black_pix_th}:pic_th={config.black_pic_th}"
 
 
-def mean_luma_limit(config: VideoCheckConfig, full_range: bool) -> float:
-    """Mean luma at or above which a frame's exact value cannot matter.
-
-    The short-burst test (classify_black) compares a black frame's mean with
-    its neighbours': a neighbour at least BLACK_HARD_CUT_CODES brighter is a
-    hard cut. A black frame's mean is at most ``pic_th`` x black level +
-    (1 - ``pic_th``) x 255, so any neighbour above that plus the cut margin
-    passes the test whatever its exact value. Frames at or above this limit
-    are not written and read back as YAVG_ABSENT (255), which decides
-    identically; 8 codes cover the analysis copy's rounding.
-    """
-    level = config.black_pix_th * 255.0 if full_range else 16.0 + config.black_pix_th * 219.0
-    darkest_black = config.black_pic_th * level + (1.0 - config.black_pic_th) * 255.0
-    return darkest_black + BLACK_HARD_CUT_CODES + 8.0
 
 
 def _release(directory: str, reader: Optional["_FlashSegmentReader"]) -> None:
@@ -1027,7 +1017,6 @@ class VideoAnalysis:
         if c.black or c.levels or c.freeze:
             # Without the flash output this branch is the graph's output.
             tail = "nullsink" if self.flash_enabled else "null[vs_area]"
-            limit = f"{mean_luma_limit(self.config, info.full_range):.3f}"
             # The freeze check's structural change: |difference| to the
             # previous frame on this copy (at least 32x averaged per side).
             chains.append(
@@ -1036,10 +1025,11 @@ class VideoAnalysis:
             chains.append(
                 "[ar_mean_d]tblend=all_mode=difference,signalstats,"
                 f"{_print('lavfi.signalstats.YAVG', self.paths['struct'])},nullsink")
+            # Every frame's mean luma: the edit-gap test compares black
+            # frames with their neighbours at whatever level the scene sits.
             chains.append(
                 f"[ar_mean_y]scale=w='max(1,trunc(iw/2))':h='max(1,trunc(ih/2))':flags=area,"
-                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'], limit, 'less')},"
-                f"{tail}")
+                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['yavg'])},{tail}")
         if self.flash_enabled:
             linear = _flash_linear_expression(info)
             cols, rows = FLASH_GRID
@@ -1387,6 +1377,16 @@ def _mean_luma_at(times: Sequence[float], yavg: Sequence[float], t: float) -> Op
     return yavg[lo]
 
 
+def _hard_side(inside: float, near: Optional[float], far: Optional[float]) -> bool:
+    """One side of a black burst is a cut (see BLACK_STEP_CODES)."""
+    if near is None:
+        return False
+    step = near - inside
+    if step < BLACK_STEP_CODES:
+        return False
+    return far is None or abs(near - far) <= step / 2
+
+
 def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: float,
                    cfg: VideoCheckConfig, times: Sequence[float] = (),
                    yavg: Sequence[float] = ()) -> BlackFindings:
@@ -1430,12 +1430,13 @@ def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: 
         if position + 1 < len(runs):
             gaps.append(runs[position + 1][0] - (start + length))
         isolated = all(gap > BLACK_ISOLATION_SECONDS for gap in gaps)
-        before = _mean_luma_at(times, yavg, start - period * 0.5)
-        after = _mean_luma_at(times, yavg, start + length + period * 0.25)
         inside = _mean_luma_at(times, yavg, start + period * 0.25)
-        hard_cut = (before is not None and after is not None and inside is not None
-                    and before - inside >= BLACK_HARD_CUT_CODES
-                    and after - inside >= BLACK_HARD_CUT_CODES)
+        before = _mean_luma_at(times, yavg, start - period * 0.5)
+        before2 = _mean_luma_at(times, yavg, start - period * 1.5)
+        after = _mean_luma_at(times, yavg, start + length + period * 0.25)
+        after2 = _mean_luma_at(times, yavg, start + length + period * 1.25)
+        hard_cut = (inside is not None and _hard_side(inside, before, before2)
+                    and _hard_side(inside, after, after2))
         if isolated and hard_cut:
             bursts.append((start, frames))
         else:

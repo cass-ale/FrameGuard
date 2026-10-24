@@ -823,3 +823,30 @@ def test_hold_allowance_has_a_settings_control(qapp):
 def test_hold_allowance_is_listed_in_the_pdf_spec():
     from frameguard import report
     assert "hold ≤3.0 s" in report._black_freeze_spec(dict(DEFAULT_CONFIG))
+
+
+# ---------------------------------------------------------------------------
+# Black: edit gaps in dark scenes; black in the first / last second
+# ---------------------------------------------------------------------------
+
+class TestBlackEditGaps:
+    cfg = vc.VideoCheckConfig()
+
+    def test_edit_gap_in_a_night_scene(self):
+        """5 black frames cut hard into a night grade (mean luma 25 -> 16 -> 25)."""
+        yavg = [25.0 + 0.2 * ((k * 3) % 4) for k in range(300)]
+        for i in range(120, 125):
+            yavg[i] = 16.0
+        found = vc.classify_black([(4.0, 4.0 + 5 / FPS)], 10.0, FPS, self.cfg, _times(300), yavg)
+        assert found.bursts == [(4.0, 5)]
+
+    def test_fade_in_a_night_scene_is_not_an_edit_gap(self):
+        yavg = [25.0] * 300
+        for i, v in zip(range(114, 120), (24, 23, 21, 19, 18, 17)):
+            yavg[i] = float(v)
+        for i in range(120, 125):
+            yavg[i] = 16.0
+        for i, v in zip(range(125, 131), (17, 18, 19, 21, 23, 24)):
+            yavg[i] = float(v)
+        found = vc.classify_black([(4.0, 4.0 + 5 / FPS)], 10.0, FPS, self.cfg, _times(300), yavg)
+        assert found.bursts == [] and found.ignored_bursts == 1
