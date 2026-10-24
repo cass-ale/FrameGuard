@@ -238,7 +238,10 @@ class TestLoudnessOnFiles:
         result = _scan(clip, loudness_mode="essential")
         assert abs(result.metadata["integrated_loudness_lufs"] + 26.0) <= 0.15, result.metadata
         row = _row(result, "Audio Loudness")
-        assert row[1] == "WARN" and row[3] < 70 and "W-channel loudness" in row[2], row
+        # Never a FAIL. Without SA3D the normalization is unsignalled and a
+        # FuMa W would read -23.0, inside the target: not verified (0.9.2).
+        assert row[1] == "WARN" and "W-channel loudness" in row[2], row
+        assert row[3] < 70 or core.NOT_VERIFIED_PREFIX in row[2], row
 
     def test_self_test_detects_a_broken_meter(self, monkeypatch):
         monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {"ffmpeg": False})

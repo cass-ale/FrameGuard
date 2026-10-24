@@ -467,6 +467,25 @@ def ambisonic_head_locked(track: dict, count: int) -> int:
     return 0
 
 
+def sn3d_positions(tracks: Sequence[dict], sa3d: Sequence[Optional[dict]],
+                   ambisonic: Sequence[int]) -> List[int]:
+    """Ambisonic tracks whose W normalization is known to be SN3D (AmbiX):
+    FFmpeg names only ACN/SN3D-signalled tracks "ambisonic N", and an SA3D
+    box with ordering 0 (ACN) and normalization 0 (SN3D) says so for AAC
+    tracks FFmpeg leaves as "4.0". Without either, W may be FuMa, which
+    carries W at -3.01 dB (1/sqrt 2), so its loudness reads 3 LU low."""
+    found = []
+    for position in ambisonic:
+        if position >= len(tracks):
+            continue
+        box = sa3d[position] if position < len(sa3d) else None
+        signalled = (bool(box) and "error" not in box and box.get("ordering") == 0
+                     and box.get("normalization") == 0)
+        if is_ambisonic(tracks[position]) or signalled:
+            found.append(position)
+    return found
+
+
 def head_locked_positions(tracks: Sequence[dict], sa3d: Sequence[Optional[dict]],
                           ambisonic: Sequence[int]) -> List[int]:
     """Ambisonic tracks that carry head-locked stereo after their ambisonic
@@ -1286,6 +1305,8 @@ class TrackContext:
     lfe: Optional[frozenset] = None
     # This FFmpeg's meter self-test (core caches it per binary), if it ran.
     meter_self_test: Optional[MeterSelfTest] = None
+    # Ambisonic only: W is known to be SN3D (sn3d_positions); else it may be FuMa.
+    sn3d_signalled: bool = True
 
     def __post_init__(self):
         if self.lfe is None:
@@ -1407,6 +1428,8 @@ def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
             return "SKIP", _with_label(ctx.label, reason[0].upper() + reason[1:] + "."), 100
         return "WARN", _with_label(ctx.label, f"Not verified: {reason}."), 100
     row = _programme_row(measured, ctx, cfg)
+    if ctx.ambisonic and not ctx.sn3d_signalled:
+        row = _unsignalled_normalization_row(row, measured, ctx, cfg)
     head_locked = measured.get("head_locked")
     if not head_locked:
         return row
@@ -1418,6 +1441,27 @@ def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
     status, text, confidence = row
     worst = aggregate([(status, "", confidence), (hl_status, "", hl_conf)])
     return worst[0], f"{text}; head-locked stereo: {hl_text}", worst[2]
+
+
+FUMA_W_OFFSET_DB = 20 * math.log10(math.sqrt(2))   # FuMa W = SN3D W / sqrt 2: -3.01 dB
+
+
+def _unsignalled_normalization_row(row: Row, measured: dict, ctx: TrackContext, cfg: dict) -> Row:
+    """W of unsignalled normalization reads the AmbiX value or 3.01 LU below
+    it (FuMa). Judge both: the same verdict stands with a note; different
+    verdicts are not verified."""
+    if row[0] == "SKIP" or not math.isfinite(measured.get("integrated", -math.inf)):
+        return row
+    fuma = dict(measured, integrated=measured["integrated"] + FUMA_W_OFFSET_DB)
+    as_fuma = _programme_row(fuma, ctx, cfg)
+    note = (f"; the normalization is not signalled (no SA3D): if W is FuMa (-3 dB) the scene reads "
+            f"{fuma['integrated']:.1f} LUFS")
+    if as_fuma[0] == row[0]:
+        return row[0], row[1].rstrip(".") + note, row[2]
+    return ("WARN", _with_label(ctx.label, f"Not verified: W-channel loudness {measured['integrated']:.1f} "
+                                           f"LUFS as AmbiX (SN3D), {fuma['integrated']:.1f} LUFS as FuMa: "
+                                           f"the ambisonic normalization is not signalled (no SA3D), and "
+                                           f"the two readings disagree on the verdict."), 100)
 
 
 _HEAD_LOCKED_CAVEAT = (" (head-locked stereo measured as its own stereo programme; the delivered "

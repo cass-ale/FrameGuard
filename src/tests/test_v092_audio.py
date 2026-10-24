@@ -639,3 +639,40 @@ class TestGlitsPattern:
         clip = media.get("tone400_r", lambda p: make_audio(p, [self.TONE400, right]))
         row = _row(_scan(clip), "Audio Dropouts")
         assert row[1] == "WARN" and "FR" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# 12d. Ambisonic W normalization: FuMa reads 3 LU low without SA3D (review §4)
+# ---------------------------------------------------------------------------
+
+FOA_W_23 = [TONE_23, NOISE, "0", NOISE.replace("0.1", "0.05")]   # W reads -26.0 LUFS (AmbiX)
+NEAR_TARGET = dict(loudness_mode="essential", loudness_profile="custom", target_loudness_lufs=-23.5,
+                   loudness_tolerance_lu=1.0)
+
+
+@needs_ffmpeg
+class TestAmbisonicNormalization:
+    def test_unsignalled_normalization_is_not_verified_when_it_decides(self, media):
+        """No SA3D: W may be FuMa (-3.01 dB), so -26.0 could be -23.0. Against
+        -23.5 +-1 the reading fails as AmbiX and passes as FuMa."""
+        from media_fixtures import inject_spherical
+        clip = media.get("foa_w_heuristic", lambda p: inject_spherical(make_audio(p, FOA_W_23, layout="4.0")))
+        row = _row(_scan(clip, **NEAR_TARGET), "Audio Loudness")
+        assert row[1] == "WARN" and core.NOT_VERIFIED_PREFIX in row[2] and "FuMa" in row[2], row
+
+    def test_sa3d_signalled_ambix_is_judged(self, media):
+        from container_fixtures import add_to_sample_entry, sa3d
+        clip = media.get("foa_w_sa3d", lambda p: add_to_sample_entry(
+            make_audio(p, FOA_W_23, layout="4.0"), b"soun", sa3d(4)))
+        result = _scan(clip, **NEAR_TARGET)
+        assert result.metadata["ambisonic_audio_tracks"] == [1]
+        row = _row(result, "Audio Loudness")
+        assert core.NOT_VERIFIED_PREFIX not in row[2] and "quieter" in row[2], row
+
+    def test_unsignalled_but_decided_either_way_is_judged(self, media):
+        """-26.0 or -23.0 are both inside -24.5 +-2: no ambiguity to report."""
+        from media_fixtures import inject_spherical
+        clip = media.get("foa_w_heuristic", lambda p: inject_spherical(make_audio(p, FOA_W_23, layout="4.0")))
+        row = _row(_scan(clip, loudness_mode="essential", loudness_profile="custom",
+                         target_loudness_lufs=-24.5, loudness_tolerance_lu=2.0), "Audio Loudness")
+        assert row[1] == "PASS" and "FuMa" in row[2], row

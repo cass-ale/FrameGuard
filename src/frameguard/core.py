@@ -2548,6 +2548,8 @@ class _ScanPlan:
             i for i, t in enumerate(self.audio) if audio_checks.is_ambisonic(t))
         self.head_locked = frozenset(audio_checks.head_locked_positions(
             self.audio, [None] * len(self.audio), sorted(self.ambisonic)))
+        self.sn3d = frozenset(audio_checks.sn3d_positions(
+            self.audio, [None] * len(self.audio), sorted(self.ambisonic)))
         self.audio_files: Optional["audio_checks.MeasurementFiles"] = None
         self.graph_dir: Optional[str] = None
         self.graph_option = GRAPH_FILE_OPTION
@@ -3221,7 +3223,7 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
             label=label, duration=duration, ambisonic=ambisonic,
             meter=audio_checks.loudness_meter(track, plan.channels(track),
                                               plan.multichannel_meter, ambisonic),
-            meter_self_test=plan.meter_self_test)
+            meter_self_test=plan.meter_self_test, sn3d_signalled=position in plan.sn3d)
         contexts.append(ctx)
         if not files_problem:
             events = evidence.silence_events(f"silencedetect@a{position}", duration)
@@ -3376,6 +3378,7 @@ def _prepare_scan_files(plan: _ScanPlan, result: QAResult) -> Optional[str]:
         plan.ambisonic = frozenset(int(n) - 1 for n in tracks)
         plan.head_locked = frozenset(
             int(n) - 1 for n in result.metadata.get("ambisonic_head_locked_tracks") or ())
+        plan.sn3d = frozenset(int(n) - 1 for n in result.metadata.get("ambisonic_sn3d_tracks") or ())
     try:
         scan_dir = tempfile.mkdtemp(prefix="frameguard-scan-")
     except OSError:
@@ -3524,6 +3527,9 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
         head_locked = audio_checks.head_locked_positions(tracks, boxes, positions)
         if head_locked:
             result.set_metadata("ambisonic_head_locked_tracks", [p + 1 for p in head_locked])
+        if positions:
+            result.set_metadata("ambisonic_sn3d_tracks",
+                                [p + 1 for p in audio_checks.sn3d_positions(tracks, boxes, positions)])
 
 
 def run_qa_checks(filepath: str, cfg: dict = None,
