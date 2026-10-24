@@ -170,9 +170,40 @@ def validate_preset_config(config: dict) -> dict:
             problems.append(f"{raw_key}={value!r} ({problem})")
         else:
             out[key] = coerced
+    for _keys, problem in _cross_field_problems(out):
+        problems.append(problem)
     if problems or unknown:
         raise PresetValidationError(problems, unknown)
     return audio_checks.normalize_custom_profile(out)
+
+
+def _cross_field_problems(config: dict) -> List[tuple]:
+    """((keys involved), problem) for values that are each in range but
+    contradict one another. Only pairs present in ``config`` are judged: a
+    preset that sets one side inherits the other from the operator's
+    settings, which this function cannot see."""
+    out = []
+    warn = config.get("av_offset_warn_ms")
+    for key, side in (("av_offset_max_early_ms", "early"), ("av_offset_max_late_ms", "late")):
+        limit = config.get(key)
+        if warn is not None and limit is not None and warn > limit:
+            # The engine used to take max(warn, limit), so this silently
+            # lifted the EBU R37 FAIL threshold to the warning threshold.
+            out.append((("av_offset_warn_ms", key),
+                        f"av_offset_warn_ms={warn!r} exceeds {key}={limit!r} (the {side} FAIL "
+                        f"threshold must be at least the warning threshold)"))
+    width, height = config.get("target_width"), config.get("target_height")
+    max_pixels = config.get("max_frame_pixels")
+    if width and height and max_pixels and width * height > max_pixels:
+        out.append((("max_frame_pixels", "target_width", "target_height"),
+                    f"max_frame_pixels={max_pixels!r} is below the target {width}x{height} "
+                    f"({width * height:,} pixels): no file can meet both"))
+    fps, max_rate = config.get("target_fps"), config.get("max_pixel_rate")
+    if width and height and fps and max_rate and width * height * fps > max_rate * 1.0005:
+        out.append((("max_pixel_rate", "target_width", "target_height", "target_fps"),
+                    f"max_pixel_rate={max_rate!r} is below the target {width}x{height} at {fps:g} fps "
+                    f"({width * height * fps:,.0f} pixels/s): no file can meet both"))
+    return out
 
 
 def normalize_preset_config(config: dict) -> dict:
@@ -194,6 +225,10 @@ def normalize_preset_config(config: dict) -> dict:
         coerced, problem = _coerce_preset_value(key, value)
         if not problem:
             out[key] = coerced
+    # A contradiction drops the value that would loosen the spec (the warning
+    # threshold, the decoder ceiling), never the FAIL threshold.
+    for keys, _problem in _cross_field_problems(out):
+        out.pop(keys[0], None)
     return audio_checks.normalize_custom_profile(out)
 
 
@@ -227,9 +262,12 @@ _PRESET_VALUE_RANGES = {
     "duration_mismatch_threshold": (0.0, 60.0),
     "av_short_tolerance_frames": (0, 1000),
     "av_long_tolerance_s": (0.0, 60.0),
+    # ITU-R BT.1359-1: sound 90 ms late / 185 ms early is the limit of
+    # acceptability for viewers; a FAIL threshold above one second (5x that)
+    # would pass sync errors no audience accepts, so that is the cap.
     "av_offset_warn_ms": (0.0, 1000.0),
-    "av_offset_max_early_ms": (0.0, 10000.0),
-    "av_offset_max_late_ms": (0.0, 10000.0),
+    "av_offset_max_early_ms": (0.0, 1000.0),
+    "av_offset_max_late_ms": (0.0, 1000.0),
     # 0 = no ceiling; 16384 x 16384 x 1000 fps bounds the rest.
     "max_frame_pixels": (0, 16384 * 16384),
     "max_pixel_rate": (0, 16384 * 16384 * 1000),

@@ -1332,9 +1332,12 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     if video is None or not tracks:
         result.add_skip(name, "Need both video and audio streams to compare.")
         return
-    warn_ms = float(cfg.get("av_offset_warn_ms", 5.0))
-    max_early = max(warn_ms, float(cfg.get("av_offset_max_early_ms", 40.0)))
-    max_late = max(warn_ms, float(cfg.get("av_offset_max_late_ms", 60.0)))
+    # The FAIL thresholds are never lifted to the warning threshold: a spec
+    # whose warning band is wider than R37 still FAILs beyond R37 (presets
+    # reject that contradiction; this guards hand-made configs).
+    max_early = float(cfg.get("av_offset_max_early_ms", 40.0))
+    max_late = float(cfg.get("av_offset_max_late_ms", 60.0))
+    warn_ms = min(float(cfg.get("av_offset_warn_ms", 5.0)), max_early, max_late)
     v_start = core._safe_float(video.get("start_time"), 0.0) or 0.0
     entries, worst, worst_range = [], 0.0, None
     for position, track in enumerate(tracks):

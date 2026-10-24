@@ -437,3 +437,40 @@ class TestUnreadMoov:
         monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
         check = _row(_scan(mov), "Timecode")
         assert _not_verified(check), check
+
+
+# ---------------------------------------------------------------------------
+# 5. Presets: cross-field validation (B15); switched-off essentials (B16)
+# ---------------------------------------------------------------------------
+
+class TestPresetCrossFields:
+    @pytest.mark.parametrize("config", [
+        {"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40},       # review repro
+        {"av_offset_warn_ms": 70, "av_offset_max_late_ms": 60},
+        {"av_offset_max_late_ms": 5000},                                 # beyond the sane cap
+        {"max_frame_pixels": 1000, "target_width": 3840, "target_height": 2160},
+        {"max_pixel_rate": 1_000_000, "target_width": 1920, "target_height": 1080, "target_fps": 30},
+    ])
+    def test_contradictory_presets_are_rejected(self, config):
+        from frameguard import presets
+        with pytest.raises(presets.PresetValidationError):
+            presets.validate_preset_config(config)
+
+    def test_consistent_presets_still_load(self):
+        from frameguard import presets
+        from frameguard.core import PRESETS, preset_config
+        assert presets.validate_preset_config({"av_offset_warn_ms": 5, "av_offset_max_early_ms": 40,
+                                               "av_offset_max_late_ms": 60})
+        for key in PRESETS:
+            presets.validate_preset_config(preset_config(key))
+
+    def test_saved_settings_drop_a_contradiction_instead_of_loosening(self):
+        from frameguard import presets
+        out = presets.normalize_preset_config({"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40,
+                                               "target_fps": 25})
+        assert out == {"av_offset_max_early_ms": 40, "target_fps": 25}, out
+
+    def test_engine_never_lifts_the_fail_threshold_to_the_warn_threshold(self):
+        check, _ = _sync_row(_sync_probe(-0.045, padding=1024), av_offset_warn_ms=500,
+                             av_offset_max_early_ms=40)
+        assert check[1] == "FAIL", check
