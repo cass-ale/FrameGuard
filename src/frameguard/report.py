@@ -19,7 +19,7 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 from frameguard import __version__
-from frameguard.core import QAResult
+from frameguard.core import ESSENTIAL_CHECKS, QAResult
 from frameguard.theme import get_theme, ThemeColors
 
 
@@ -1095,7 +1095,9 @@ def _conformance_spec_rows(c: dict) -> List[tuple]:
     if flags:
         rows.append(("Also required", ", ".join(flags)))
     if c.get("disabled_checks"):
-        rows.append(("Checks switched off", ", ".join(c["disabled_checks"])))
+        rows.append(("Checks switched off", ", ".join(
+            f"{name} (essential: not verified)" if name in ESSENTIAL_CHECKS else name
+            for name in c["disabled_checks"])))
     return rows
 
 

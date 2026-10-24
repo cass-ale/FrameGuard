@@ -2295,8 +2295,16 @@ def run_structure_checks(filepath: str, structure: Structure, probe_data: dict, 
         (TRACK_LAYOUT, lambda: check_track_layout(probe_data, result, cfg)),
     )
     result.set_metadata("container_family", structure.family)
+    essential = _core().ESSENTIAL_CHECKS
     for name, step in steps:
         if is_disabled(cfg, name):
-            result.add_skip(name, "Switched off by this spec.")
+            if name in essential:
+                # An essential check a spec switches off must not vanish from
+                # the verdict as a SKIP: it is unverified ground, recorded as
+                # the spec's choice (Strict Mode does not escalate a choice).
+                result.add_not_verified(name, "switched off by this spec; this essential check did not run.",
+                                        by_choice=True)
+            else:
+                result.add_skip(name, "Switched off by this spec.")
             continue
         step()

@@ -474,3 +474,24 @@ class TestPresetCrossFields:
         check, _ = _sync_row(_sync_probe(-0.045, padding=1024), av_offset_warn_ms=500,
                              av_offset_max_early_ms=40)
         assert check[1] == "FAIL", check
+
+
+class TestSwitchedOffEssentials:
+    ESSENTIAL_OFF = ["A/V Sync Offset", "Codec Profile", "Spatial Audio"]
+
+    def test_switched_off_essentials_are_not_verified_not_skipped(self, media):
+        result = _scan(_clean(media), quick=False, disabled_checks=self.ESSENTIAL_OFF + ["Edit List"])
+        for name in ("A/V Sync Offset", "Codec Profile"):
+            check = _row(result, name)
+            assert _not_verified(check) and "switched off" in check[2], check
+        assert _row(result, "Edit List")[1] == "SKIP"            # advisory: still a plain skip
+        assert result.status == "PASS_WITH_WARNINGS", [c[:3] for c in result.checks if c[1] != "PASS"]
+
+    def test_the_spec_choice_does_not_escalate_in_strict_mode(self, media):
+        result = _scan(_clean(media), quick=False, strict=True, disabled_checks=["Codec Profile"])
+        assert result.status != "MISMATCH", [c[:3] for c in result.checks if c[1] != "PASS"]
+
+    def test_pdf_spec_row_names_switched_off_essentials(self):
+        from frameguard.report import spec_rows
+        rows = dict(spec_rows(dict(DEFAULT_CONFIG, disabled_checks=["Codec Profile", "Edit List"])))
+        assert "Codec Profile (essential: not verified)" in rows["Checks switched off"], rows
