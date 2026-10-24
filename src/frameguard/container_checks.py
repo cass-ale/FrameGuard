@@ -423,6 +423,8 @@ class Structure:
     family: str = "unknown"
     file_size: int = 0
     brand: str = ""
+    compatible_brands: List[str] = field(default_factory=list)
+    extension: str = ""
     top: List[Box] = field(default_factory=list)
     damage: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
@@ -941,6 +943,7 @@ def _reparse_stsd_with_handler(trak: Box, handler: str, structure: Structure) ->
 def read_structure(path: str) -> Structure:
     """Read the box structure of ``path``; never raises (errors land in ``error``)."""
     structure = Structure()
+    structure.extension = os.path.splitext(path)[1].lower()
     try:
         structure.file_size = os.path.getsize(path)
         structure.family, detail = sniff_container(path)
@@ -951,7 +954,10 @@ def read_structure(path: str) -> Structure:
             for box in structure.top:
                 if box.type == b"ftyp":
                     stream.seek(box.offset + box.header)
-                    structure.brand = stream.read(4).decode("latin-1").strip()
+                    head = stream.read(min(box.size - box.header, 4096))
+                    structure.brand = head[:4].decode("latin-1").strip()
+                    structure.compatible_brands = [head[i:i + 4].decode("latin-1").strip()
+                                                   for i in range(8, len(head) - 3, 4)]
                 elif box.type == b"moov":
                     structure.moov_count += 1
                     if structure.moov_offset is None:
@@ -1067,6 +1073,10 @@ def _missing_media_text(structure: Structure) -> List[str]:
     return out
 
 
+_MP4_BRANDS = frozenset({"mp41", "mp42", "mp71", "avc1", "dash", "msnv", "M4V", "M4A", "f4v", "3gp4", "3gp5",
+                         "3gp6", "3g2a"})
+
+
 def check_container_structure(structure: Structure, result, cfg: dict) -> None:
     """Box-level health of an MP4/MOV: truncation, index position, duplicates.
 
@@ -1114,6 +1124,13 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
                 notes.append(text + " (fine for file delivery)")
         else:
             notes.append("fast-start (index before media)")
+    quicktime_only = structure.brand == "qt" and not any(
+        b in _MP4_BRANDS or b.startswith("iso") for b in structure.compatible_brands)
+    if quicktime_only and structure.extension in (".mp4", ".m4v"):
+        # ISO/IEC 14496-14 MP4 files carry an MP4/ISO brand; a file whose only
+        # brand is 'qt  ' is a QuickTime movie, which strict MP4 ingest refuses.
+        problems.append(f"the ftyp brand is 'qt  ' only (a QuickTime movie) but the file is named "
+                        f"'{structure.extension}'; rename it .mov or remux it as MP4")
     if structure.fragmented:
         notes.append(f"fragmented MP4 ({structure.moof_count} fragment(s))")
     if structure.brand:

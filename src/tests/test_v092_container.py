@@ -722,3 +722,21 @@ class TestFilenameSuggestions:
         from frameguard import presets
         from frameguard.core import PRESETS
         assert presets.detect_preset_from_filename(name, PRESETS) == expected
+
+
+class TestQuickTimeBrandNamedMp4:
+    def test_quicktime_movie_named_mp4_is_flagged(self, media, tmp_path):
+        """R1.1 (review section 1, NOT DONE): a 'qt  ' brand with no ISO brand
+        in a file named .mp4 passed silently."""
+        mov = tmp_path / "movie.mov"
+        ffmpeg("-i", _clean(media), "-c", "copy", str(mov))
+        renamed = tmp_path / "movie.mp4"
+        os.rename(mov, renamed)
+        check = _row(_scan(renamed), "Container Structure")
+        assert check[1] == "WARN" and "QuickTime" in check[2], check
+
+    def test_real_mp4_and_mov_are_quiet(self, media, tmp_path):
+        mov = tmp_path / "movie.mov"
+        ffmpeg("-i", _clean(media), "-c", "copy", str(mov))
+        for path in (_clean(media), mov):
+            assert _row(_scan(path), "Container Structure")[1] == "PASS", path
