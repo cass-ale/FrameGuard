@@ -342,3 +342,113 @@ class TestInterlaceScan:
                             ["-flags", "+ildct+ilme", "-x264-params", "bff=1", "-r", "30"])
         row = _row(_scan(path, require_progressive=False), "Interlace Detection")
         assert row[1] == "WARN" and "mismatch" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# EBU R 103 v3.0 low-pass filter at native resolution
+# ---------------------------------------------------------------------------
+
+_R103_H = (1, 2, 3, 4, 3, 2, 1)
+_R103_V = (1, 2, 1)
+
+
+def _r103_share(tile, high=246, low=5):
+    """Exact share of a periodic tile outside R 103 after its filter.
+
+    ``tile`` is a list of rows of 8-bit luma; the picture is the tile
+    repeated, so the filter wraps around. A filtered value counts when it
+    rounds outside 5..246 (as an 8-bit pipeline stores it).
+    """
+    tile = tile.rows()
+    th, tw = len(tile), len(tile[0])
+    horiz = [[sum(w * row[(x + k - 3) % tw] for k, w in enumerate(_R103_H)) / 16.0
+              for x in range(tw)] for row in tile]
+    outside = 0
+    for y in range(th):
+        for x in range(tw):
+            v = sum(w * horiz[(y + k - 1) % th][x] for k, w in enumerate(_R103_V)) / 4.0
+            outside += v >= high + 0.5 or v < low - 0.5
+    return outside / (tw * th)
+
+
+class _Tile:
+    """Rectangles of super-white on black repeated over the picture."""
+
+    def __init__(self, tw, th, rects, level=254, background=16):
+        self.tw, self.th, self.rects = tw, th, rects
+        self.level, self.background = level, background
+
+    def rows(self):
+        tile = [[self.background] * self.tw for _ in range(self.th)]
+        for x0, y0, w, h in self.rects:
+            for y in range(y0, y0 + h):
+                for x in range(x0, x0 + w):
+                    tile[y % self.th][x % self.tw] = self.level
+        return tile
+
+    def expression(self):
+        x, y = f"mod(X,{self.tw})", f"mod(Y,{self.th})"
+        inside = "+".join(f"between({x},{x0},{x0 + w - 1})*between({y},{y0},{y0 + h - 1})"
+                          for x0, y0, w, h in self.rects)
+        return f"if(gt({inside},0),{self.level},{self.background})"
+
+
+def _tiled_clip(path, tile, width, height, frames=4):
+    """A lossless clip of ``tile`` repeated over width x height (codes kept:
+    geq writes limited-range YUV directly, as the 0.9.1 luma test does)."""
+    source = f"color=black:s={width}x{height}:r=30:d={frames / 30},format=yuv420p,setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709"
+    ffmpeg("-f", "lavfi", "-i", source, "-vf", f"geq=lum='{tile.expression()}':cb=128:cr=128",
+           "-frames:v", str(frames), "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0",
+           "-color_range", "tv", "-colorspace", "bt709", "-color_primaries", "bt709",
+           "-color_trc", "bt709", "-an", str(path))
+    return str(path)
+
+
+def _levels(path, width, height):
+    result = _scan(path, target_width=width, target_height=height)
+    return _row(result, "Signal Levels"), result.metadata.get("levels_max_luma_pct")
+
+
+# Tiles whose sizes are not multiples of the 4 x 2 analysis lattice, so the
+# squares fall at every lattice phase across the picture.
+_SPECULAR = _Tile(127, 95, [(5, 7, 16, 16), (61, 52, 16, 16)])               # 16 px speculars
+_SMALL = _Tile(127, 95, [(9, 11, 10, 10), (70, 50, 10, 10), (40, 80, 10, 10)])  # 10 px blobs
+_RULES = _Tile(127, 95, [(0, 20, 127, 4)])                                      # 4-line rules
+
+
+@needs_ffmpeg
+class TestR103Filter:
+    def test_reference_shares(self):
+        """The cases straddle the 1 % rule under the R 103 filter itself."""
+        assert 0.012 < _r103_share(_SPECULAR) < 0.03
+        assert 0.006 < _r103_share(_SMALL) < 0.0095
+        assert 0.012 < _r103_share(_RULES) < 0.03
+
+    def test_uhd_speculars_are_caught(self, tmp_path):
+        expected = _r103_share(_SPECULAR)
+        path = _tiled_clip(tmp_path / "uhd.mp4", _SPECULAR, 3840, 2160)
+        row, share = _levels(path, 3840, 2160)
+        assert row[1] == "WARN" and "Luma" in row[2], row
+        assert share == pytest.approx(expected * 100, rel=0.1)
+
+    def test_8k_speculars_are_caught(self, tmp_path):
+        expected = _r103_share(_SPECULAR)
+        path = _tiled_clip(tmp_path / "8k.mp4", _SPECULAR, 7680, 3840, frames=3)
+        row, share = _levels(path, 7680, 3840)
+        assert row[1] == "WARN" and "Luma" in row[2], row
+        assert share == pytest.approx(expected * 100, rel=0.1)
+
+    def test_uhd_thin_rules_are_caught(self, tmp_path):
+        expected = _r103_share(_RULES)
+        path = _tiled_clip(tmp_path / "rules.mp4", _RULES, 3840, 2160)
+        row, share = _levels(path, 3840, 2160)
+        assert row[1] == "WARN", row
+        assert share == pytest.approx(expected * 100, rel=0.1)
+
+    def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
+        """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
+        expected = _r103_share(_SMALL)
+        path = _tiled_clip(tmp_path / "hd.mp4", _SMALL, 1920, 1080)
+        row, share = _levels(path, 1920, 1080)
+        assert row[1] == "PASS", row
+        assert share == pytest.approx(expected * 100, rel=0.1)

@@ -420,7 +420,7 @@ class TestRealScan:
         assert row[1] == "WARN" and "not signalled" not in row[2], row
         video = core._primary_video_stream(core.run_ffprobe(path))
         with vc.VideoAnalysis(video, dict(DEFAULT_CONFIG)) as analysis:
-            graph = ";".join(analysis._area_chains())
+            graph = ";".join(analysis._levels_chains())
         assert "[ar_gamut1]" not in graph and "[ar_gamut0]" in graph
 
     def test_luma_patch_inside_the_area_tolerance(self, tmp_path):

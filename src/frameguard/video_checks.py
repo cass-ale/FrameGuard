@@ -75,16 +75,22 @@ CANCEL_CHECK_EVERY = 8192
 # Analysis geometry
 # ---------------------------------------------------------------------------
 
-# Levels, gamut and flash are measured on an area-averaged copy at most this
-# wide and at least 4x smaller than the source. Averaging 4x4 source pixels
-# (sigma 1.15 px) is comparable to the EBU R 103 v3.0 low-pass horizontally
-# (1-2-3-4-3-2-1 / 16, sigma 1.41 px) and stronger vertically (1-2-1 / 4,
-# sigma 0.71 px), so chroma-subsampling ringing on saturated edges cannot
-# trip the 1 % area rule, while regions of the size that rule is about
-# (1 % of the picture) survive averaging intact. A 2x copy flagged ringing
-# on clean graphics (testsrc-style colour bars) as gamut errors.
+# Flash and the black short-tier mean luma are measured on an area-averaged
+# copy at most this wide and at least 4x smaller than the source (both are
+# area measurements, which averaging preserves).
 ANALYSIS_MAX_WIDTH = 480
 ANALYSIS_MIN_FACTOR = 4
+# EBU R 103 v3.0, "Video Signal Filtering": "A quarter band filter applied
+# horizontally and a half band filter applied vertically is recommended.
+# Horizontal Filter Coefficients: 1/16, 2/16, 3/16, 4/16, 3/16, 2/16, 1/16
+# Vertical Filter Coefficients: 1/4, 1/2, 1/4", for interlaced and
+# progressive signals, in pixel taps at the signal's own resolution - so the
+# levels are judged on the native picture filtered exactly so, at every
+# resolution (0.9.1 approximated it with box averaging that grew with the
+# resolution and missed UHD/8K violations).
+# The filtered luma is evaluated on a lattice of every 4th column and 2nd
+# line (see VideoAnalysis._levels_chains for why that is exact there).
+R103_LATTICE = (4, 2)
 # Interlace analysis keeps every line (fields must stay separate) but
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
@@ -120,7 +126,7 @@ R103_RGB_MAX = 1.05
 R103_AREA = 0.01
 R103_MIN_FRAMES = 3
 
-# Range plausibility (codes on the 8-bit analysis copy, after averaging).
+# Range plausibility (8-bit codes of the R 103-filtered picture).
 # Limited-range content has black at 16 and white at 235; full-range black
 # is 0 and white 255.
 RANGE_DEEP_BLACK_MAX = 10      # tv: well below limited black
@@ -254,6 +260,12 @@ def is_full_range(video: dict) -> bool:
     return str(video.get("pix_fmt") or "").lower().startswith("yuvj")
 
 
+def _is_420(pix_fmt: str) -> bool:
+    """4:2:0 chroma (yuv420p*, yuvj420p, nv12/nv21, p010/p016); unknown counts as 4:2:0."""
+    name = pix_fmt.lower()
+    return not name or "420" in name or name.startswith(("nv12", "nv21", "p010", "p012", "p016"))
+
+
 def _rate(text) -> float:
     try:
         num, _, den = str(text or "0/0").partition("/")
@@ -274,6 +286,7 @@ class PictureInfo:
     field_order: str
     hdr: bool
     matrix_assumed: bool = False    # no colour-matrix tag: guessed from the size
+    chroma_420: bool = True         # 4:2:0 chroma (half width, half height)
 
     @classmethod
     def from_stream(cls, video: dict) -> "PictureInfo":
@@ -284,7 +297,8 @@ class PictureInfo:
                    field_order=str(video.get("field_order") or "unknown").lower(),
                    hdr=str(video.get("color_transfer") or "").lower() in _HDR_TRANSFERS,
                    matrix_assumed=str(video.get("color_space") or "").lower()
-                   in ("", "unknown", "unspecified", "reserved"))
+                   in ("", "unknown", "unspecified", "reserved"),
+                   chroma_420=_is_420(str(video.get("pix_fmt") or "")))
 
     @property
     def gamut_matrices(self) -> Tuple[str, ...]:
@@ -389,6 +403,95 @@ def _select(key: str, value: str, function: str) -> str:
     return f"metadata=mode=select:key={key}:value={value}:function={function}"
 
 
+# 8-bit codes widen to 16 bits as v x 257 and narrow by dropping the low
+# byte, so a 16-bit mean is first rounded to the nearest v x 257: the 8-bit
+# result is then the rounded filter output, as an 8-bit filter would store.
+_ROUND_TO_8BIT = "lutyuv=y='round(val/257)*257':u='round(val/257)*257':v='round(val/257)*257'"
+
+
+def _r103_lattice(source: str, out: str, work: str, final: str) -> List[str]:
+    """``[source]`` R 103-filtered on the 4 x 2 lattice -> ``[out]`` (see _levels_chains).
+
+    Lattice column m is source column 4m + 3, line n is source line 2n + 1.
+    """
+    columns, lines = R103_LATTICE
+    width = f"trunc((iw-{columns - 1})/{columns})*{columns}"
+    height = f"trunc((ih-{lines - 1})/{lines})*{lines}"
+    chains = [f"[{source}]split={columns}" + "".join(f"[{out}_c{p}]" for p in range(columns))]
+    for p in range(columns):
+        chains.append(f"[{out}_c{p}]crop=w='{width}':h=ih:x={p}:y=0,"
+                      f"scale=w=iw/{columns}:h=ih:flags=area,format={work}[{out}_h{p}]")
+    chains += _mean_tree([f"{out}_h{p}" for p in range(columns)], f"{out}_hm",
+                         f",split={lines}" + "".join(f"[{out}_r{q}]" for q in range(lines)))
+    for q in range(lines):
+        chains.append(f"[{out}_r{q}]crop=w=iw:h='{height}':x=0:y={q},"
+                      f"scale=w=iw:h=ih/{lines}:flags=area[{out}_v{q}]")
+    # format= pins the 16-bit averages (negotiation could otherwise move the
+    # 8-bit conversion ahead of them).
+    chains += _mean_tree([f"{out}_v{q}" for q in range(lines)], f"{out}_vm",
+                         f",format={work},{_ROUND_TO_8BIT},format={final}[{out}]")
+    return chains
+
+
+def _r103_chroma_420(source: str, out: str) -> List[str]:
+    """A 4:2:0 chroma plane R 103-filtered at the luma lattice -> ``[out]``.
+
+    The chroma is taken as linearly interpolated to the luma grid with
+    H.264/HEVC default siting (chroma sample k at luma column 2k, chroma row
+    n midway between luma lines 2n and 2n+1). The R 103 kernels at lattice
+    point (luma column 4m+3, line 2n+1) then reduce to
+    * horizontally 1-3-3-1/8 over chroma samples 2m..2m+3: with A the 2:1
+      area reduction from sample 0 and B the one from sample 1, that is
+      mean(mean(A[m], B[m]), mean(B[m], A[m+1]));
+    * vertically 1-10-5/16 over chroma rows n-1, n, n+1, i.e.
+      1/4 C[n] + 3/4 (5/6 P + 1/6 Q) with P = mean(C[n], C[n+1]) and
+      Q = mean(C[n-1], C[n]).
+    Lattice line 0 has no chroma row above it, so the lattice starts at
+    line 1 (the luma lattice drops its first line to match).
+    """
+    lattice_w = "trunc((iw*2-3)/4)"          # luma lattice width, in chroma samples
+    return [
+        f"[{source}]split=2[{out}_a][{out}_b]",
+        f"[{out}_a]crop=w='2*{lattice_w}+2':h=ih:x=0:y=0,scale=w=iw/2:h=ih:flags=area,"
+        f"format=gray16,split=2[{out}_a0][{out}_a1]",
+        f"[{out}_b]crop=w='2*{lattice_w}':h=ih:x=1:y=0,scale=w=iw/2:h=ih:flags=area,"
+        f"format=gray16,split=2[{out}_b0][{out}_b1]",
+        f"[{out}_a0]crop=w=iw-1:h=ih:x=0:y=0[{out}_l]",
+        f"[{out}_a1]crop=w=iw-1:h=ih:x=1:y=0[{out}_r]",
+        f"[{out}_l][{out}_b0]blend=all_mode=average[{out}_lb]",
+        f"[{out}_b1][{out}_r]blend=all_mode=average[{out}_br]",
+        f"[{out}_lb][{out}_br]blend=all_mode=average,split=3[{out}_m][{out}_0][{out}_p]",
+        f"[{out}_m]crop=w=iw:h=ih-2:x=0:y=0[{out}_cm]",
+        f"[{out}_0]crop=w=iw:h=ih-2:x=0:y=1,split=3[{out}_c0a][{out}_c0b][{out}_c0c]",
+        f"[{out}_p]crop=w=iw:h=ih-2:x=0:y=2[{out}_cp]",
+        f"[{out}_c0a][{out}_cp]blend=all_mode=average[{out}_pp]",
+        f"[{out}_cm][{out}_c0b]blend=all_mode=average[{out}_qq]",
+        f"[{out}_qq][{out}_pp]blend=all_mode=normal:all_opacity={1 / 6:.10f}[{out}_x]",
+        f"[{out}_c0c][{out}_x]blend=all_mode=normal:all_opacity=0.25,format=gray16,{_ROUND_TO_8BIT},"
+        f"format=gray[{out}]",
+    ]
+
+
+def _mean_tree(labels: List[str], prefix: str, tail: str) -> List[str]:
+    """Chains averaging ``labels`` (a power of two of them) pairwise.
+
+    ``blend=all_mode=average`` on 16-bit frames is exact to 1/65536 of full
+    scale; the last average is followed by ``tail``.
+    """
+    chains, level = [], list(labels)
+    depth = 0
+    while len(level) > 1:
+        nxt = []
+        for k in range(0, len(level), 2):
+            out = f"{prefix}{depth}_{k // 2}"
+            last = len(level) == 2
+            chains.append(f"[{level[k]}][{level[k + 1]}]blend=all_mode=average"
+                          + (tail if last else f"[{out}]"))
+            nxt.append(out)
+        level, depth = nxt, depth + 1
+    return chains
+
+
 def _disp_name(d: int) -> str:
     return f"disp_{'m' if d < 0 else 'p'}{abs(d)}"
 
@@ -440,7 +543,7 @@ def _rgb_mask_expressions(info: PictureInfo,
 
 
 def _luma_mask_expressions(info: PictureInfo) -> Tuple[str, str, str]:
-    """Three luma masks (255 = pixel in class) of the averaged picture.
+    """Three luma masks (255 = pixel in class) of the R 103-filtered picture.
 
     Limited range: outside the R 103 luma limits, deep sub-black, and
     super-white. Full range: the R 103 luma limits cannot be exceeded, so
@@ -621,9 +724,13 @@ class VideoAnalysis:
     # -- what runs ------------------------------------------------------------
     @property
     def needs_area_branch(self) -> bool:
-        """Levels, flash and the black short-tier mean luma share one copy."""
+        """Flash and the black short-tier mean luma share one reduced copy."""
         c = self.config
         return self.info.analysable and (c.levels or c.flash or c.black)
+
+    @property
+    def needs_levels_branch(self) -> bool:
+        return self.info.analysable and self.config.levels
 
     @property
     def needs_interlace_branch(self) -> bool:
@@ -657,6 +764,8 @@ class VideoAnalysis:
         graphs: List[Tuple[str, Optional[str]]] = []
         if self.needs_interlace_branch:
             graphs.append((";".join(self._interlace_chains()), "[vs_il]"))
+        if self.needs_levels_branch:
+            graphs.append((";".join(self._levels_chains()), "[vs_lv]"))
         if self.needs_area_branch:
             label = None if self.flash_enabled else "[vs_area]"
             graphs.append((";".join(self._area_chains()), label))
@@ -698,42 +807,83 @@ class VideoAnalysis:
                 f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths[_disp_name(d)])},nullsink")
         return chains
 
-    def _area_chains(self) -> List[str]:
-        """Levels, gamut, mean luma and flash from one area-averaged copy.
+    def _levels_chains(self) -> List[str]:
+        """EBU R 103 luma and RGB gamut masks of the R 103-filtered picture.
 
-        Few, cheap filters: the graph runs serially per frame, so filter
-        count matters more than pixel count on a 480-pixel copy. Planes are
-        reordered with single-input mergeplanes (shuffleplanes would force a
-        yuva444p conversion) and processed three at a time by lutyuv/lut2,
-        and each packed mask frame gives three area fractions from one
-        signalstats call (plane averages, on a 4x smaller copy - area
-        averaging preserves the mean).
+        The R 103 kernels factor into boxes - 1-2-3-4-3-2-1/16 is a 4-pixel
+        box applied twice, 1-2-1/4 a 2-line box applied twice - and an area
+        reduction by an integer factor is an exact box mean. The filtered
+        value at every 4th column and 2nd line (the lattice) is therefore the
+        mean of the four column phases' 4:1 area reductions, then of the two
+        line phases' 2:1 area reductions: the R 103 output itself there,
+        computed in 16 bits and rounded once, for a few reads of the plane.
+        Each lattice point stands for its 4 x 2 cell, so the violating share
+        is an unbiased lattice estimate of the native share (it differs only
+        where a region's edge cuts a cell; the tests hold it to 10 % of the
+        exact share at HD, UHD and 8K).
+
+        Chroma gets the same filter at the same points. R 103 does not say
+        how subsampled chroma reaches the luma grid; with linear
+        interpolation of 4:2:0 chroma the horizontal kernel becomes
+        fixed short kernels on the chroma samples (see _r103_chroma_420),
+        computed from 2:1 area reductions and 16-bit averages. Other
+        subsamplings are brought to 4:4:4 and filtered exactly like luma.
+
+        The planes are merged on the lattice, reordered with single-input
+        mergeplanes and processed three at a time by lutyuv/lut2; each
+        packed mask frame gives three area fractions from one signalstats
+        call. The graph ends in ``[vs_lv]``.
+        """
+        info = self.info
+        rng = info.range_name
+        matrices = info.gamut_matrices
+        uses = ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
+        labels = "".join(f"[ar_{u}]" for u in uses)
+        if info.chroma_420:
+            chains = [f"[0:{self.index}]extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
+            chains += _r103_lattice("lv_luma", "lv_yl", "gray16", "gray")
+            chains.append("[lv_yl]crop=w=iw:h=ih-1:x=0:y=1[lv_y]")
+            chains += _r103_chroma_420("lv_cb", "lv_u")
+            chains += _r103_chroma_420("lv_cr", "lv_v")
+            chains.append("[lv_y][lv_u][lv_v]mergeplanes=map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0"
+                          f":format=yuv444p,split={len(uses)}{labels}")
+        else:
+            # 4:4:4 first, so the odd column phases crop exact pixels.
+            chains = [f"[0:{self.index}]scale=in_range={rng}:out_range={rng},format=yuv444p16[lv_src]"]
+            chains += _r103_lattice("lv_src", "lv_all", "yuv444p16", "yuv444p")
+            chains.append(f"[lv_all]split={len(uses)}{labels}")
+        # Masks are area-reduced 4:1 before signalstats: a 0/255 mask's mean
+        # (the violating share) is preserved exactly.
+        reduce4 = "scale=w='max(1,trunc(iw/4))':h='max(1,trunc(ih/4))':flags=area"
+        m1, m2, m3 = _luma_mask_expressions(info)
+        for k, matrix in enumerate(matrices):
+            chains += self._gamut_chains(k, matrix)
+        chains += self._gamut_combined(len(matrices), reduce4)
+        chains += [
+            f"[ar_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p,lutyuv=y='{m1}':u='{m2}':v='{m3}',"
+            f"{reduce4},signalstats,{','.join(self._luma_prints())},null[vs_lv]",
+        ]
+        return chains
+
+    def _area_chains(self) -> List[str]:
+        """Mean luma and the flash grid from one area-averaged copy.
+
+        Few, cheap filters on a copy at most ANALYSIS_MAX_WIDTH wide: the
+        graph runs serially per frame, so filter count matters more than
+        pixel count.
         """
         info, c = self.info, self.config
         rng = info.range_name
         uses = []
-        matrices = info.gamut_matrices
-        if c.levels:
-            uses += ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
         if c.black or c.levels:
             uses.append("mean")
         if self.flash_enabled:
             uses.append("flash")
         labels = "".join(f"[ar_{u}]" for u in uses)
-        reduce4 = "scale=w='max(1,trunc(iw/4))':h='max(1,trunc(ih/4))':flags=area"
         chains = [
             f"[0:{self.index}]scale=w='max(2,min({ANALYSIS_MAX_WIDTH},trunc(iw/{2 * ANALYSIS_MIN_FACTOR})*2))'"
             f":h=-2:flags=area:in_range={rng}:out_range={rng},format=yuv444p,"
             f"split={len(uses)}{labels}"]
-        if c.levels:
-            m1, m2, m3 = _luma_mask_expressions(info)
-            for k, matrix in enumerate(matrices):
-                chains += self._gamut_chains(k, matrix)
-            chains += self._gamut_combined(len(matrices), reduce4)
-            chains += [
-                f"[ar_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p,lutyuv=y='{m1}':u='{m2}':v='{m3}',"
-                f"{reduce4},signalstats,{','.join(self._luma_prints())},nullsink",
-            ]
         if c.black or c.levels:
             # Without the flash output this branch is the graph's output.
             tail = "nullsink" if self.flash_enabled else "null[vs_area]"
@@ -871,7 +1021,7 @@ class VideoAnalysis:
                       for d in INTERLACE_DISPLACEMENTS]
             series.displacement = [field_displacement(dict(zip(INTERLACE_DISPLACEMENTS, values)))
                                    for values in zip(*errors)]
-        if self.needs_area_branch and self.config.levels:
+        if self.needs_levels_branch:
             def fraction(name: str) -> List[float]:
                 return sparse(name, 0.0, lambda v: _to_float(v) / 255.0)
             series.luma, series.band1, series.band2 = fraction("luma"), fraction("band1"), fraction("band2")
@@ -1314,7 +1464,7 @@ def range_plausibility(series: VideoSeries, full_range: bool) -> Optional[str]:
     range at 0 and 255. Mis-tagging shows as crushed or washed-out pictures
     on every correctly behaving player.
 
-    * Tagged limited: deep sub-black (<= code 10 after averaging) over more
+    * Tagged limited: deep sub-black (<= code 10 after the R 103 filter) over more
       than 1 % of the picture in at least a quarter of the frames is not
       overshoot or noise - it is full-range black.
     * Tagged full: no frame ever uses codes below 12 or above 241, yet in at
@@ -1346,7 +1496,7 @@ def range_plausibility(series: VideoSeries, full_range: bool) -> Optional[str]:
 
 def assess_levels(series: VideoSeries, fps: float, full_range: bool,
                   gamut_matrices: Sequence[str] = ()) -> LevelsFindings:
-    """EBU R 103 v3.0 luma and RGB-gamut tolerance on the averaged copy.
+    """EBU R 103 v3.0 luma and RGB-gamut tolerance on the R 103-filtered picture.
 
     A frame violates when more than 1 % of its picture lies outside the
     preferred range (luma 5-246 / 20-984; R, G and B -5 % .. 105 %); an event
@@ -1414,8 +1564,8 @@ def levels_entry(findings: LevelsFindings, mode: str, full_range: bool) -> Tuple
     if mode == "report":
         return "PASS", "Not enforced: " + detail, 100
     peak = max([e.peak for e in findings.luma + findings.gamut] or [0.0])
-    # Near the 1 % limit the result depends on the averaging approximation
-    # of the R 103 filter: keep confidence below 70 there.
+    # Near the 1 % limit coding noise can tip the share either way: keep
+    # confidence below 70 there.
     confident = peak >= 2 * R103_AREA or bool(findings.range_hint and peak >= R103_AREA)
     if mode == "essential":
         return "FAIL", detail, 85 if confident else 60
