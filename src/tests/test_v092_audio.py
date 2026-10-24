@@ -302,3 +302,31 @@ class TestAmbisonicPeaksAndHeadLocked:
         assert audio_checks.channel_names(track, 6, ambisonic=True) == ["W", "Y", "Z", "X", "HL-L", "HL-R"]
         assert audio_checks.stereo_pairs(track, audio_checks.channel_names(track, 6, True), True) == \
             [(4, 5, "HL-L/HL-R")]
+
+
+# ---------------------------------------------------------------------------
+# 6. The phase check keeps its own end marker (review B1)
+# ---------------------------------------------------------------------------
+
+@needs_ffmpeg
+class TestPhaseEndMarker:
+    def test_a_short_antiphase_section_ends_where_it_ends(self, media):
+        """2.2 s of anti-phase (2.0-4.2 s) in a 6 s clip: the start recorder's
+        ametadata=mode=delete stripped out_phase_end, so every region ran to
+        the end of the file ("4.0 s, 67 %, polarity-inverted")."""
+        left = "0.1*(random(0)-0.5)"
+        right = "if(between(t,2,4.2),-0.09,0.09)*(random(0)-0.5)"
+        clip = media.get("phase_section", lambda p: make_audio(p, [left, right], seconds=6))
+        row = _row(_scan(clip), "Audio Phase")
+        assert row[1] == "WARN", row
+        assert "4.0s" not in row[2] and "polarity-inverted" not in row[2], row
+        assert "00:00:02.0" in row[2], row
+
+    def test_the_end_recorder_sees_the_end_key(self):
+        chains = audio_checks._phase_chains(0, {"channel_layout": "stereo"}, ["FL", "FR"],
+                                            dict(DEFAULT_CONFIG), False,
+                                            audio_checks.MeasurementFiles("/tmp"))
+        chain = chains[0][1]
+        start = chain.index("out_phase_start")
+        end = chain.index("out_phase_end")
+        assert "mode=delete" not in chain[start:end], chain

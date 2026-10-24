@@ -588,16 +588,19 @@ class MeasurementFiles:
             return handle.read()
 
 
-def _record(instance: str, files: Optional[MeasurementFiles], key: Optional[str] = None) -> str:
+def _record(instance: str, files: Optional[MeasurementFiles], key: Optional[str] = None,
+            strip: bool = True) -> str:
     """Filters after a detector that copy its frame metadata to the
     instance's file, then strip it so the next detector's file holds only
-    its own events. Nothing without a directory (the rows then report not
-    verified)."""
+    its own events. ``strip=False`` keeps the metadata for a second
+    recorder of the same detector (mode=delete removes every key, not just
+    the one printed). Nothing without a directory (the rows then report
+    not verified)."""
     if files is None:
         return ""
     selector = f":key={key}" if key else ""
     return (f",ametadata=mode=print{selector}:file={_filter_path(files.path(instance))}"
-            f",ametadata=mode=delete")
+            + (",ametadata=mode=delete" if strip else ""))
 
 
 def _phase_angle(cfg: dict) -> float:
@@ -705,7 +708,9 @@ def _phase_chains(i: int, track: dict, names: Sequence[str], cfg: dict, ambisoni
             f"[a{i}q{j}]pan=stereo|c0=c{left}|c1=c{right},"
             f"aphasemeter@a{i}p{j}=video=0:phasing=1:angle={_phase_angle(cfg):.4f}"
             f":duration={_number(cfg, 'phase_min_duration'):g}"
-            + _record(f"aphasemeter@a{i}p{j}.start", files, "lavfi.aphasemeter.out_phase_start")
+            # The start recorder must not strip: out_phase_end rides the same frames.
+            + _record(f"aphasemeter@a{i}p{j}.start", files, "lavfi.aphasemeter.out_phase_start",
+                      strip=False)
             + _record(f"aphasemeter@a{i}p{j}.end", files, "lavfi.aphasemeter.out_phase_end")
             + ",anullsink")))
     return chains
@@ -1514,8 +1519,9 @@ def _file_values(evidence: ScanEvidence, instance: str) -> List[float]:
 
 def phase_events(evidence: ScanEvidence, ctx: TrackContext, j: int) -> Events:
     """aphasemeter's sustained out-of-phase regions of pair ``j``, from its
-    start and end files; a region still open at the end of the stream (its
-    end is only logged, never attached to a frame) closes at the track end."""
+    start and end files; only a region still open at the end of the stream
+    (its end is only logged, never attached to a frame) closes at the track
+    end."""
     base = f"aphasemeter@a{ctx.position}p{j}"
     marks = sorted([(t, 0) for t in _file_values(evidence, f"{base}.start")]
                    + [(t, 1) for t in _file_values(evidence, f"{base}.end")])
