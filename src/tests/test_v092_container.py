@@ -495,3 +495,41 @@ class TestSwitchedOffEssentials:
         from frameguard.report import spec_rows
         rows = dict(spec_rows(dict(DEFAULT_CONFIG, disabled_checks=["Codec Profile", "Edit List"])))
         assert "Codec Profile (essential: not verified)" in rows["Checks switched off"], rows
+
+
+# ---------------------------------------------------------------------------
+# 6. Quest presets: codecs Meta names for 180/360 (B17); Media Studio's mono max (B18)
+# ---------------------------------------------------------------------------
+
+QUEST_360 = ("8k360", "360tb5760", "360tb3840")
+
+
+def _video_probe(codec, profile, width, height, fps="30/1", level=-99):
+    return {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"},
+            "streams": [{"index": 0, "codec_type": "video", "codec_name": codec, "profile": profile,
+                         "pix_fmt": "yuv420p", "width": width, "height": height, "avg_frame_rate": fps,
+                         "r_frame_rate": fps, "level": level}]}
+
+
+class TestQuestCodecs:
+    @pytest.mark.parametrize("key", QUEST_360)
+    def test_h264_is_refused_at_quest_360_sizes(self, key):
+        from frameguard import core
+        cfg = dict(DEFAULT_CONFIG, **core.preset_config(key))
+        rows = _Rows()
+        core.check_video_codec(_video_probe("h264", "High", cfg["target_width"], cfg["target_height"]), rows, cfg)
+        assert rows.checks[0][1] == "FAIL", rows.checks
+
+    @pytest.mark.parametrize("key", QUEST_360)
+    def test_hevc_main_and_av1_main_pass_and_444_profiles_fail(self, key):
+        from frameguard import core
+        cfg = dict(DEFAULT_CONFIG, **core.preset_config(key))
+        size = (cfg["target_width"], cfg["target_height"])
+        for codec, profile in (("hevc", "Main"), ("av1", "Main")):
+            rows = _Rows()
+            core.check_video_codec(_video_probe(codec, profile, *size), rows, cfg)
+            cc.check_codec_profile(_video_probe(codec, profile, *size), rows, cfg)
+            assert [c[1] for c in rows.checks] == ["PASS", "PASS"], rows.checks
+        rows = _Rows()
+        cc.check_codec_profile(_video_probe("hevc", "Rext", *size), rows, cfg)
+        assert rows.checks[0][1] == "FAIL", rows.checks

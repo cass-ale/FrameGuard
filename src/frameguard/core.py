@@ -118,13 +118,20 @@ except ImportError:
 # (16:9, flat); an 8K 360 equirect is 7680x3840 (2:1) and has its own preset.
 
 # Meta Quest 360 delivery (Meta Media Studio 360/180 video requirements; Meta
-# Horizon OS media requirements): MP4, H.264/HEVC, "Yuv 420p", SAR 1:1,
-# 30 or 60 fps, hardware decode limit 8192x4096 at 60 fps. Fast-start is
-# YouTube's and every streaming player's requirement.
+# Horizon OS "Media requirements and guidelines for streaming apps"): MP4,
+# "Yuv 420p", SAR 1:1, 30 or 60 fps, hardware decode limit 8192x4096 at
+# 60 fps. Codec: Horizon OS gives 180/360 video encoding as "h.265 or AV1
+# (AV1 will work on Quest 3 and above only)"; H.264 is listed for 2D only,
+# and every Quest 360 size needs H.264 Level 6.x (ITU-T H.264 Table A-1:
+# 3840x3840 is 57 600 macroblocks against Level 5.2's MaxFS of 36 864),
+# beyond common hardware decoders. Main profile keeps 4:2:0 8-bit (a 4:4:4
+# profile can still carry yuv420p). Fast-start is YouTube's and every
+# streaming player's requirement.
 _QUEST_360_DELIVERY = {
     "required_projection": "equirectangular",
     "accepted_containers": [".mp4"],
-    "accepted_codecs": ["h264", "hevc"],
+    "accepted_codecs": ["hevc", "av1"],
+    "allowed_video_profiles": ["Main"],
     "allowed_pix_fmts": ["yuv420p"],
     "require_square_pixels": True,
     "require_faststart": True,
