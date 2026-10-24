@@ -23,7 +23,8 @@ def media(tmp_path_factory):
 def _uniform_noise(rms_dbfs: float, seed: int) -> str:
     """Independent white noise at an RMS level: uniform on [-a/2, a/2] has
     RMS a / (2 sqrt 3). ``random(i)`` starts from the variable's value, so
-    each stream is seeded once at the first sample."""
+    each stream is seeded once at the first sample. The seed is a statement
+    ("...;"), so other terms must follow the noise: "<noise>+<tone>"."""
     amplitude = 10 ** (rms_dbfs / 20.0) * 2 * 3 ** 0.5
     return f"if(eq(n,0),st({seed},{seed * 7919 + 13}));{amplitude:.8g}*(random({seed})-0.5)"
 
@@ -422,3 +423,41 @@ class TestDialogueGatedTarget:
         rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG, loudness_mode="essential",
                                                         loudness_profile="netflix"))))
         assert "Netflix -27" in rows["Loudness"] and "warn only" in rows["Loudness"], rows["Loudness"]
+
+
+# ---------------------------------------------------------------------------
+# 10. Hum: mains tolerance (EN 50160, +-1 %) and the harmonic series (held-out h19)
+# ---------------------------------------------------------------------------
+
+def _harmonic_tone(f0, amps):
+    return "+".join(f"{a}*sin(2*PI*{f0 * (k + 1):g}*t)" for k, a in enumerate(amps))
+
+
+ORGAN = _harmonic_tone(58.27, (0.1, 0.05, 0.03))    # sustained B-flat-1 with its harmonics
+
+
+@needs_ffmpeg
+class TestHumFrequencyAndHarmonics:
+    def test_a_58_hz_bass_note_is_not_60_hz_hum(self, media):
+        """58.27 Hz is 2.9 % below 60 Hz, outside any mains tolerance; it
+        leaked through 0.9.1's 2 Hz-wide band as "60 Hz tone at -43 dBFS"."""
+        exprs = [f"{_uniform_noise(-50, 1)}+{ORGAN}", f"{_uniform_noise(-50, 2)}+{ORGAN}"]
+        clip = media.get("organ58", lambda p: make_audio(p, exprs, seconds=6))
+        row = _row(_scan(clip), "Audio Hum")
+        assert row[1] == "PASS", row
+
+    def test_hum_inside_the_mains_tolerance_is_found(self, media):
+        """60.4 Hz (+0.67 %, inside EN 50160's +-1 %) with its 2nd and 3rd harmonics."""
+        hum = _harmonic_tone(60.4, (0.014, 0.005, 0.004))
+        exprs = [f"{NOISE}+{hum}", f"{_uniform_noise(-30, 3)}+{hum}"]
+        clip = media.get("hum604", lambda p: make_audio(p, exprs, seconds=6))
+        row = _row(_scan(clip), "Audio Hum")
+        assert row[1] == "WARN" and "60 Hz" in row[2] and "harmonic" in row[2], row
+
+    def test_a_lone_mains_frequency_sine_is_not_hum(self, media):
+        """No 2f/3f: a test tone or a synth note at 50 Hz, not mains hum."""
+        exprs = [f"{_uniform_noise(-30, 1)}+0.014*sin(2*PI*50*t)",
+                 f"{_uniform_noise(-30, 2)}+0.014*sin(2*PI*50*t)"]
+        clip = media.get("pure50", lambda p: make_audio(p, exprs, seconds=6))
+        row = _row(_scan(clip), "Audio Hum")
+        assert row[1] == "PASS" and "harmonic" in row[2], row

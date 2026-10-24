@@ -35,8 +35,9 @@ Measurements and the standard each threshold comes from:
 * Dual mono: L-R residual below -90 dBFS (Qualify AQ-103), or a Pearson
   correlation of at least 0.999 for lossy tracks whose residual is coding
   noise.
-* DC offset (advisory; no Qualify test exists) and 50/60 Hz hum (Qualify
-  AQ-118 "50/60 Hz +-1 Hz", thresholds inferred).
+* DC offset (advisory; no Qualify test exists) and 50/60 Hz hum: a steady
+  tone within the mains-frequency tolerance (EN 50160: +-1 %) together with
+  its 2nd or 3rd harmonic (see hum_row).
 """
 
 import math
@@ -202,10 +203,21 @@ PHASE_INVERTED_SHARE = 0.5    # out of phase for half the active programme
 # +0.37 inverted reads -0.37, a 2.0 LU loss. The value is a setting
 # (phase_correlation_min).
 HUM_FREQUENCIES = (50, 60)
-HUM_RATE = 1000
-HUM_BAND_HZ = 2               # each band: three cascaded 2 Hz-wide biquads
-HUM_NEIGHBOUR_HZ = 6          # reference bands 6 Hz either side of the mains tone
-HUM_PROMINENCE_DB = 6.0       # mains band at least 6 dB above both neighbours
+HUM_HARMONICS = (2, 3)        # at least one must stand out with the fundamental
+HUM_RATE = 1000               # 180 Hz (3 x 60) is well inside its 500 Hz Nyquist
+# EN 50160 (supply voltage characteristics) holds the mains frequency of an
+# interconnected system to 50 Hz +-1 % (99.5 % of a year); 60 Hz grids are
+# held tighter still. Each band (at the fundamental and at each harmonic,
+# whose tolerance scales with it) is three cascaded biquads with a
+# half-power width of HUM_BAND_SHARE of the band frequency, judged against
+# near bands 2 widths either side: a tone at the band frequency stands out
+# from both, and a tone x widths off ties with the near band at x = 1, so
+# the 6 dB prominence rule accepts tones within 0.86 widths (+-1.03 % of
+# the frequency) and rejects anything further off: a 58.27 Hz bass note
+# (2.9 % below 60 Hz) falls in the near band, not the mains band.
+HUM_BAND_SHARE = 0.012
+HUM_NEAR_WIDTHS = 2
+HUM_PROMINENCE_DB = 6.0       # mains band at least 6 dB above both near bands
 HUM_STATIONARY_DB = 6.0       # 1 s RMS trough within 6 dB of the mean
 EDGE_MARGIN_S = 0.05          # dropouts this close to either end are fades
 # Line-up idents interrupt a steady tone on purpose: GLITS (BBC; also the
@@ -743,25 +755,43 @@ def _phase_chains(i: int, track: dict, names: Sequence[str], cfg: dict, ambisoni
     return chains
 
 
+def _hum_band_name(freq: int, harmonic: int, tag: str) -> str:
+    """"60c" for the fundamental band (0.9.1's names), "60x2l" for harmonics."""
+    return f"{freq}{'' if harmonic == 1 else f'x{harmonic}'}{tag}"
+
+
+def _hum_bands() -> List[Tuple[str, float, float]]:
+    """(name, centre Hz, half-power width Hz) of every hum band."""
+    bands = []
+    for freq in HUM_FREQUENCIES:
+        for harmonic in (1,) + HUM_HARMONICS:
+            centre = freq * harmonic
+            width = HUM_BAND_SHARE * centre
+            near = HUM_NEAR_WIDTHS * width
+            for tag, offset in (("c", 0.0), ("l", -near), ("u", near)):
+                bands.append((_hum_band_name(freq, harmonic, tag), centre + offset, width))
+    return bands
+
+
 def _hum_chains(i: int, names: Sequence[str], cfg: dict, ambisonic: bool,
                 files: Optional[MeasurementFiles], lfe: frozenset = frozenset()) -> List[str]:
-    """``[a<N>h]`` -> 2 Hz bands at 50/60 Hz and 6 Hz either side, each
-    band's RMS per 1 s window written to a file (``astats@a<N>h<F><tag>``).
-    44-66 Hz bands need no more than a 1 kHz rate: resampling first makes the
-    18 biquads 48 times cheaper and better conditioned."""
+    """``[a<N>h]`` -> narrow bands at 50/60 Hz and their 2nd and 3rd
+    harmonics, each with near bands either side (see HUM_BAND_SHARE), each
+    band's RMS per 1 s window written to a file (``astats@a<N>h<band>``).
+    Bands up to 198 Hz need no more than a 1 kHz rate: resampling first makes
+    the biquads 48 times cheaper and better conditioned."""
     mix = _hum_mix(names, ambisonic, lfe)
     if not check_enabled(cfg, HUM) or (len(names) != 1 and not mix):
         return []
-    bands = [(freq, tag, freq + offset) for freq in HUM_FREQUENCIES
-             for tag, offset in (("c", 0), ("l", -HUM_NEIGHBOUR_HZ), ("u", HUM_NEIGHBOUR_HZ))]
-    outputs = "".join(f"[a{i}h{freq}{tag}]" for freq, tag, _ in bands)
+    bands = _hum_bands()
+    outputs = "".join(f"[a{i}h{name}]" for name, _, _ in bands)
     chains = [f"[a{i}h]{mix + ',' if mix else ''}aresample={HUM_RATE},asplit={len(bands)}{outputs}"]
     chains.extend(
-        f"[a{i}h{freq}{tag}]{_bandpass(centre, HUM_BAND_HZ)},asetnsamples=n={HUM_RATE}:p=0,"
-        f"astats@a{i}h{freq}{tag}=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none"
-        + _record(f"astats@a{i}h{freq}{tag}", files, "lavfi.astats.1.RMS_level")
+        f"[a{i}h{name}]{_bandpass(centre, width)},asetnsamples=n={HUM_RATE}:p=0,"
+        f"astats@a{i}h{name}=metadata=1:reset=1:measure_perchannel=RMS_level:measure_overall=none"
+        + _record(f"astats@a{i}h{name}", files, "lavfi.astats.1.RMS_level")
         + ",anullsink"
-        for freq, tag, centre in bands)
+        for name, centre, width in bands)
     return chains
 
 
@@ -961,7 +991,7 @@ _EVIDENCE_RE = re.compile(r"\[astats@a\d+[sp]\d* @ |\[loudnorm@a\d+ @ "
 # are diagnostics, not evidence (with thousands of dropouts they would
 # otherwise crowd the summaries out of the bounded capture).
 _FILE_ROUTED_RE = re.compile(r"\[(?:silencedetect@a\d+[a-z]?\d*|aphasemeter@a\d+p\d+"
-                             r"|astats@a\d+h\d+[clu]) @ ")
+                             r"|astats@a\d+h\d+(?:x\d)?[clu]) @ ")
 
 
 def is_file_routed_line(line: str) -> bool:
@@ -1789,41 +1819,69 @@ def _mean_level(levels: Sequence[float]) -> Optional[float]:
     return 10 * math.log10(power) if power > 0 else -math.inf
 
 
-def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
-    """Mains hum: a steady tone in a 2 Hz band at 50 or 60 Hz.
+def _band_prominence(evidence: ScanEvidence, ctx: TrackContext, freq: int, harmonic: int
+                     ) -> Tuple[Optional[float], Optional[float], List[float]]:
+    """(level dBFS, prominence over the near bands dB, 1 s windows) of one band."""
+    windows = {tag: _band_windows(evidence, f"astats@a{ctx.position}h{_hum_band_name(freq, harmonic, tag)}")
+               for tag in ("c", "l", "u")}
+    level = _mean_level(windows["c"])
+    near = [_mean_level(windows[t]) for t in ("l", "u")]
+    if level is None or any(n is None for n in near):
+        return None, None, []
+    if not math.isfinite(level):
+        return level, None, windows["c"]
+    return level, level - max(n if math.isfinite(n) else -math.inf for n in near), windows["c"]
 
-    The mains band must stand ``HUM_PROMINENCE_DB`` above both 2 Hz bands
-    6 Hz away (broadband programme fills all three alike; a tone fills one),
-    sit above ``hum_min_db``, and be steady: its quietest 1 s window within
-    6 dB of its mean, which a bass line or a passing note is not. The rules
-    and the -65 dBFS floor are inferred (Qualify AQ-118 publishes only
-    "50/60 Hz +-1 Hz"), so the result is advisory with confidence below 70.
+
+def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
+    """Mains hum: a steady tone at 50 or 60 Hz, within the mains tolerance,
+    with its harmonic series.
+
+    The fundamental band must stand ``HUM_PROMINENCE_DB`` above both near
+    bands (broadband programme fills all three alike; a tone off the mains
+    frequency fills a near band; see HUM_BAND_SHARE), sit above
+    ``hum_min_db``, and be steady: its quietest 1 s window within 6 dB of
+    its mean, which a bass line or a passing note is not. At least one of
+    the 2nd and 3rd harmonics must stand out the same way: hum is induced
+    by the supply and by transformer and rectifier currents, whose waveform
+    is never a pure sine (EN 50160 itself bounds the supply's 3rd harmonic
+    at 5 %), whereas a lone sine at 50/60 Hz is a test tone or a synth note.
+    The -65 dBFS floor is inferred, so the result is advisory (confidence
+    below 70).
     """
     floor = _number(cfg, "hum_min_db")
-    found, measured = [], []
+    found, measured, lone = [], [], []
     for freq in HUM_FREQUENCIES:
-        windows = {tag: _band_windows(evidence, f"astats@a{ctx.position}h{freq}{tag}")
-                   for tag in ("c", "l", "u")}
-        level = _mean_level(windows["c"])
-        neighbours = [_mean_level(windows[t]) for t in ("l", "u")]
-        if level is None or any(n is None for n in neighbours):
+        level, prominence, windows = _band_prominence(evidence, ctx, freq, 1)
+        if level is None:
             continue
         if not math.isfinite(level):
             measured.append(f"{freq} Hz silent")
             continue
-        prominence = level - max(n if math.isfinite(n) else -math.inf for n in neighbours)
         measured.append(f"{freq} Hz {level:.1f} dBFS")
-        trough = min(windows["c"])
+        trough = min(windows)
         steady = math.isfinite(trough) and level - trough <= HUM_STATIONARY_DB
-        if level >= floor and prominence >= HUM_PROMINENCE_DB and steady:
+        if not (level >= floor and prominence >= HUM_PROMINENCE_DB and steady):
+            continue
+        harmonics = []
+        for harmonic in HUM_HARMONICS:
+            h_level, h_prominence, _ = _band_prominence(evidence, ctx, freq, harmonic)
+            if h_prominence is not None and h_prominence >= HUM_PROMINENCE_DB:
+                harmonics.append(f"{freq * harmonic} Hz at {h_level:.1f} dBFS")
+        if harmonics:
             found.append(f"{freq} Hz tone at {level:.1f} dBFS, {prominence:.1f} dB above the bands "
-                         f"±{HUM_NEIGHBOUR_HZ} Hz, steady throughout")
+                         f"±{HUM_NEAR_WIDTHS * HUM_BAND_SHARE * 100:.1f} % away, steady throughout, "
+                         f"with harmonic(s) {', '.join(harmonics)}")
+        else:
+            lone.append(f"{freq} Hz")
     if not measured:
         return "WARN", _with_label(ctx.label, "Not verified: hum bands were not measured."), 100
     if found:
         return "WARN", _with_label(ctx.label, "Possible mains hum: " + "; ".join(found) + "."), LOW_CONFIDENCE
-    return "PASS", _with_label(ctx.label, f"No steady 50/60 Hz tone ({', '.join(measured)}; "
-                                          f"floor {floor:g} dBFS)."), 100
+    lone_text = (f"; steady {' and '.join(lone)} tone without a 2nd or 3rd harmonic (a test tone or "
+                 f"note, not mains hum)" if lone else "")
+    return "PASS", _with_label(ctx.label, f"No mains hum ({', '.join(measured)}; floor {floor:g} "
+                                          f"dBFS){lone_text}."), 100
 
 
 # ---------------------------------------------------------------------------
