@@ -231,9 +231,13 @@ HUM_STATIONARY_DB = 6.0       # 1 s RMS trough within 6 dB of the mean
 EDGE_MARGIN_S = 0.05          # dropouts this close to either end are fades
 # Line-up idents interrupt a steady tone on purpose: GLITS (BBC; also the
 # stereo part of EBU Tech 3304's BLITS) cuts L once and R twice for 250 ms
-# in a 4 s cycle of 1 kHz at -18 dBFS. A gap in this range with a steady
-# sinusoid on both sides is the ident, not a dropout.
+# in a 4 s cycle of 1 kHz at -18 dBFS: L at 0 s, R at 0.5 s and 1.0 s, one
+# channel at a time. A gap is set aside as the ident only when it fits that
+# pattern (see _glits_gaps); any other gap in a tone is a dropout in the
+# line-up. BLITS' per-channel 5.1 sequence is not recognised.
 LINEUP_GAP_S = (0.20, 0.30)
+GLITS_STEP_S = 0.5            # L gap -> first R gap -> second R gap
+GLITS_STEP_TOLERANCE_S = 0.06
 LINEUP_TONE_MIN_S = 0.08      # shortest steady-tone stretch the detector reports
 LINEUP_BEFORE_S = 0.15        # the tone must end within this of the gap start
 LINEUP_AFTER_S = 0.25         # ...and resume within this of its end (onset settling)
@@ -1808,22 +1812,72 @@ def _inside_steady_tone(tones: Events, start: float, end: float) -> bool:
     return before and after
 
 
+def _glits_pair(ctx: TrackContext) -> Optional[Tuple[int, int]]:
+    """The channels GLITS runs on: the L/R pair (FL/FR, or a 2-channel track)."""
+    pairs = stereo_pairs(ctx.track, ctx.names, ctx.ambisonic)
+    return (pairs[0][0], pairs[0][1]) if pairs else None
+
+
+def _glits_gaps(gaps: Dict[int, Events], dropouts: Dict[int, Events],
+                pair: Optional[Tuple[int, int]]) -> set:
+    """(channel, start) of the 200-300 ms in-tone gaps that fit GLITS: on L
+    or R only, the other channel not interrupted at the same time, and an L
+    gap followed by an R gap 0.5 s later, or an R gap with its sibling R gap
+    0.5 s before or after (the L gap of a cycle that starts the file sits in
+    the edge margin)."""
+    if pair is None:
+        return set()
+    left, right = pair
+
+    def near(starts, t):
+        return any(abs(s - t) <= GLITS_STEP_TOLERANCE_S for s in starts)
+
+    def alone(channel, start, dur):
+        other = right if channel == left else left
+        return not any(s < start + dur and start < s + d for s, d in dropouts.get(other, []))
+
+    right_starts = [s for s, _ in gaps.get(right, [])]
+    found = set()
+    for start, dur in gaps.get(left, []):
+        if alone(left, start, dur) and near(right_starts, start + GLITS_STEP_S):
+            found.add((left, start))
+    for start, dur in gaps.get(right, []):
+        if alone(right, start, dur) and (near(right_starts, start + GLITS_STEP_S)
+                                         or near(right_starts, start - GLITS_STEP_S)):
+            found.add((right, start))
+    return found
+
+
 def _dropout_candidates(evidence: ScanEvidence, ctx: TrackContext,
                         cfg: dict) -> Tuple[List[Tuple[float, float, int, bool]], int]:
     """(start, duration, channel, inside a steady tone) per candidate, and
     the number of line-up ident gaps set aside."""
     longest = float(cfg["silence_duration"])
     candidates, lineup = [], 0
+    pair = _glits_pair(ctx)
+    # Every channel's raw dropouts (for "one channel at a time") and its
+    # ident-shaped gaps, edge ones included, before anything is set aside.
+    raw: Dict[int, Events] = {}
+    ident_shaped: Dict[int, Events] = {}
+    tones_by_channel: Dict[int, Events] = {}
+    for k in range(len(ctx.names)):
+        if k in ctx.lfe or k in ctx.dead_channels:
+            continue
+        tones_by_channel[k] = evidence.silence_events(f"silencedetect@a{ctx.position}t{k}", ctx.duration,
+                                                      DROPOUT_JOIN_S)
+        raw[k] = evidence.silence_events(f"silencedetect@a{ctx.position}d{k}", ctx.duration,
+                                         DROPOUT_JOIN_S)
+        ident_shaped[k] = [(s, d) for s, d in raw[k] if LINEUP_GAP_S[0] <= d <= LINEUP_GAP_S[1]
+                           and _inside_steady_tone(tones_by_channel[k], s, s + d)]
+    glits = _glits_gaps(ident_shaped, raw, pair)
     for k in range(len(ctx.names)):
         if k in ctx.lfe or k in ctx.dead_channels:
             continue
         silences = evidence.silence_events(f"silencedetect@a{ctx.position}c{k}", ctx.duration)
         # Short gaps 250 ms apart (GLITS R) are separate events: the 0.25 s
         # merge used for long silences would fuse them.
-        tones = evidence.silence_events(f"silencedetect@a{ctx.position}t{k}", ctx.duration,
-                                        DROPOUT_JOIN_S)
-        for start, dur in evidence.silence_events(f"silencedetect@a{ctx.position}d{k}",
-                                                  ctx.duration, DROPOUT_JOIN_S):
+        tones = tones_by_channel[k]
+        for start, dur in raw[k]:
             end = start + dur
             if dur >= longest or start < EDGE_MARGIN_S:
                 continue
@@ -1833,7 +1887,7 @@ def _dropout_candidates(evidence: ScanEvidence, ctx: TrackContext,
                    for s, d in silences):
                 continue
             in_tone = _inside_steady_tone(tones, start, end)
-            if in_tone and LINEUP_GAP_S[0] <= dur <= LINEUP_GAP_S[1]:
+            if (k, start) in glits:
                 lineup += 1
                 continue
             candidates.append((start, dur, k, in_tone))
@@ -1847,8 +1901,9 @@ def dropout_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
     long (-70 dB, >= silence_duration) silence of the same channel and does
     not sit at either end of the track. Regions of different channels that
     overlap are one event. A 200-300 ms gap with a steady sinusoid on both
-    sides is a line-up ident interruption (GLITS) and is not reported; any
-    other gap inside a tone still is, as a dropout in the line-up.
+    sides that fits the GLITS pattern (_glits_gaps) is a line-up ident
+    interruption and is not reported; any other gap inside a tone still is,
+    as a dropout in the line-up.
     """
     longest = float(cfg["silence_duration"])
     candidates, lineup = _dropout_candidates(evidence, ctx, cfg)

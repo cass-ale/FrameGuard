@@ -615,3 +615,27 @@ class TestMeterSelfTest:
             # The bundled arm64 9.0.2: broken >2-channel K-weighting, and a
             # true peak that over-reads 12-16 kHz by about 1 dB.
             assert verdict is False and test.true_peak_error_db > 0.2
+
+
+# ---------------------------------------------------------------------------
+# 12c. Line-up ident exemption follows the real GLITS pattern (review B10)
+# ---------------------------------------------------------------------------
+
+@needs_ffmpeg
+class TestGlitsPattern:
+    TONE400 = "0.1259*sin(2*PI*400*t)"
+
+    def test_a_simultaneous_l_r_gap_in_a_tone_is_a_dropout(self, media):
+        """GLITS interrupts one channel at a time; a 250 ms gap on both
+        channels at once was set aside as "line-up ident interruption"."""
+        gap = f"if(between(t,2,2.25),0,{self.TONE400})"
+        clip = media.get("tone400_both", lambda p: make_audio(p, [gap, gap]))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "line-up ident" not in row[2], row
+
+    def test_an_isolated_one_channel_gap_is_a_dropout(self, media):
+        """One 250 ms gap on R with no partner gap 0.5 s away is not GLITS."""
+        right = f"if(between(t,2,2.25),0,{self.TONE400})"
+        clip = media.get("tone400_r", lambda p: make_audio(p, [self.TONE400, right]))
+        row = _row(_scan(clip), "Audio Dropouts")
+        assert row[1] == "WARN" and "FR" in row[2], row
