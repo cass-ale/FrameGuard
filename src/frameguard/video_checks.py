@@ -1143,6 +1143,10 @@ class VideoAnalysis:
         by_pts = {e[1]: k for k, e in enumerate(master)}
 
         def sparse(name: str, default, convert, table=by_frame, key: int = 0) -> list:
+            if not os.path.exists(self.paths[name]):
+                # The metadata filter creates its file when the graph starts,
+                # so a missing file means this measurement never ran.
+                series.missing.add(name)
             values = [default] * len(master)
             for entry in read_print_entries(self.paths[name], cancel):
                 position = table.get(entry[key])
@@ -1272,6 +1276,8 @@ class VideoSeries:
     # (start, end or None while open) black runs from blackdetect's frame
     # marks; None when FFmpeg wrote no mark file (the detector did not run).
     black_runs: Optional[List[Tuple[float, Optional[float]]]] = None
+    # Measurement files FFmpeg did not write (the measurement never ran).
+    missing: set = field(default_factory=set)
 
     def align(self) -> None:
         """Truncate every non-empty series to the shortest one.
@@ -2448,6 +2454,9 @@ def _report_freeze(result, config, series, duration, fps, black, decoded, reason
     if decoded and not series.mafd:
         result.add_not_verified(FREEZE, reason)
         return
+    if decoded and "struct" in series.missing:
+        result.add_not_verified(FREEZE, "FFmpeg wrote no structural-change measurements.")
+        return
     side = analysis.structural_side_factor if analysis is not None else 16.0
     findings = detect_freezes(series.mafd, series.times, fps, config.freeze_duration,
                               duration, black, structural=series.structural or None,
@@ -2460,6 +2469,10 @@ def _report_freeze(result, config, series, duration, fps, black, decoded, reason
     _add(result, FREEZE, *freeze_entry(findings, duration, config))
 
 
+def full_range_of(analysis) -> bool:
+    return bool(analysis is not None and analysis.info.full_range)
+
+
 def _report_levels(result, config, series, analysis, fps, decoded, reason) -> None:
     if not config.levels:
         result.add_skip(LEVELS, "Not measured (switched off in the settings).")
@@ -2469,6 +2482,12 @@ def _report_levels(result, config, series, analysis, fps, decoded, reason) -> No
         return
     if decoded and not series.gam:
         result.add_not_verified(LEVELS, reason)
+        return
+    written = {"luma", "band1", "gam_r", "gam_g", "gam_b"} | ({"band2"} if full_range_of(analysis) else set())
+    lost = series.missing & written
+    if decoded and lost:
+        result.add_not_verified(LEVELS, "FFmpeg wrote no R 103 measurements "
+                                        f"({', '.join(sorted(lost))}).")
         return
     full = analysis.info.full_range if analysis is not None else False
     matrices = analysis.info.gamut_matrices if analysis is not None else ()
@@ -2517,6 +2536,12 @@ def _report_interlace(result, config, series, analysis, video, fps, decoded, rea
         return
     if decoded and not series.idet:
         result.add_not_verified(INTERLACE, reason)
+        return
+    lost = series.missing & ({"idet", "idet1", "rep_top", "rep_bottom"}
+                             | {_disp_name(d) for d in INTERLACE_DISPLACEMENTS})
+    if decoded and lost:
+        result.add_not_verified(INTERLACE, "FFmpeg wrote no field measurements "
+                                           f"({', '.join(sorted(lost))}).")
         return
     field_order = str((video or {}).get("field_order") or "unknown").lower()
     findings = assess_interlace(series.idet, series.times, fps, field_order,

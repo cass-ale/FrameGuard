@@ -7,6 +7,7 @@ small clips with the bundled FFmpeg and run the full deep scan.
 """
 
 import math
+import os
 
 import pytest
 
@@ -896,3 +897,32 @@ class TestCfrNominalRate:
     def test_ntsc_rate(self):
         row, _ = _cfr([k * 1001 / 30000 for k in range(300)], "30000/1001", "1/30000")
         assert row[1] == "PASS" and "29.970" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# No FFmpeg summary -> Not verified, never PASS
+# ---------------------------------------------------------------------------
+
+@needs_ffmpeg
+class TestNoSummaryIsNotVerified:
+    def test_missing_measurement_files_are_not_verified(self, tmp_path, monkeypatch):
+        """FFmpeg decoded the frames but wrote none of a check's summaries
+        (an older build, a filter that did not run): those rows must say
+        Not verified."""
+        path = _clip(tmp_path / "clean.mp4", seconds=3)
+        real_collect = vc.VideoAnalysis.collect
+
+        def collect_without_summaries(self):
+            for name, file in self.paths.items():
+                if name != "mafd" and os.path.exists(file):
+                    os.remove(file)
+            return real_collect(self)
+
+        monkeypatch.setattr(vc.VideoAnalysis, "collect", collect_without_summaries)
+        result = _scan(path)
+        for name in (vc.FREEZE, vc.LEVELS, vc.INTERLACE):
+            row = _row(result, name)
+            assert row[1] == "WARN" and "not verified" in row[2].lower(), row
+        # Black Frames still has blackdetect's own log record (see TestBlackEvidence
+        # for the case where that is missing too).
+        assert _row(result, vc.BLACK)[1] == "PASS"
