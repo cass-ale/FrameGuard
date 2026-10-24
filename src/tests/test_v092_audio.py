@@ -244,3 +244,61 @@ class TestLayoutAwareFallbackMeter:
         clip = media.get("fb_2.1", lambda p: make_audio(p, [TONE_23, TONE_23, LOUD_LFE], layout="2.1"))
         result = _scan(clip, loudness_mode="essential")
         assert abs(result.metadata["true_peak_dbtp"] - (-6.0)) <= 0.2, result.metadata
+
+
+# ---------------------------------------------------------------------------
+# 4. Ambisonic true peak on every channel; head-locked stereo measured (review B5)
+# ---------------------------------------------------------------------------
+
+# fs/4 at 45 degrees: samples sit at A * 0.707, the true peak is A. A = 1.07
+# gives +0.6 dBTP with a -2.4 dBFS sample peak (EBU Tech 3341 case 16 shape).
+INTERSAMPLE_OVER = "1.07*sin(2*PI*12000*t+PI/4)"
+
+
+def _foa_with_head_locked(path, exprs):
+    from container_fixtures import add_to_sample_entry, sa3d
+    clip = make_audio(path, exprs, layout="5.1")
+    return add_to_sample_entry(clip, b"soun", sa3d(6, head_locked=True))
+
+
+@needs_ffmpeg
+class TestAmbisonicPeaksAndHeadLocked:
+    def test_true_peak_is_taken_on_every_component(self, media):
+        """An inter-sample over on X: 0.9.1 measured W alone and passed it."""
+        from media_fixtures import inject_spherical
+        clip = media.get("foa_over_x", lambda p: inject_spherical(make_audio(
+            p, [TONE_23, "0", "0", INTERSAMPLE_OVER], layout="4.0")))
+        result = _scan(clip, loudness_mode="essential")
+        # Tech 3341 allows -0.4 dB; the darwin-arm64 build over-reads 12 kHz
+        # (+1.2 here), so only the lower bound is asserted.
+        assert result.metadata["true_peak_dbtp"] >= 0.6 - 0.4, result.metadata
+        row = _row(result, "Audio True Peak")
+        assert row[1] == "FAIL" and row[3] >= 70, row
+        # Loudness is still the W-channel reading (-26.0 for a -23 dBFS W tone).
+        assert abs(result.metadata["integrated_loudness_lufs"] + 26.0) <= 0.15, result.metadata
+
+    def test_head_locked_stereo_is_its_own_programme(self, media):
+        """SA3D FOA + head-locked stereo (6 channels, FFmpeg layout
+        "ambisonic 1+stereo"): the narration on the head-locked pair was
+        invisible (W read -58 LUFS, Phase and Dual Mono skipped it)."""
+        bed = "0.001*sin(2*PI*300*t)"
+        clip = media.get("foa_hl", lambda p: _foa_with_head_locked(
+            p, [bed, "0", "0", "0", TONE_23, tone(1000, MINUS_23 * 0.5)]))
+        result = _scan(clip, loudness_mode="essential")
+        assert result.metadata["ambisonic_audio_tracks"] == [1]
+        loudness = _row(result, "Audio Loudness")
+        assert "head-locked stereo" in loudness[2] and "-25.0 LUFS" in loudness[2], loudness
+        assert "HL-L/HL-R" in _row(result, "Audio Phase")[2]
+        assert "HL-L/HL-R" in _row(result, "Dual Mono")[2]
+
+    def test_head_locked_over_fails_true_peak(self, media):
+        clip = media.get("foa_hl_over", lambda p: _foa_with_head_locked(
+            p, [TONE_23, "0", "0", "0", INTERSAMPLE_OVER, tone(1000, MINUS_23)]))
+        row = _row(_scan(clip, loudness_mode="essential"), "Audio True Peak")
+        assert row[1] == "FAIL", row
+
+    def test_names_of_a_head_locked_track(self):
+        track = {"channel_layout": "ambisonic 1+stereo", "channels": 6}
+        assert audio_checks.channel_names(track, 6, ambisonic=True) == ["W", "Y", "Z", "X", "HL-L", "HL-R"]
+        assert audio_checks.stereo_pairs(track, audio_checks.channel_names(track, 6, True), True) == \
+            [(4, 5, "HL-L/HL-R")]

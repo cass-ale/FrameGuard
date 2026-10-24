@@ -2518,9 +2518,10 @@ def _lines_with_context(text: str, name: str) -> str:
 # Scan plan
 # ---------------------------------------------------------------------------
 
-def _channel_names(track: dict, count: int, ambisonic: bool = False) -> List[str]:
+def _channel_names(track: dict, count: int, ambisonic: bool = False,
+                   head_locked: Optional[bool] = None) -> List[str]:
     """Channel names by layout (audio_checks.channel_names)."""
-    return audio_checks.channel_names(track, count, ambisonic)
+    return audio_checks.channel_names(track, count, ambisonic, head_locked)
 
 
 class _ScanPlan:
@@ -2544,6 +2545,8 @@ class _ScanPlan:
         self.multichannel_meter = audio_checks.METER_EBUR128
         self.ambisonic = frozenset(
             i for i, t in enumerate(self.audio) if audio_checks.is_ambisonic(t))
+        self.head_locked = frozenset(audio_checks.head_locked_positions(
+            self.audio, [None] * len(self.audio), sorted(self.ambisonic)))
         self.audio_files: Optional["audio_checks.MeasurementFiles"] = None
         self.graph_dir: Optional[str] = None
         self.graph_option = GRAPH_FILE_OPTION
@@ -2725,7 +2728,7 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     summary: List[str] = []
     units: List["audio_checks.MeasurementUnit"] = []
     for i, track in enumerate(plan.audio):
-        names = _channel_names(track, plan.channels(track), i in plan.ambisonic)
+        names = _channel_names(track, plan.channels(track), i in plan.ambisonic, i in plan.head_locked)
         parts = audio_checks.track_graphs(
             i, track, names, cfg, plan.loudness, MAX_CHANNEL_SPLIT, plan.multichannel_meter,
             ambisonic=i in plan.ambisonic, files=plan.audio_files)
@@ -3206,7 +3209,7 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
         ambisonic = position in plan.ambisonic
         ctx = audio_checks.TrackContext(
             position=position, track=track,
-            names=_channel_names(track, plan.channels(track), ambisonic),
+            names=_channel_names(track, plan.channels(track), ambisonic, position in plan.head_locked),
             label=label, duration=duration, ambisonic=ambisonic,
             meter=audio_checks.loudness_meter(track, plan.channels(track),
                                               plan.multichannel_meter, ambisonic))
@@ -3362,6 +3365,8 @@ def _prepare_scan_files(plan: _ScanPlan, result: QAResult) -> Optional[str]:
     tracks = result.metadata.get("ambisonic_audio_tracks")
     if tracks is not None:
         plan.ambisonic = frozenset(int(n) - 1 for n in tracks)
+        plan.head_locked = frozenset(
+            int(n) - 1 for n in result.metadata.get("ambisonic_head_locked_tracks") or ())
     try:
         scan_dir = tempfile.mkdtemp(prefix="frameguard-scan-")
     except OSError:
@@ -3503,10 +3508,13 @@ def _run_metadata_checks(probe_data: dict, result: QAResult, cfg: dict,
     # --- audio: tracks analysed as ambisonics (audio_checks.ambisonic_positions) ---
     tracks = _audio_streams(probe_data)
     if tracks:
+        boxes = [container_checks._sa3d_for(structure, t) for t in tracks]
         positions = audio_checks.ambisonic_positions(
-            tracks, [container_checks._sa3d_for(structure, t) for t in tracks],
-            spherical=projection not in (None, "none"))
+            tracks, boxes, spherical=projection not in (None, "none"))
         result.set_metadata("ambisonic_audio_tracks", [p + 1 for p in positions])
+        head_locked = audio_checks.head_locked_positions(tracks, boxes, positions)
+        if head_locked:
+            result.set_metadata("ambisonic_head_locked_tracks", [p + 1 for p in head_locked])
 
 
 def run_qa_checks(filepath: str, cfg: dict = None,

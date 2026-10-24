@@ -415,12 +415,33 @@ def ambisonic_head_locked(track: dict, count: int) -> int:
     return 0
 
 
-def channel_names(track: dict, count: int, ambisonic: bool = False) -> List[str]:
+def head_locked_positions(tracks: Sequence[dict], sa3d: Sequence[Optional[dict]],
+                          ambisonic: Sequence[int]) -> List[int]:
+    """Ambisonic tracks that carry head-locked stereo after their ambisonic
+    channels: named so by FFmpeg, or flagged by an SA3D box whose channel
+    count matches (order + 1)^2 + 2 (AAC tracks keep FFmpeg's 5.1 name)."""
+    found = []
+    for position in ambisonic:
+        if position >= len(tracks):
+            continue
+        track = tracks[position]
+        count = _whole(track.get("channels"))
+        box = sa3d[position] if position < len(sa3d) else None
+        flagged = (bool(box) and "error" not in box and box.get("head_locked_stereo")
+                   and count == (_whole(box.get("order")) + 1) ** 2 + 2)
+        if ambisonic_head_locked(track, count) or flagged:
+            found.append(position)
+    return found
+
+
+def channel_names(track: dict, count: int, ambisonic: bool = False,
+                  head_locked: Optional[bool] = None) -> List[str]:
     """Channel names in decoded order: FFmpeg's layout table, its "N channels
     (A+B+...)" description, ACN component names for ambisonics (W, Y, Z, X,
-    then ACN4...; head-locked stereo as HL-L, HL-R), else ch1..chN."""
+    then ACN4...; head-locked stereo as HL-L, HL-R), else ch1..chN.
+    ``head_locked`` None: as FFmpeg's layout name says."""
     if ambisonic:
-        extra = ambisonic_head_locked(track, count)
+        extra = ambisonic_head_locked(track, count) if head_locked is None else (2 if head_locked else 0)
         acn = ["W", "Y", "Z", "X"] + [f"ACN{k}" for k in range(4, max(4, count - extra))]
         return acn[:count - extra] + ["HL-L", "HL-R"][:extra]
     layout = _layout_text(track)
@@ -460,10 +481,16 @@ def stereo_pairs(track: dict, names: Sequence[str],
     Only true L/R pairs are correlated: FL/FR, BL/BR and SL/SR of named
     layouts, or the two channels of a 2-channel track whose layout is
     unknown (cameras write that). Ambisonic W/Y etc. legitimately correlate
-    negatively for sources on one side, so they are never paired.
+    negatively for sources on one side, so they are never paired; an
+    ambisonic track's head-locked stereo pair is.
     """
     count = len(names)
-    if count < 2 or ambisonic:
+    if ambisonic:
+        # Head-locked stereo is an ordinary stereo programme.
+        if count >= 2 and names[-2:] == ["HL-L", "HL-R"]:
+            return [(count - 2, count - 1, "HL-L/HL-R")]
+        return []
+    if count < 2:
         return []
     if count == 2:
         return [(0, 1, "L/R")]
@@ -712,14 +739,11 @@ def _main_chain(i: int, main: str, cfg: dict, meter: str, loudness: bool, ambiso
     chain = (f"{main}silencedetect@a{i}=n={float(cfg['silence_noise_db'])}dB"
              f":d={float(cfg['silence_duration'])}" + _record(f"silencedetect@a{i}", files))
     if loudness:
-        if meter == METER_EBUR128 and ambisonic:
-            # W only: BS.1770-5 defines no scene-based method; summing B-format
-            # components over-reads by ~3.5 LU (benchmark F13).
-            chain += ",pan=mono|c0=c0"
-        # Always on every channel as decoded: with METER_LOUDNORM or
-        # METER_NONE its loudness is discarded, but the true peak is exact on
-        # every build (true peak is taken before the K-weighting the arm64
-        # build gets wrong; verified there on 5.1 and 4.0 tones).
+        # Always on every channel as decoded, ambisonic components and
+        # head-locked stereo included. Its loudness is used only for
+        # METER_EBUR128 non-ambisonic tracks (track_measurement); the true
+        # peak is exact on every build (it is taken before the K-weighting
+        # the arm64 build gets wrong; verified there on 5.1 and 4.0 tones).
         chain += f",ebur128@a{i}=peak=true+sample:framelog=quiet"
     return chain + f"[a{i}]"
 
@@ -799,6 +823,15 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
             branches.append((f"a{i}p{j}", (
                 f"pan=stereo|c0=c{left}+c{right}|c1=c{left}-c{right},aformat=sample_fmts=dblp,"
                 f"astats@a{i}p{j}=measure_perchannel={_PAIR_STATS}:measure_overall=none")))
+    if loudness and ambisonic:
+        # W only: BS.1770-5 defines no scene-based method; summing B-format
+        # components over-reads by ~3.5 LU (benchmark F13). Head-locked
+        # stereo is an ordinary stereo programme and is measured as one.
+        branches.append((f"a{i}w", f"pan=mono|c0=c0,ebur128@a{i}w=peak=true:framelog=quiet"))
+        if names[-2:] == ["HL-L", "HL-R"]:
+            left, right = len(names) - 2, len(names) - 1
+            branches.append((f"a{i}hl", f"pan=stereo|c0=c{left}|c1=c{right},"
+                                        f"ebur128@a{i}h=peak=true:framelog=quiet"))
     if meter == METER_LOUDNORM:
         # loudnorm resamples to 192 kHz internally: keep it off the mapped output.
         # JSON prints the input loudness to 0.01 LU (the summary rounds to 0.1).
@@ -958,7 +991,10 @@ def parse_astats(log_text: str, instance: str) -> List[Dict[str, float]]:
     return channels
 
 
-_SUMMARY_RE = re.compile(r"\[ebur128@a(\d+) @ [0-9A-Fa-fx]+\].*Summary:")
+_SUMMARY_RE = re.compile(r"\[ebur128@a(\d+)([a-z]?) @ [0-9A-Fa-fx]+\].*Summary:")
+# ebur128 instances: "" every channel (true peak; loudness of ordinary
+# tracks), "w" ambisonic W, "h" head-locked stereo.
+EBUR128_W, EBUR128_HEAD_LOCKED = "w", "h"
 _NUMBER = r"(-?inf|-?\d+(?:\.\d+)?)"
 _SECTION_KEYS = {
     "Integrated loudness:": ("I", "integrated"),
@@ -968,19 +1004,22 @@ _SECTION_KEYS = {
 }
 
 
-def parse_loudness(log_text: str) -> Dict[int, dict]:
-    """I, LRA, sample peak and true peak per ``ebur128@a<N>`` summary.
+def parse_loudness(log_text: str, suffix: str = "") -> Dict[int, dict]:
+    """I, LRA, sample peak and true peak per ``ebur128@a<N><suffix>`` summary.
 
     The summary prints "Sample peak:" before "True peak:", each followed by
-    a "Peak:" line, so values are attributed by section, not by order.
+    a "Peak:" line, so values are attributed by section, not by order. A
+    summary without peaks (peak=none) ends at the next summary.
     """
     results: Dict[int, dict] = {}
     current, section = None, None
     for line in log_text.splitlines():
         header = _SUMMARY_RE.search(line)
         if header:
-            current, section = int(header.group(1)), None
-            results[current] = {}
+            current, section = None, None
+            if header.group(2) == suffix:
+                current = int(header.group(1))
+                results[current] = {}
             continue
         if current is None:
             continue
@@ -1035,8 +1074,9 @@ def parse_meters(log_text: str) -> Dict[int, Dict[str, dict]]:
     """Every meter's report per track: {track: {"ebur128": ..., "loudnorm": ...}}
     (``track_measurement`` picks what each track's meter vouches for)."""
     merged: Dict[int, Dict[str, dict]] = {}
-    for track, values in parse_loudness(log_text).items():
-        merged.setdefault(track, {})[METER_EBUR128] = values
+    for suffix in ("", EBUR128_W, EBUR128_HEAD_LOCKED):
+        for track, values in parse_loudness(log_text, suffix).items():
+            merged.setdefault(track, {})[METER_EBUR128 + suffix] = values
     for track, values in parse_loudnorm(log_text).items():
         merged.setdefault(track, {})[METER_LOUDNORM] = values
     return merged
@@ -1053,7 +1093,13 @@ def track_measurement(meters: Dict[int, Dict[str, dict]], ctx: "TrackContext") -
     sources = meters.get(ctx.position) or {}
     main = sources.get(METER_EBUR128) or {}
     entry = {key: main[key] for key in ("true_peak", "sample_peak") if key in main}
-    loud = {METER_EBUR128: main, METER_LOUDNORM: sources.get(METER_LOUDNORM) or {}}.get(ctx.meter, {})
+    if ctx.ambisonic:
+        loud = sources.get(METER_EBUR128 + EBUR128_W) or {}
+        head_locked = sources.get(METER_EBUR128 + EBUR128_HEAD_LOCKED)
+        if head_locked and "integrated" in head_locked:
+            entry["head_locked"] = head_locked
+    else:
+        loud = {METER_EBUR128: main, METER_LOUDNORM: sources.get(METER_LOUDNORM) or {}}.get(ctx.meter, {})
     entry.update({key: loud[key] for key in ("integrated", "lra") if key in loud})
     if not entry:
         return None
@@ -1216,14 +1262,36 @@ def track_sample_peak(evidence: "ScanEvidence", ctx: TrackContext) -> Optional[f
 
 
 def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
-    """Integrated loudness against the delivery profile."""
+    """Integrated loudness against the delivery profile (for an ambisonic
+    track with head-locked stereo, the W reading and the head-locked pair)."""
     mode = cfg.get("loudness_mode", "report")
-    profile = resolve_profile(cfg)
     if not measured or "integrated" not in measured or ctx.meter == METER_NONE:
         reason = _unmeasured_reason(ctx, "loudness summary")
         if mode == "report":
             return "SKIP", _with_label(ctx.label, reason[0].upper() + reason[1:] + "."), 100
         return "WARN", _with_label(ctx.label, f"Not verified: {reason}."), 100
+    row = _programme_row(measured, ctx, cfg)
+    head_locked = measured.get("head_locked")
+    if not head_locked:
+        return row
+    # The head-locked pair as its own stereo programme (exact BS.1770), but
+    # advisory: the listener hears it mixed with the ambisonic render.
+    hl_ctx = TrackContext(position=ctx.position, track=ctx.track, names=["HL-L", "HL-R"],
+                          label="", duration=ctx.duration, meter=METER_EBUR128)
+    hl_status, hl_text, hl_conf = _programme_row(head_locked, hl_ctx, cfg, _HEAD_LOCKED_CAVEAT)
+    status, text, confidence = row
+    worst = aggregate([(status, "", confidence), (hl_status, "", hl_conf)])
+    return worst[0], f"{text}; head-locked stereo: {hl_text}", worst[2]
+
+
+_HEAD_LOCKED_CAVEAT = (" (head-locked stereo measured as its own stereo programme; the delivered "
+                       "mix adds the ambisonic render)", LOW_CONFIDENCE)
+
+
+def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
+                   caveat_override: Optional[Tuple[str, int]] = None) -> Row:
+    mode = cfg.get("loudness_mode", "report")
+    profile = resolve_profile(cfg)
     integrated = measured["integrated"]
     lra = measured.get("lra")
     lra_text = f", LRA {lra:.1f} LU" if lra is not None else ""
@@ -1231,7 +1299,7 @@ def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
         return "SKIP", _with_label(ctx.label, "No measurable programme loudness: the track is silent "
                                               "(see Audio Silence)."), 100
     method = "programme loudness (not dialogue-gated)" if profile.dialogue_gated else "integrated"
-    caveat, cap = _loudness_caveat(ctx)
+    caveat, cap = caveat_override or _loudness_caveat(ctx)
     measured_text = f"{integrated:.1f} LUFS {method}{lra_text}{caveat}"
     limit_text = f"{profile.label} target {profile.target:g} ± {profile.tolerance:g} LU"
     if mode == "report":
