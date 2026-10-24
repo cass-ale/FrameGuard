@@ -94,9 +94,21 @@ try:
     from frameguard.tools import (
         get_ffmpeg_path, get_ffprobe_path, get_mediainfo_path,
     )
+    from frameguard.tools import banner_version as tools_banner_version
+    from frameguard.tools import ffmpeg_banner_problem as _ffmpeg_banner_problem
+    from frameguard.tools import _ffmpeg_cache_key as _tool_identity
     _HAS_TOOLS_MODULE = True
 except ImportError:
     _HAS_TOOLS_MODULE = False
+
+    def tools_banner_version(banner):
+        return None
+
+    def _ffmpeg_banner_problem(banner):
+        return None
+
+    def _tool_identity(path):
+        return (path,)
 
     # Provide minimal fallbacks so callers can still use these APIs.
     def get_ffmpeg_path():
@@ -977,7 +989,9 @@ def get_tool_versions() -> Dict[str, Dict[str, Optional[str]]]:
     newer FFmpeg can change what counts as a decode error.
     """
     paths = (("ffmpeg", get_ffmpeg_path()), ("ffprobe", get_ffprobe_path()))
-    key = tuple(p for _, p in paths)
+    # Keyed by binary identity (path, inode, size, mtime): a binary replaced
+    # between scans is probed again, so each scan records the FFmpeg it used.
+    key = tuple(_tool_identity(p) if p else None for _, p in paths)
     with _tool_version_lock:
         if key in _tool_version_cache:
             return dict(_tool_version_cache[key])
@@ -3365,6 +3379,14 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     ffmpeg_path = get_ffmpeg_path()
     if not ffmpeg_path:
         _mark_not_verified(result, plan.frame_check_names(), "FFmpeg was not found.")
+        return
+    # The banner this scan recorded (get_tool_versions re-probes a binary
+    # whose identity changed), judged against tools.FFMPEG_MIN_VERSION.
+    banner = ((result.tool_versions or get_tool_versions()).get("ffmpeg") or {}).get("version")
+    too_old = _ffmpeg_banner_problem(banner)
+    if too_old:
+        result.set_metadata("ffmpeg_below_minimum", tools_banner_version(banner) or "unknown")
+        _mark_not_verified(result, plan.frame_check_names(), too_old + ".")
         return
     if plan.duration and "duration_seconds" not in result.metadata:
         result.set_metadata("duration_seconds", round(plan.duration, 2))

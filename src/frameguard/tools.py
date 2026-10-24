@@ -59,7 +59,8 @@ def _subprocess_kwargs() -> dict:
 
 
 __all__ = [
-    "ToolInfo", "ToolRegistry", "get_tool_registry",
+    "ToolInfo", "ToolRegistry", "get_tool_registry", "FFMPEG_MIN_VERSION",
+    "ffmpeg_version_problem", "ffmpeg_banner_problem",
     "check_all_tools", "get_ffmpeg_path", "get_ffprobe_path",
     "get_mediaconch_path", "get_mediainfo_path",
 ]
@@ -97,10 +98,27 @@ DOWNLOAD_URLS = {
     },
 }
 
+# Directory searched before the bundled tools (see _find_executable).
+TOOLS_DIR_ENV = "FRAMEGUARD_TOOLS_DIR"
+
+# Oldest FFmpeg the engine test suite passes on (0.9.2 version matrix: the
+# 525 engine, audio, video, container and XR tests run against conda-forge
+# 7.0.2, 7.1.1 and 8.0.1 and the bundled martin-riedl 9.0.2):
+#   * 7.0.2 and 7.1.1 abort the one-pass scan's multi-graph command
+#     ("Assertion best_input >= 0 failed", fftools/ffmpeg_filter.c), so every
+#     frame-level check is unmeasured (80+ failures);
+#   * 8.0.1 runs it but reports no black segments where there are some and
+#     counts decode errors in clean Matroska files (11 failures, several of
+#     them silent false PASSes);
+#   * 9.0.2 passes all of them.
+# Below this the deep scan is refused (Not verified), never run on a build
+# whose output FrameGuard cannot read correctly.
+FFMPEG_MIN_VERSION = (9, 0, 2)
+
 # Minimum versions (semver-style, compared as tuples)
 MIN_VERSIONS = {
-    "ffmpeg": (4, 0),
-    "ffprobe": (4, 0),
+    "ffmpeg": FFMPEG_MIN_VERSION,
+    "ffprobe": FFMPEG_MIN_VERSION,
     "mediaconch": (23, 0),
     "mediainfo": (23, 0),
 }
@@ -252,6 +270,15 @@ def _find_executable(name: str) -> Optional[str]:
     """Find an executable, checking bundled dirs first, then system PATH."""
     ext = ".exe" if platform.system() == "Windows" else ""
     full_name = name + ext
+
+    # 0. An explicit override (FRAMEGUARD_TOOLS_DIR): runs the engine and the
+    # test suite against another FFmpeg build without touching the bundle.
+    override = os.environ.get(TOOLS_DIR_ENV, "").strip()
+    if override:
+        candidate = os.path.join(os.path.expanduser(override), full_name)
+        if os.path.isfile(candidate) and _ensure_executable(candidate):
+            return candidate
+        logger.debug("%s=%s has no %s; using the normal search.", TOOLS_DIR_ENV, override, full_name)
 
     # 1. Bundled/source tool directories
     for bundled in _candidate_tools_dirs():
@@ -456,6 +483,66 @@ def get_mediainfo_path() -> Optional[str]:
     """Return the path to mediainfo, or None if not available."""
     reg = get_tool_registry()
     return reg.mediainfo.path if reg.mediainfo.found else None
+
+
+# ============================================================================
+# FFMPEG VERSION GATE
+# ============================================================================
+
+def version_text(version: Tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def ffmpeg_banner_problem(banner: Optional[str]) -> Optional[str]:
+    """Why an ``ffmpeg -version`` banner is below FFMPEG_MIN_VERSION, else None.
+
+    Only a release number right after "version" counts ("9.0.2-<vendor>",
+    "n9.1"); git builds ("N-118000-g1234abcd") carry none and are taken as
+    current, as _detect_tool does.
+    """
+    import re
+    first = (banner or "").splitlines()[0] if banner else ""
+    match = re.search(r"version\s+n?(\d+(?:\.\d+)+)", first)
+    if not match:
+        return None
+    version = tuple(int(part) for part in match.group(1).split("."))
+    if version >= FFMPEG_MIN_VERSION:
+        return None
+    minimum = version_text(FFMPEG_MIN_VERSION)
+    return (f"FFmpeg {match.group(1)} is older than {minimum}, the oldest version FrameGuard's frame-level "
+            f"analysis is verified on (older builds abort or misreport it); use the bundled FFmpeg or "
+            f"FFmpeg {minimum} or newer")
+
+
+def banner_version(banner: Optional[str]) -> Optional[str]:
+    """The release number in an ``-version`` banner ("9.0.2"), or None."""
+    import re
+    match = re.search(r"version\s+n?(\d+(?:\.\d+)+)", (banner or "").splitlines()[0] if banner else "")
+    return match.group(1) if match else None
+
+
+_gate_cache: Dict[tuple, Tuple[Optional[str], Optional[str]]] = {}
+_gate_lock = threading.Lock()
+
+
+def ffmpeg_version_problem(ffmpeg_path: Optional[str] = None) -> Optional[str]:
+    """ffmpeg_banner_problem for the binary at ``ffmpeg_path`` (default: the
+    resolved ffmpeg). Called once per scan; the ``-version`` probe is cached
+    per binary identity (path, inode, size, mtime), so a binary replaced
+    between scans is detected again. None when no version can be read: the
+    scan itself then reports what failed."""
+    path = ffmpeg_path or get_ffmpeg_path()
+    if not path:
+        return None
+    key = _ffmpeg_cache_key(path)
+    with _gate_lock:
+        if key in _gate_cache:
+            return _gate_cache[key][1]
+    banner, _ = _get_tool_version(path, "ffmpeg")
+    problem = ffmpeg_banner_problem(banner)
+    with _gate_lock:
+        _gate_cache[key] = (banner, problem)
+    return problem
 
 
 # ============================================================================

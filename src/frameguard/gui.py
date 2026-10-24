@@ -5709,6 +5709,12 @@ class MainWindow(QMainWindow):
                 f"FrameGuard requires FFmpeg and FFprobe to function.\n\n{msg}\n\n"
                 "Please install FFmpeg and ensure it is in your system PATH."
             )
+            return
+        from frameguard.tools import ffmpeg_version_problem
+        too_old = ffmpeg_version_problem()
+        if too_old:
+            QMessageBox.warning(self, "FFmpeg Too Old",
+                                f"{too_old}.\n\nFrame-level checks will be reported as Not verified.")
 
 
     def _sync_preset_from_settings(self):

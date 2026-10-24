@@ -4,6 +4,9 @@
 Each class is one defect; every test failed on release/0.9.2 before its fix.
 """
 
+import os
+import time
+
 import pytest
 
 from frameguard import container_checks as cc
@@ -552,3 +555,74 @@ class TestQuestMonoPresets:
         assert cfg["required_stereo_mode"] == "mono" and cfg["required_projection"] == "equirectangular"
         presets.validate_preset_config(cfg)
         assert presets.detect_preset_from_filename("TPG_360_7200x3600.mp4", PRESETS) == "360mono7200"
+
+
+# ---------------------------------------------------------------------------
+# 7. FFmpeg version gate
+# ---------------------------------------------------------------------------
+
+def _fake_ffmpeg(directory, version: str) -> str:
+    """An ffmpeg that reports ``version`` for -version and runs the real one
+    otherwise, so the gate is tested without installing old builds."""
+    from media_fixtures import FFMPEG
+    path = os.path.join(str(directory), "ffmpeg")
+    with open(path, "w") as handle:
+        handle.write("#!/bin/sh\n"
+                     f'if [ "$1" = "-version" ]; then echo "ffmpeg version {version} Copyright (c) the FFmpeg '
+                     f'developers"; exit 0; fi\nexec "{FFMPEG}" "$@"\n')
+    os.chmod(path, 0o755)
+    return path
+
+
+needs_posix = pytest.mark.skipif(os.name == "nt", reason="shell-script FFmpeg stand-in")
+
+
+class TestFFmpegVersionGate:
+    def test_minimum_is_the_oldest_build_the_suite_passes_on(self):
+        from frameguard import tools
+        assert tools.MIN_VERSIONS["ffmpeg"] == tools.MIN_VERSIONS["ffprobe"] == (9, 0, 2)
+
+    @pytest.mark.parametrize("banner,ok", [
+        ("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright", False),
+        ("ffmpeg version 7.0.2 Copyright (c) 2000-2024", False),
+        ("ffmpeg version 7.1.1 Copyright (c) 2000-2025", False),
+        ("ffmpeg version 8.0.1 Copyright (c) 2000-2025", False),
+        ("ffmpeg version 9.0.2-https://www.martin-riedl.de Copyright", True),
+        ("ffmpeg version n9.1 Copyright", True),
+        ("ffmpeg version N-118000-g1234abcd Copyright", True),     # git build: current
+    ])
+    def test_banner_against_the_minimum(self, banner, ok):
+        from frameguard import tools
+        assert tools.ffmpeg_banner_problem(banner) is None if ok else tools.ffmpeg_banner_problem(banner)
+
+    @needs_posix
+    def test_old_ffmpeg_refuses_frame_level_checks_as_not_verified(self, media, tmp_path, monkeypatch):
+        from frameguard import core
+        fake = _fake_ffmpeg(tmp_path, "7.1.1")
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
+        result = _scan(_clean(media), quick=False)
+        integrity = _row(result, "File Integrity")
+        assert _not_verified(integrity) and "7.1.1" in integrity[2] and "9.0.2" in integrity[2], integrity
+        for name in ("Black Frames", "Audio Silence", "Audio Hum"):
+            assert _not_verified(_row(result, name)), _row(result, name)
+        assert result.status == "PASS_WITH_WARNINGS"
+        assert result.metadata["ffmpeg_below_minimum"] == "7.1.1"
+
+    @needs_posix
+    def test_version_is_detected_per_scan_when_the_binary_changes(self, tmp_path):
+        from frameguard import tools
+        fake = _fake_ffmpeg(tmp_path, "8.0.1")
+        assert "8.0.1" in tools.ffmpeg_version_problem(fake)
+        time.sleep(0.01)
+        _fake_ffmpeg(tmp_path, "9.0.2.1")         # replaced in place (new size and mtime)
+        assert tools.ffmpeg_version_problem(fake) is None
+
+    def test_pdf_tools_line_shows_the_version_and_the_gate(self):
+        from frameguard.core import QAResult
+        from frameguard.report import _tools_line
+        result = QAResult("a.mp4")
+        result.tool_versions = {"ffmpeg": {"version": "ffmpeg version 7.1.1 Copyright (c) 2000-2025"},
+                                "ffprobe": {"version": "ffprobe version 7.1.1 Copyright (c) 2000-2025"}}
+        result.set_metadata("ffmpeg_below_minimum", "7.1.1")
+        line = _tools_line([result])
+        assert "ffmpeg version 7.1.1" in line and "below the 9.0.2 minimum" in line, line

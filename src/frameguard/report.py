@@ -1160,6 +1160,10 @@ def _tools_line(results) -> str:
                 version = (tools.get(name) or {}).get("version")
                 if version:
                     parts.append(version.split(" Copyright")[0])
+            if any((getattr(x, "metadata", None) or {}).get("ffmpeg_below_minimum") for x in results):
+                from frameguard.tools import FFMPEG_MIN_VERSION, version_text
+                parts.append(f"below the {version_text(FFMPEG_MIN_VERSION)} minimum: frame-level checks "
+                             f"not verified")
             return "   |   ".join(parts)
     return f"FrameGuard {__version__}"
 
