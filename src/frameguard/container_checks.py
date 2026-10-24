@@ -2287,14 +2287,24 @@ LAYOUT_MAX_DISPARITY = 0.05
 LAYOUT_MIN_TEXTURE = 3.0
 LAYOUT_MIN_BLOCKS = 16    # textured blocks a frame needs to count (1/16 of the eye)
 # Decision per frame, on the median over textured blocks of each block's best
-# normalised cross-correlation within the disparity range. Two views of one
-# scene: a block and its counterpart in the other eye correlate at 0.6 or
-# better in most blocks (occlusions and encoding noise pull some down, the
-# median ignores them). Unrelated texture also produces a best-of-39-shifts
-# correlation well above zero, so the same search is repeated against rows
-# half an eye lower (control): a stacked second view matches its own rows
-# and not the control rows, while two unrelated halves match both equally.
+# normalised cross-correlation within the disparity range, against a control:
+# the same search on rows half an eye lower. A stacked second view matches its
+# own rows and not the control's; two unrelated halves match both alike.
+#
+# LAYOUT_MATCH: for one surface seen twice with independent non-shared power
+# N on shared texture power S, NCC = S / (S + N). 0.6 accepts a block as the
+# same content while N is up to 2/3 of S (SNR >= +1.8 dB): sensor and coding
+# noise sit tens of dB below texture at delivery bitrates, so the slack is
+# for view-dependent shading, occlusion borders and resampling inside a
+# 12-px block. The median ignores the blocks that occlusion pulls lower.
 LAYOUT_MATCH = 0.6
+# LAYOUT_MARGIN: with unrelated halves the match and control medians are two
+# draws of one statistic. A block's best-of-(2D+1)-shifts NCC has a spread of
+# about 1/sqrt(n_eff); texture correlated over ~3x3 px leaves n_eff ~ 16 of a
+# block's 144 pixels, so sigma ~ 0.25. Over LAYOUT_MIN_BLOCKS = 16 blocks a
+# median's standard error is ~1.25 sigma / 4 ~ 0.08, and the difference of two
+# medians ~ 0.11. 0.25 is ~2.3 of those: about 1 % false top-bottom frames,
+# and ~3e-4 once a majority of LAYOUT_FRAMES = 3 frames must agree.
 LAYOUT_MARGIN = 0.25
 
 
