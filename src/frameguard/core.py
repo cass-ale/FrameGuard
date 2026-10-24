@@ -2397,7 +2397,19 @@ MAX_ERROR_SAMPLES = 20
 # Above this many channels per track the per-channel split is skipped (and
 # reported as not verified) rather than building an enormous filter graph.
 MAX_CHANNEL_SPLIT = 32
-INTEGRITY_MIN_DECODED_RATIO = 0.98
+# Decoded coverage is judged with an absolute tolerance, never a share of
+# the length (0.9.1's 98 % let a 2-hour master lose 144 s). A complete file
+# decodes everything its header declares; the legitimate shortfalls are
+# bounded and do not grow with the length:
+# * video: the declared duration rounds the last frame, and a leading
+#   picture of an open GOP that references a GOP not in the file is skipped
+#   by the decoder: 2 frames, or 0.1 s where that is more (above 20 fps);
+# * audio: encoder priming and padding (AAC: 1024 + up to 1024 samples,
+#   43 ms at 48 kHz) are trimmed; 0.1 s covers them at 32 kHz.
+# A GOP is deliberately not allowed: frames lost before the first decodable
+# keyframe are missing pictures too.
+INTEGRITY_VIDEO_SLACK_FRAMES = 2
+INTEGRITY_SLACK_SECONDS = 0.1
 
 
 def _parse_log_line(line: str) -> Tuple[List[str], Optional[str], str]:
@@ -2900,9 +2912,9 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
               last_out_time: Optional[float]) -> Tuple[List[str], List[str], List[str]]:
     """(per-stream descriptions, shortfalls, streams whose completeness is unknown).
 
-    A stream is short when it decoded under 98% of what its own header
-    declares, with a small absolute slack (2 frames / 0.1 s) so a 1-second
-    clip that loses its last frame to an edit list is not called truncated.
+    A stream is short when it decoded less than its own header declares by
+    more than an absolute slack (INTEGRITY_VIDEO_SLACK_FRAMES frames /
+    INTEGRITY_SLACK_SECONDS; see there), whatever the programme length.
     A truncated copy keeps its original header, so this is the measurement
     that catches it: the old scan never compared decoded media with the
     probed duration.
@@ -2917,7 +2929,7 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
             unknown.append("video")
         else:
             described.append(f"{decoded_s:.2f}/{expected_s:.2f} s video (variable frame rate)")
-            if decoded_s < expected_s * INTEGRITY_MIN_DECODED_RATIO - 0.1:
+            if decoded_s < expected_s - INTEGRITY_SLACK_SECONDS:
                 short.append(f"decoding stopped at {decoded_s:.2f} of {expected_s:.2f} s "
                              f"({decoded_s / expected_s * 100:.0f}%)")
     elif plan.video is not None:
@@ -2929,7 +2941,10 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
             described.append(f"{decoded} video frames")
         else:
             described.append(f"{decoded}/{expected} video frames")
-            if decoded < expected * INTEGRITY_MIN_DECODED_RATIO - 2:
+            fps = plan.video_fps()
+            slack = max(INTEGRITY_VIDEO_SLACK_FRAMES,
+                        int(INTEGRITY_SLACK_SECONDS * fps) if fps > 0 else 0)
+            if decoded < expected - slack:
                 short.append(f"video decoded {decoded} of {expected} frames "
                              f"({decoded / expected * 100:.0f}%)")
     total = len(plan.audio)
@@ -2945,7 +2960,7 @@ def _coverage(plan: _ScanPlan, accounting: _DecodeAccounting,
                 described.append(f"{decoded:.2f} s {name}")
             continue
         described.append(f"{decoded:.2f}/{expected:.2f} s {name}")
-        if decoded < expected * INTEGRITY_MIN_DECODED_RATIO - 0.1:
+        if decoded < expected - INTEGRITY_SLACK_SECONDS:
             short.append(f"{name} decoded {decoded:.2f} of {expected:.2f} s "
                          f"({decoded / expected * 100:.0f}%)")
     return described, short, unknown

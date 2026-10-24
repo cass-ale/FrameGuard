@@ -452,3 +452,47 @@ class TestR103Filter:
         row, share = _levels(path, 1920, 1080)
         assert row[1] == "PASS", row
         assert share == pytest.approx(expected * 100, rel=0.1)
+
+
+# ---------------------------------------------------------------------------
+# File Integrity: absolute truncation tolerance
+# ---------------------------------------------------------------------------
+
+def _integrity(expected_frames, decoded_frames, fps=30.0, audio=None):
+    from frameguard import core
+    probe = {"streams": [{"index": 0, "codec_type": "video", "avg_frame_rate": f"{int(fps)}/1",
+                          "nb_frames": str(expected_frames),
+                          "duration": f"{expected_frames / fps:.6f}"}],
+             "format": {"duration": f"{expected_frames / fps:.6f}"}}
+    if audio:
+        probe["streams"].append({"index": 1, "codec_type": "audio", "sample_rate": "48000",
+                                 "channels": 2, "duration": f"{audio[0]:.6f}"})
+    plan = core._ScanPlan(probe, dict(DEFAULT_CONFIG))
+    accounting = core._DecodeAccounting()
+    accounting.add(f"Input stream #0:0 (video): {decoded_frames} packets read (1 bytes); "
+                   f"{decoded_frames} frames decoded; 0 decode errors")
+    if audio:
+        samples = int(audio[1] * 48000)
+        accounting.add(f"Input stream #0:1 (audio): 10 packets read (1 bytes); "
+                       f"10 frames decoded; 0 decode errors ({samples} samples)")
+    return core._coverage(plan, accounting, None)[1]
+
+
+class TestTruncationTolerance:
+    def test_two_hour_master_missing_ten_seconds_is_truncated(self):
+        """0.9.1 accepted up to 2 % missing: 144 s of a 2 h master."""
+        frames = 2 * 3600 * 30
+        assert _integrity(frames, frames - 300)          # 10 s missing
+        assert _integrity(frames, frames - 30)           # 1 s missing
+
+    def test_review_mkv_case_is_truncated(self):
+        """45 s MKV cut at 98.5 % of its bytes: 1328 of 1350 frames (0.73 s)."""
+        assert _integrity(1350, 1328)
+
+    def test_rounding_of_the_last_frame_is_tolerated(self):
+        assert not _integrity(216000, 215998)            # 2 frames
+        assert not _integrity(300, 298)
+
+    def test_audio_tolerance_is_absolute(self):
+        assert _integrity(300, 300, audio=(3600.0, 3590.0))       # 10 s of audio missing
+        assert not _integrity(300, 300, audio=(10.0, 9.95))       # AAC priming/padding
