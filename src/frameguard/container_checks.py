@@ -1039,9 +1039,11 @@ def _missing_media_text(structure: Structure) -> List[str]:
             continue
         kind = "video" if track.handler == "vide" else "audio"
         at = track.sample_time(track.first_missing_sample)
-        total = track.seconds(track.duration)
+        # mdhd's duration can be shorter than the sample table says (a cut
+        # moov, a hostile header): the missing span runs to whichever ends later.
+        end = max(track.seconds(track.duration), track.sample_time(track.sample_count))
         out.append(f"{kind} samples from {_clock(at)} on (sample {track.first_missing_sample + 1} of "
-                   f"{track.sample_count}, {total - at:.2f} s) lie beyond the end of the file")
+                   f"{track.sample_count}, {max(0.0, end - at):.2f} s) lie beyond the end of the file")
     return out
 
 

@@ -626,3 +626,17 @@ class TestFFmpegVersionGate:
         result.set_metadata("ffmpeg_below_minimum", "7.1.1")
         line = _tools_line([result])
         assert "ffmpeg version 7.1.1" in line and "below the 9.0.2 minimum" in line, line
+
+
+# ---------------------------------------------------------------------------
+# 9. Remaining low-severity container items (B10, B11, B12, B14, B19, R1.1 brand)
+# ---------------------------------------------------------------------------
+
+class TestMissingMediaText:
+    def test_no_negative_seconds_when_mdhd_is_shorter_than_the_samples(self):
+        """B12: '... -1.00 s ...' when the declared duration ends before the missing sample."""
+        track = cc.TrackInfo(track_id=1, handler="vide", timescale=1000, duration=500, sample_count=100,
+                             first_missing_sample=60)
+        track.stts = [(100, 33)]
+        text = cc._missing_media_text(cc.Structure(family="ISO-BMFF", tracks=[track]))[0]
+        assert "-" not in text.split("(")[1], text
