@@ -782,3 +782,28 @@ class TestMissingSummariesAreNotVerified:
         row = audio_checks.loudness_row({"integrated": -26.0, "true_peak": -10.0}, ctx,
                                         dict(DEFAULT_CONFIG, loudness_mode="essential"))
         assert row[0] == "WARN" and "head-locked stereo" in row[1] and "Not verified" in row[1], row
+
+
+# ---------------------------------------------------------------------------
+# R3 bug 12. AGENTS.md: new settings carry no helper line or secondary label
+# ---------------------------------------------------------------------------
+
+class TestNewSettingsCopy:
+    NEW = ("Phase Threshold", "Dialogue-Gated Target", "Allow Dual Mono")
+
+    def test_new_audio_settings_have_no_helper_line(self, qapp):
+        from frameguard.gui import SettingsPanel
+        panel = SettingsPanel()
+        rows = {name.text(): desc for _, name, _, _, desc in panel._setting_rows}
+        for title in self.NEW:
+            assert rows[title].text() == "" and rows[title].isHidden(), title
+        # 0.9.1's own settings keep their copy.
+        assert rows["Phase"].text() == "Warn when left and right are out of phase for a second or more"
+
+    def test_option_labels_carry_no_secondary_text(self):
+        from frameguard.gui import SettingsPanel
+        for _, key, kind, _, _, choices in SettingsPanel._RULE_CONTROLS:
+            if key in ("phase_correlation_min", "dialogue_gated_loudness") and kind == "choice":
+                for _, label in choices:
+                    assert "(" not in label and ":" not in label, label
+
