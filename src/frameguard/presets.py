@@ -70,6 +70,7 @@ PRESET_CONFIG_KEYS = (
     "av_offset_warn_ms",
     "av_offset_max_early_ms",
     "av_offset_max_late_ms",
+    "aac_priming",
     "allow_display_rotation",
     "spatial_audio",
     "require_square_pixels",
@@ -169,9 +170,40 @@ def validate_preset_config(config: dict) -> dict:
             problems.append(f"{raw_key}={value!r} ({problem})")
         else:
             out[key] = coerced
+    for _keys, problem in _cross_field_problems(out):
+        problems.append(problem)
     if problems or unknown:
         raise PresetValidationError(problems, unknown)
     return audio_checks.normalize_custom_profile(out)
+
+
+def _cross_field_problems(config: dict) -> List[tuple]:
+    """((keys involved), problem) for values that are each in range but
+    contradict one another. Only pairs present in ``config`` are judged: a
+    preset that sets one side inherits the other from the operator's
+    settings, which this function cannot see."""
+    out = []
+    warn = config.get("av_offset_warn_ms")
+    for key, side in (("av_offset_max_early_ms", "early"), ("av_offset_max_late_ms", "late")):
+        limit = config.get(key)
+        if warn is not None and limit is not None and warn > limit:
+            # The engine used to take max(warn, limit), so this silently
+            # lifted the EBU R37 FAIL threshold to the warning threshold.
+            out.append((("av_offset_warn_ms", key),
+                        f"av_offset_warn_ms={warn!r} exceeds {key}={limit!r} (the {side} FAIL "
+                        f"threshold must be at least the warning threshold)"))
+    width, height = config.get("target_width"), config.get("target_height")
+    max_pixels = config.get("max_frame_pixels")
+    if width and height and max_pixels and width * height > max_pixels:
+        out.append((("max_frame_pixels", "target_width", "target_height"),
+                    f"max_frame_pixels={max_pixels!r} is below the target {width}x{height} "
+                    f"({width * height:,} pixels): no file can meet both"))
+    fps, max_rate = config.get("target_fps"), config.get("max_pixel_rate")
+    if width and height and fps and max_rate and width * height * fps > max_rate * 1.0005:
+        out.append((("max_pixel_rate", "target_width", "target_height", "target_fps"),
+                    f"max_pixel_rate={max_rate!r} is below the target {width}x{height} at {fps:g} fps "
+                    f"({width * height * fps:,.0f} pixels/s): no file can meet both"))
+    return out
 
 
 def normalize_preset_config(config: dict) -> dict:
@@ -193,6 +225,10 @@ def normalize_preset_config(config: dict) -> dict:
         coerced, problem = _coerce_preset_value(key, value)
         if not problem:
             out[key] = coerced
+    # A contradiction drops the value that would loosen the spec (the warning
+    # threshold, the decoder ceiling), never the FAIL threshold.
+    for keys, _problem in _cross_field_problems(out):
+        out.pop(keys[0], None)
     return audio_checks.normalize_custom_profile(out)
 
 
@@ -226,9 +262,12 @@ _PRESET_VALUE_RANGES = {
     "duration_mismatch_threshold": (0.0, 60.0),
     "av_short_tolerance_frames": (0, 1000),
     "av_long_tolerance_s": (0.0, 60.0),
+    # ITU-R BT.1359-1: sound 90 ms late / 185 ms early is the limit of
+    # acceptability for viewers; a FAIL threshold above one second (5x that)
+    # would pass sync errors no audience accepts, so that is the cap.
     "av_offset_warn_ms": (0.0, 1000.0),
-    "av_offset_max_early_ms": (0.0, 10000.0),
-    "av_offset_max_late_ms": (0.0, 10000.0),
+    "av_offset_max_early_ms": (0.0, 1000.0),
+    "av_offset_max_late_ms": (0.0, 1000.0),
     # 0 = no ceiling; 16384 x 16384 x 1000 fps bounds the rest.
     "max_frame_pixels": (0, 16384 * 16384),
     "max_pixel_rate": (0, 16384 * 16384 * 1000),
@@ -258,6 +297,7 @@ def _enum_choices(key: str):
         "required_stereo_mode": core.STEREO_CHOICES,
         "loudness_mode": core.LOUDNESS_MODES,
         "spatial_audio": core.SPATIAL_AUDIO_CHOICES,
+        "aac_priming": core.AAC_PRIMING_CHOICES,
         **audio_checks.ENUM_CHOICES,
         "signal_levels_mode": core.SIGNAL_LEVELS_MODES,
     }.get(key)
@@ -670,6 +710,7 @@ _RESOLUTION_TOKENS = {
     "8k": ("8k", "4320p", "7680x4320"),
     # Frame sizes that are only ever 360 deliverables.
     "8k360": ("7680x3840",),
+    "mono7200": ("7200x3600",),
     "tb5760": ("5760x5760",),
     "tb3840": ("3840x3840",),
 }
@@ -677,6 +718,8 @@ _RESOLUTION_TOKENS = {
 # their own (a clip named "C0360" or "overview_vr" is not a 360 deliverable);
 # they only turn a bare "8k" into the 8K 360 preset.
 _SPHERICAL_TOKENS = frozenset({"360", "vr", "vr360", "360vr", "equirect", "equirectangular", "spherical"})
+# 16:9 families: never suggested for a name that also says 360/VR.
+_FLAT_FAMILIES = frozenset({"4k", "1080p", "720p", "8k"})
 # Stereo words make a 5.7K/8K name ambiguous (mono 2:1 or top-bottom 1:1).
 _STEREO_TOKENS = frozenset({"tb", "ou", "overunder", "3d", "stereo", "sbs", "lr"})
 # Resolution family + frame rate -> built-in preset. Combinations with no
@@ -686,6 +729,7 @@ _PRESET_BY_TOKENS = {
     ("1080p", 30): "1080p30", ("1080p", 60): "1080p60", ("1080p", 24): "1080p24",
     ("720p", 30): "720p30", ("5.7k", 30): "5.7k30", ("8k", 30): "8k30",
     ("8k360", 30): "8k360", ("tb5760", 30): "360tb5760", ("tb3840", 30): "360tb3840",
+    ("mono7200", 30): "360mono7200",
 }
 
 
@@ -714,8 +758,14 @@ def detect_preset_from_filename(filename: str, presets: dict = None) -> Optional
     if tokens & (_NTSC_RATE_TOKENS | _HALF_SPHERE_TOKENS):
         return None
     families = [fam for fam, words in _RESOLUTION_TOKENS.items() if tokens & set(words)]
-    if families == ["8k"] and tokens & _SPHERICAL_TOKENS:
-        families = ["8k360"]
+    if tokens & _SPHERICAL_TOKENS:
+        # A bare "8k" next to a 360 word is the 8K 360 frame; an explicit
+        # 16:9 size ("7680x4320", "4320p") or a flat family ("4k", "1080p")
+        # contradicts it, and a flat preset would judge the wrong frame.
+        if families == ["8k"] and tokens & {"8k"} and not tokens & {"7680x4320", "4320p"}:
+            families = ["8k360"]
+        elif any(fam in _FLAT_FAMILIES for fam in families):
+            return None
     if len(families) == 1 and families[0] in ("5.7k", "8k", "8k360") and tokens & _STEREO_TOKENS:
         return None
     rates = {fps for fps, words in _FPS_TOKENS.items() if tokens & set(words)}

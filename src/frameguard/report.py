@@ -19,7 +19,7 @@ from fpdf import FPDF
 from fpdf.enums import XPos, YPos
 
 from frameguard import __version__, audio_checks
-from frameguard.core import QAResult
+from frameguard.core import ESSENTIAL_CHECKS, QAResult
 from frameguard.theme import get_theme, ThemeColors
 
 
@@ -1100,7 +1100,10 @@ def _conformance_spec_rows(c: dict) -> List[tuple]:
         return "any" if "any" in [str(v).lower() for v in values] else ", ".join(map(str, values))
     rows = [
         ("A/V start offset", f"warn beyond ±{c.get('av_offset_warn_ms', 5.0):g} ms; fail beyond "
-                             f"{c.get('av_offset_max_early_ms', 40.0):g} ms early / {c.get('av_offset_max_late_ms', 60.0):g} ms late"),
+                             f"{c.get('av_offset_max_early_ms', 40.0):g} ms early / {c.get('av_offset_max_late_ms', 60.0):g} ms late; "
+                             + ("unsignalled AAC priming judged over 0-2112 samples"
+                                if str(c.get('aac_priming', 'unknown')) == 'unknown'
+                                else f"unsignalled AAC priming {c.get('aac_priming')} samples")),
         ("A/V end", f"audio ≤{c.get('av_short_tolerance_frames', 2)} frames short, ≤{c.get('av_long_tolerance_s', 2.0):g} s long"),
         ("Profiles / pixel formats", f"{listed('allowed_video_profiles')} / {listed('allowed_pix_fmts')}"),
     ]
@@ -1116,7 +1119,9 @@ def _conformance_spec_rows(c: dict) -> List[tuple]:
     if flags:
         rows.append(("Also required", ", ".join(flags)))
     if c.get("disabled_checks"):
-        rows.append(("Checks switched off", ", ".join(c["disabled_checks"])))
+        rows.append(("Checks switched off", ", ".join(
+            f"{name} (essential: not verified)" if name in ESSENTIAL_CHECKS else name
+            for name in c["disabled_checks"])))
     return rows
 
 
@@ -1180,6 +1185,10 @@ def _tools_line(results) -> str:
                 version = (tools.get(name) or {}).get("version")
                 if version:
                     parts.append(version.split(" Copyright")[0])
+            if any((getattr(x, "metadata", None) or {}).get("ffmpeg_below_minimum") for x in results):
+                from frameguard.tools import FFMPEG_MIN_VERSION, version_text
+                parts.append(f"below the {version_text(FFMPEG_MIN_VERSION)} minimum: frame-level checks "
+                             f"not verified")
             return "   |   ".join(parts)
     return f"FrameGuard {__version__}"
 

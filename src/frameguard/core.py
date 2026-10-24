@@ -94,9 +94,21 @@ try:
     from frameguard.tools import (
         get_ffmpeg_path, get_ffprobe_path, get_mediainfo_path,
     )
+    from frameguard.tools import banner_version as tools_banner_version
+    from frameguard.tools import ffmpeg_banner_problem as _ffmpeg_banner_problem
+    from frameguard.tools import _ffmpeg_cache_key as _tool_identity
     _HAS_TOOLS_MODULE = True
 except ImportError:
     _HAS_TOOLS_MODULE = False
+
+    def tools_banner_version(banner):
+        return None
+
+    def _ffmpeg_banner_problem(banner):
+        return None
+
+    def _tool_identity(path):
+        return (path,)
 
     # Provide minimal fallbacks so callers can still use these APIs.
     def get_ffmpeg_path():
@@ -118,13 +130,20 @@ except ImportError:
 # (16:9, flat); an 8K 360 equirect is 7680x3840 (2:1) and has its own preset.
 
 # Meta Quest 360 delivery (Meta Media Studio 360/180 video requirements; Meta
-# Horizon OS media requirements): MP4, H.264/HEVC, "Yuv 420p", SAR 1:1,
-# 30 or 60 fps, hardware decode limit 8192x4096 at 60 fps. Fast-start is
-# YouTube's and every streaming player's requirement.
+# Horizon OS "Media requirements and guidelines for streaming apps"): MP4,
+# "Yuv 420p", SAR 1:1, 30 or 60 fps, hardware decode limit 8192x4096 at
+# 60 fps. Codec: Horizon OS gives 180/360 video encoding as "h.265 or AV1
+# (AV1 will work on Quest 3 and above only)"; H.264 is listed for 2D only,
+# and every Quest 360 size needs H.264 Level 6.x (ITU-T H.264 Table A-1:
+# 3840x3840 is 57 600 macroblocks against Level 5.2's MaxFS of 36 864),
+# beyond common hardware decoders. Main profile keeps 4:2:0 8-bit (a 4:4:4
+# profile can still carry yuv420p). Fast-start is YouTube's and every
+# streaming player's requirement.
 _QUEST_360_DELIVERY = {
     "required_projection": "equirectangular",
     "accepted_containers": [".mp4"],
-    "accepted_codecs": ["h264", "hevc"],
+    "accepted_codecs": ["hevc", "av1"],
+    "allowed_video_profiles": ["Main"],
     "allowed_pix_fmts": ["yuv420p"],
     "require_square_pixels": True,
     "require_faststart": True,
@@ -144,8 +163,17 @@ PRESETS = {
     "5.7k30": {"label": "5.7K @ 30fps (360 VR Capture)", "width": 5760, "height": 2880, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 40,
                "required_projection": "equirectangular", "require_square_pixels": True},
     "8k30": {"label": "8K UHD @ 30fps (7680x4320, flat)", "width": 7680, "height": 4320, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 60},
-    "8k360": {"label": "8K 360° mono @ 30fps (7680x3840, Quest)", "width": 7680, "height": 3840, "fps": 30.0, "fps_tolerance": 0.5,
-              "min_bitrate_mbps": 60, "required_stereo_mode": "mono", **_QUEST_360_DELIVERY},
+    # Two Meta specs disagree on 8K mono 360. Horizon OS streaming apps:
+    # "Realistically ... 7680x3840 / 60fps. Max 8192x4096 / 60fps (hardware
+    # decode limit)", bitrate "higher than 50 mbps". Media Studio uploads:
+    # 2D monoscopic "recommended max 7200x3600", bitrate "Recommended 25-60
+    # Mbps". Each gets its own preset, named for the spec it follows.
+    "8k360": {"label": "8K 360° mono @ 30fps (7680x3840, Quest Horizon OS streaming)", "width": 7680, "height": 3840,
+              "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 50, "required_stereo_mode": "mono",
+              **_QUEST_360_DELIVERY},
+    "360mono7200": {"label": "7.2K 360° mono @ 30fps (7200x3600, Quest Media Studio max)", "width": 7200, "height": 3600,
+                    "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 25, "required_stereo_mode": "mono",
+                    **_QUEST_360_DELIVERY},
     "360tb5760": {"label": "5.7K 360° 3D top-bottom @ 30fps (5760x5760, Quest)", "width": 5760, "height": 5760, "fps": 30.0,
                   "fps_tolerance": 0.5, "min_bitrate_mbps": 40, "required_stereo_mode": "top_bottom", **_QUEST_360_DELIVERY},
     "360tb3840": {"label": "4K 360° 3D top-bottom @ 30fps (3840x3840, Quest)", "width": 3840, "height": 3840, "fps": 30.0,
@@ -304,6 +332,7 @@ STEREO_CHOICES = ("any", "mono", "top_bottom", "side_by_side")
 LOUDNESS_MODES = ("off", "report", "advisory", "essential")
 # "required" fails a file without a consistent SA3D ambisonic track.
 SPATIAL_AUDIO_CHOICES = ("any", "required")
+AAC_PRIMING_CHOICES = container_checks.AAC_PRIMING_CHOICES
 SIGNAL_LEVELS_MODES = video_checks.LEVELS_MODES
 
 DEFAULT_CONFIG = {
@@ -432,6 +461,10 @@ DEFAULT_CONFIG = {
     "av_offset_warn_ms": 5.0,
     "av_offset_max_early_ms": 40.0,
     "av_offset_max_late_ms": 60.0,
+    # AAC encoder priming for audio whose container does not signal it
+    # (MPEG-TS; MP4 without an edit list): "unknown" judges every priming an
+    # encoder may use (0-2112 samples), or the deliverer's encoder's count.
+    "aac_priming": "unknown",
 
     # Timeouts
     "timeout_base_seconds": 120,
@@ -962,7 +995,9 @@ def get_tool_versions() -> Dict[str, Dict[str, Optional[str]]]:
     newer FFmpeg can change what counts as a decode error.
     """
     paths = (("ffmpeg", get_ffmpeg_path()), ("ffprobe", get_ffprobe_path()))
-    key = tuple(p for _, p in paths)
+    # Keyed by binary identity (path, inode, size, mtime): a binary replaced
+    # between scans is probed again, so each scan records the FFmpeg it used.
+    key = tuple(_tool_identity(p) if p else None for _, p in paths)
     with _tool_version_lock:
         if key in _tool_version_cache:
             return dict(_tool_version_cache[key])
@@ -1136,7 +1171,22 @@ def check_container_format(filepath: str, result: QAResult, cfg: dict):
     if mismatch:
         result.add_fail("Container Format", mismatch)
         return
-    result.add_pass("Container Format", f"{_format_size(file_size_mb)}, container: {ext}")
+    # The PASS waits for ffprobe's identification (confirm_container_format).
+
+
+def confirm_container_format(filepath: str, probe_data: Optional[dict], result: QAResult) -> None:
+    """Container Format row once ffprobe has (or has not) read the file: the
+    signature and ffprobe's demuxer must both agree with the extension
+    (container_checks.container_format_verdict)."""
+    ext = os.path.splitext(filepath)[1].lower()
+    status, detail = container_checks.container_format_verdict(filepath, ext, probe_data)
+    if status == "FAIL":
+        result.add_fail("Container Format", detail)
+    elif status == "NOT_VERIFIED":
+        result.add_not_verified("Container Format", detail)
+    else:
+        size = _format_size(os.path.getsize(filepath) / (1024 * 1024))
+        result.add_pass("Container Format", f"{size}, container: {ext}" + (f" ({detail})" if detail else ""))
 
 
 def check_video_codec(probe_data: dict, result: QAResult, cfg: dict):
@@ -1727,6 +1777,8 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
         result.add_skip("XR Metadata", "No video stream found.")
         return
     projection, stereo = _xr_metadata(video, first_frame or {})
+    if stereo is None:
+        stereo = container_checks.box_stereo(structure, video)
     result.set_metadata("projection", projection or "none")
     result.set_metadata("stereo_mode", stereo or "mono")
     found = (f"projection {projection}" if projection else "no spherical metadata (flat)")
@@ -1747,6 +1799,12 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
     hard, soft, notes = container_checks.xr_metadata_findings(
         video, projection, stereo, structure, cfg, grabber, _stream_duration(video) or _probed_duration(probe_data))
     problems += hard
+    # The V1/V2 generations, per-eye bounds and pose come from the box reader;
+    # when it could not read the moov they are unverified, never passed.
+    unread = container_checks.unread_reason(structure) if (projection or want_projection not in ("any", "none")
+                                                           or want_stereo != "any") else ""
+    if unread and (problems or soft):
+        notes.append(f"box-level spherical metadata not verified: {unread}")
     note = f" ({'; '.join(notes)})" if notes else ""
     if problems:
         result.add_fail("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(problems + soft) + "." + note)
@@ -1754,6 +1812,9 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
         content_only = all("content check" in text for text in soft)
         result.add_warn("XR Metadata", f"{found[0].upper()}{found[1:]}. " + "; ".join(soft) + "." + note,
                         confidence=60 if content_only else 80)
+    elif unread:
+        result.add_not_verified("XR Metadata", f"{found}; box-level spherical metadata (V1/V2, bounds, "
+                                               f"pose) could not be read: {unread}." + note)
     else:
         enforced = want_projection != "any" or want_stereo != "any"
         result.add_pass("XR Metadata", f"{found[0].upper()}{found[1:]}"
@@ -3334,6 +3395,14 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
     if not ffmpeg_path:
         _mark_not_verified(result, plan.frame_check_names(), "FFmpeg was not found.")
         return
+    # The banner this scan recorded (get_tool_versions re-probes a binary
+    # whose identity changed), judged against tools.FFMPEG_MIN_VERSION.
+    banner = ((result.tool_versions or get_tool_versions()).get("ffmpeg") or {}).get("version")
+    too_old = _ffmpeg_banner_problem(banner)
+    if too_old:
+        result.set_metadata("ffmpeg_below_minimum", tools_banner_version(banner) or "unknown")
+        _mark_not_verified(result, plan.frame_check_names(), too_old + ".")
+        return
     if plan.duration and "duration_seconds" not in result.metadata:
         result.set_metadata("duration_seconds", round(plan.duration, 2))
         result.set_metadata("duration_display", _format_duration(plan.duration))
@@ -3560,6 +3629,11 @@ def run_qa_checks(filepath: str, cfg: dict = None,
             return result
 
         probe_data = run_ffprobe(filepath, process_owner, cancel_event)
+        if cancel_event and cancel_event.is_set():
+            return result
+        confirm_container_format(filepath, probe_data, result)
+        if not result.passed:
+            return result
         if probe_data is None:
             result.add_fail("FFprobe", "FFprobe failed to read the file. "
                            "Possible causes: file is corrupt, codec not supported by installed FFmpeg, "

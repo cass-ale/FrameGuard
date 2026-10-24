@@ -27,8 +27,9 @@ import os
 import re
 import struct
 import subprocess
+import sys
+from array import array
 from dataclasses import dataclass, field
-from itertools import accumulate
 from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
@@ -38,6 +39,18 @@ from typing import Dict, List, Optional, Tuple
 MAX_TOP_LEVEL_BOXES = 200_000
 MAX_MOOV_BYTES = 256 * 1024 * 1024
 MAX_BOX_DEPTH = 16
+# Boxes parsed inside one moov. A track is ~20 boxes, so 100 000 is several
+# thousand tracks; a moov of 8-byte boxes stops here instead of building a
+# Python object per 8 bytes (review B3: 524 k boxes, 131 MiB).
+MAX_MOOV_BOXES = 100_000
+# Entries read from one sample table (stts/stsc/stsz/stco/co64/stss). Four
+# million is 18.5 h of 60 fps video or 23 h of 48 kHz AAC frames in one
+# track; tables are kept as packed arrays (4-8 bytes per entry), so the
+# reader's memory is bounded by the bytes present, never by declared counts.
+MAX_TABLE_ENTRIES = 4_000_000
+# Edits kept per track: every edit is a splice, so a few thousand is already
+# a cut list no player handles; the rest are noted, not modelled.
+MAX_EDITS = 4096
 MAX_TIMECODE_SAMPLES = 100_000
 MAX_GOP_HEADERS = 20_000
 SNIFF_BYTES = 65_536
@@ -74,11 +87,55 @@ EXTENSION_FAMILY = {
 }
 
 
+# MPEG transport stream framings (sync byte 0x47 at a fixed period): ISO/IEC
+# 13818-1 §2.4.3.2 188-byte packets; BDAV/M2TS 192 bytes (a 4-byte arrival
+# timestamp before each 188-byte packet); 204 bytes (188 + 16 Reed-Solomon
+# parity, DVB/ISDB transmission captures). Demuxers resynchronise on the sync
+# byte, so a TS with stray leading bytes still plays and must still be named.
+_TS_PACKET_SIZES = (188, 192, 204)
+# Sync bytes that must line up before a period counts. Five aligned 0x47
+# bytes in random data have probability 256**-5 (~1e-12) per candidate
+# offset, so over the 65 536-byte sniff window a false TS is ~1e-7.
+_TS_SYNC_RUN = 5
+_ASF_GUID = bytes.fromhex("3026b2758e66cf11a6d900aa0062ce6c")
+
+
+def _ts_sync(head: bytes) -> Optional[Tuple[int, int]]:
+    """(packet size, offset of the first packet) of an MPEG-TS, else None."""
+    for start in range(0, len(head)):
+        if head[start] != 0x47:
+            continue
+        for size in _TS_PACKET_SIZES:
+            last = start + size * (_TS_SYNC_RUN - 1)
+            if last >= len(head):
+                continue
+            if all(head[start + size * k] == 0x47 for k in range(1, _TS_SYNC_RUN)):
+                # M2TS carries its sync 4 bytes into each 192-byte packet.
+                return size, start - 4 if size == 192 and start >= 4 else start
+    return None
+
+
+def _ts_detail(size: int, first: int) -> str:
+    kind = {188: "188-byte packets", 192: "192-byte (M2TS) packets",
+            204: "204-byte (188 + Reed-Solomon) packets"}[size]
+    return kind + (f", {first} junk byte(s) before the first packet" if first else "")
+
+
+def _program_stream(head: bytes) -> bool:
+    """MPEG-2 program stream: a pack header (00 00 01 BA, ISO/IEC 13818-1
+    §2.5.3.3) at the start, followed by another pack or a system/PES header."""
+    if head[:4] != b"\x00\x00\x01\xba" or len(head) < 14:
+        return False
+    # MPEG-2 packs start '01' in the next byte; MPEG-1 packs '0010'.
+    return (head[4] >> 6) == 0b01 or (head[4] >> 4) == 0b0010
+
+
 def sniff_container(path: str) -> Tuple[str, str]:
     """(family, detail) from the file's own signature, independent of its name.
 
-    Families: ISO-BMFF, Matroska, MPEG-TS, MXF, AVI or unknown. Raises OSError
-    only when the file cannot be opened (the caller already checked it exists).
+    Families: ISO-BMFF, Matroska, MPEG-TS, MPEG-PS, MXF, AVI, FLV, Ogg, ASF,
+    WAV or unknown. Raises OSError only when the file cannot be opened (the
+    caller already checked it exists).
     """
     with open(path, "rb") as stream:
         head = stream.read(SNIFF_BYTES)
@@ -90,15 +147,49 @@ def sniff_container(path: str) -> Tuple[str, str]:
     if head[:4] == b"\x1a\x45\xdf\xa3":
         doctype = "webm" if b"webm" in head[:64] else "matroska"
         return "Matroska", f"DocType {doctype}"
-    if len(head) > 376 and head[0] == 0x47 and head[188] == 0x47 and head[376] == 0x47:
-        return "MPEG-TS", "188-byte packets"
-    if len(head) > 388 and head[4] == 0x47 and head[196] == 0x47 and head[388] == 0x47:
-        return "MPEG-TS", "192-byte (M2TS) packets"
-    if _MXF_PARTITION_KEY in head:
-        return "MXF", ""
+    if head[:3] == b"FLV" and len(head) >= 9 and head[3] == 1:
+        return "FLV", ""
+    if head[:4] == b"OggS":
+        return "Ogg", ""
+    if head[:16] == _ASF_GUID:
+        return "ASF", ""
     if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
         return "AVI", ""
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "WAV", ""
+    if _program_stream(head):
+        return "MPEG-PS", ""
+    if _MXF_PARTITION_KEY in head:
+        return "MXF", ""
+    sync = _ts_sync(head)
+    if sync is not None:
+        return "MPEG-TS", _ts_detail(*sync)
+    first = _loose_first_box(head)
+    if first:
+        return "ISO-BMFF", f"first box '{first}'"
     return "unknown", ""
+
+
+def _loose_first_box(head: bytes) -> str:
+    """The first box type of an MP4/MOV that opens with a box outside
+    _ISO_FIRST_BOXES (QuickTime allows any top-level atom), else "".
+
+    Requires two consecutive well-formed box headers inside the sniff window
+    (printable four-cc, size >= 8) so arbitrary bytes do not pass; the box
+    walker then judges the whole structure.
+    """
+    pos, seen = 0, []
+    while len(seen) < 2 and pos + 8 <= len(head):
+        size, kind = struct.unpack(">I4s", head[pos:pos + 8])
+        if not _plausible_type(kind) or kind == b"\x20\x20\x20\x20":
+            return ""
+        if size == 1 and pos + 16 <= len(head):
+            size = struct.unpack(">Q", head[pos + 8:pos + 16])[0]
+        if size < 8:
+            return ""
+        seen.append(kind.decode("latin-1"))
+        pos += size
+    return seen[0] if len(seen) == 2 else ""
 
 
 def extension_mismatch(path: str, ext: str) -> Optional[str]:
@@ -107,8 +198,8 @@ def extension_mismatch(path: str, ext: str) -> Optional[str]:
     A Matroska or MPEG-TS file renamed ``.mp4`` used to pass Container Format
     because only the extension was read. Players and platforms that trust
     the extension (Quest, many ingest services) reject such files. An
-    unrecognised signature is not judged here: ffprobe and the decode pass
-    decide whether such a file is readable at all.
+    unrecognised signature is judged after ffprobe has read the file
+    (container_format_verdict).
     """
     expected = EXTENSION_FAMILY.get(ext.lower())
     if expected is None:
@@ -124,6 +215,64 @@ def extension_mismatch(path: str, ext: str) -> Optional[str]:
             f"Rename or remux it; players that trust the extension will refuse it.")
 
 
+# ffprobe ``format_name`` (comma-separated demuxer aliases) -> family.
+_PROBE_FAMILIES = {
+    "mov": "ISO-BMFF", "mp4": "ISO-BMFF", "m4a": "ISO-BMFF", "3gp": "ISO-BMFF", "3g2": "ISO-BMFF",
+    "mj2": "ISO-BMFF", "matroska": "Matroska", "webm": "Matroska", "mpegts": "MPEG-TS",
+    "mpeg": "MPEG-PS", "mxf": "MXF", "avi": "AVI", "flv": "FLV", "ogg": "Ogg", "asf": "ASF",
+    "wav": "WAV",
+}
+
+
+def probe_family(probe_data: Optional[dict]) -> Tuple[Optional[str], str]:
+    """(family, ffprobe format_name) of what ffprobe's demuxer read; family is
+    the raw format name for formats outside the table (e.g. ``h264`` for a
+    raw elementary stream) and None when ffprobe reported no format."""
+    name = str(((probe_data or {}).get("format") or {}).get("format_name") or "").strip()
+    if not name:
+        return None, ""
+    for alias in name.split(","):
+        family = _PROBE_FAMILIES.get(alias.strip().lower())
+        if family:
+            return family, name
+    return name, name
+
+
+def container_format_verdict(path: str, ext: str, probe_data: Optional[dict]) -> Tuple[str, str]:
+    """("PASS" | "FAIL" | "NOT_VERIFIED", detail) for Container Format once
+    ffprobe has read the file (or failed to: ``probe_data`` None).
+
+    The file's own signature (sniff_container) and the demuxer ffprobe chose
+    are two independent identifications; the extension's promise must agree
+    with both. An unrecognised signature is never a pass: either ffprobe
+    names a different format (FAIL), or nothing confirms the container
+    (Not verified). A signature that differs from the extension already
+    failed in extension_mismatch.
+    """
+    expected = EXTENSION_FAMILY.get(ext.lower())
+    try:
+        sniffed, detail = sniff_container(path)
+    except OSError as exc:
+        return "NOT_VERIFIED", f"the file could not be read to verify its container ({type(exc).__name__})."
+    probed, format_name = probe_family(probe_data)
+    if expected is None:
+        return "PASS", ""
+    if probed is not None and probed != expected:
+        what = f"FFprobe reads it as '{format_name}'" + (
+            f" ({probed})" if probed != format_name else "")
+        return "FAIL", (f"The file is named '{ext}', which promises {expected}, but {what}. "
+                        f"Rename or remux it; players that trust the extension will refuse it.")
+    if sniffed == "unknown":
+        if probe_data is None:
+            return "NOT_VERIFIED", (f"no {expected} signature was found and FFprobe could not read the "
+                                    f"file, so its container is unconfirmed.")
+        return "NOT_VERIFIED", (f"no {expected} signature at the start of the file; FFprobe reads it as "
+                                f"'{format_name or 'unknown'}', but the container structure is unconfirmed.")
+    if probe_data is None:
+        return "NOT_VERIFIED", f"the file carries a {sniffed} signature but FFprobe could not read it."
+    return "PASS", detail
+
+
 # ---------------------------------------------------------------------------
 # Box reader
 # ---------------------------------------------------------------------------
@@ -136,14 +285,25 @@ _STRICT_BOXES = {b"moov", b"trak", b"mdia", b"minf", b"stbl", b"edts"}
 SPHERICAL_V1_UUID = bytes.fromhex("ffcc8263f8554a938814587a02521fdd")
 
 
-@dataclass
 class Box:
-    type: bytes
-    offset: int          # absolute file offset of the box header
-    size: int            # declared size including the header
-    header: int          # 8 or 16
-    payload: bytes = b""  # only for boxes inside moov
-    children: List["Box"] = field(default_factory=list)
+    """One box. Inside moov the payload is a view into the single moov read,
+    sliced on demand: a box costs one small object, never a copy (review B3)."""
+    __slots__ = ("type", "offset", "size", "header", "_data", "_start", "children")
+
+    def __init__(self, kind: bytes, offset: int, size: int, header: int, data=b"", start: int = 0):
+        self.type = kind
+        self.offset = offset      # absolute file offset of the box header
+        self.size = size          # declared size including the header
+        self.header = header      # 8 or 16
+        self._data = data         # the enclosing buffer (boxes inside moov only)
+        self._start = start
+        self.children: List["Box"] = ()
+
+    @property
+    def payload(self):
+        if not self._data:
+            return b""
+        return self._data[self._start:self._start + self.size - self.header]
 
     @property
     def name(self) -> str:
@@ -200,12 +360,13 @@ class TrackInfo:
     entries: List[SampleEntry] = field(default_factory=list)
     stts: List[Tuple[int, int]] = field(default_factory=list)
     ctts: List[Tuple[int, int]] = field(default_factory=list)
-    sync_samples: Optional[List[int]] = None
+    sync_samples: Optional[array] = None
     sample_count: int = 0
     max_sample_end: int = 0
     first_missing_sample: Optional[int] = None
     table_problem: str = ""
     v1_xml: str = ""
+    tables_skipped: str = ""    # a table above MAX_TABLE_ENTRIES (not checked)
     _chunk_offsets: Tuple[int, ...] = ()
     _stsc: List[Tuple[int, int, int]] = field(default_factory=list)
     _sizes: Tuple[int, ...] = ()
@@ -262,6 +423,8 @@ class Structure:
     family: str = "unknown"
     file_size: int = 0
     brand: str = ""
+    compatible_brands: List[str] = field(default_factory=list)
+    extension: str = ""
     top: List[Box] = field(default_factory=list)
     damage: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
@@ -272,8 +435,10 @@ class Structure:
     has_mvex: bool = False
     movie_timescale: int = 0
     tracks: List[TrackInfo] = field(default_factory=list)
+    boxes_parsed: int = 0
     parsed: bool = False
     error: str = ""
+    moov_unread: str = ""     # why a moov that exists was not parsed
 
     @property
     def fragmented(self) -> bool:
@@ -331,19 +496,30 @@ def _parse_children(data: bytes, start: int, end: int, base: int, depth: int,
     pos = start
     strict = parent in _STRICT_BOXES
     while pos + 8 <= end:
+        if structure.boxes_parsed >= MAX_MOOV_BOXES:
+            structure.moov_unread = (f"the moov index holds more than {MAX_MOOV_BOXES:,} boxes, so it was not "
+                                     f"read in full")
+            break
         size, kind = struct.unpack(">I4s", data[pos:pos + 8])
         header = 8
         if size == 1 and pos + 16 <= end:
             size = struct.unpack(">Q", data[pos + 8:pos + 16])[0]
             header = 16
         elif size == 0:
-            size = end - pos
+            # ISO/IEC 14496-12 §4.2: "extends to the end of the file" is
+            # allowed only for the last top-level box. Inside a sample entry
+            # QuickTime tolerates a 4-byte zero terminator: stop quietly there.
+            if strict:
+                structure.damage.append(f"box inside '{parent.decode('latin-1')}' at offset {base + pos} "
+                                        f"has size 0, which is allowed only for the last top-level box")
+            break
         if size < header or pos + size > end or not _plausible_type(kind):
             if strict:
                 structure.damage.append(f"box inside '{parent.decode('latin-1')}' at offset {base + pos} "
                                         f"overruns its parent or is not a valid box")
             break
-        box = Box(kind, base + pos, size, header, data[pos + header:pos + size])
+        box = Box(kind, base + pos, size, header, data, pos + header)
+        structure.boxes_parsed += 1
         if depth < MAX_BOX_DEPTH:
             _expand(box, data, pos, depth, parent, handler, structure)
         out.append(box)
@@ -351,17 +527,36 @@ def _parse_children(data: bytes, start: int, end: int, base: int, depth: int,
     return out
 
 
-def _audio_entry_header(payload: bytes) -> int:
-    """Bytes before an audio sample entry's child boxes (QuickTime v0/v1/v2)."""
+def _audio_entry_header(payload: bytes, quicktime: bool = True) -> int:
+    """Bytes before an audio sample entry's child boxes.
+
+    Version 1 differs by family: a QuickTime SoundDescription v1 adds four
+    32-bit fields (44 bytes); an ISO/IEC 14496-12 AudioSampleEntryV1 keeps
+    the 28-byte layout. The brand decides, and when the chosen offset does
+    not start a plausible box but the other does, the other is used (QuickTime
+    v1 entries also appear in files with ISO brands).
+    """
     version = struct.unpack(">H", payload[8:10])[0] if len(payload) >= 10 else 0
-    return {0: 28, 1: 44, 2: 64}.get(version, 28)
+    if version != 1:
+        return {0: 28, 2: 64}.get(version, 28)
+    first, second = (44, 28) if quicktime else (28, 44)
+    if not _starts_box(payload, first) and _starts_box(payload, second):
+        return second
+    return first
 
 
-def _entry_header_size(handler: str, payload: bytes) -> Optional[int]:
+def _starts_box(payload, at: int) -> bool:
+    if at + 8 > len(payload):
+        return False
+    size, kind = struct.unpack(">I4s", payload[at:at + 8])
+    return size >= 8 and at + size <= len(payload) and _plausible_type(kind)
+
+
+def _entry_header_size(handler: str, payload: bytes, quicktime: bool = True) -> Optional[int]:
     if handler == "vide":
         return 78
     if handler == "soun":
-        return _audio_entry_header(payload)
+        return _audio_entry_header(payload, quicktime)
     if handler == "tmcd":
         return 26
     return None
@@ -387,12 +582,43 @@ def _fullbox(payload: bytes) -> Tuple[int, bytes]:
     return (payload[0] if payload else 0), payload[4:]
 
 
-def _u32_array(body: bytes, count: int, offset: int = 0, wide: bool = False) -> Optional[Tuple[int, ...]]:
+_U32 = next(code for code in "IL" if array(code).itemsize == 4)
+_U64 = next(code for code in "QL" if array(code).itemsize == 8)
+
+
+def _u32_array(body: bytes, count: int, offset: int = 0, wide: bool = False) -> Optional[array]:
+    """``count`` big-endian 32-bit (or 64-bit) values as a packed array, or
+    None when the body holds fewer bytes than the count declares (so a
+    declared count can never allocate more than the bytes present)."""
     width = 8 if wide else 4
     need = offset + count * width
     if count < 0 or need > len(body):
         return None
-    return struct.unpack(f">{count}{'Q' if wide else 'I'}", body[offset:need])
+    values = array(_U64 if wide else _U32)
+    values.frombytes(body[offset:need])
+    if sys.byteorder == "little":
+        values.byteswap()
+    return values
+
+
+class _Runs:
+    """A run-length table (stts, stsc) as packed columns; iterates as tuples."""
+    __slots__ = ("columns",)
+
+    def __init__(self, values: array, width: int):
+        self.columns = [values[i::width] for i in range(width)]
+
+    def __iter__(self):
+        return zip(*self.columns)
+
+    def __len__(self) -> int:
+        return len(self.columns[0])
+
+    def __bool__(self) -> bool:
+        return len(self.columns[0]) > 0
+
+    def __getitem__(self, index: int) -> tuple:
+        return tuple(column[index] for column in self.columns)
 
 
 def _parse_sv3d(box: Box) -> dict:
@@ -463,7 +689,7 @@ def _read_track(trak: Box, structure: Structure) -> TrackInfo:
             track.track_id = struct.unpack(">I", body[id_at:id_at + 4])[0]
     hdlr = trak.child(b"mdia", b"hdlr")
     if hdlr is not None and len(hdlr.payload) >= 12:
-        track.handler = hdlr.payload[8:12].decode("latin-1")
+        track.handler = bytes(hdlr.payload[8:12]).decode("latin-1")
     mdhd = trak.child(b"mdia", b"mdhd")
     if mdhd is not None:
         version, body = _fullbox(mdhd.payload)
@@ -475,8 +701,9 @@ def _read_track(trak: Box, structure: Structure) -> TrackInfo:
     if elst is not None:
         track.edits = _read_edits(elst, structure)
     for child in trak.all(b"uuid"):
-        if child.payload[:16] == SPHERICAL_V1_UUID:
-            track.v1_xml = child.payload[16:].decode("utf-8", "replace")
+        if bytes(child.payload[:16]) == SPHERICAL_V1_UUID:
+            # The XML is a few hundred bytes; a hostile one is read only this far.
+            track.v1_xml = bytes(child.payload[16:16 + 65536]).decode("utf-8", "replace")
     stbl = trak.child(b"mdia", b"minf", b"stbl")
     if stbl is not None:
         _read_sample_tables(track, stbl)
@@ -496,6 +723,10 @@ def _read_edits(elst: Box, structure: Structure) -> List[Edit]:
         structure.damage.append(f"edit list at offset {elst.offset} declares {count} entries but holds "
                                 f"{(len(body) - 4) // width}")
         count = (len(body) - 4) // width
+    if count > MAX_EDITS:
+        structure.notes.append(f"edit list at offset {elst.offset} has {count:,} entries; the first "
+                               f"{MAX_EDITS:,} were judged")
+        count = MAX_EDITS
     edits = []
     for i in range(count):
         at = 4 + i * width
@@ -507,16 +738,27 @@ def _read_edits(elst: Box, structure: Structure) -> List[Edit]:
     return edits
 
 
+def _table_count(track: TrackInfo, name: str, body, per_entry: int = 1) -> int:
+    """Declared entry count of a FullBox table, or -1 when it is above
+    MAX_TABLE_ENTRIES (recorded on the track as not checked)."""
+    count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
+    if count > MAX_TABLE_ENTRIES:
+        track.tables_skipped = (f"its {name} table declares {count:,} entries, above the "
+                                f"{MAX_TABLE_ENTRIES:,} FrameGuard checks")
+        return -1
+    return count * per_entry
+
+
 def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
     stts = stbl.child(b"stts")
     if stts is not None:
         _, body = _fullbox(stts.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        values = _u32_array(body, count * 2, 4)
-        if values is None:
+        count = _table_count(track, "time-to-sample", body, 2)
+        values = _u32_array(body, count, 4) if count >= 0 else None
+        if values is None and count >= 0:
             track.table_problem = "time-to-sample table is shorter than its entry count"
-        else:
-            track.stts = list(zip(values[0::2], values[1::2]))
+        elif values is not None:
+            track.stts = _Runs(values, 2)
     ctts = stbl.child(b"ctts")
     if ctts is not None:
         version, body = _fullbox(ctts.payload)
@@ -528,9 +770,8 @@ def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
     stss = stbl.child(b"stss")
     if stss is not None:
         _, body = _fullbox(stss.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        values = _u32_array(body, count, 4)
-        track.sync_samples = list(values) if values is not None else None
+        count = _table_count(track, "sync-sample", body)
+        track.sync_samples = _u32_array(body, count, 4) if count >= 0 else None
     stsz = stbl.child(b"stsz")
     if stsz is not None:
         _, body = _fullbox(stsz.payload)
@@ -539,6 +780,9 @@ def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
             track.sample_count = count
             if constant:
                 track._constant_size = constant
+            elif count > MAX_TABLE_ENTRIES:
+                track.tables_skipped = (f"its sample-size table declares {count:,} entries, above the "
+                                        f"{MAX_TABLE_ENTRIES:,} FrameGuard checks")
             else:
                 sizes = _u32_array(body, count, 8)
                 if sizes is None:
@@ -548,32 +792,47 @@ def _read_sample_tables(track: TrackInfo, stbl: Box) -> None:
     stsc = stbl.child(b"stsc")
     if stsc is not None:
         _, body = _fullbox(stsc.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        values = _u32_array(body, count * 3, 4)
-        if values is None:
+        count = _table_count(track, "sample-to-chunk", body, 3)
+        values = _u32_array(body, count, 4) if count >= 0 else None
+        if values is None and count >= 0:
             track.table_problem = "sample-to-chunk table is shorter than its entry count"
-        else:
-            track._stsc = list(zip(values[0::3], values[1::3], values[2::3]))
+        elif values is not None:
+            firsts = values[0::3]
+            # ISO/IEC 14496-12 §8.7.4: first_chunk starts at 1 and increases
+            # strictly. A table that does not cannot be walked in order; walking
+            # it anyway was quadratic (review B1: 60 KB, 43 s).
+            if firsts and (firsts[0] != 1 or any(b <= a for a, b in zip(firsts, firsts[1:]))):
+                track.table_problem = ("the sample-to-chunk table's first_chunk values do not increase "
+                                       "strictly from 1 (ISO/IEC 14496-12 §8.7.4)")
+            else:
+                track._stsc = _Runs(values, 3)
     for kind, wide in ((b"stco", False), (b"co64", True)):
         box = stbl.child(kind)
         if box is None:
             continue
         _, body = _fullbox(box.payload)
-        count = struct.unpack(">I", body[:4])[0] if len(body) >= 4 else 0
-        offsets = _u32_array(body, count, 4, wide)
-        if offsets is None:
+        count = _table_count(track, "chunk-offset", body)
+        offsets = _u32_array(body, count, 4, wide) if count >= 0 else None
+        if offsets is None and count >= 0:
             track.table_problem = "chunk-offset table is shorter than its entry count"
-        else:
+        elif offsets is not None:
             track._chunk_offsets = offsets
 
 
 def _chunk_layout(track: TrackInfo):
-    """Yield (chunk_offset, first_sample_index, samples_in_chunk) per chunk."""
+    """Yield (chunk_offset, first_sample_index, samples_in_chunk) per chunk.
+
+    stsc is validated strictly increasing, so the walk visits each chunk
+    once: at most len(chunk offsets) iterations whatever the run count.
+    """
     runs = track._stsc
     offsets = track._chunk_offsets
     sample = 0
+    total = len(runs)
     for i, (first_chunk, per_chunk, _) in enumerate(runs):
-        last_chunk = runs[i + 1][0] - 1 if i + 1 < len(runs) else len(offsets)
+        last_chunk = runs[i + 1][0] - 1 if i + 1 < total else len(offsets)
+        if first_chunk > len(offsets):
+            return
         for chunk in range(max(first_chunk, 1), min(last_chunk, len(offsets)) + 1):
             yield offsets[chunk - 1], sample, per_chunk
             sample += per_chunk
@@ -584,37 +843,37 @@ def _locate_samples(track: TrackInfo, file_size: int) -> None:
 
     Iterates chunks, not samples: a PCM track stores one "sample" per audio
     frame (48 000 a second), so a per-sample loop over a long camera file
-    would cost seconds.
+    would cost seconds. Each sample size is summed once (chunks come in
+    sample order), so the cost is linear in the tables.
     """
     if not track._chunk_offsets or not track._stsc or not track.sample_count:
         return
-    prefix = None
+    sizes = None
     if not track._constant_size:
         if len(track._sizes) != track.sample_count:
             return
-        prefix = (0,) + tuple(accumulate(track._sizes))
+        sizes = memoryview(track._sizes) if isinstance(track._sizes, array) else track._sizes   # slices: no copy
     mapped = 0
     for offset, first, count in _chunk_layout(track):
         count = min(count, track.sample_count - first)
         if count <= 0:
             break
         mapped = first + count
-        if prefix is None:
-            span = count * track._constant_size
-        else:
-            span = prefix[first + count] - prefix[first]
+        span = count * track._constant_size if sizes is None else sum(sizes[first:first + count])
         end = offset + span
         track.max_sample_end = max(track.max_sample_end, end)
         if end > file_size and track.first_missing_sample is None:
-            track.first_missing_sample = _first_sample_past(offset, first, count, file_size, track, prefix)
+            track.first_missing_sample = _first_sample_past(offset, first, count, file_size, track)
     if mapped < track.sample_count and not track.table_problem:
         track.table_problem = (f"the chunk tables place {mapped} of {track.sample_count} samples")
 
 
-def _first_sample_past(offset: int, first: int, count: int, file_size: int,
-                       track: TrackInfo, prefix) -> int:
+def _first_sample_past(offset: int, first: int, count: int, file_size: int, track: TrackInfo) -> int:
+    if track._constant_size:
+        inside = max(0, file_size - offset) // track._constant_size
+        return first + min(count, inside)
     for k in range(count):
-        size = track._constant_size if prefix is None else track._sizes[first + k]
+        size = track._sizes[first + k]
         if offset + size > file_size:
             return first + k
         offset += size
@@ -624,11 +883,16 @@ def _first_sample_past(offset: int, first: int, count: int, file_size: int,
 def _read_moov(stream, box: Box, structure: Structure) -> None:
     payload_size = box.size - box.header
     if payload_size > MAX_MOOV_BYTES:
-        structure.notes.append(f"the moov index is {payload_size / 1048576:.0f} MB; it was not inspected")
+        structure.moov_unread = (f"the moov index is {payload_size:,} bytes, above the "
+                                 f"{MAX_MOOV_BYTES:,}-byte inspection limit, so it was not read")
         return
     stream.seek(box.offset)
-    data = stream.read(box.size)
+    # One read of the moov; every box payload is a view into it, so nesting
+    # never copies (review B3: 16 MiB nested 15 deep peaked at 272 MiB).
+    data = memoryview(stream.read(box.size))
     box.children = _parse_children(data, box.header, len(data), box.offset, 1, b"moov", "", structure)
+    if structure.moov_unread:
+        return
     mvhd = box.child(b"mvhd")
     if mvhd is not None:
         version, body = _fullbox(mvhd.payload)
@@ -637,8 +901,11 @@ def _read_moov(stream, box: Box, structure: Structure) -> None:
             structure.movie_timescale = struct.unpack(">I", body[at:at + 4])[0]
     structure.has_mvex = box.child(b"mvex") is not None
     for trak in box.all(b"trak"):
+        if structure.moov_unread:
+            return
         handler_box = trak.child(b"mdia", b"hdlr")
-        handler = handler_box.payload[8:12].decode("latin-1") if handler_box and len(handler_box.payload) >= 12 else ""
+        handler = (bytes(handler_box.payload[8:12]).decode("latin-1")
+                   if handler_box and len(handler_box.payload) >= 12 else "")
         if handler:
             _reparse_stsd_with_handler(trak, handler, structure)
         track = _read_track(trak, structure)
@@ -661,8 +928,10 @@ def _reparse_stsd_with_handler(trak: Box, handler: str, structure: Structure) ->
             structure.damage.append(f"sample description at offset {stsd.offset + stsd.header + pos} "
                                     f"overruns its stsd box")
             break
-        entry = Box(kind, stsd.offset + stsd.header + pos, size, 8, payload[pos + 8:pos + size])
-        skip = _entry_header_size(handler, entry.payload)
+        entry = Box(kind, stsd.offset + stsd.header + pos, size, 8, payload, pos + 8)
+        structure.boxes_parsed += 1
+        # No ftyp at all is a classic QuickTime movie (ISO files must start with one).
+        skip = _entry_header_size(handler, entry.payload, quicktime=structure.brand in ("qt", ""))
         if skip is not None and skip <= len(entry.payload):
             entry.children = _parse_children(entry.payload, skip, len(entry.payload),
                                              entry.offset + 8, 2, kind, handler, structure)
@@ -674,6 +943,7 @@ def _reparse_stsd_with_handler(trak: Box, handler: str, structure: Structure) ->
 def read_structure(path: str) -> Structure:
     """Read the box structure of ``path``; never raises (errors land in ``error``)."""
     structure = Structure()
+    structure.extension = os.path.splitext(path)[1].lower()
     try:
         structure.file_size = os.path.getsize(path)
         structure.family, detail = sniff_container(path)
@@ -684,7 +954,10 @@ def read_structure(path: str) -> Structure:
             for box in structure.top:
                 if box.type == b"ftyp":
                     stream.seek(box.offset + box.header)
-                    structure.brand = stream.read(4).decode("latin-1").strip()
+                    head = stream.read(min(box.size - box.header, 4096))
+                    structure.brand = head[:4].decode("latin-1").strip()
+                    structure.compatible_brands = [head[i:i + 4].decode("latin-1").strip()
+                                                   for i in range(8, len(head) - 3, 4)]
                 elif box.type == b"moov":
                     structure.moov_count += 1
                     if structure.moov_offset is None:
@@ -701,8 +974,25 @@ def read_structure(path: str) -> Structure:
     return structure
 
 
+def unread_reason(structure: Optional[Structure]) -> str:
+    """Why the box-level view of an MP4/MOV is missing ("" when it was read,
+    or the file is not ISO-BMFF so box-level checks do not apply)."""
+    if structure is None or structure.family != "ISO-BMFF":
+        return ""
+    if structure.error:
+        return f"the file's box structure could not be read ({structure.error})"
+    if not structure.parsed:
+        return structure.moov_unread or "the file has no readable moov index"
+    return ""
+
+
 def sample_offsets(track: TrackInfo, wanted: List[int]) -> Dict[int, Tuple[int, int]]:
-    """{sample index: (file offset, size)} for the zero-based indices in ``wanted``."""
+    """{sample index: (file offset, size)} for the zero-based indices in ``wanted``.
+
+    One running offset per chunk: each sample size is added at most once
+    (review B2: summing from the chunk start per wanted sample was
+    O(targets x chunk length), 20 s for a 0.7 MB timecode track).
+    """
     targets = sorted(set(i for i in wanted if 0 <= i < track.sample_count))
     found: Dict[int, Tuple[int, int]] = {}
     if not targets or not track._chunk_offsets:
@@ -713,17 +1003,18 @@ def sample_offsets(track: TrackInfo, wanted: List[int]) -> Dict[int, Tuple[int, 
     pending = iter(targets)
     target = next(pending, None)
     for offset, first, count in _chunk_layout(track):
+        at, index = offset, first
         while target is not None and target < first + count:
             if target < first:
                 target = next(pending, None)
                 continue
             if track._constant_size:
-                at = offset + (target - first) * track._constant_size
-                size = track._constant_size
+                found[target] = (offset + (target - first) * track._constant_size, track._constant_size)
             else:
-                at = offset + sum(sizes[first:target])
-                size = sizes[target]
-            found[target] = (at, size)
+                while index < target:
+                    at += sizes[index]
+                    index += 1
+                found[target] = (at, sizes[target])
             target = next(pending, None)
         if target is None:
             break
@@ -774,10 +1065,16 @@ def _missing_media_text(structure: Structure) -> List[str]:
             continue
         kind = "video" if track.handler == "vide" else "audio"
         at = track.sample_time(track.first_missing_sample)
-        total = track.seconds(track.duration)
+        # mdhd's duration can be shorter than the sample table says (a cut
+        # moov, a hostile header): the missing span runs to whichever ends later.
+        end = max(track.seconds(track.duration), track.sample_time(track.sample_count))
         out.append(f"{kind} samples from {_clock(at)} on (sample {track.first_missing_sample + 1} of "
-                   f"{track.sample_count}, {total - at:.2f} s) lie beyond the end of the file")
+                   f"{track.sample_count}, {max(0.0, end - at):.2f} s) lie beyond the end of the file")
     return out
+
+
+_MP4_BRANDS = frozenset({"mp41", "mp42", "mp71", "avc1", "dash", "msnv", "M4V", "M4A", "f4v", "3gp4", "3gp5",
+                         "3gp6", "3g2a"})
 
 
 def check_container_structure(structure: Structure, result, cfg: dict) -> None:
@@ -798,7 +1095,12 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
         result.add_skip(name, f"{structure.family} file: box-level checks apply to MP4/MOV."
                         if structure.family != "unknown" else "Not an MP4/MOV file: box-level checks do not apply.")
         return
-    problems, notes = list(structure.damage), []
+    if structure.moov_unread and not structure.damage:
+        result.add_not_verified(name, structure.moov_unread + "; box tables and samples were not checked.")
+        return
+    problems, notes, unchecked = list(structure.damage), [], []
+    if structure.moov_unread:
+        notes.append(structure.moov_unread)
     problems += _missing_media_text(structure)
     if structure.moov_count == 0 and not structure.fragmented and not structure.damage:
         problems.append("no moov index box: players cannot open the file")
@@ -810,6 +1112,8 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
                             f"(a splice of differently encoded media)")
         if track.is_av and track.table_problem:
             problems.append(f"{track.handler} track {track.track_id}: {track.table_problem}")
+        if track.is_av and track.tables_skipped:
+            unchecked.append(f"{track.handler} track {track.track_id}: {track.tables_skipped}")
     if structure.moov_offset is not None and structure.first_mdat_offset is not None:
         if structure.moov_offset > structure.first_mdat_offset:
             text = "index (moov) after the media data, not fast-start"
@@ -820,6 +1124,13 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
                 notes.append(text + " (fine for file delivery)")
         else:
             notes.append("fast-start (index before media)")
+    quicktime_only = structure.brand == "qt" and not any(
+        b in _MP4_BRANDS or b.startswith("iso") for b in structure.compatible_brands)
+    if quicktime_only and structure.extension in (".mp4", ".m4v"):
+        # ISO/IEC 14496-14 MP4 files carry an MP4/ISO brand; a file whose only
+        # brand is 'qt  ' is a QuickTime movie, which strict MP4 ingest refuses.
+        problems.append(f"the ftyp brand is 'qt  ' only (a QuickTime movie) but the file is named "
+                        f"'{structure.extension}'; rename it .mov or remux it as MP4")
     if structure.fragmented:
         notes.append(f"fragmented MP4 ({structure.moof_count} fragment(s))")
     if structure.brand:
@@ -829,7 +1140,9 @@ def check_container_structure(structure: Structure, result, cfg: dict) -> None:
     result.set_metadata("faststart", structure.moov_offset is not None and structure.first_mdat_offset is not None
                         and structure.moov_offset < structure.first_mdat_offset)
     if problems:
-        result.add_warn(name, _sentence(problems + notes))
+        result.add_warn(name, _sentence(problems + unchecked + notes))
+    elif unchecked:
+        result.add_not_verified(name, _sentence(unchecked + ["its samples were not located"] + notes))
     else:
         tracks = sum(1 for t in structure.tracks if t.is_av)
         result.add_pass(name, _sentence([f"ISO-BMFF, {tracks} audio/video track(s), every box and sample "
@@ -960,58 +1273,104 @@ def check_edit_lists(structure: Structure, result, cfg: dict) -> None:
 # A/V Sync Offset (ESSENTIAL)
 # ---------------------------------------------------------------------------
 
-# Largest AAC encoder delay in common use: 2112 samples (Apple/QuickTime
-# AAC-LC; FFmpeg's encoder uses 1024). HE-AAC doubles it at the output rate.
+# AAC encoder delay (priming) is not defined by ISO/IEC 14496-3; encoders in
+# use prime 1024 (FFmpeg's native encoder, its initial_padding) to 2112
+# samples (Apple AAC-LC, Apple Technical Note TN2258). HE-AAC (SBR) runs the
+# core at half rate, so the same core priming is twice as many output
+# samples. When a container does not signal the priming, the programme sound
+# begins anywhere from the track start up to this much later.
 AAC_MAX_PRIMING_SAMPLES = 2112
+# ``aac_priming``: what a spec knows about its encoder. "unknown" judges the
+# whole 0..AAC_MAX_PRIMING_SAMPLES range; a sample count (the deliverer's
+# encoder) makes unsignalled priming exact.
+AAC_PRIMING_CHOICES = ("unknown", 1024, 2112)
 
 
-def _unsignalled_priming(track: dict) -> float:
-    """Seconds of AAC encoder priming the container does not signal (upper bound), else 0.
+def _edit_list_priming(structure: Optional["Structure"], track: dict) -> Optional[float]:
+    """Seconds of stored audio (priming, or a trim's lead-in) the audio track's own MP4/MOV edit list hides, else None.
 
-    An MP4/MOV edit list (or a Matroska CodecDelay) tells the player to drop
-    the priming, and ffprobe then reports it as ``initial_padding`` with the
-    start time already at the first real sample. Without that signal (MPEG-TS
-    always; an MP4 written without an edit list) the decoder plays the
-    priming, so the sound starts 1024-2112 samples after the track does.
+    The first media edit's ``media_time`` is the decoder delay a muxer tells
+    the player to skip (ISO/IEC 14496-12 §8.6.6; Apple's AAC priming
+    convention), so an edit list states the priming exactly even where
+    ffprobe reports ``initial_padding=0`` (FFmpeg 6/7 for edit-listed MP4).
+    None when there is no box-level view, no such track or no edit list.
+    """
+    if structure is None or not structure.parsed:
+        return None
+    found = structure.track_by_id(stream_track_id(track) or -1)
+    if found is None or found.handler != "soun" or not found.edits or not found.timescale:
+        return None
+    media = next((e for e in found.edits if e.media_time >= 0), None)
+    if media is None:
+        return None
+    hidden = media.media_time / found.timescale
+    # Any hidden lead-in starts the presentation after the stored start, so
+    # the priming (stored first) is skipped with it: a lossless trim's edit
+    # (hiding more than AUDIO_PRIMING_MAX_S) signals it as surely as an
+    # encoder's priming edit.
+    return hidden if hidden > 0 else None
+
+
+def _unsignalled_priming(track: dict, structure: Optional["Structure"] = None,
+                         cfg_priming="unknown") -> Tuple[float, bool]:
+    """(priming seconds the container does not signal, exact?) for one audio track.
+
+    (0, True) when nothing is unsignalled; (upper bound, False) when the
+    encoder is unknown; (the spec's ``aac_priming``, True) when it is set.
+
+    An MP4/MOV edit list (or a Matroska CodecDelay, an iTunSMPB tag) tells
+    the player to drop the priming; ffprobe then reports it as
+    ``initial_padding`` or the box reader finds it in the audio edit list,
+    and the start time is already at the first real sample. Without that
+    signal (MPEG-TS always; an MP4 written without an edit list) the decoder
+    plays the priming, so the sound starts 0 to this many seconds after the
+    track does.
     """
     core = _core()
     if str(track.get("codec_name") or "").lower() != "aac":
-        return 0.0
+        return 0.0, True
     if (core._safe_int(track.get("initial_padding"), 0) or 0) > 0:
-        return 0.0
+        return 0.0, True
+    if _edit_list_priming(structure, track) is not None:
+        return 0.0, True
     rate = core._safe_int(track.get("sample_rate"), 0) or 0
     if rate <= 0:
-        return 0.0
-    he = "he" in str(track.get("profile") or "").lower()
-    return AAC_MAX_PRIMING_SAMPLES * (2 if he else 1) / rate
+        return 0.0, True
+    scale = 2 if "he" in str(track.get("profile") or "").lower() else 1
+    known = cfg_priming if isinstance(cfg_priming, int) and not isinstance(cfg_priming, bool) else None
+    if known:
+        return known * scale / rate, True
+    return AAC_MAX_PRIMING_SAMPLES * scale / rate, False
 
 
-def _judged_offset(raw: float, priming: float) -> float:
-    """The programme offset closest to zero that the unknown priming allows.
+def _offset_range(track: dict, video_start: float, structure: Optional["Structure"] = None,
+                  cfg_priming="unknown") -> Tuple[float, float, float, float, bool]:
+    """(lowest, highest possible programme offset, raw start difference,
+    unsignalled priming, priming known?) in seconds.
 
-    The sound begins between ``raw`` and ``raw + priming`` after the picture;
-    choosing the value nearest zero means only an offset that is certain
-    whatever encoder made the AAC can fail (FrameGuard's no-false-FAIL rule).
+    The programme sound begins between ``raw`` and ``raw + priming`` after
+    the picture when the priming is unknown, exactly ``raw + priming`` when
+    the spec states its encoder's priming, and at ``raw`` when signalled.
     """
-    if priming <= 0 or raw >= 0:
-        return raw
-    return min(0.0, raw + priming)
-
-
-def _audio_offset(track: dict, video_start: float) -> Tuple[float, float, str]:
-    """(judged offset s, raw start difference s, note) of one audio track against the picture."""
     core = _core()
     start = core._safe_float(track.get("start_time"), 0.0) or 0.0
     raw = start - video_start
-    priming = _unsignalled_priming(track)
-    judged = _judged_offset(raw, priming)
-    note = ""
-    if priming and abs(judged - raw) > 0.0005 and abs(judged) <= 0.0005:
-        note = f"; the track's {abs(raw) * 1000:.0f} ms early start is AAC encoder priming"
-    elif priming and abs(judged - raw) > 0.0005:
-        note = (f"; the track starts {abs(raw) * 1000:.0f} ms before the picture, but its AAC encoder "
-                f"priming (up to {priming * 1000:.0f} ms, not signalled by the container) plays first")
-    return judged, raw, note
+    priming, exact = _unsignalled_priming(track, structure, cfg_priming)
+    if exact:
+        return raw + priming, raw + priming, raw, priming, True
+    return raw, raw + priming, raw, priming, False
+
+
+def _range_status(low_ms: float, high_ms: float, warn_ms: float, max_early: float,
+                  max_late: float) -> str:
+    """PASS only if every possible offset is within the file tolerance; FAIL
+    only if every possible offset is beyond the R37 limit on one side;
+    otherwise WARN (the offset may be out of tolerance)."""
+    if -warn_ms <= low_ms and high_ms <= warn_ms:
+        return "PASS"
+    if high_ms < -max_early or low_ms > max_late:
+        return "FAIL"
+    return "WARN"
 
 
 # Program-stream formats whose per-stream durations ffprobe can only estimate.
@@ -1116,7 +1475,11 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     ``av_offset_max_late_ms``). R37 is a chain budget, not a file
     tolerance, which is why it bounds the FAIL and not the WARN. AAC whose
     encoder priming is not signalled (MPEG-TS; MP4 without an edit list) is
-    judged at the most favourable priming (_judged_offset). Sync inside the
+    judged over the whole range of priming it may carry (_offset_range):
+    PASS needs every possible offset within the file tolerance, FAIL needs
+    every possible offset beyond R37, anything else WARNs. A spec that knows
+    its encoder sets ``aac_priming`` (1024 FFmpeg, 2112 Apple TN2258) and the
+    offset becomes exact. Sync inside the
     essence (a lip-sync error baked into picture or sound) is not measurable
     from metadata.
     """
@@ -1127,36 +1490,72 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     if video is None or not tracks:
         result.add_skip(name, "Need both video and audio streams to compare.")
         return
-    warn_ms = float(cfg.get("av_offset_warn_ms", 5.0))
-    max_early = max(warn_ms, float(cfg.get("av_offset_max_early_ms", 40.0)))
-    max_late = max(warn_ms, float(cfg.get("av_offset_max_late_ms", 60.0)))
+    # The FAIL thresholds are never lifted to the warning threshold: a spec
+    # whose warning band is wider than R37 still FAILs beyond R37 (presets
+    # reject that contradiction; this guards hand-made configs).
+    max_early = float(cfg.get("av_offset_max_early_ms", 40.0))
+    max_late = float(cfg.get("av_offset_max_late_ms", 60.0))
+    warn_ms = min(float(cfg.get("av_offset_warn_ms", 5.0)), max_early, max_late)
     v_start = core._safe_float(video.get("start_time"), 0.0) or 0.0
-    entries, worst = [], 0.0
+    entries, worst, worst_range = [], 0.0, None
     for position, track in enumerate(tracks):
         label = core._track_label(position, track, len(tracks))
-        judged, raw, priming_note = _audio_offset(track, v_start)
-        offset = judged * 1000
-        worst = offset if abs(offset) > abs(worst) else worst
-        direction = "after" if offset > 0 else "before"
+        low, high, raw, priming, exact = _offset_range(track, v_start, structure,
+                                                       cfg.get("aac_priming", "unknown"))
+        low_ms, high_ms = low * 1000, high * 1000
+        # The offset nearest zero that the range allows (0 when it straddles).
+        nearest = 0.0 if low_ms <= 0 <= high_ms else (low_ms if abs(low_ms) < abs(high_ms) else high_ms)
+        if abs(nearest) > abs(worst) or worst_range is None:
+            worst, worst_range = nearest, [round(low_ms, 1), round(high_ms, 1)]
+        status = _range_status(low_ms, high_ms, warn_ms, max_early, max_late)
         cause = (_empty_edit_note(structure, video, "video") + _empty_edit_note(structure, track, "audio")
                  + _no_edit_list_note(structure, video, raw))
-        if abs(offset) <= warn_ms:
-            entries.append(("PASS", core._with_track(label, f"Audio and video start together ({offset:+.1f} ms"
-                                                            f"{priming_note}; container timing only)")))
+        known = (f"; the track starts {_signed_ms_text(raw * 1000)}, then plays this spec's "
+                 f"{priming * 1000:.0f} ms AAC encoder priming" if priming and exact else "")
+        if priming and not exact:
+            text = (f"Sound starts {_range_text(low_ms, high_ms)} the picture{cause}: the track starts "
+                    f"{_signed_ms_text(raw * 1000)} and its AAC encoder priming (up to {priming * 1000:.0f} ms) "
+                    f"is not signalled by the container, so the programme sound begins somewhere in that range")
+        elif abs(low_ms) <= warn_ms:
+            entries.append(("PASS", core._with_track(label, f"Audio and video start together ({low_ms:+.1f} ms"
+                                                            f"{known}; container timing only)")))
             continue
-        limit = max_late if offset > 0 else max_early
-        text = (f"Sound starts {abs(offset):.0f} ms {direction} the picture{cause}{priming_note} "
-                f"(file limit ±{warn_ms:g} ms, DPP v5 §2.8")
-        if abs(offset) <= limit:
-            entries.append(("WARN", core._with_track(label, text + f"; within the {limit:g} ms EBU R37 "
-                                                                   f"chain budget)")))
         else:
-            entries.append(("FAIL", core._with_track(label, text + f"; beyond the {limit:g} ms EBU R37 allows "
-                                                                   f"a whole broadcast chain)")))
+            direction = "after" if low_ms > 0 else "before"
+            text = f"Sound starts {abs(low_ms):.0f} ms {direction} the picture{cause}{known}"
+        limits = (f"file limit ±{warn_ms:g} ms, DPP v5 §2.8; EBU R37 allows {max_early:g} ms early / "
+                  f"{max_late:g} ms late for a whole broadcast chain")
+        if status == "PASS":
+            entries.append(("PASS", core._with_track(label, f"{text} (within ±{warn_ms:g} ms; container "
+                                                            f"timing only)")))
+        elif status == "WARN":
+            entries.append(("WARN", core._with_track(label, f"{text} ({limits})")))
+        else:
+            entries.append(("FAIL", core._with_track(label, f"{text}, beyond EBU R37 ({limits})")))
     result.set_metadata("av_start_offset_ms", round(worst, 1))
+    result.set_metadata("av_start_offset_range_ms", worst_range)
     statuses = {s for s, _ in entries}
     confidence = 85 if "FAIL" in statuses else 60 if "WARN" in statuses else 100
     core._add_aggregate(result, name, entries, confidence)
+
+
+def _signed_ms_text(value_ms: float) -> str:
+    if abs(value_ms) < 0.5:
+        return "with the picture"
+    return f"{abs(value_ms):.0f} ms {'after' if value_ms > 0 else 'before'} it"
+
+
+def _range_text(low_ms: float, high_ms: float) -> str:
+    """'between 61 and 17 ms before', 'between 21 ms before and 23 ms after'."""
+    def side(v):
+        return "after" if v > 0 else "before"
+    if abs(low_ms) < 0.5:
+        return f"between 0 and {abs(high_ms):.0f} ms after"
+    if abs(high_ms) < 0.5:
+        return f"between {abs(low_ms):.0f} ms before and 0 ms after"
+    if (low_ms > 0) == (high_ms > 0):
+        return f"between {abs(low_ms):.0f} and {abs(high_ms):.0f} ms {side(low_ms)}"
+    return f"between {abs(low_ms):.0f} ms before and {abs(high_ms):.0f} ms after"
 
 
 # ---------------------------------------------------------------------------
@@ -1256,7 +1655,7 @@ def _tmcd_report(path: str, track: TrackInfo) -> Tuple[Optional[str], Optional[s
 
 def _gop_report(path: str, track: TrackInfo, fps: int) -> Tuple[Optional[str], Optional[str], int]:
     """MPEG-2 GOP-header timecode (ISO/IEC 13818-2 §6.2.2.6) at every sync sample."""
-    sync = track.sync_samples or list(range(1, track.sample_count + 1))
+    sync = track.sync_samples or range(1, min(track.sample_count, MAX_GOP_HEADERS) + 1)
     indices = [n - 1 for n in sync[:MAX_GOP_HEADERS]]
     where = sample_offsets(track, indices)
     found: List[Tuple[int, int, bool]] = []
@@ -1285,6 +1684,17 @@ def _gop_report(path: str, track: TrackInfo, fps: int) -> Tuple[Optional[str], O
     return start, None, len(found)
 
 
+def _probe_shows_timecode(probe_data: dict) -> bool:
+    """ffprobe lists a QuickTime timecode track as a 'tmcd' data stream and
+    the start timecode as a ``timecode`` tag."""
+    for stream in (probe_data or {}).get("streams", []) or []:
+        if str(stream.get("codec_tag_string") or "").lower() == "tmcd":
+            return True
+        if (stream.get("tags") or {}).get("timecode"):
+            return True
+    return bool(((probe_data or {}).get("format") or {}).get("tags", {}).get("timecode"))
+
+
 def check_timecode(path: str, structure: Structure, probe_data: dict, result, cfg: dict) -> None:
     """Timecode continuity in a QuickTime tmcd track and in MPEG-2 GOP headers.
 
@@ -1293,9 +1703,13 @@ def check_timecode(path: str, structure: Structure, probe_data: dict, result, cf
     the file (an edit or a recorder restart) breaks conform and EDL
     relinking, so it is reported as advisory.
     """
-    if structure.family != "ISO-BMFF" or not structure.parsed:
+    if structure.family != "ISO-BMFF":
         return
     core = _core()
+    if not structure.parsed:
+        if _probe_shows_timecode(probe_data):
+            result.add_not_verified(TIMECODE, f"{unread_reason(structure)}; the timecode track was not read.")
+        return
     video = core._primary_video_stream(probe_data) or {}
     problems, notes = [], []
     try:
@@ -1544,6 +1958,11 @@ def check_spatial_audio(structure: Optional[Structure], probe_data: dict, result
         else:
             result.add_skip(name, "No audio stream.")
         return
+    unread = unread_reason(structure)
+    if unread and (required or xr):
+        # ffmpeg does not expose SA3D: without the box view it cannot be judged.
+        result.add_not_verified(name, f"{unread}; SA3D ambisonic metadata could not be read.")
+        return
     strict = required or _xr_enforced(cfg)
     entries = []
     for position, (track, sa3d) in enumerate(zip(tracks, boxes)):
@@ -1624,7 +2043,12 @@ def display_transform(video: dict) -> Tuple[int, bool]:
     """(rotation degrees, mirrored) from the stream's display matrix.
 
     A negative determinant of the 2x2 part means the picture is flipped,
-    which a rotation angle alone cannot express.
+    which a rotation angle alone cannot express. A flipped matrix is read
+    as "mirrored left to right, then rotated": FFmpeg's rotation for it is
+    taken from the flipped matrix as is (an hflip reads -180, a vflip 0), so
+    the angle is recomputed with the mirror removed (an hflip is a mirror
+    only; a vflip is a mirror rotated 180 degrees), with FFmpeg's sign
+    convention (av_display_rotation_get).
     """
     rotation = _core()._stream_rotation_degrees(video)
     mirrored = False
@@ -1635,7 +2059,13 @@ def display_transform(video: dict) -> Tuple[int, bool]:
         rows = [[int(v) for v in re.findall(r"-?\d+", line.split(":", 1)[1])]
                 for line in str(text).strip().splitlines() if ":" in line]
         if len(rows) >= 2 and len(rows[0]) >= 2 and len(rows[1]) >= 2:
-            mirrored = rows[0][0] * rows[1][1] - rows[0][1] * rows[1][0] < 0
+            a, b = rows[0][0], rows[0][1]
+            c, d = rows[1][0], rows[1][1]
+            mirrored = a * d - b * c < 0
+            if mirrored:
+                angle = -math.degrees(math.atan2(b, -a))
+                rotation = int(round(angle)) % 360
+                rotation = rotation - 360 if rotation > 180 else rotation
     return rotation, mirrored
 
 
@@ -1659,9 +2089,21 @@ def _generations(structure: Optional[Structure], video: dict) -> Tuple[Optional[
     if entry is not None:
         v2 = {"projection": (entry.sv3d or {}).get("projection"),
               "stereo": _V2_STEREO.get(entry.st3d, "mono") if entry.st3d is not None else "mono",
+              "right_left": entry.st3d == 4,
+              "st3d": entry.st3d,
               "bounds": (entry.sv3d or {}).get("bounds", (0, 0, 0, 0)),
               "pose": (entry.sv3d or {}).get("pose", (0.0, 0.0, 0.0))}
     return v1, v2
+
+
+def box_stereo(structure: Optional[Structure], video: dict) -> Optional[str]:
+    """The stereo layout of the picture track's V2 st3d box, or None.
+
+    FFmpeg 9 does not export stereo_mode 4 (right-left) at all, so when it
+    reports no stereo side data the box is the only evidence.
+    """
+    _, v2 = _generations(structure, video)
+    return v2["stereo"] if v2 and v2.get("st3d") is not None else None
 
 
 def _bounds(video: dict, v2: Optional[dict]) -> Tuple[float, float, float, float]:
@@ -1707,11 +2149,14 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
                                           "mirrored" if mirrored else ""]))
         flag(f"the display matrix says {what}: headsets apply it on top of the projection; the view "
              f"orientation belongs in the projection pose (prhd)")
+    if v2 and v2.get("right_left"):
+        soft.append("st3d stereo_mode 4: side-by-side with the right eye on the left (Spherical Video V2 "
+                    "'right-left'); players that expect left-right show the eyes swapped")
     if v2 and any(abs(a) > 1e-6 for a in v2.get("pose", ())):
         yaw, pitch, roll = v2["pose"]
         notes.append(f"initial view yaw {yaw:g}°, pitch {pitch:g}°, roll {roll:g}°")
-    if projection == "equirectangular":
-        _equirect_geometry(video, stereo, v2, cfg, flag, hard, notes)
+    if projection in _EQUIRECT_PROJECTIONS:
+        _equirect_geometry(video, projection, stereo, v2, cfg, flag, hard, notes)
     if projection or enforced:
         content, content_note = _content_layout_finding(video, stereo, grabber, duration)
         if content:
@@ -1721,14 +2166,26 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
     return hard, soft, notes
 
 
-def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], cfg: dict,
+# ffprobe names V2 'equi' with non-zero bounds (every 180° file) "tiled
+# equirectangular"; FFmpeg 7.1+ names Apple's 180° 'hequ' "half
+# equirectangular". All three are equirect pictures whose per-eye shape
+# follows from the covered field of view.
+_EQUIRECT_PROJECTIONS = ("equirectangular", "tiled_equirectangular", "half_equirectangular")
+
+
+def _equirect_geometry(video: dict, projection: str, stereo: Optional[str], v2: Optional[dict], cfg: dict,
                        flag, hard: List[str], notes: List[str]) -> None:
+    """Per-eye aspect against the field of view the projection covers: a
+    full sphere is 2:1 per eye, a 180° hemisphere 1:1 (Meta Media Studio
+    360/180 requirements; Spherical Video V2 RFC equi bounds)."""
     core = _core()
     width = core._safe_int(video.get("width"), 0) or 0
     height = core._safe_int(video.get("height"), 0) or 0
     if not width or not height:
         return
     top, bottom, left, right = _bounds(video, v2)
+    if projection == "half_equirectangular" and not any((top, bottom, left, right)):
+        left = right = 0.25      # 'hequ' is 180° x 180° by definition
     span_h, span_v = 360.0 * (1 - left - right), 180.0 * (1 - top - bottom)
     if span_h <= 0 or span_v <= 0:
         flag("the equirectangular bounds leave no picture")
@@ -1755,8 +2212,9 @@ def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], c
         elif layout == "side_by_side" and abs(ratio * 2 / expected - 1) <= 0.01:
             notes.append(f"half-width side-by-side (each eye squeezed to {eye_w:.0f}x{eye_h:.0f})")
         else:
+            shown = f"{expected:g}" if abs(expected - round(expected)) < 0.005 else f"{expected:.2f}"
             flag(f"{width}x{height} does not fit an equirectangular {layout.replace('_', '-')} picture: "
-                 f"each eye is {ratio:.2f}:1, a {cover} equirect is {expected:.2f}:1")
+                 f"each eye is {ratio:.2f}:1, a {cover} equirect is {shown}:1")
     if layout == "side_by_side" and span_h >= 359.9:
         flag("360° stereo is tagged side-by-side; Meta Quest and YouTube take 360° stereo only as top-bottom")
 
@@ -1766,10 +2224,30 @@ def _equirect_geometry(video: dict, stereo: Optional[str], v2: Optional[dict], c
 # ---------------------------------------------------------------------------
 
 LAYOUT_GRAB_SIZE = (384, 192)
-LAYOUT_SHIFT = 8          # horizontal disparity searched, in grab pixels
-LAYOUT_MATCH = 0.9        # top and bottom halves this alike are two views of one scene
-LAYOUT_MARGIN = 0.15      # ...and clearly more alike than the left/right halves
-LAYOUT_MIN_DETAIL = 2.0   # gradient RMS below this is a flat frame: no evidence
+# Frames compared (at 25, 50 and 75 % of the duration): one frame can be a
+# title card, a fade or a static sky; the verdict follows the majority.
+LAYOUT_FRAMES = 3
+LAYOUT_BLOCK = 12         # matching block, grab pixels (32 x 8 blocks per eye in a 384x96 eye)
+# Largest disparity searched, as a fraction of the eye width, either sign
+# (eyes may be swapped). Omnidirectional stereo with a 64 mm interpupillary
+# baseline gives an angular disparity of ~IPD / distance: 5 % of 360 deg
+# (18 deg) is an object 0.2 m from the lens, nearer than anyone can fuse.
+LAYOUT_MAX_DISPARITY = 0.05
+# Blocks with a grey-level standard deviation below this carry no
+# correspondence evidence: it is the size of 8-bit quantisation plus the
+# texture an H.264/HEVC encode keeps in flat sky or walls.
+LAYOUT_MIN_TEXTURE = 3.0
+LAYOUT_MIN_BLOCKS = 16    # textured blocks a frame needs to count (1/16 of the eye)
+# Decision per frame, on the median over textured blocks of each block's best
+# normalised cross-correlation within the disparity range. Two views of one
+# scene: a block and its counterpart in the other eye correlate at 0.6 or
+# better in most blocks (occlusions and encoding noise pull some down, the
+# median ignores them). Unrelated texture also produces a best-of-39-shifts
+# correlation well above zero, so the same search is repeated against rows
+# half an eye lower (control): a stacked second view matches its own rows
+# and not the control rows, while two unrelated halves match both equally.
+LAYOUT_MATCH = 0.6
+LAYOUT_MARGIN = 0.25
 
 
 class FrameGrabber:
@@ -1832,91 +2310,156 @@ class FrameGrabber:
         return [float(b) for b in data]
 
 
-def _gradient(pixels: List[float], width: int, height: int) -> List[float]:
-    """|dx| + |dy| removes smooth ramps that make unrelated halves correlate."""
-    out = [0.0] * (width * height)
-    for y in range(1, height):
-        row, above = y * width, (y - 1) * width
-        for x in range(1, width):
-            i = row + x
-            out[i] = abs(pixels[i] - pixels[i - 1]) + abs(pixels[i] - pixels[above + x])
+def _padded_rows(pixels: List[float], width: int, first_row: int, rows: int, pad: int) -> List[List[float]]:
+    """Rows of one eye, each wrapped by ``pad`` pixels on both sides (an
+    equirect picture is continuous across its left and right edges)."""
+    out = []
+    for y in range(first_row, first_row + rows):
+        row = pixels[y * width:(y + 1) * width]
+        out.append(row[width - pad:] + row + row[:pad])
     return out
 
 
-def _ncc(a: List[float], b: List[float]) -> float:
-    n = len(a)
-    if n == 0:
-        return 0.0
-    ma, mb = sum(a) / n, sum(b) / n
-    da = [v - ma for v in a]
-    db = [v - mb for v in b]
-    den = math.sqrt(sum(v * v for v in da) * sum(v * v for v in db))
-    return sum(x * y for x, y in zip(da, db)) / den if den else 0.0
+def _prefix(values: List[float]) -> Tuple[List[float], List[float]]:
+    sums, squares, s1, s2 = [0.0], [0.0], 0.0, 0.0
+    for v in values:
+        s1 += v
+        s2 += v * v
+        sums.append(s1)
+        squares.append(s2)
+    return sums, squares
 
 
-def _half_similarity(grad: List[float], width: int, height: int, split: str) -> float:
-    """Best NCC between the two halves over +-LAYOUT_SHIFT px of horizontal disparity."""
-    if split == "top_bottom":
-        rows = height // 2
-        first = [grad[y * width:(y + 1) * width] for y in range(rows)]
-        second = [grad[(y + rows) * width:(y + rows + 1) * width] for y in range(rows)]
-        cols = width
-    else:
-        cols = width // 2
-        first = [grad[y * width:y * width + cols] for y in range(height)]
-        second = [grad[y * width + cols:y * width + 2 * cols] for y in range(height)]
+def _best_match(a_rows: List[List[float]], a_energy: float, candidates: List[List[float]],
+                prefixes, x: int, pad: int, block: int) -> float:
+    """Best NCC of the mean-removed block ``a_rows`` against ``candidates`` rows
+    over every horizontal shift in [-pad, pad]."""
+    from operator import mul
+    n = block * len(a_rows)
     best = -1.0
-    for shift in range(-LAYOUT_SHIFT, LAYOUT_SHIFT + 1, 2):
-        lo, hi = max(0, shift), cols + min(0, shift)
-        a = [v for row in first for v in row[lo:hi]]
-        b = [v for row in second for v in row[lo - shift:hi - shift]]
-        best = max(best, _ncc(a, b))
+    for shift in range(-pad, pad + 1):
+        lo = x + pad + shift
+        hi = lo + block
+        dot = 0.0
+        s1 = s2 = 0.0
+        for a_row, c_row, (sums, squares) in zip(a_rows, candidates, prefixes):
+            dot += sum(map(mul, a_row, c_row[lo:hi]))
+            s1 += sums[hi] - sums[lo]
+            s2 += squares[hi] - squares[lo]
+        var = s2 - s1 * s1 / n
+        if var <= 1e-6:
+            continue
+        ncc = dot / math.sqrt(a_energy * var)
+        if ncc > best:
+            best = ncc
     return best
 
 
-def stereo_layout_scores(pixels: List[float]) -> Optional[Tuple[float, float]]:
-    """(top/bottom similarity, left/right similarity) of one grey frame, or None if flat."""
-    width, height = LAYOUT_GRAB_SIZE
-    grad = _gradient(pixels, width, height)
-    rms = math.sqrt(sum(v * v for v in grad) / len(grad))
-    if rms < LAYOUT_MIN_DETAIL:
+def _median(values: List[float]) -> float:
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def stereo_layout_scores(pixels: List[float], size: Tuple[int, int] = LAYOUT_GRAB_SIZE
+                         ) -> Optional[Tuple[float, float, int]]:
+    """(top/bottom match, control match, textured blocks) of one grey frame, or None.
+
+    Each textured block of the top half is searched in the bottom half
+    along the same rows, over every horizontal disparity within
+    LAYOUT_MAX_DISPARITY at 1-px steps, and keeps its best normalised
+    cross-correlation; the control repeats the search half an eye lower.
+    Block-wise matching follows depth-varying disparity (every block finds
+    its own shift), which a single global shift cannot. None when fewer than
+    LAYOUT_MIN_BLOCKS blocks are textured (a flat or blank frame).
+    """
+    width, height = size
+    eye = height // 2
+    block = LAYOUT_BLOCK
+    pad = max(1, int(round(width * LAYOUT_MAX_DISPARITY)))
+    top = _padded_rows(pixels, width, 0, eye, 0)
+    bottom = _padded_rows(pixels, width, eye, eye, pad)
+    prefixes = [_prefix(row) for row in bottom]
+    bands = eye // block
+    matched, control = [], []
+    for band in range(bands):
+        y = band * block
+        aligned_rows = list(range(y, y + block))
+        control_rows = [(r + eye // 2) % eye for r in aligned_rows]
+        for x in range(0, width - block + 1, block):
+            values = [v for r in aligned_rows for v in top[r][x:x + block]]
+            mean = sum(values) / len(values)
+            energy = sum((v - mean) ** 2 for v in values)
+            if math.sqrt(energy / len(values)) < LAYOUT_MIN_TEXTURE:
+                continue
+            a_rows = [[v - mean for v in top[r][x:x + block]] for r in aligned_rows]
+            matched.append(_best_match(a_rows, energy, [bottom[r] for r in aligned_rows],
+                                       [prefixes[r] for r in aligned_rows], x, pad, block))
+            control.append(_best_match(a_rows, energy, [bottom[r] for r in control_rows],
+                                       [prefixes[r] for r in control_rows], x, pad, block))
+    if len(matched) < LAYOUT_MIN_BLOCKS:
         return None
-    return (_half_similarity(grad, width, height, "top_bottom"),
-            _half_similarity(grad, width, height, "side_by_side"))
+    return _median(matched), _median(control), len(matched)
+
+
+def stereo_layout_evidence(frames: List[List[float]], size: Tuple[int, int] = LAYOUT_GRAB_SIZE
+                           ) -> Optional[Tuple[bool, float, float, int]]:
+    """(looks top-bottom, median match, median control, frames judged) over
+    several grabbed frames, or None when no frame carries enough texture.
+    A frame looks top-bottom when its match reaches LAYOUT_MATCH and beats
+    the control by LAYOUT_MARGIN; the file does when most judged frames do."""
+    scores = [s for s in (stereo_layout_scores(f, size) for f in frames) if s is not None]
+    if not scores:
+        return None
+    votes = sum(1 for m, c, _ in scores if m >= LAYOUT_MATCH and m - c >= LAYOUT_MARGIN)
+    return (2 * votes > len(scores), _median([m for m, _, _ in scores]),
+            _median([c for _, c, _ in scores]), len(scores))
+
+
+def _grab_times(duration: Optional[float]) -> List[float]:
+    if not duration or duration <= 1:
+        return [0.0]
+    return [duration * (k + 1) / (LAYOUT_FRAMES + 1) for k in range(LAYOUT_FRAMES)]
 
 
 def _content_layout_finding(video: dict, stereo: Optional[str], grabber: Optional[FrameGrabber],
                             duration: Optional[float]) -> Tuple[str, str]:
     """A warning when a spherical picture tagged mono (or side-by-side) looks top-bottom.
 
-    Gradient-domain NCC of the two half-frames over a small disparity search
-    (container benchmark prototype). Measured on synthetic stitches: true
-    top-bottom 0.95-0.97, mono equirect 0.06-0.80. Only the top-bottom claim
-    is made, the Quest-critical mislabel: a mono picture whose left and right
-    halves look alike is common (horizontally periodic scenes), so a
-    side-by-side claim would be unreliable. Thresholds are validated on
-    synthetic content only, so this is advisory (confidence 60), never a
-    failure, and costs one keyframe decode on spherical files only.
+    Block-wise normalised cross-correlation between the top and bottom
+    halves over a 1-px disparity search, with a row-misaligned control and a
+    majority over LAYOUT_FRAMES frames (stereo_layout_evidence); the
+    constants are derived in their comments, not fitted to a corpus. Only
+    the top-bottom claim is made, the Quest-critical mislabel: a mono
+    picture whose left and right halves look alike is common (horizontally
+    periodic scenes), so a side-by-side claim would be unreliable. Content
+    evidence is advisory (confidence 60), never a failure, and costs three
+    keyframe decodes on spherical files only.
 
     Returns (finding, note): a frame that cannot be grabbed is a note that
     this one sub-check was not verified, never an error.
     """
     if grabber is None or "index" not in video or stereo == "top_bottom":
         return "", ""
-    at = duration / 2 if duration and duration > 1 else 0.0
-    pixels = grabber.gray(int(video["index"]), at)
-    if pixels is None:
-        reason = grabber.problem
+    frames, reason = [], ""
+    for at in _grab_times(duration):
+        pixels = grabber.gray(int(video["index"]), at)
+        if pixels is None:
+            reason = reason or grabber.problem
+            if not grabber.problem:     # cancelled
+                return "", ""
+            continue
+        frames.append(pixels)
+    if not frames:
         return "", (f"picture layout content check not verified: {reason}" if reason else "")
-    found = stereo_layout_scores(pixels)
-    if found is None:
+    found = stereo_layout_evidence(frames)
+    if found is None or not found[0]:
         return "", ""
-    tb, sbs = found
-    if tb < LAYOUT_MATCH or tb - sbs < LAYOUT_MARGIN:
-        return "", ""
+    _, match, control, judged = found
     layout = (stereo or "mono").replace("_", "-")
-    return (f"the picture looks top-bottom stereo (top and bottom halves match at {tb:.2f}, left/right "
-            f"{sbs:.2f}) but the metadata says {layout}; check the layout tag (content check, advisory)"), ""
+    return (f"the picture looks top-bottom stereo (top and bottom halves match at {match:.2f} against "
+            f"{control:.2f} for misaligned rows, {judged} frame(s)) but the metadata says {layout}; "
+            f"check the layout tag (content check, advisory)"), ""
 
 
 # ---------------------------------------------------------------------------
@@ -1936,8 +2479,16 @@ def run_structure_checks(filepath: str, structure: Structure, probe_data: dict, 
         (TRACK_LAYOUT, lambda: check_track_layout(probe_data, result, cfg)),
     )
     result.set_metadata("container_family", structure.family)
+    essential = _core().ESSENTIAL_CHECKS
     for name, step in steps:
         if is_disabled(cfg, name):
-            result.add_skip(name, "Switched off by this spec.")
+            if name in essential:
+                # An essential check a spec switches off must not vanish from
+                # the verdict as a SKIP: it is unverified ground, recorded as
+                # the spec's choice (Strict Mode does not escalate a choice).
+                result.add_not_verified(name, "switched off by this spec; this essential check did not run.",
+                                        by_choice=True)
+            else:
+                result.add_skip(name, "Switched off by this spec.")
             continue
         step()
