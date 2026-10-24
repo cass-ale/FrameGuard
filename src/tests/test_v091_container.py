@@ -219,8 +219,10 @@ class TestAVSyncOffset:
         ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", str(ts))
         check = _row(_scan(ts, accepted_containers=[".ts"], aac_priming=1024), "A/V Sync Offset")
         assert check[1] == "PASS", check
+        # Encoder unknown: FFmpeg's TS lead of exactly 1024 samples is read as its
+        # priming (ISO/IEC 13818-1 PTS semantics; 0.9.2 round 2, bug 6).
         unknown = _row(_scan(ts, accepted_containers=[".ts"]), "A/V Sync Offset")
-        assert unknown[1] == "WARN" and "not signalled" in unknown[2], unknown
+        assert unknown[1] == "PASS" and "inferred" in unknown[2], unknown
 
     def _bframe_encode(self, path, *extra, audio=("-c:a", "aac")):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=3", "-f", "lavfi",
@@ -237,7 +239,8 @@ class TestAVSyncOffset:
         assert check[1] == "FAIL" and "80 ms before" in check[2] and "no edit list" in check[2], check
         aac = self._bframe_encode(tmp_path / "noedit.mp4", "-use_editlist", "0")
         check = _row(_scan(aac, target_fps=25.0), "A/V Sync Offset")
-        assert check[1] == "WARN" and "36 ms before" in check[2] and "priming" in check[2], check
+        # Unknown priming (0-2624 samples): -80 .. -25 ms, no compliant value: WARN.
+        assert check[1] == "WARN" and "80 and 25 ms before" in check[2] and "priming" in check[2], check
 
     def test_ffmpeg_transport_stream_with_bframes_passes(self, tmp_path):
         ts = self._bframe_encode(tmp_path / "bf.ts")

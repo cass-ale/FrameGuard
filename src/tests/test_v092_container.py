@@ -189,8 +189,10 @@ class _Rows:
     def add_skip(self, name, detail="", confidence=100):
         self.checks.append((name, "SKIP", detail, confidence))
 
-    def add_not_verified(self, name, reason, by_choice=False):
+    def add_not_verified(self, name, reason, by_choice=False, inherent=False):
         self.checks.append((name, "WARN", "Not verified: " + reason, 100))
+        if by_choice or inherent:
+            self.metadata.setdefault("strict_exempt", []).append(name)
 
     def set_metadata(self, key, value):
         self.metadata[key] = value
@@ -210,8 +212,9 @@ class TestAacPrimingRange:
         ffmpeg("-i", _clean(media), "-itsoffset", "-0.020", "-i", _clean(media), "-map", "0:v",
                "-map", "1:a", "-c", "copy", "-f", "mpegts", str(early))
         check = _row(_scan(early, accepted_containers=[".ts"]), "A/V Sync Offset")
-        assert check[1] == "WARN", check
-        assert "priming" in check[2] and "not signalled" in check[2], check
+        # A -41 ms lead is no priming in use, and compliant sync is still possible
+        # inside the unknown range: Not verified (round 2, bug 6), never PASS.
+        assert _not_verified(check) and "not signalled" in check[2], check
         known = _row(_scan(early, accepted_containers=[".ts"], aac_priming=1024), "A/V Sync Offset")
         assert known[1] == "WARN" and "20 ms before" in known[2], known
 
@@ -230,17 +233,19 @@ class TestAacPrimingRange:
             presets.validate_preset_config({"aac_priming": 999})
         assert presets.normalize_preset_config({"av_offset_warn_ms": 5}) == {"av_offset_warn_ms": 5}
         rows = dict(spec_rows(dict(DEFAULT_CONFIG)))
-        assert "0-2112 samples" in rows["A/V start offset"], rows
+        assert "0-2624 samples" in rows["A/V start offset"], rows
 
     def test_he_aac_window_no_longer_hides_88_ms(self):
-        check, meta = _sync_row(_sync_probe(-0.088, profile="HE-AAC"))
-        assert check[1] == "WARN" and "88" in check[2], check
-        assert meta["av_start_offset_range_ms"] == [-88.0, 0.0], meta
+        # 90 ms is no HE priming in use (88 ms = 2 x 2112 is, and is inferred:
+        # TestAacPrimingDefault): it is never "start together".
+        check, meta = _sync_row(_sync_probe(-0.090, profile="HE-AAC"))
+        assert _not_verified(check) and "90" in check[2], check
+        assert meta["av_start_offset_range_ms"][0] == -90.0, meta
 
     def test_whole_range_beyond_r37_fails_and_whole_range_late_fails(self):
-        assert _sync_row(_sync_probe(-0.090))[0][1] == "FAIL"     # -90 .. -46 ms: all beyond 40 early
+        assert _sync_row(_sync_probe(-0.110))[0][1] == "FAIL"     # -110 .. -55 ms: all beyond 40 early
         assert _sync_row(_sync_probe(0.070))[0][1] == "FAIL"      # priming only makes late later
-        assert _sync_row(_sync_probe(-0.060))[0][1] == "WARN"     # -60 .. -16 ms straddles the limit
+        assert _sync_row(_sync_probe(-0.060))[0][1] == "WARN"     # -60 .. -5.3 ms: no compliant value
 
     def test_priming_is_read_from_the_audio_edit_list(self, media, monkeypatch):
         """ffprobe 6/7 report initial_padding=0 for an edit-listed AAC MP4;
@@ -740,3 +745,63 @@ class TestQuickTimeBrandNamedMp4:
         ffmpeg("-i", _clean(media), "-c", "copy", str(mov))
         for path in (_clean(media), mov):
             assert _row(_scan(path), "Container Structure")[1] == "PASS", path
+
+
+# ---------------------------------------------------------------------------
+# Round 2, bug 6: the unknown-priming default
+# ---------------------------------------------------------------------------
+
+class TestAacPrimingDefault:
+    """WARN/FAIL only when no priming value in use can explain the offset;
+    a range that allows compliant sync is Not verified and Strict does not
+    escalate it; a PTS lead that equals a priming in use is that priming."""
+
+    def test_ffmpeg_transport_stream_passes_by_its_pts_lead(self, media, tmp_path):
+        ts = tmp_path / "cam.ts"
+        ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "mpegts", str(ts))
+        result = _scan(ts, strict=True, accepted_containers=[".ts"])
+        check = _row(result, "A/V Sync Offset")
+        assert check[1] == "PASS" and "inferred" in check[2] and "1024" in check[2], check
+
+    @pytest.mark.parametrize("samples", [1024, 2048, 2112, 2624])
+    def test_every_priming_in_use_is_inferred_from_an_exact_lead(self, samples):
+        check, meta = _sync_row(_sync_probe(-samples / 48000))
+        assert check[1] == "PASS" and str(samples) in check[2], check
+        assert meta["av_start_offset_range_ms"] == [0.0, 0.0], meta
+
+    def test_he_aac_lead_is_inferred_at_twice_the_core_priming(self):
+        check, _ = _sync_row(_sync_probe(-2 * 2112 / 48000, profile="HE-AAC"))
+        assert check[1] == "PASS", check
+
+    def test_a_lead_that_is_no_priming_in_use_is_not_inferred(self):
+        check, _ = _sync_row(_sync_probe(-1500 / 48000))
+        assert _not_verified(check) and "not signalled" in check[2], check
+        off_by_two = _sync_row(_sync_probe(-1026 / 48000))[0]
+        assert _not_verified(off_by_two), off_by_two
+
+    def test_compliant_range_is_not_verified_and_strict_exempt(self):
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(-0.050), rows, _cfg())   # -50 .. +4.7 ms
+        assert _not_verified(rows.checks[0]), rows.checks
+        assert rows.metadata["strict_exempt"] == ["A/V Sync Offset"], rows.metadata
+
+    def test_strict_mode_does_not_escalate_unsignalled_priming(self, media, tmp_path):
+        early = tmp_path / "early30.ts"
+        ffmpeg("-i", _clean(media), "-itsoffset", "-0.030", "-i", _clean(media), "-map", "0:v",
+               "-map", "1:a", "-c", "copy", "-f", "mpegts", str(early))
+        result = _scan(early, strict=True, accepted_containers=[".ts"])
+        assert _not_verified(_row(result, "A/V Sync Offset"))
+        assert "A/V Sync Offset" in result.metadata.get("not_verifiable", []), result.metadata
+        escalating = [c[:3] for c in result.checks if c[1] in ("WARN", "FAIL") and c[0] not in
+                      set(result.metadata.get("not_verifiable", [])) | set(result.metadata.get("not_run_by_choice", []))]
+        assert result.status != "MISMATCH" or escalating, escalating
+
+    def test_no_compliant_value_warns_and_whole_range_beyond_r37_fails(self):
+        assert _sync_row(_sync_probe(0.020))[0][1] == "WARN"      # +20 .. +75 ms: never within 5 ms
+        assert _sync_row(_sync_probe(-0.070))[0][1] == "WARN"     # -70 .. -15 ms
+        assert _sync_row(_sync_probe(-0.120))[0][1] == "FAIL"     # -120 .. -65 ms
+        assert _sync_row(_sync_probe(0.061))[0][1] == "FAIL"      # later than R37's 60 ms whatever the priming
+
+    def test_signalled_priming_stays_exact(self):
+        assert _sync_row(_sync_probe(-0.030, padding=1024))[0][1] == "WARN"
+        assert _sync_row(_sync_probe(0.003, padding=1024))[0][1] == "PASS"

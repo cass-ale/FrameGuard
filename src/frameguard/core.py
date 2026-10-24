@@ -613,7 +613,8 @@ class QAResult:
         with self._lock:
             self.checks.append((check_name, "SKIP", detail, confidence))
 
-    def add_not_verified(self, check_name: str, reason: str, by_choice: bool = False):
+    def add_not_verified(self, check_name: str, reason: str, by_choice: bool = False,
+                         inherent: bool = False):
         """Record an analysis that did not run.
 
         SKIP is ignored by the verdict, so an unrun integrity scan used to read
@@ -622,13 +623,15 @@ class QAResult:
 
         ``by_choice`` marks analysis the operator chose not to run (a quick
         scan). Strict Mode escalates genuine failures to analyse, but not a
-        choice: otherwise every quick + strict scan was a FAIL.
+        choice: otherwise every quick + strict scan was a FAIL. ``inherent``
+        marks a measurement the file format itself cannot support (AAC
+        priming an MPEG-TS cannot signal); Strict does not escalate it either.
         """
         with self._lock:
             detail = f"{NOT_VERIFIED_PREFIX}{reason}"
             self.checks.append((check_name, "WARN", detail, 100))
             self.warnings.append(f"{check_name}: {detail}")
-            key = "not_run_by_choice" if by_choice else "not_verified"
+            key = "not_run_by_choice" if by_choice else "not_verifiable" if inherent else "not_verified"
             self.metadata.setdefault(key, [])
             if check_name not in self.metadata[key]:
                 self.metadata[key].append(check_name)
@@ -726,7 +729,7 @@ class QAResult:
         """
         strict = strict or bool(getattr(self, "strict", False))
         flagged = False
-        by_choice = set(self.metadata.get("not_run_by_choice") or ())
+        by_choice = set(self.metadata.get("not_run_by_choice") or ()) | set(self.metadata.get("not_verifiable") or ())
 
         for check_tuple in self.checks:
             name, status = check_tuple[0], check_tuple[1]

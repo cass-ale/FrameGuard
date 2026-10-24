@@ -344,7 +344,7 @@ class _Rows:
             return self._add(status)
         raise AttributeError(attr)
 
-    def add_not_verified(self, name, reason, by_choice=False):
+    def add_not_verified(self, name, reason, by_choice=False, inherent=False):
         self.checks.append((name, "WARN", "Not verified: " + reason))
 
     def set_metadata(self, key, value):

@@ -1273,16 +1273,31 @@ def check_edit_lists(structure: Structure, result, cfg: dict) -> None:
 # A/V Sync Offset (ESSENTIAL)
 # ---------------------------------------------------------------------------
 
-# AAC encoder delay (priming) is not defined by ISO/IEC 14496-3; encoders in
-# use prime 1024 (FFmpeg's native encoder, its initial_padding) to 2112
-# samples (Apple AAC-LC, Apple Technical Note TN2258). HE-AAC (SBR) runs the
-# core at half rate, so the same core priming is twice as many output
-# samples. When a container does not signal the priming, the programme sound
-# begins anywhere from the track start up to this much later.
-AAC_MAX_PRIMING_SAMPLES = 2112
-# ``aac_priming``: what a spec knows about its encoder. "unknown" judges the
-# whole 0..AAC_MAX_PRIMING_SAMPLES range; a sample count (the deliverer's
-# encoder) makes unsignalled priming exact.
+# AAC encoder delay (priming) is not defined by ISO/IEC 14496-3. AAC-LC
+# encoders in use prime 1024 samples (FFmpeg's native encoder, its
+# initial_padding), 2048 (Fraunhofer FDK), 2112 (Apple, Technical Note
+# TN2258) or 2624 (Nero). When a container does not signal the priming, the
+# programme sound begins anywhere from the track start up to the largest of
+# these later.
+AAC_PRIMINGS_IN_USE = (1024, 2048, 2112, 2624)
+AAC_MAX_PRIMING_SAMPLES = max(AAC_PRIMINGS_IN_USE)
+# HE-AAC runs its AAC core at half the output rate, so a core priming is twice
+# as many output samples, and SBR/PS add filterbank delay of their own. The
+# HE bound is one more LC maximum on top of the doubled core: deliberately
+# generous, because a wider range can only turn a verdict into Not verified,
+# never into a false PASS or FAIL.
+AAC_HE_CORE_SCALE = 2
+AAC_HE_BOUND_SAMPLES = AAC_HE_CORE_SCALE * AAC_MAX_PRIMING_SAMPLES + AAC_MAX_PRIMING_SAMPLES
+# ISO/IEC 13818-1 §2.4.3.7: an audio PTS is the presentation time of the first
+# decoded sample of its access unit, and the first decoded samples are the
+# priming. An encoder that keeps sound and picture aligned therefore stamps
+# its first audio access unit exactly its priming ahead of the picture, as
+# FFmpeg does. A lead equal to a priming in use, to within one audio sample
+# plus one 90 kHz PTS tick of rounding, is read as that priming.
+PTS_TICK_S = 1 / 90000
+# ``aac_priming``: what a spec knows about its encoder. "unknown" infers the
+# priming from the PTS lead when it can, else judges the whole range; a
+# sample count (the deliverer's encoder) makes unsignalled priming exact.
 AAC_PRIMING_CHOICES = ("unknown", 1024, 2112)
 
 
@@ -1312,11 +1327,14 @@ def _edit_list_priming(structure: Optional["Structure"], track: dict) -> Optiona
 
 
 def _unsignalled_priming(track: dict, structure: Optional["Structure"] = None,
-                         cfg_priming="unknown") -> Tuple[float, bool]:
-    """(priming seconds the container does not signal, exact?) for one audio track.
+                         cfg_priming="unknown", raw: Optional[float] = None) -> Tuple[float, bool, str]:
+    """(priming seconds the container does not signal, exact?, how known) for one audio track.
 
-    (0, True) when nothing is unsignalled; (upper bound, False) when the
-    encoder is unknown; (the spec's ``aac_priming``, True) when it is set.
+    (0, True, "") when nothing is unsignalled; (the spec's ``aac_priming``,
+    True, "spec") when it is set; (the priming the audio's PTS lead equals,
+    True, "lead") when ``raw`` (audio start minus picture start) is exactly
+    minus a priming in use; else (upper bound, False, "") for an unknown
+    encoder.
 
     An MP4/MOV edit list (or a Matroska CodecDelay, an iTunSMPB tag) tells
     the player to drop the priming; ffprobe then reports it as
@@ -1328,49 +1346,60 @@ def _unsignalled_priming(track: dict, structure: Optional["Structure"] = None,
     """
     core = _core()
     if str(track.get("codec_name") or "").lower() != "aac":
-        return 0.0, True
+        return 0.0, True, ""
     if (core._safe_int(track.get("initial_padding"), 0) or 0) > 0:
-        return 0.0, True
+        return 0.0, True, ""
     if _edit_list_priming(structure, track) is not None:
-        return 0.0, True
+        return 0.0, True, ""
     rate = core._safe_int(track.get("sample_rate"), 0) or 0
     if rate <= 0:
-        return 0.0, True
-    scale = 2 if "he" in str(track.get("profile") or "").lower() else 1
+        return 0.0, True, ""
+    he = "he" in str(track.get("profile") or "").lower()
+    scale = AAC_HE_CORE_SCALE if he else 1
     known = cfg_priming if isinstance(cfg_priming, int) and not isinstance(cfg_priming, bool) else None
     if known:
-        return known * scale / rate, True
-    return AAC_MAX_PRIMING_SAMPLES * scale / rate, False
+        return known * scale / rate, True, "spec"
+    if raw is not None and raw < 0:
+        for samples in AAC_PRIMINGS_IN_USE:
+            priming = samples * scale / rate
+            if abs(raw + priming) <= 1 / rate + PTS_TICK_S:
+                return priming, True, "lead"
+    return (AAC_HE_BOUND_SAMPLES if he else AAC_MAX_PRIMING_SAMPLES) / rate, False, ""
 
 
 def _offset_range(track: dict, video_start: float, structure: Optional["Structure"] = None,
-                  cfg_priming="unknown") -> Tuple[float, float, float, float, bool]:
+                  cfg_priming="unknown") -> Tuple[float, float, float, float, bool, str]:
     """(lowest, highest possible programme offset, raw start difference,
-    unsignalled priming, priming known?) in seconds.
+    unsignalled priming, priming known?, how known) in seconds.
 
     The programme sound begins between ``raw`` and ``raw + priming`` after
     the picture when the priming is unknown, exactly ``raw + priming`` when
-    the spec states its encoder's priming, and at ``raw`` when signalled.
+    the spec states it or the PTS lead shows it, and at ``raw`` when the
+    container signals it.
     """
     core = _core()
     start = core._safe_float(track.get("start_time"), 0.0) or 0.0
     raw = start - video_start
-    priming, exact = _unsignalled_priming(track, structure, cfg_priming)
+    priming, exact, source = _unsignalled_priming(track, structure, cfg_priming, raw)
     if exact:
-        return raw + priming, raw + priming, raw, priming, True
-    return raw, raw + priming, raw, priming, False
+        return raw + priming, raw + priming, raw, priming, True, source
+    return raw, raw + priming, raw, priming, False, source
 
 
 def _range_status(low_ms: float, high_ms: float, warn_ms: float, max_early: float,
                   max_late: float) -> str:
-    """PASS only if every possible offset is within the file tolerance; FAIL
-    only if every possible offset is beyond the R37 limit on one side;
-    otherwise WARN (the offset may be out of tolerance)."""
+    """PASS when every possible offset is within the file tolerance; FAIL
+    when every possible offset is beyond the R37 limit on one side; WARN when
+    no possible offset is within the tolerance; NOT_VERIFIED when the range
+    holds both compliant and non-compliant offsets (only an unknown priming
+    makes a range: the file cannot say which applies)."""
     if -warn_ms <= low_ms and high_ms <= warn_ms:
         return "PASS"
     if high_ms < -max_early or low_ms > max_late:
         return "FAIL"
-    return "WARN"
+    if high_ms < -warn_ms or low_ms > warn_ms:
+        return "WARN"
+    return "NOT_VERIFIED"
 
 
 # Program-stream formats whose per-stream durations ffprobe can only estimate.
@@ -1475,11 +1504,13 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     ``av_offset_max_late_ms``). R37 is a chain budget, not a file
     tolerance, which is why it bounds the FAIL and not the WARN. AAC whose
     encoder priming is not signalled (MPEG-TS; MP4 without an edit list) is
+    read from its PTS lead when that lead equals a priming in use, else
     judged over the whole range of priming it may carry (_offset_range):
-    PASS needs every possible offset within the file tolerance, FAIL needs
-    every possible offset beyond R37, anything else WARNs. A spec that knows
-    its encoder sets ``aac_priming`` (1024 FFmpeg, 2112 Apple TN2258) and the
-    offset becomes exact. Sync inside the
+    WARN or FAIL only when no value in the range is compliant, and Not
+    verified (exempt from Strict escalation: the file format cannot say)
+    when the range allows compliant sync. A spec that knows its encoder sets
+    ``aac_priming`` (1024 FFmpeg, 2112 Apple TN2258) and the offset becomes
+    exact. Sync inside the
     essence (a lip-sync error baked into picture or sound) is not measurable
     from metadata.
     """
@@ -1500,8 +1531,8 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     entries, worst, worst_range = [], 0.0, None
     for position, track in enumerate(tracks):
         label = core._track_label(position, track, len(tracks))
-        low, high, raw, priming, exact = _offset_range(track, v_start, structure,
-                                                       cfg.get("aac_priming", "unknown"))
+        low, high, raw, priming, exact, source = _offset_range(track, v_start, structure,
+                                                               cfg.get("aac_priming", "unknown"))
         low_ms, high_ms = low * 1000, high * 1000
         # The offset nearest zero that the range allows (0 when it straddles).
         nearest = 0.0 if low_ms <= 0 <= high_ms else (low_ms if abs(low_ms) < abs(high_ms) else high_ms)
@@ -1510,14 +1541,22 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
         status = _range_status(low_ms, high_ms, warn_ms, max_early, max_late)
         cause = (_empty_edit_note(structure, video, "video") + _empty_edit_note(structure, track, "audio")
                  + _no_edit_list_note(structure, video, raw))
-        known = (f"; the track starts {_signed_ms_text(raw * 1000)}, then plays this spec's "
-                 f"{priming * 1000:.0f} ms AAC encoder priming" if priming and exact else "")
+        rate = _core()._safe_int(track.get("sample_rate"), 0) or 0
+        samples = round(priming * rate / (AAC_HE_CORE_SCALE if "he" in str(track.get("profile") or "").lower()
+                                         else 1)) if rate else 0
+        known = ""
+        if priming and exact and source == "lead":
+            known = (f"; the track starts {_signed_ms_text(raw * 1000)}, exactly the {samples}-sample AAC "
+                     f"encoder priming (inferred from the audio's PTS lead)")
+        elif priming and exact:
+            known = (f"; the track starts {_signed_ms_text(raw * 1000)}, then plays this spec's "
+                     f"{samples}-sample AAC encoder priming")
         if priming and not exact:
             text = (f"Sound starts {_range_text(low_ms, high_ms)} the picture{cause}: the track starts "
                     f"{_signed_ms_text(raw * 1000)} and its AAC encoder priming (up to {priming * 1000:.0f} ms) "
                     f"is not signalled by the container, so the programme sound begins somewhere in that range")
         elif abs(low_ms) <= warn_ms:
-            entries.append(("PASS", core._with_track(label, f"Audio and video start together ({low_ms:+.1f} ms"
+            entries.append(("PASS", core._with_track(label, f"Audio and video start together ({round(low_ms, 1) + 0.0:+.1f} ms"
                                                             f"{known}; container timing only)")))
             continue
         else:
@@ -1528,6 +1567,9 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
         if status == "PASS":
             entries.append(("PASS", core._with_track(label, f"{text} (within ±{warn_ms:g} ms; container "
                                                             f"timing only)")))
+        elif status == "NOT_VERIFIED":
+            entries.append(("NOT_VERIFIED", core._with_track(label, f"{text}; compliant sync is possible "
+                                                                    f"within it ({limits})")))
         elif status == "WARN":
             entries.append(("WARN", core._with_track(label, f"{text} ({limits})")))
         else:
@@ -1535,7 +1577,13 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     result.set_metadata("av_start_offset_ms", round(worst, 1))
     result.set_metadata("av_start_offset_range_ms", worst_range)
     statuses = {s for s, _ in entries}
-    confidence = 85 if "FAIL" in statuses else 60 if "WARN" in statuses else 100
+    if "NOT_VERIFIED" in statuses and not statuses & {"WARN", "FAIL"}:
+        # Unsignalled priming is a limit of the file format, not of the scan:
+        # Not verified, and Strict Mode does not escalate it.
+        result.add_not_verified(name, _sentence([d for _, d in entries])[:-1] + ".", inherent=True)
+        return
+    entries = [("WARN" if s == "NOT_VERIFIED" else s, d) for s, d in entries]
+    confidence = 85 if "FAIL" in statuses else 60 if statuses & {"WARN", "NOT_VERIFIED"} else 100
     core._add_aggregate(result, name, entries, confidence)
 
 
