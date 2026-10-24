@@ -1771,6 +1771,8 @@ def check_xr_metadata(probe_data: dict, result: QAResult, cfg: dict,
         result.add_skip("XR Metadata", "No video stream found.")
         return
     projection, stereo = _xr_metadata(video, first_frame or {})
+    if stereo is None:
+        stereo = container_checks.box_stereo(structure, video)
     result.set_metadata("projection", projection or "none")
     result.set_metadata("stereo_mode", stereo or "mono")
     found = (f"projection {projection}" if projection else "no spherical metadata (flat)")

@@ -2052,9 +2052,21 @@ def _generations(structure: Optional[Structure], video: dict) -> Tuple[Optional[
     if entry is not None:
         v2 = {"projection": (entry.sv3d or {}).get("projection"),
               "stereo": _V2_STEREO.get(entry.st3d, "mono") if entry.st3d is not None else "mono",
+              "right_left": entry.st3d == 4,
+              "st3d": entry.st3d,
               "bounds": (entry.sv3d or {}).get("bounds", (0, 0, 0, 0)),
               "pose": (entry.sv3d or {}).get("pose", (0.0, 0.0, 0.0))}
     return v1, v2
+
+
+def box_stereo(structure: Optional[Structure], video: dict) -> Optional[str]:
+    """The stereo layout of the picture track's V2 st3d box, or None.
+
+    FFmpeg 9 does not export stereo_mode 4 (right-left) at all, so when it
+    reports no stereo side data the box is the only evidence.
+    """
+    _, v2 = _generations(structure, video)
+    return v2["stereo"] if v2 and v2.get("st3d") is not None else None
 
 
 def _bounds(video: dict, v2: Optional[dict]) -> Tuple[float, float, float, float]:
@@ -2100,6 +2112,9 @@ def xr_metadata_findings(video: dict, projection: Optional[str], stereo: Optiona
                                           "mirrored" if mirrored else ""]))
         flag(f"the display matrix says {what}: headsets apply it on top of the projection; the view "
              f"orientation belongs in the projection pose (prhd)")
+    if v2 and v2.get("right_left"):
+        soft.append("st3d stereo_mode 4: side-by-side with the right eye on the left (Spherical Video V2 "
+                    "'right-left'); players that expect left-right show the eyes swapped")
     if v2 and any(abs(a) > 1e-6 for a in v2.get("pose", ())):
         yaw, pitch, roll = v2["pose"]
         notes.append(f"initial view yaw {yaw:g}°, pitch {pitch:g}°, roll {roll:g}°")

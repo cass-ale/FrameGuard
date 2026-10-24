@@ -659,3 +659,17 @@ class TestDisplayTransform:
 
     def test_unflipped_rotation_is_unchanged(self):
         assert cc.display_transform(_matrix_stream(0, 65536, -65536, 0, -90)) == (-90, False)
+
+
+class TestRightLeftStereo:
+    def test_st3d_mode_4_is_side_by_side_with_the_eyes_reversed(self, media, tmp_path):
+        """B10: FFmpeg ignores stereo_mode 4 (right-left), so the row read
+        'no stereo metadata (mono)'; the box reader names the layout and the
+        eye order."""
+        from container_fixtures import add_to_sample_entry, st3d, sv3d
+        clip = media.get("vr180_640x320.mp4", lambda p: make_clip(p, duration=2, size="640x320") or p)
+        path = add_to_sample_entry(_copy(clip, tmp_path / "rl.mp4"), b"vide", st3d(4),
+                                   sv3d(bounds=(0, 0, QUARTER, QUARTER)))
+        check = _row(_scan(path, target_width=640, target_height=320, audio_required=False), "XR Metadata")
+        assert "side_by_side" in check[2] and "right eye" in check[2], check
+        assert "does not fit" not in check[2], check
