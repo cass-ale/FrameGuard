@@ -972,3 +972,26 @@ class TestVersionGateRound2:
         result = _scan(_clean(media), quick=False)
         integrity = _row(result, "File Integrity")
         assert _not_verified(integrity) and "libavfilter" in integrity[2], integrity
+
+
+# ---------------------------------------------------------------------------
+# Round 2: AGENTS.md UI copy for this fixer's new setting and dialog
+# ---------------------------------------------------------------------------
+
+class TestUiCopy:
+    def test_aac_priming_has_no_helper_line_and_plain_option_labels(self, qapp):
+        from frameguard import gui
+        panel = gui.SettingsPanel()
+        combo = panel._rule_controls["aac_priming"]
+        assert [combo.itemText(i) for i in range(combo.count())] == ["Unknown", "1024 samples", "2112 samples"]
+        row = next(r for r in panel._setting_rows if r[1].text() == "AAC Encoder Priming")
+        assert row[4].text() == "" and row[4].isHidden(), row[4].text()
+
+    def test_ffmpeg_too_old_dialog_is_one_plain_sentence(self, qapp, monkeypatch):
+        from frameguard import gui, tools
+        shown = []
+        monkeypatch.setattr(gui, "check_ffmpeg_available", lambda: (True, ""))
+        monkeypatch.setattr(tools, "ffmpeg_version_problem", lambda path=None: "FFmpeg 8.0.1 is too old")
+        monkeypatch.setattr(gui.QMessageBox, "warning", lambda parent, title, text: shown.append((title, text)))
+        gui.MainWindow._check_ffmpeg(type("W", (), {})())
+        assert shown == [("FFmpeg Too Old", "FFmpeg 8.0.1 is too old.")], shown

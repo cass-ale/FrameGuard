@@ -3846,11 +3846,8 @@ class SettingsPanel(QWidget):
         ("delivery", "spatial_audio", "choice", "Spatial Audio",
          "Require an ambisonic track with valid spatial (SA3D) metadata for 360 deliverables",
          (("any", "Not required"), ("required", "Required"))),
-        ("delivery", "aac_priming", "choice", "AAC Encoder Priming",
-         "Priming of the AAC encoder, used to judge the A/V start offset where the container "
-         "does not signal it (MPEG-TS, MP4 without an edit list)",
-         (("unknown", "Unknown (judge 0-2112 samples)"), (1024, "1024 samples (FFmpeg)"),
-          (2112, "2112 samples (Apple)"))),
+        ("delivery", "aac_priming", "choice", "AAC Encoder Priming", "",
+         (("unknown", "Unknown"), (1024, "1024 samples"), (2112, "2112 samples"))),
         ("delivery", "warn_untagged_color", "bool", "Warn on Untagged Colour",
          "Warn when a file carries no colour primaries, transfer or matrix tags, so players "
          "have to guess", None),
@@ -4056,8 +4053,10 @@ class SettingsPanel(QWidget):
         cell_lay.setSpacing(0)
         cell_lay.addWidget(control, 1, Qt.AlignVCenter)
 
-        # --- Description (floating text, subdued) ---
-        desc = QLabel(description)
+        # --- Description (floating text, subdued; none for newer settings,
+        # per AGENTS.md: no helper text) ---
+        desc = QLabel(description or "")
+        desc.setVisible(bool(description))
         desc.setWordWrap(True)
         desc.setFont(ui_font(D.FONT_SMALL))
         _set_role(desc, "muted")
@@ -5733,8 +5732,7 @@ class MainWindow(QMainWindow):
         from frameguard.tools import ffmpeg_version_problem
         too_old = ffmpeg_version_problem()
         if too_old:
-            QMessageBox.warning(self, "FFmpeg Too Old",
-                                f"{too_old}.\n\nFrame-level checks will be reported as Not verified.")
+            QMessageBox.warning(self, "FFmpeg Too Old", f"{too_old}.")
 
 
     def _sync_preset_from_settings(self):
