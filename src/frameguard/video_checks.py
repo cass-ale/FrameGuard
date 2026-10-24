@@ -273,6 +273,65 @@ MATRICES = {
 
 _HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}
 
+# Colour signalling families (ITU-T H.273 code points as FFmpeg names them).
+# A set of primaries implies its own Y'CbCr matrix: BT.709 (Part 2, signal
+# format) derives its luma and colour-difference coefficients from the
+# BT.709 primaries, BT.2020 (Table 4) from the BT.2020 ones (non-constant or
+# constant luminance), BT.601 from the 525/625 ones; BT.2100 adds ICtCp. PQ and HLG (BT.2100 Tables 4/5) are
+# defined only with BT.2020 primaries (BT.2100 Table 2, colorimetry). The BT.709, BT.601
+# and BT.2020 OETFs are the same curve (H.273: transfer 1, 6, 14 and 15 are
+# functionally identical), so an SDR transfer is consistent with any SDR
+# primaries.
+_UNSIGNALLED_TAGS = ("", "unknown", "unspecified", "reserved", "none")
+_PRIMARY_MATRICES = {
+    "bt709": ("bt709",),
+    "bt2020": ("bt2020nc", "bt2020c", "ictcp"),
+    "smpte170m": ("smpte170m", "bt470bg"),
+    "bt470bg": ("bt470bg", "smpte170m"),
+}
+_MATRIX_LABELS = {"bt709": "BT.709", "bt2020nc": "BT.2020", "bt2020c": "BT.2020 (constant luminance)",
+                  "ictcp": "ICtCp", "smpte170m": "BT.601", "bt470bg": "BT.601"}
+_PRIMARY_LABELS = {"bt709": "BT.709", "bt2020": "BT.2020", "smpte170m": "BT.601 (525)",
+                   "bt470bg": "BT.601 (625)", "smpte432": "P3-D65", "smpte431": "DCI-P3"}
+
+
+def colour_tag_advisories(primaries: str, transfer: str, matrix: str,
+                          report_partial: bool = True) -> List[str]:
+    """Sentences on inconsistent or partial colour tags (advisory).
+
+    ``primaries``/``transfer``/``matrix`` are FFmpeg's color_primaries,
+    color_transfer and color_space names. A fully untagged stream is
+    reported elsewhere; here: some tags present and others missing (players
+    then assume the missing ones, often differently), primaries with another
+    system's matrix, and PQ/HLG outside BT.2100.
+    """
+    p, t, m = (str(v or "").lower() for v in (primaries, transfer, matrix))
+    missing = [name for name, v in (("primaries", p), ("transfer", t), ("matrix", m))
+               if v in _UNSIGNALLED_TAGS]
+    out = []
+    if report_partial and missing and len(missing) < 3:
+        present = [name for name in ("primaries", "transfer", "matrix") if name not in missing]
+        out.append(f"colour tags are only partly signalled ({' and '.join(present)} set, "
+                   f"{' and '.join(missing)} not), so players assume the rest and can disagree")
+    expected = _PRIMARY_MATRICES.get(p)
+    if expected and m not in _UNSIGNALLED_TAGS and m not in expected:
+        out.append(f"{_PRIMARY_LABELS.get(p, p)} primaries are signalled with a "
+                   f"{_MATRIX_LABELS.get(m, m)} matrix; each system's Y'CbCr matrix is derived "
+                   f"from its own primaries (BT.709 / BT.2020 / BT.601), so the tags contradict "
+                   f"each other and colours decode wrong in one of the two")
+    if t in _HDR_TRANSFERS:
+        name = "PQ" if t == "smpte2084" else "HLG"
+        if p not in _UNSIGNALLED_TAGS and p != "bt2020":
+            out.append(f"{name} is signalled with {_PRIMARY_LABELS.get(p, p)} primaries; ITU-R "
+                       f"BT.2100 defines {name} only with BT.2020 primaries")
+        if m not in _UNSIGNALLED_TAGS and m not in ("bt2020nc", "bt2020c", "ictcp"):
+            out.append(f"{name} is signalled with a {_MATRIX_LABELS.get(m, m)} matrix; ITU-R "
+                       f"BT.2100 uses the BT.2020 matrix or ICtCp")
+    elif t in ("bt2020-10", "bt2020-12") and p not in _UNSIGNALLED_TAGS and p != "bt2020":
+        out.append(f"the BT.2020 transfer is signalled with {_PRIMARY_LABELS.get(p, p)} primaries; "
+                   f"it belongs to the BT.2020 system")
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Picture description

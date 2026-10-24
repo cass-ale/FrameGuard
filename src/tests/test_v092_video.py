@@ -624,3 +624,61 @@ class TestDecoderMessagesScan:
                "-c:v", "libx264", "-bf", "0", path)
         row = _row(_scan(path, require_cfr=False), "File Integrity")
         assert row[1] == "PASS", row
+
+
+# ---------------------------------------------------------------------------
+# Colour metadata: consistent primaries / transfer / matrix, complete tagging
+# ---------------------------------------------------------------------------
+
+def _colour(primaries="bt709", transfer="bt709", matrix="bt709", width=1920, **extra):
+    from frameguard import core
+    video = {"index": 0, "codec_type": "video", "width": width, "height": 1080,
+             "pix_fmt": "yuv420p10le", "color_primaries": primaries, "color_transfer": transfer,
+             "color_space": matrix, **extra}
+    result = core.QAResult("x.mp4")
+    core.check_color_hdr({"streams": [video], "format": {}}, result, dict(DEFAULT_CONFIG))
+    return _row(result, "Color / HDR")
+
+
+class TestColourTags:
+    def test_consistent_sets_pass(self):
+        assert _colour()[1] == "PASS"
+        assert _colour("bt2020", "smpte2084", "bt2020nc",
+                       side_data_list=[])[1] in ("PASS", "WARN")   # HDR metadata gaps are separate
+        assert _colour("bt2020", "bt2020-10", "bt2020nc")[1] == "PASS"
+        assert _colour("bt2020", "bt709", "bt2020nc")[1] == "PASS"   # same OETF (H.273 note)
+        assert _colour("smpte170m", "smpte170m", "smpte170m", width=720)[1] == "PASS"
+
+    def test_bt2020_primaries_on_bt709_matrix(self):
+        """Held-out review case: BT.2020 primaries with BT.709 transfer and matrix."""
+        row = _colour("bt2020", "bt709", "bt709")
+        assert row[1] == "WARN" and "BT.2020 primaries" in row[2] and "matrix" in row[2], row
+
+    def test_bt709_primaries_with_bt2020_matrix(self):
+        row = _colour("bt709", "bt709", "bt2020nc")
+        assert row[1] == "WARN" and "matrix" in row[2], row
+
+    def test_pq_needs_bt2020_primaries(self):
+        row = _colour("bt709", "smpte2084", "bt709")
+        assert row[1] == "WARN" and "BT.2100" in row[2], row
+
+    def test_hlg_with_bt709_matrix(self):
+        row = _colour("bt2020", "arib-std-b67", "bt709")
+        assert row[1] == "WARN" and "BT.2100" in row[2], row
+
+    def test_partial_tagging_is_flagged(self):
+        """x264's common case: only the matrix is signalled."""
+        row = _colour("unknown", "unknown", "bt709")
+        assert row[1] == "WARN" and "partly" in row[2], row
+        row = _colour("bt709", "unknown", "bt709")
+        assert row[1] == "WARN" and "transfer" in row[2], row
+
+    def test_partial_tagging_follows_the_untagged_setting(self):
+        from frameguard import core
+        video = {"index": 0, "codec_type": "video", "width": 1920, "height": 1080,
+                 "pix_fmt": "yuv420p", "color_space": "bt709"}
+        result = core.QAResult("x.mp4")
+        core.check_color_hdr({"streams": [video], "format": {}}, result,
+                             dict(DEFAULT_CONFIG, warn_untagged_color=False))
+        assert _row(result, "Color / HDR")[1] == "PASS"
+

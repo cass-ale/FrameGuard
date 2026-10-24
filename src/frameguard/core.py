@@ -1663,6 +1663,11 @@ def _colour_signalling_advisories(video: dict, first_frame: dict, transfer: str,
     if width >= 1280 and matrix in ("smpte170m", "bt470bg"):
         out.append(f"a BT.601 (SD) matrix is signalled on a {width}-wide HD picture; HD and UHD SDR use "
                    f"BT.709, so colours decode shifted if the tag is wrong")
+    raw_transfer = video.get("color_transfer") or first_frame.get("color_transfer") or ""
+    untagged = matrix in _UNSIGNALLED and primaries in _UNSIGNALLED and transfer == "unspecified"
+    if not untagged:
+        out += video_checks.colour_tag_advisories(
+            primaries, raw_transfer, matrix, report_partial=cfg.get("warn_untagged_color", True))
     if transfer in ("pq", "hlg") and depth is not None and depth < 10:
         out.append(f"{transfer.upper()} HDR is signalled on {depth}-bit video; ITU-R BT.2100 requires 10 or "
                    f"12 bits, so this is most likely SDR tagged as HDR")
