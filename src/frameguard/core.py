@@ -2518,23 +2518,9 @@ def _lines_with_context(text: str, name: str) -> str:
 # Scan plan
 # ---------------------------------------------------------------------------
 
-_LAYOUT_CHANNELS = {
-    "mono": ["FC"], "stereo": ["FL", "FR"], "2.1": ["FL", "FR", "LFE"],
-    "3.0": ["FL", "FR", "FC"], "quad": ["FL", "FR", "BL", "BR"],
-    "4.0": ["FL", "FR", "FC", "BC"], "5.0": ["FL", "FR", "FC", "BL", "BR"],
-    "5.0(side)": ["FL", "FR", "FC", "SL", "SR"],
-    "5.1": ["FL", "FR", "FC", "LFE", "BL", "BR"],
-    "5.1(side)": ["FL", "FR", "FC", "LFE", "SL", "SR"],
-    "7.1": ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"],
-    "7.1(wide)": ["FL", "FR", "FC", "LFE", "BL", "BR", "FLC", "FRC"],
-}
-
-
-def _channel_names(track: dict, count: int) -> List[str]:
-    names = _LAYOUT_CHANNELS.get(str(track.get("channel_layout") or "").lower())
-    if names and len(names) == count:
-        return names
-    return [f"ch{k + 1}" for k in range(count)]
+def _channel_names(track: dict, count: int, ambisonic: bool = False) -> List[str]:
+    """Channel names by layout (audio_checks.channel_names)."""
+    return audio_checks.channel_names(track, count, ambisonic)
 
 
 class _ScanPlan:
@@ -2739,7 +2725,7 @@ def _build_scan_command(ffmpeg: str, filepath: str, plan: _ScanPlan, cfg: dict) 
     summary: List[str] = []
     units: List["audio_checks.MeasurementUnit"] = []
     for i, track in enumerate(plan.audio):
-        names = _channel_names(track, plan.channels(track))
+        names = _channel_names(track, plan.channels(track), i in plan.ambisonic)
         parts = audio_checks.track_graphs(
             i, track, names, cfg, plan.loudness, MAX_CHANNEL_SPLIT, plan.multichannel_meter,
             ambisonic=i in plan.ambisonic, files=plan.audio_files)
@@ -3111,7 +3097,8 @@ def _dead_channels(track: dict, position: int, evidence: "audio_checks.ScanEvide
 
 
 def _dead_channel_entry(label: str, track: dict, dead_channels: List[int],
-                        track_dead: bool) -> Tuple[str, str]:
+                        track_dead: bool, names: List[str],
+                        lfe: frozenset = frozenset()) -> Tuple[str, str]:
     """Per-channel silence: one dead channel in a live track.
 
     silencedetect on a whole track only fires when every channel is silent,
@@ -3126,13 +3113,14 @@ def _dead_channel_entry(label: str, track: dict, dead_channels: List[int],
                                           f"{MAX_CHANNEL_SPLIT}-channel analysis limit.")
     if track_dead:
         return "SKIP", _with_track(label, "Whole track is silent (see Audio Silence).")
-    names = _channel_names(track, count)
     dead = [names[k] for k in dead_channels]
     if not dead:
         return "PASS", _with_track(label, f"All {count} channels carry signal.")
-    live_dead = [n for n in dead if n != "LFE"]
+    live_dead = [names[k] for k in dead_channels if k not in lfe]
     if not live_dead:
-        return "PASS", _with_track(label, "LFE channel is silent (common when the mix has no low-frequency content); all other channels carry signal.")
+        which = ", ".join(audio_checks.lfe_note(track, names, k) for k in dead_channels)
+        return "PASS", _with_track(label, f"LFE channel is silent: {which} (common when the mix has no "
+                                          f"low-frequency content); all other channels carry signal.")
     text = f"Silent channel(s): {', '.join(dead)} of {count} ({track.get('channel_layout') or 'unknown layout'})."
     if count == 2:
         return "FAIL", _with_track(label, text)
@@ -3217,7 +3205,8 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
                     or plan.audio_expected_seconds(track) or 0.0)
         ambisonic = position in plan.ambisonic
         ctx = audio_checks.TrackContext(
-            position=position, track=track, names=_channel_names(track, plan.channels(track)),
+            position=position, track=track,
+            names=_channel_names(track, plan.channels(track), ambisonic),
             label=label, duration=duration, ambisonic=ambisonic,
             meter=audio_checks.loudness_meter(track, plan.channels(track),
                                               plan.multichannel_meter, ambisonic))
@@ -3236,7 +3225,8 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
             alone = audio_checks.channel_silence_entries(evidence, ctx, cfg, events)
             channel_warning = channel_warning or bool(alone)
             silence.append(_with_channel_silence(status, detail, label, alone))
-            dead.append(_dead_channel_entry(label, track, ctx.dead_channels, ctx.track_silent))
+            dead.append(_dead_channel_entry(label, track, ctx.dead_channels, ctx.track_silent,
+                                            ctx.names, ctx.lfe))
         if plan.loudness:
             entry = measured.get(position)
             loudness.append(audio_checks.loudness_row(entry, ctx, cfg))

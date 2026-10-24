@@ -360,6 +360,99 @@ def ambisonic_positions(tracks: Sequence[dict], sa3d: Sequence[Optional[dict]],
     return found
 
 
+# FFmpeg's standard channel layouts in decoded channel order (``ffmpeg
+# -layouts``; libavutil/channel_layout.c, channel_layout_map), as ffprobe
+# names them in ``channel_layout``.
+FFMPEG_LAYOUTS = {
+    "mono": "FC", "stereo": "FL+FR", "2.1": "FL+FR+LFE", "3.0": "FL+FR+FC",
+    "3.0(back)": "FL+FR+BC", "4.0": "FL+FR+FC+BC", "quad": "FL+FR+BL+BR",
+    "quad(side)": "FL+FR+SL+SR", "3.1": "FL+FR+FC+LFE", "5.0": "FL+FR+FC+BL+BR",
+    "5.0(side)": "FL+FR+FC+SL+SR", "4.1": "FL+FR+FC+LFE+BC", "5.1": "FL+FR+FC+LFE+BL+BR",
+    "5.1(side)": "FL+FR+FC+LFE+SL+SR", "6.0": "FL+FR+FC+BC+SL+SR",
+    "6.0(front)": "FL+FR+FLC+FRC+SL+SR", "3.1.2": "FL+FR+FC+LFE+TFL+TFR",
+    "hexagonal": "FL+FR+FC+BL+BR+BC", "6.1": "FL+FR+FC+LFE+BC+SL+SR",
+    "6.1(back)": "FL+FR+FC+LFE+BL+BR+BC", "6.1(front)": "FL+FR+LFE+FLC+FRC+SL+SR",
+    "7.0": "FL+FR+FC+BL+BR+SL+SR", "7.0(front)": "FL+FR+FC+FLC+FRC+SL+SR",
+    "7.1": "FL+FR+FC+LFE+BL+BR+SL+SR", "7.1(wide)": "FL+FR+FC+LFE+BL+BR+FLC+FRC",
+    "7.1(wide-side)": "FL+FR+FC+LFE+FLC+FRC+SL+SR", "5.1.2": "FL+FR+FC+LFE+SL+SR+TFL+TFR",
+    "5.1.2(back)": "FL+FR+FC+LFE+BL+BR+TFL+TFR", "octagonal": "FL+FR+FC+BL+BR+BC+SL+SR",
+    "cube": "FL+FR+BL+BR+TFL+TFR+TBL+TBR", "5.1.4": "FL+FR+FC+LFE+SL+SR+TFL+TFR+TBL+TBR",
+    "7.1.2": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR",
+    "7.1.4": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBL+TBR",
+    "7.2.3": "FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBC+LFE2",
+    "9.1.4": "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR",
+    "9.1.6": "FL+FR+FC+LFE+BL+BR+FLC+FRC+SL+SR+TFL+TFR+TBL+TBR+TSL+TSR",
+    "hexadecagonal": "FL+FR+FC+BL+BR+BC+SL+SR+TFL+TFC+TFR+TBL+TBC+TBR+WL+WR",
+    "binaural": "BIL+BIR", "downmix": "DL+DR",
+    "22.2": "FL+FR+FC+LFE+BL+BR+FLC+FRC+BC+SL+SR+TC+TFL+TFC+TFR+TBL+TBC+TBR+LFE2+TSL+TSR+BFC+BFL+BFR",
+}
+LFE_NAMES = frozenset({"LFE", "LFE2"})
+# FFmpeg describes a layout outside its table as "3 channels (FL+FR+LFE)".
+_DESCRIBED_RE = re.compile(r"^\d+ channels \(([A-Z0-9+]+)\)$")
+# An unsignalled 6- or 8-channel track: the fourth channel is the LFE
+# position of the standard order L, R, C, LFE, Ls, Rs[, Lb, Rb] (ITU-R
+# BS.775, SMPTE ST 2036-2, WAVE_FORMAT_EXTENSIBLE). Field recorders also
+# write unsignalled iso tracks, so the assumption is named in the row text.
+_UNSIGNALLED_LFE = {6: 3, 8: 3}
+
+
+def _layout_text(track: dict) -> str:
+    return str(track.get("channel_layout") or "").strip().lower()
+
+
+def layout_signalled(track: dict) -> bool:
+    layout = _layout_text(track)
+    return bool(layout) and layout != "unknown" and not layout.endswith(" channels")
+
+
+def ambisonic_head_locked(track: dict, count: int) -> int:
+    """Channels of head-locked (non-diegetic) stereo after the ambisonic
+    ones: FFmpeg names an SA3D track with head_locked_stereo
+    "ambisonic N+stereo" (Spatial Audio RFC: (order + 1)^2 + 2 channels)."""
+    match = re.match(r"^ambisonic (\d+)\+stereo$", _layout_text(track))
+    if match and count == (int(match.group(1)) + 1) ** 2 + 2:
+        return 2
+    return 0
+
+
+def channel_names(track: dict, count: int, ambisonic: bool = False) -> List[str]:
+    """Channel names in decoded order: FFmpeg's layout table, its "N channels
+    (A+B+...)" description, ACN component names for ambisonics (W, Y, Z, X,
+    then ACN4...; head-locked stereo as HL-L, HL-R), else ch1..chN."""
+    if ambisonic:
+        extra = ambisonic_head_locked(track, count)
+        acn = ["W", "Y", "Z", "X"] + [f"ACN{k}" for k in range(4, max(4, count - extra))]
+        return acn[:count - extra] + ["HL-L", "HL-R"][:extra]
+    layout = _layout_text(track)
+    decomposition = FFMPEG_LAYOUTS.get(layout)
+    if decomposition is None:
+        match = _DESCRIBED_RE.match(str(track.get("channel_layout") or "").strip())
+        decomposition = match.group(1) if match else None
+    names = decomposition.split("+") if decomposition else []
+    if len(names) == count:
+        return names
+    return [f"ch{k + 1}" for k in range(count)]
+
+
+def lfe_positions(track: dict, names: Sequence[str]) -> frozenset:
+    """Channels that are LFE by layout: named LFE/LFE2, or the LFE position
+    of an unsignalled 6/8-channel track (see _UNSIGNALLED_LFE). An LFE is
+    legitimately silent, gappy and full of 50/60 Hz programme."""
+    named = frozenset(k for k, name in enumerate(names) if name in LFE_NAMES)
+    if named or layout_signalled(track) or is_ambisonic(track):
+        return named
+    position = _UNSIGNALLED_LFE.get(len(names))
+    return frozenset() if position is None else frozenset({position})
+
+
+def lfe_note(track: dict, names: Sequence[str], k: int) -> str:
+    """How a channel was identified as the LFE, for row texts."""
+    if k < len(names) and names[k] in LFE_NAMES:
+        return names[k]
+    return (f"{names[k] if k < len(names) else f'ch{k + 1}'} (the LFE position of the standard "
+            f"L, R, C, LFE order; the layout is not signalled)")
+
+
 def stereo_pairs(track: dict, names: Sequence[str],
                  ambisonic: bool = False) -> List[Tuple[int, int, str]]:
     """Left/right pairs whose correlation means something.
@@ -381,18 +474,14 @@ def stereo_pairs(track: dict, names: Sequence[str],
     return pairs
 
 
-def _non_lfe(names: Sequence[str]) -> List[int]:
-    return [k for k, name in enumerate(names) if name != "LFE"]
-
-
-def _hum_mix(names: Sequence[str], ambisonic: bool) -> Optional[str]:
+def _hum_mix(names: Sequence[str], ambisonic: bool, lfe: frozenset = frozenset()) -> Optional[str]:
     """pan expression averaging the non-LFE channels (LFE legitimately
     carries 50/60 Hz programme). Ambisonic tracks use channel 0 (W), since
     summing B-format components is meaningless."""
     count = len(names)
     if count == 1:
         return None
-    channels = [0] if ambisonic else _non_lfe(names)
+    channels = [0] if ambisonic else [k for k in range(count) if k not in lfe]
     if not channels:
         return None
     gain = 1.0 / len(channels)
@@ -521,7 +610,7 @@ _FULL_SCALE_RUNS = (f"aeval=exprs='st(0,if(gte(abs(val(0)),{FULL_SCALE_AMPLITUDE
                     f"if(gte(ld(0),{CLIP_RUN_SAMPLES}),0,1)'")
 
 
-def _channel_chain(i: int, k: int, track: dict, name: str, cfg: dict,
+def _channel_chain(i: int, k: int, track: dict, is_lfe: bool, cfg: dict,
                    files: Optional[MeasurementFiles]) -> List[str]:
     """``[a<N>c<K>]``: one channel's event detectors, all writing files.
 
@@ -536,7 +625,7 @@ def _channel_chain(i: int, k: int, track: dict, name: str, cfg: dict,
             f"silencedetect@a{i}c{k}=n={_number(cfg, 'channel_silence_noise_db')}dB"
             f":d={float(cfg['silence_duration'])}" + _record(f"silencedetect@a{i}c{k}", files))
     tails = []
-    if check_enabled(cfg, DROPOUTS) and name != "LFE":
+    if check_enabled(cfg, DROPOUTS) and not is_lfe:
         rate = min(_whole(track.get("sample_rate"), 48000) or 48000, TONE_RATE)
         head += (f",silencedetect@a{i}d{k}=n={_number(cfg, 'dropout_noise_db')}dB"
                  f":d={_number(cfg, 'dropout_min_ms') / 1000.0}"
@@ -577,12 +666,12 @@ def _phase_chains(i: int, track: dict, names: Sequence[str], cfg: dict, ambisoni
 
 
 def _hum_chains(i: int, names: Sequence[str], cfg: dict, ambisonic: bool,
-                files: Optional[MeasurementFiles]) -> List[str]:
+                files: Optional[MeasurementFiles], lfe: frozenset = frozenset()) -> List[str]:
     """``[a<N>h]`` -> 2 Hz bands at 50/60 Hz and 6 Hz either side, each
     band's RMS per 1 s window written to a file (``astats@a<N>h<F><tag>``).
     44-66 Hz bands need no more than a 1 kHz rate: resampling first makes the
     18 biquads 48 times cheaper and better conditioned."""
-    mix = _hum_mix(names, ambisonic)
+    mix = _hum_mix(names, ambisonic, lfe)
     if not check_enabled(cfg, HUM) or (len(names) != 1 and not mix):
         return []
     bands = [(freq, tag, freq + offset) for freq in HUM_FREQUENCIES
@@ -700,12 +789,13 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
         summary = [_main_chain(i, source, cfg, meter, loudness, ambisonic, files)]
 
     units = []
+    lfe = frozenset() if ambisonic else lfe_positions(track, names)
     if 1 <= len(names) <= max_split:
-        units += [MeasurementUnit(source, f"[a{i}c{k}]", _channel_chain(i, k, track, name, cfg, files))
-                  for k, name in enumerate(names)]
+        units += [MeasurementUnit(source, f"[a{i}c{k}]", _channel_chain(i, k, track, k in lfe, cfg, files))
+                  for k in range(len(names))]
     units += [MeasurementUnit(source, label, [body])
               for label, body in _phase_chains(i, track, names, cfg, ambisonic, files)]
-    hum = _hum_chains(i, names, cfg, ambisonic, files)
+    hum = _hum_chains(i, names, cfg, ambisonic, files, lfe)
     if hum:
         units.append(MeasurementUnit(source, f"[a{i}h]", hum))
     return TrackGraphs(summary, units)
@@ -926,6 +1016,12 @@ class TrackContext:
     track_silent: bool = False
     meter: str = METER_EBUR128
     ambisonic: bool = False
+    # Channels that are LFE by layout (lfe_positions); derived when omitted.
+    lfe: Optional[frozenset] = None
+
+    def __post_init__(self):
+        if self.lfe is None:
+            self.lfe = frozenset() if self.ambisonic else lfe_positions(self.track, self.names)
 
 
 Row = Tuple[str, str, int]  # (status, detail, confidence)
@@ -1359,7 +1455,7 @@ def _dropout_candidates(evidence: ScanEvidence, ctx: TrackContext,
     longest = float(cfg["silence_duration"])
     candidates, lineup = [], 0
     for k in range(len(ctx.names)):
-        if ctx.names[k] == "LFE" or k in ctx.dead_channels:
+        if k in ctx.lfe or k in ctx.dead_channels:
             continue
         silences = evidence.silence_events(f"silencedetect@a{ctx.position}c{k}", ctx.duration)
         # Short gaps 250 ms apart (GLITS R) are separate events: the 0.25 s
@@ -1427,7 +1523,7 @@ def channel_silence_entries(evidence: ScanEvidence, ctx: TrackContext, cfg: dict
     longest = float(cfg["silence_duration"])
     texts = []
     for k, name in enumerate(ctx.names):
-        if name == "LFE" or k in ctx.dead_channels:
+        if k in ctx.lfe or k in ctx.dead_channels:
             continue
         events = evidence.silence_events(f"silencedetect@a{ctx.position}c{k}", ctx.duration)
         alone = [e for e in _subtract(events, track_events) if e[1] >= longest]
