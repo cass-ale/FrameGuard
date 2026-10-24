@@ -525,3 +525,93 @@ class TestLoudnessMetadata:
         clip = media.get("two_tracks", lambda p: _two_tracks(p, tone(1000, MINUS_23 / 3), TONE_23))
         result = _scan(clip, loudness_mode="essential")
         assert abs(result.metadata["integrated_loudness_lufs"] + 23.0) <= 0.1, result.metadata
+
+
+# ---------------------------------------------------------------------------
+# 12b. Meter self-test: every weighted channel, the LFE, the fallback and true peak (review B9)
+# ---------------------------------------------------------------------------
+
+class _Proc:
+    def __init__(self, stderr):
+        self.stderr, self.stdout, self.returncode = stderr, "", 0
+
+
+def _ebur128_summary(instance, integrated, true_peak=None):
+    lines = [f"[{instance} @ 0x1] [info] Summary:", "", "  Integrated loudness:",
+             f"    I:         {integrated:.1f} LUFS", "    Threshold: -33.0 LUFS", "",
+             "  Loudness range:", "    LRA:         0.0 LU", ""]
+    if true_peak is not None:
+        lines += ["  Sample peak:", f"    Peak:      {true_peak:.1f} dBFS", "",
+                  "  True peak:", f"    Peak:      {true_peak:.1f} dBFS"]
+    return "\n".join(lines)
+
+
+def _loudnorm_json(instance, integrated):
+    return "\n".join([f"[{instance} @ 0x2] [info] ", "{", f'\t"input_i" : "{integrated:.2f}",',
+                      '\t"input_tp" : "-20.00",', '\t"input_lra" : "0.00",', '\t"input_thresh" : "-33.00",'])
+
+
+class TestMeterSelfTest:
+    def test_a_meter_that_drops_the_centre_is_caught(self, monkeypatch):
+        """0.9.1 tested L and R of 3.0 with the centre silent (+-0.3 LU): a
+        meter that ignored C, mis-weighted the surrounds or counted the LFE
+        passed. Here the binary reads -23.0 for that old signal and -24.2
+        for EBU Tech 3341 case 6 in 5.1 (C dropped)."""
+        def fake(cmd, *args, **kwargs):
+            text = " ".join(cmd)
+            if "pan=3.0" in text:
+                return _Proc("    I:         -23.0 LUFS")
+            return _Proc("\n".join([_ebur128_summary("ebur128@a0", -24.2),
+                                    _loudnorm_json("loudnorm@a0", -23.05),
+                                    _ebur128_summary("ebur128@a1", -18.0, -6.0)]))
+        monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
+        monkeypatch.setattr(core, "_METER_SELF_TEST", {}, raising=False)
+        monkeypatch.setattr(core, "_run_owned_subprocess", fake)
+        assert core._ebur128_multichannel_ok("ffmpeg") is False
+
+    def test_a_failing_fallback_leaves_loudness_unmeasured(self, monkeypatch):
+        def fake(cmd, *args, **kwargs):
+            return _Proc("\n".join([_ebur128_summary("ebur128@a0", -5.0),
+                                    _loudnorm_json("loudnorm@a0", -21.0),
+                                    _ebur128_summary("ebur128@a1", -18.0, -6.0)]))
+        monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
+        monkeypatch.setattr(core, "_METER_SELF_TEST", {}, raising=False)
+        monkeypatch.setattr(core, "_run_owned_subprocess", fake)
+        tracks = [{"codec_type": "audio", "index": 1, "channels": 6, "channel_layout": "5.1"}]
+        plan = core._ScanPlan({"streams": tracks}, dict(DEFAULT_CONFIG))
+        assert core._multichannel_meter("ffmpeg", plan) == audio_checks.METER_NONE
+
+    def test_true_peak_over_read_widens_the_low_confidence_band(self):
+        """A build whose true peak over-reads its Tech 3341-shaped self-test by
+        1.0 dB cannot call a 0.5 dB over a confident FAIL."""
+        test = audio_checks.MeterSelfTest(ebur128_multichannel=True, loudnorm=True, true_peak_error_db=1.0)
+        ctx = audio_checks.TrackContext(position=0, track={"channel_layout": "stereo"}, names=["FL", "FR"],
+                                        label="", duration=60.0, meter_self_test=test)
+        cfg = dict(DEFAULT_CONFIG, loudness_mode="essential")
+        status, text, confidence = audio_checks.true_peak_row({"true_peak": -0.5}, ctx, cfg)
+        assert status == "FAIL" and confidence == audio_checks.LOW_CONFIDENCE and "over-reads" in text
+        assert audio_checks.true_peak_row({"true_peak": 1.0}, ctx, cfg)[2] == 95
+
+    def test_fallback_readings_near_a_limit_are_low_confidence(self):
+        """loudnorm's meter read EBU Tech 3341 case 5 0.14 LU low on this
+        build (outside Tech 3341's +-0.1): a 0.15 LU miss is not proof."""
+        ctx = audio_checks.TrackContext(position=0, track={"channel_layout": "5.1"},
+                                        names=["FL", "FR", "FC", "LFE", "BL", "BR"], label="",
+                                        duration=60.0, meter=audio_checks.METER_LOUDNORM)
+        row = audio_checks.loudness_row({"integrated": -23.65}, ctx, dict(DEFAULT_CONFIG, loudness_mode="essential"))
+        assert row[0] == "FAIL" and row[2] == audio_checks.LOW_CONFIDENCE, row
+
+    @needs_ffmpeg
+    def test_real_self_test_on_this_build(self, monkeypatch):
+        import platform
+        from frameguard.tools import get_ffmpeg_path
+        monkeypatch.setattr(core, "_EBUR128_MULTICHANNEL_OK", {})
+        monkeypatch.setattr(core, "_METER_SELF_TEST", {}, raising=False)
+        path = get_ffmpeg_path()
+        verdict = core._ebur128_multichannel_ok(path)
+        test = core._METER_SELF_TEST[path]
+        assert test.loudnorm is True     # the remapped fallback reads case 6 within +-0.1 LU
+        if "darwin-arm64" in path and platform.machine() == "arm64":
+            # The bundled arm64 9.0.2: broken >2-channel K-weighting, and a
+            # true peak that over-reads 12-16 kHz by about 1 dB.
+            assert verdict is False and test.true_peak_error_db > 0.2

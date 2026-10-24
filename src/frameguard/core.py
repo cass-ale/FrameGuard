@@ -2543,6 +2543,7 @@ class _ScanPlan:
         # tracks to treat as ambisonics, and the scan's private directory for
         # measurement files and filter-graph scripts.
         self.multichannel_meter = audio_checks.METER_EBUR128
+        self.meter_self_test: Optional["audio_checks.MeterSelfTest"] = None
         self.ambisonic = frozenset(
             i for i, t in enumerate(self.audio) if audio_checks.is_ambisonic(t))
         self.head_locked = frozenset(audio_checks.head_locked_positions(
@@ -2606,51 +2607,56 @@ class _ScanPlan:
 
 
 _EBUR128_MULTICHANNEL_OK: Dict[str, bool] = {}
-_EBUR128_REFERENCE_RE = re.compile(r"^\s*I:\s+(-?\d+(?:\.\d+)?)\s+LUFS", re.MULTILINE)
+_METER_SELF_TEST: Dict[str, "audio_checks.MeterSelfTest"] = {}
 
 
 def _ebur128_multichannel_ok(ffmpeg: str, process_owner=None,
                              cancel_event: Optional[threading.Event] = None) -> Optional[bool]:
-    """Known-answer test of the bundled ebur128 on three channels.
+    """Known-answer test of the bundled meters (audio_checks.meter_self_test_command).
 
-    1 kHz at -23 dBFS in L and R of a 3.0 layout is -23.0 LUFS by EBU Tech
-    3341 case 1. The darwin-arm64 FFmpeg 9.0.2 build reads -5.0 (its >2
-    channel K-weighting is broken; stereo is exact), the x86_64 build of the
-    same release reads -23.0. Only a definite reading is cached; a run that
-    fails, times out or prints no summary says nothing about the binary, so
-    this scan uses the independent fallback meter and the next one retries.
-    The process belongs to the scan, so Cancel stops it. None: cancelled.
+    EBU Tech 3341 case 6 in 5.1, with a tone in the LFE that must be
+    excluded, is -23.0 LUFS +-0.1: ebur128 on it checks the centre, the
+    surround weighting and the LFE (the darwin-arm64 FFmpeg 9.0.2 build's
+    >2-channel K-weighting is broken; stereo is exact), loudnorm on it
+    checks the layout-remapped fallback, and HF sines check the true peak.
+    Only a definite reading is cached; a run that fails, times out or
+    prints no summary says nothing about the binary, so this scan uses the
+    fallback meter and the next one retries. The process belongs to the
+    scan, so Cancel stops it. None: cancelled.
     """
     if ffmpeg in _EBUR128_MULTICHANNEL_OK:
         return _EBUR128_MULTICHANNEL_OK[ffmpeg]
-    cmd = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-f", "lavfi",
-           "-i", "sine=f=1000:d=2:sample_rate=48000,volume=0.5663568",
-           "-af", "pan=3.0|c0=c0|c1=c0,ebur128", "-f", "null", "-"]
+    cmd = audio_checks.meter_self_test_command(ffmpeg)
     try:
         proc = _run_owned_subprocess(cmd, 30, process_owner, cancel_event)
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return False
     if proc is None or (cancel_event is not None and cancel_event.is_set()):
         return None
-    match = _EBUR128_REFERENCE_RE.search(proc.stderr or "")
-    if proc.returncode != 0 or not match:
+    test = audio_checks.evaluate_meter_self_test(proc.stderr or "") if proc.returncode == 0 else None
+    if test is None:
         return False
-    ok = abs(float(match.group(1)) + 23.0) <= 0.3
-    _EBUR128_MULTICHANNEL_OK[ffmpeg] = ok
-    return ok
+    _METER_SELF_TEST[ffmpeg] = test
+    _EBUR128_MULTICHANNEL_OK[ffmpeg] = test.ebur128_multichannel
+    return test.ebur128_multichannel
 
 
 def _multichannel_meter(ffmpeg: str, plan: "_ScanPlan", process_owner=None,
                         cancel_event: Optional[threading.Event] = None) -> Optional[str]:
-    """The loudness meter for tracks of three or more channels (None: cancelled)."""
-    needs = plan.loudness and any(plan.channels(t) > 2 and i not in plan.ambisonic
-                                  for i, t in enumerate(plan.audio))
-    if not needs:
+    """The loudness meter for tracks of three or more channels (None:
+    cancelled). The self-test runs for any measured audio, since its true
+    peak verdict applies to every track."""
+    if not plan.loudness:
         return audio_checks.METER_EBUR128
     ok = _ebur128_multichannel_ok(ffmpeg, process_owner, cancel_event)
     if ok is None:
         return None
-    return audio_checks.METER_EBUR128 if ok else audio_checks.METER_LOUDNORM
+    plan.meter_self_test = _METER_SELF_TEST.get(ffmpeg)
+    if ok:
+        return audio_checks.METER_EBUR128
+    if plan.meter_self_test is not None and not plan.meter_self_test.loudnorm:
+        return audio_checks.METER_NONE
+    return audio_checks.METER_LOUDNORM
 
 
 # FFmpeg >= 7 reads any option's value from a file with "-/option file";
@@ -3214,7 +3220,8 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
             names=_channel_names(track, plan.channels(track), ambisonic, position in plan.head_locked),
             label=label, duration=duration, ambisonic=ambisonic,
             meter=audio_checks.loudness_meter(track, plan.channels(track),
-                                              plan.multichannel_meter, ambisonic))
+                                              plan.multichannel_meter, ambisonic),
+            meter_self_test=plan.meter_self_test)
         contexts.append(ctx)
         if not files_problem:
             events = evidence.silence_events(f"silencedetect@a{position}", duration)

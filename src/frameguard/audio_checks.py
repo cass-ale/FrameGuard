@@ -181,6 +181,11 @@ CUSTOM_LOUDNESS_KEYS = ("target_loudness_lufs", "loudness_tolerance_lu", "true_p
 # own error band cannot be called a violation with confidence.
 METER_TOLERANCE_LU = 0.1
 METER_TOLERANCE_TP_DB = 0.2
+# The loudnorm fallback, measured on the darwin-arm64 build with EBU Tech
+# 3341 cases 1-6 (fg092_work/audio_ebu): -0.05 LU on steady tones, -0.07 on
+# cases 3-4 and -0.14 on case 5, i.e. outside Tech 3341's +-0.1 on the
+# gating case. Its readings get a 0.2 LU band.
+METER_TOLERANCE_LOUDNORM_LU = 0.2
 LOW_CONFIDENCE = 60
 
 CLIP_MIN_PEAK_DB = -20.0      # below this, equal runs are quantisation, not clipping
@@ -988,6 +993,65 @@ def loudness_meter(track: dict, count: int, multichannel_meter: str,
     return multichannel_meter
 
 
+@dataclass(frozen=True)
+class MeterSelfTest:
+    """What a known-answer run says about this FFmpeg's meters (see
+    meter_self_test_command): the >2-channel ebur128 loudness, the remapped
+    loudnorm fallback, and the true-peak error in dB (positive: over-reads)."""
+
+    ebur128_multichannel: bool
+    loudnorm: bool
+    true_peak_error_db: float = 0.0
+
+
+# EBU Tech 3341 V4 case 6 (5.0: L, R -28 dBFS, C -24, Ls, Rs -30; 1 kHz) reads
+# -23.0 LUFS +-0.1. It runs as 5.1 with a 60 Hz tone at -6 dBFS in the LFE,
+# which every meter must exclude, so one reading checks the centre, the
+# surround weighting, the LFE exclusion and the channel order.
+_SELF_TEST_CASE6 = {"FL": -28.0, "FR": -28.0, "FC": -24.0, "BL": -30.0, "BR": -30.0}
+SELF_TEST_TOLERANCE_LU = 0.1          # Tech 3341 table 1
+# True peak: continuous sines at 0.5 FS (true peak -6.02 dBTP) at 12 kHz,
+# 45 degrees (Tech 3341 case 16's shape) and 16 kHz, 0 degrees - where
+# interpolation errors are largest. Tech 3341 allows +0.2 / -0.4 dB.
+_SELF_TEST_PEAK_DBTP = 20 * math.log10(0.5)
+TRUE_PEAK_ALLOWED_OVER_DB, TRUE_PEAK_ALLOWED_UNDER_DB = 0.2, 0.4
+
+
+def meter_self_test_command(ffmpeg: str, seconds: float = 3.0) -> List[str]:
+    """One FFmpeg run, three meters: ebur128 on case 6 (5.1 + LFE), loudnorm
+    on the same signal remapped by layout, ebur128 true peak on the HF sines."""
+    names = channel_names({"channel_layout": "5.1"}, 6)
+    exprs = []
+    for name in names:
+        if name == "LFE":
+            exprs.append("0.5*sin(2*PI*60*t)")
+        else:
+            exprs.append(f"{10 ** (_SELF_TEST_CASE6[name] / 20):.9f}*sin(2*PI*1000*t)")
+    mapping = loudnorm_mapping({"channel_layout": "5.1"}, names)
+    graph = (f"[0:a]asplit[m][f];[m]ebur128@a0=framelog=quiet[o0];"
+             f"[f]{mapping},loudnorm@a0=print_format=json[o1];"
+             f"[1:a]ebur128@a1=peak=true:framelog=quiet[o2]")
+    return [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-filter_complex_threads", "1",
+            "-f", "lavfi", "-i", f"aevalsrc=exprs='{'|'.join(exprs)}':s=48000:d={seconds:g}:c=5.1",
+            "-f", "lavfi", "-i", f"aevalsrc=exprs='0.5*sin(2*PI*12000*t+PI/4)|0.5*sin(2*PI*16000*t)'"
+                                 f":s=48000:d={seconds:g}",
+            "-filter_complex", graph, "-map", "[o0]", "-map", "[o1]", "-map", "[o2]", "-f", "null", "-"]
+
+
+def evaluate_meter_self_test(log_text: str) -> Optional[MeterSelfTest]:
+    """The verdicts of a self-test run's log; None when a summary is missing
+    (the run says nothing about the binary)."""
+    ebur = parse_loudness(log_text)
+    fallback = parse_loudnorm(log_text).get(0, {})
+    case6, peaks = ebur.get(0, {}), ebur.get(1, {})
+    if "integrated" not in case6 or "integrated" not in fallback or "true_peak" not in peaks:
+        return None
+    return MeterSelfTest(
+        ebur128_multichannel=abs(case6["integrated"] + 23.0) <= SELF_TEST_TOLERANCE_LU + 1e-9,
+        loudnorm=abs(fallback["integrated"] + 23.0) <= SELF_TEST_TOLERANCE_LU + 1e-9,
+        true_peak_error_db=round(peaks["true_peak"] - _SELF_TEST_PEAK_DBTP, 2))
+
+
 _EVIDENCE_RE = re.compile(r"\[astats@a\d+[sp]\d* @ |\[loudnorm@a\d+ @ "
                           r"|^Input (?:Integrated|True Peak|LRA|Threshold):"
                           r'|^\s*"input_(?:i|tp|lra|thresh)" :')
@@ -1216,6 +1280,8 @@ class TrackContext:
     ambisonic: bool = False
     # Channels that are LFE by layout (lfe_positions); derived when omitted.
     lfe: Optional[frozenset] = None
+    # This FFmpeg's meter self-test (core caches it per binary), if it ran.
+    meter_self_test: Optional[MeterSelfTest] = None
 
     def __post_init__(self):
         if self.lfe is None:
@@ -1383,7 +1449,8 @@ def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
     margin = abs(deviation) - profile.tolerance
     if margin <= 0:
         return "PASS", _with_label(ctx.label, f"{measured_text}, within {limit_text}"), 100
-    confidence = _violation_confidence(margin, METER_TOLERANCE_LU)
+    tolerance = METER_TOLERANCE_LOUDNORM_LU if ctx.meter == METER_LOUDNORM else METER_TOLERANCE_LU
+    confidence = _violation_confidence(margin, tolerance)
     if profile.dialogue_gated and margin <= 4.0:
         # Programme and dialogue-gated loudness of a typical mix differ by a
         # few LU, so a near miss on the full mix is not proof of a miss.
@@ -1394,6 +1461,26 @@ def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
     direction = "louder" if deviation > 0 else "quieter"
     text = f"{measured_text} is {abs(deviation):.1f} LU {direction} than the {limit_text}"
     return status, _with_label(ctx.label, text), confidence
+
+
+def _true_peak_tolerance(ctx: TrackContext) -> Tuple[float, str]:
+    """(dB band within which an over is low-confidence, note for the row).
+    Tech 3341's +0.2 dB, widened by what this binary's self-test over-read
+    beyond it (the darwin-arm64 9.0.2 build reads 12-16 kHz about 1 dB
+    high). An under-read beyond Tech 3341's -0.4 is named in the row."""
+    test = ctx.meter_self_test
+    if test is None:
+        return METER_TOLERANCE_TP_DB, ""
+    error = test.true_peak_error_db
+    if error > TRUE_PEAK_ALLOWED_OVER_DB:
+        return (error + METER_TOLERANCE_TP_DB,
+                f" (this FFmpeg build's true-peak meter over-reads high frequencies by up to "
+                f"{error:.1f} dB in its self-test)")
+    if error < -TRUE_PEAK_ALLOWED_UNDER_DB:
+        return (METER_TOLERANCE_TP_DB,
+                f" (this FFmpeg build's true-peak meter under-reads high frequencies by up to "
+                f"{-error:.1f} dB in its self-test)")
+    return METER_TOLERANCE_TP_DB, ""
 
 
 def true_peak_row(measured: Optional[dict], ctx: TrackContext, cfg: dict,
@@ -1413,14 +1500,15 @@ def true_peak_row(measured: Optional[dict], ctx: TrackContext, cfg: dict,
         return "PASS", _with_label(ctx.label, "No signal (true peak -inf dBTP)."), 100
     sample_text = (f", sample peak {sample:.1f} dBFS" if sample is not None and math.isfinite(sample)
                    else "")
-    measured_text = f"true peak {peak:+.1f} dBTP{sample_text}"
+    tolerance, meter_note = _true_peak_tolerance(ctx)
+    measured_text = f"true peak {peak:+.1f} dBTP{sample_text}{meter_note}"
     limit_text = f"{profile.label} max {profile.true_peak_max:g} dBTP"
     if mode == "report":
         return "PASS", _with_label(ctx.label, f"{measured_text}; not enforced ({limit_text})"), 100
     margin = peak - profile.true_peak_max
     if margin <= 0:
         return "PASS", _with_label(ctx.label, f"{measured_text}, within {limit_text}"), 100
-    confidence = _violation_confidence(margin, METER_TOLERANCE_TP_DB)
+    confidence = _violation_confidence(margin, tolerance)
     status = "FAIL" if mode == "essential" else "WARN"
     return status, _with_label(ctx.label, f"{measured_text} exceeds the {limit_text} by {margin:.1f} dB"), confidence
 
