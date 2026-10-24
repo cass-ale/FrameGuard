@@ -706,3 +706,19 @@ class TestAudioSampleEntryV1:
     def test_quicktime_v1_audio_entry_still_reads(self, tmp_path):
         structure = cc.read_structure(_iso_audio_v1_file(tmp_path / "qt.mov", b"qt  ", True))
         assert structure.tracks[0].entries[0].sa3d is not None, structure.tracks[0].entries
+
+
+class TestFilenameSuggestions:
+    @pytest.mark.parametrize("name,expected", [
+        ("promo_360_7680x4320.mp4", None),      # an explicit 16:9 size contradicts 360
+        ("promo_4K_360.mp4", None),             # a 4K 360 is not the flat 4K UHD spec
+        ("tour_vr_1080p.mp4", None),
+        ("TPG_VR_8K_360_C001.mp4", "8k360"),    # bare 8K next to 360 is still 8K 360
+        ("show_8k_30p.mp4", "8k30"),
+        ("clip_4k_30p.mov", "4k30"),
+    ])
+    def test_spherical_tokens_never_suggest_a_flat_preset(self, name, expected):
+        """B19."""
+        from frameguard import presets
+        from frameguard.core import PRESETS
+        assert presets.detect_preset_from_filename(name, PRESETS) == expected

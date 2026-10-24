@@ -718,6 +718,8 @@ _RESOLUTION_TOKENS = {
 # their own (a clip named "C0360" or "overview_vr" is not a 360 deliverable);
 # they only turn a bare "8k" into the 8K 360 preset.
 _SPHERICAL_TOKENS = frozenset({"360", "vr", "vr360", "360vr", "equirect", "equirectangular", "spherical"})
+# 16:9 families: never suggested for a name that also says 360/VR.
+_FLAT_FAMILIES = frozenset({"4k", "1080p", "720p", "8k"})
 # Stereo words make a 5.7K/8K name ambiguous (mono 2:1 or top-bottom 1:1).
 _STEREO_TOKENS = frozenset({"tb", "ou", "overunder", "3d", "stereo", "sbs", "lr"})
 # Resolution family + frame rate -> built-in preset. Combinations with no
@@ -756,8 +758,14 @@ def detect_preset_from_filename(filename: str, presets: dict = None) -> Optional
     if tokens & (_NTSC_RATE_TOKENS | _HALF_SPHERE_TOKENS):
         return None
     families = [fam for fam, words in _RESOLUTION_TOKENS.items() if tokens & set(words)]
-    if families == ["8k"] and tokens & _SPHERICAL_TOKENS:
-        families = ["8k360"]
+    if tokens & _SPHERICAL_TOKENS:
+        # A bare "8k" next to a 360 word is the 8K 360 frame; an explicit
+        # 16:9 size ("7680x4320", "4320p") or a flat family ("4k", "1080p")
+        # contradicts it, and a flat preset would judge the wrong frame.
+        if families == ["8k"] and tokens & {"8k"} and not tokens & {"7680x4320", "4320p"}:
+            families = ["8k360"]
+        elif any(fam in _FLAT_FAMILIES for fam in families):
+            return None
     if len(families) == 1 and families[0] in ("5.7k", "8k", "8k360") and tokens & _STEREO_TOKENS:
         return None
     rates = {fps for fps, words in _FPS_TOKENS.items() if tokens & set(words)}
