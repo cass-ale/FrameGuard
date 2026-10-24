@@ -321,8 +321,10 @@ class TestDropouts:
         assert _row(_scan(clip), "Audio Dropouts")[1] == "PASS"
 
     def test_long_gap_is_silence_not_a_dropout(self, media):
-        gap = f"if(between(t,0.8,3.2),0,{tone(440)})"
-        clip = media.get("droplong", lambda p: make_audio(p, [gap, gap.replace("440", "554.37")]))
+        # 2.5 s of 6 s: a silence, but under half the track (more than half FAILs).
+        gap = f"if(between(t,1.5,4),0,{tone(440)})"
+        clip = media.get("droplong6", lambda p: make_audio(p, [gap, gap.replace("440", "554.37")],
+                                                           seconds=6))
         result = _scan(clip)
         assert _row(result, "Audio Dropouts")[1] == "PASS"
         assert _row(result, "Audio Silence")[1] == "WARN"

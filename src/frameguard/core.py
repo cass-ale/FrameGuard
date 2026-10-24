@@ -3076,7 +3076,10 @@ def _track_silence_entry(label: str, events, duration: float, cfg: dict,
     carries no programme and fails whatever its length (the old >30 s
     condition let a completely silent 20 s clip through as a warning). A
     blank secondary track only warns: broadcast and archive layouts reserve
-    empty tracks on purpose.
+    empty tracks on purpose. A track that is silent for more than half its
+    length fails at any length too: no standard ties the share to a minimum
+    duration, and the 0.9.0 "> 30 s" gate let a 20 s clip that was 80 %
+    silence through as a warning (review, unjustified deviation).
     """
     if not events:
         return "PASS", _with_track(label, "No extended silence detected.")
@@ -3088,7 +3091,7 @@ def _track_silence_entry(label: str, events, duration: float, cfg: dict,
         if not primary:
             return "WARN", f"Track {number} is silent - intentional blank track? ({share})"
         return "FAIL", _with_track(label, f"{share[0].upper()}{share[1:]}: the main track carries no audio.")
-    if total > duration * 0.5 and duration > 30:
+    if duration > 0 and total > duration * 0.5:
         return "FAIL", _with_track(label, f"{count} silence region(s), total {total:.1f}s. Extended silence in deliverable. At: {positions}")
     if total < 1.0:
         return "PASS", _with_track(label, f"{count} brief silence(s), total {total:.1f}s (natural pauses)")

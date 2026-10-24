@@ -46,3 +46,26 @@ class TestRoomToneIsNotSilence:
         silence = _row(result, "Audio Silence")
         assert silence[1] == "PASS", silence
         assert result.status != "MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# 2. "More than half silent" FAILs at any length (REVIEW §4: unjustified > 30 s gate)
+# ---------------------------------------------------------------------------
+
+@needs_ffmpeg
+class TestMostlySilentShortFile:
+    def test_eight_second_clip_75_percent_silent_fails(self, media):
+        """6 s of digital silence in an 8 s clip: the >50 % rule applied only
+        to files longer than 30 s, so a short clip that is mostly silence
+        only warned."""
+        gap = f"if(between(t,1,7),0,{tone(440)})"
+        clip = media.get("mostly_silent8", lambda p: make_audio(
+            p, [gap, gap.replace("440", "554.37")], seconds=8))
+        row = _row(_scan(clip), "Audio Silence")
+        assert row[1] == "FAIL" and "Extended silence" in row[2], row
+
+    def test_short_pause_still_warns(self, media):
+        gap = f"if(between(t,1,4),0,{tone(440)})"
+        clip = media.get("pause8", lambda p: make_audio(
+            p, [gap, gap.replace("440", "554.37")], seconds=8))
+        assert _row(_scan(clip), "Audio Silence")[1] == "WARN"
