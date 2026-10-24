@@ -402,7 +402,14 @@ DEFAULT_CONFIG = {
     "flash_check_enabled": True,
     # idet combing in progressive video / field order vs metadata.
     "interlace_check_enabled": True,
-    "silence_noise_db": -50,
+    # Whole-track silence: -70 dBFS, the default level of Telestream
+    # Qualify's Audio Silence test (AQ-110), the same value the per-channel
+    # detector uses (audio_checks channel_silence_noise_db). silencedetect
+    # compares every sample's magnitude, so this is a peak level: 16-bit TPDF
+    # dither (about -96 dBFS RMS) stays far below it, while the quietest
+    # usable room tone (about -60 dBFS RMS, peaks near -55) stays above it.
+    # 0.9.1's -50 called -64 dBFS RMS room tone "no audio" (review B2).
+    "silence_noise_db": -70,
     "silence_duration": 2.0,
     # A channel (or a whole track) silent for at least this fraction of its
     # length is dead.

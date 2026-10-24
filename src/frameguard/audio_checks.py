@@ -20,9 +20,9 @@ Measurements and the standard each threshold comes from:
 * Integrated loudness, loudness range and true peak: ITU-R BS.1770-5 /
   EBU Tech 3341 via FFmpeg ``ebur128`` (validated against Tech 3341 cases
   1-6, 9, 12, 15-23 and Tech 3342 cases 1-4; see the 0.9.1 audio report).
-* Per-channel silence at -70 dBFS for >= 2 s: the default of Telestream
-  Qualify's silence test (AQ-110/AQ-111). Whole-track silence keeps the
-  0.9.0 rules in ``core``.
+* Silence at -70 dBFS (sample peak) for >= 2 s, per channel and for the
+  whole track: the default level of Telestream Qualify's Audio Silence test
+  (AQ-110/AQ-111). The whole-track tiers live in ``core``.
 * Dropouts: 5 ms - 2 s at or below -90 dBFS (digital zero for 16-bit
   material) inside otherwise active audio.
 * Clipping: runs of >= 3 identical samples at the channel's peak, the
