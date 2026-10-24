@@ -58,6 +58,47 @@ VIDEO_CHECK_NAMES = (BLACK, FREEZE, LEVELS, FLASH, INTERLACE)
 LEVELS_MODES = ("off", "report", "advisory", "essential")
 
 
+class BenignDecoderError:
+    """An error-level FFmpeg record that is not damage in the file, and why."""
+
+    __slots__ = ("pattern", "reason")
+
+    def __init__(self, pattern: str, reason: str):
+        self.pattern = re.compile(pattern)
+        self.reason = reason
+
+
+# File Integrity counts every error-level record FFmpeg prints during the
+# decode (decoders conceal damage - an HEVC slice with an impossible
+# cu_qp_delta decodes "successfully" and leaves FFmpeg's own decode-error
+# count at 0), except these. Each is listed with the reason it is not damage;
+# nothing else is excused.
+BENIGN_DECODER_ERRORS: Tuple[BenignDecoderError, ...] = (
+    BenignDecoderError(
+        r"non monotonically increasing dts to muxer",
+        "the null muxer complaining about FrameGuard's own output timestamps "
+        "(passthrough of variable-rate input); timing is judged by the CFR check "
+        "(Oct 21 recommendation R7a)"),
+    BenignDecoderError(
+        r"^mmco: unref short failure",
+        "H.264 asked to release a short-term reference picture the decoder never "
+        "received - a stream that starts on an open-GOP / recovery-point picture, as a "
+        "lossless trim does; releasing a picture that is not there changes no decoded "
+        "picture (H.264 8.2.5.4.1)"),
+    BenignDecoderError(
+        r"^Error while decoding stream #|^Decoding error:|^Error submitting packet to decoder",
+        "FFmpeg's per-packet summary of a decode failure, which its stream "
+        "accounting already counts as a decode error (counting it again would "
+        "double the number)"),
+)
+
+
+def is_benign_decoder_error(message: str) -> bool:
+    """True when an error-level record is on BENIGN_DECODER_ERRORS."""
+    text = message.strip()
+    return any(rule.pattern.search(text) for rule in BENIGN_DECODER_ERRORS)
+
+
 class ScanCancelled(Exception):
     """The operator cancelled while the measurements were being evaluated."""
 

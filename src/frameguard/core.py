@@ -2442,6 +2442,8 @@ class _DecodeAccounting:
         self.stream_stats: Dict[int, dict] = {}
         self.corrupt_frames: Counter = Counter()
         self.corrupt_packets: Counter = Counter()
+        # Error-level records not on video_checks.BENIGN_DECODER_ERRORS.
+        self.error_messages = 0
         self.messages: List[str] = []
 
     def add(self, line: str) -> None:
@@ -2467,6 +2469,8 @@ class _DecodeAccounting:
             self._sample(contexts, message)
             return
         if level in _ERROR_LEVELS:
+            if not video_checks.is_benign_decoder_error(message):
+                self.error_messages += 1
             self._sample(contexts, message)
 
     @staticmethod
@@ -2487,11 +2491,21 @@ class _DecodeAccounting:
         return sum(s["errors"] for s in self.stream_stats.values())
 
     @property
-    def total_errors(self) -> int:
+    def accounted_errors(self) -> int:
         """Undecodable packets + frames the decoder flagged corrupt + packets
-        the demuxer flagged corrupt: all FFmpeg's own accounting."""
+        the demuxer flagged corrupt: FFmpeg's own accounting."""
         return (self.decode_failures + sum(self.corrupt_frames.values())
                 + sum(self.corrupt_packets.values()))
+
+    @property
+    def total_errors(self) -> int:
+        """FFmpeg's accounting, or the error records it printed when more.
+
+        Decoders conceal damage without failing the frame, so the accounting
+        can read 0 while the decoder reported errors; a failed frame usually
+        prints its own error too, so the larger of the two is taken rather
+        than the sum."""
+        return max(self.accounted_errors, self.error_messages)
 
     def decoder_unavailable(self) -> bool:
         return any(_DECODER_UNAVAILABLE_RE.search(m) for m in self.messages)
@@ -2995,6 +3009,8 @@ def _report_file_integrity(result: QAResult, plan: _ScanPlan, outcome: _ScanOutc
             breakdown.append(f"{sum(accounting.corrupt_frames.values())} corrupt frame(s)")
         if accounting.corrupt_packets:
             breakdown.append(f"{sum(accounting.corrupt_packets.values())} corrupt packet(s)")
+        if accounting.error_messages > accounting.accounted_errors:
+            breakdown.append(f"{accounting.error_messages} decoder error message(s)")
         sample = "; ".join(accounting.messages[:3])
         problems.append(f"{errors} decoder error(s), max allowed {allowed} "
                         f"({', '.join(breakdown)})" + (f". First: {sample}" if sample else ""))

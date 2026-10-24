@@ -549,3 +549,78 @@ class TestBlackScan:
         path = _clip(tmp_path / "tc.mp4", vf)
         row = _row(_scan(path), "Black Frames")
         assert row[1] == "WARN" and "00:00:02.000" in row[2], row
+
+
+# ---------------------------------------------------------------------------
+# File Integrity: decoder error messages count unless known-benign
+# ---------------------------------------------------------------------------
+
+class TestDecoderMessages:
+    def test_concealed_decoder_error_counts(self):
+        from frameguard import core
+        accounting = core._DecodeAccounting()
+        accounting.add("[hevc @ 0x1] [error] The cu_qp_delta -70 is outside the valid range [-26, 25].")
+        accounting.add("Input stream #0:0 (video): 240 packets read (1 bytes); 240 frames decoded; "
+                       "0 decode errors")
+        assert accounting.total_errors == 1
+
+    def test_benign_messages_are_listed_and_justified(self):
+        assert vc.BENIGN_DECODER_ERRORS
+        for rule in vc.BENIGN_DECODER_ERRORS:
+            assert rule.pattern and len(rule.reason) > 30
+
+    def test_null_muxer_timestamp_complaint_is_benign(self):
+        """R7a: jittered timestamps make FFmpeg's null muxer complain about
+        FrameGuard's own output; the CFR check judges timing."""
+        from frameguard import core
+        accounting = core._DecodeAccounting()
+        accounting.add("[null @ 0x2] [error] Application provided invalid, non monotonically "
+                       "increasing dts to muxer in stream 0: 3 >= 3")
+        assert accounting.total_errors == 0
+
+    def test_failed_frame_is_not_counted_twice(self):
+        from frameguard import core
+        accounting = core._DecodeAccounting()
+        accounting.add("[vist#0:0/h264 @ 0x3] [error] Error while decoding stream #0:0: "
+                       "Invalid data found when processing input")
+        accounting.add("[h264 @ 0x4] [error] Invalid NAL unit size (1000 > 20).")
+        accounting.add("Input stream #0:0 (video): 10 packets read (1 bytes); 9 frames decoded; "
+                       "1 decode errors")
+        assert accounting.total_errors == 1
+
+
+@needs_ffmpeg
+class TestDecoderMessagesScan:
+    def test_hevc_slice_corruption_fails(self, tmp_path):
+        """Held-out review case: FFmpeg prints a decoder error for damaged
+        HEVC slice data but its accounting shows 0 decode errors."""
+        import random
+        import subprocess
+        from frameguard.tools import get_ffprobe_path
+        clean = tmp_path / "hevc.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=8", "-c:v", "libx265",
+               "-x265-params", "log-level=error:keyint=60", "-tag:v", "hvc1",
+               "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
+               str(clean))
+        packets = subprocess.run([get_ffprobe_path(), "-v", "error", "-select_streams", "v",
+                                  "-show_entries", "packet=pos,size", "-of", "csv=p=0", str(clean)],
+                                 capture_output=True, text=True).stdout.split()
+        data = bytearray(clean.read_bytes())
+        rng = random.Random(1)
+        for entry in packets[70:75]:
+            size, pos = (int(v) for v in entry.split(","))
+            for k in range(pos + 40, min(pos + 60, pos + size)):
+                data[k] = rng.randrange(256)
+        damaged = tmp_path / "damaged.mp4"
+        damaged.write_bytes(bytes(data))
+        result = _scan(str(damaged), audio_required=False)
+        row = _row(result, "File Integrity")
+        assert row[1] == "FAIL" and "decoder error" in row[2], row
+
+    def test_jittered_timestamps_stay_clean(self, tmp_path):
+        path = str(tmp_path / "jitter.mkv")
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=4",
+               "-vf", "setpts='(N+0.4*sin(N))/30/TB'", "-fps_mode", "passthrough",
+               "-c:v", "libx264", "-bf", "0", path)
+        row = _row(_scan(path, require_cfr=False), "File Integrity")
+        assert row[1] == "PASS", row
