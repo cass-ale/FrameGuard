@@ -151,8 +151,17 @@ PRESETS = {
     "5.7k30": {"label": "5.7K @ 30fps (360 VR Capture)", "width": 5760, "height": 2880, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 40,
                "required_projection": "equirectangular", "require_square_pixels": True},
     "8k30": {"label": "8K UHD @ 30fps (7680x4320, flat)", "width": 7680, "height": 4320, "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 60},
-    "8k360": {"label": "8K 360° mono @ 30fps (7680x3840, Quest)", "width": 7680, "height": 3840, "fps": 30.0, "fps_tolerance": 0.5,
-              "min_bitrate_mbps": 60, "required_stereo_mode": "mono", **_QUEST_360_DELIVERY},
+    # Two Meta specs disagree on 8K mono 360. Horizon OS streaming apps:
+    # "Realistically ... 7680x3840 / 60fps. Max 8192x4096 / 60fps (hardware
+    # decode limit)", bitrate "higher than 50 mbps". Media Studio uploads:
+    # 2D monoscopic "recommended max 7200x3600", bitrate "Recommended 25-60
+    # Mbps". Each gets its own preset, named for the spec it follows.
+    "8k360": {"label": "8K 360° mono @ 30fps (7680x3840, Quest Horizon OS streaming)", "width": 7680, "height": 3840,
+              "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 50, "required_stereo_mode": "mono",
+              **_QUEST_360_DELIVERY},
+    "360mono7200": {"label": "7.2K 360° mono @ 30fps (7200x3600, Quest Media Studio max)", "width": 7200, "height": 3600,
+                    "fps": 30.0, "fps_tolerance": 0.5, "min_bitrate_mbps": 25, "required_stereo_mode": "mono",
+                    **_QUEST_360_DELIVERY},
     "360tb5760": {"label": "5.7K 360° 3D top-bottom @ 30fps (5760x5760, Quest)", "width": 5760, "height": 5760, "fps": 30.0,
                   "fps_tolerance": 0.5, "min_bitrate_mbps": 40, "required_stereo_mode": "top_bottom", **_QUEST_360_DELIVERY},
     "360tb3840": {"label": "4K 360° 3D top-bottom @ 30fps (3840x3840, Quest)", "width": 3840, "height": 3840, "fps": 30.0,

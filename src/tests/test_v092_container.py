@@ -533,3 +533,22 @@ class TestQuestCodecs:
         rows = _Rows()
         cc.check_codec_profile(_video_probe("hevc", "Rext", *size), rows, cfg)
         assert rows.checks[0][1] == "FAIL", rows.checks
+
+
+class TestQuestMonoPresets:
+    def test_8k360_is_the_horizon_streaming_target(self):
+        from frameguard.core import PRESETS
+        preset = PRESETS["8k360"]
+        assert (preset["width"], preset["height"]) == (7680, 3840)
+        assert "Horizon" in preset["label"] and preset["min_bitrate_mbps"] == 50, preset
+
+    def test_media_studio_mono_maximum_has_its_own_preset(self):
+        from frameguard import presets
+        from frameguard.core import PRESETS, preset_config
+        preset = PRESETS["360mono7200"]
+        assert (preset["width"], preset["height"]) == (7200, 3600)
+        assert "Media Studio" in preset["label"] and preset["min_bitrate_mbps"] == 25, preset
+        cfg = preset_config("360mono7200")
+        assert cfg["required_stereo_mode"] == "mono" and cfg["required_projection"] == "equirectangular"
+        presets.validate_preset_config(cfg)
+        assert presets.detect_preset_from_filename("TPG_360_7200x3600.mp4", PRESETS) == "360mono7200"
