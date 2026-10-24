@@ -58,6 +58,7 @@ PHASE = "Audio Phase"
 DUAL_MONO = "Dual Mono"
 DC_OFFSET = "DC Offset"
 HUM = "Audio Hum"
+LOW_LEVEL = "Low-Level Audio"
 
 # True peak and clipping follow the delivery-profile enforcement in
 # ``loudness_mode``: "report" (the default) measures and shows them, because
@@ -66,7 +67,7 @@ HUM = "Audio Hum"
 # as file-delivery QC rejects full-scale clipping (Qualify AQ-105, DPP).
 # Everything else is content-dependent and therefore advisory.
 ESSENTIAL_CHECKS = frozenset({TRUE_PEAK, CLIPPING})
-ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM})
+ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM, LOW_LEVEL})
 
 # Severity weights (core.check_severity: weight x confidence, WARN at half)
 # rank a row by the risk that the defect gets the delivery rejected, on
@@ -87,6 +88,9 @@ ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM})
 #   makes dual mono a per-specification limit); reported, rarely rejected.
 # * DC offset 15: inaudible and removed by any high-pass; no delivery
 #   specification rejects it on its own.
+# * Low-level audio 30: dead air with a noise floor is rejected like silence
+#   when it is real, so Audio Silence's weight; judged from content, so
+#   advisory (confidence 60).
 SEVERITY_WEIGHTS = {
     LOUDNESS: 70,
     TRUE_PEAK: 65,
@@ -96,6 +100,7 @@ SEVERITY_WEIGHTS = {
     DUAL_MONO: 20,
     HUM: 20,
     DC_OFFSET: 15,
+    LOW_LEVEL: 30,
 }
 
 PLAIN_SUMMARIES = {
@@ -106,7 +111,11 @@ PLAIN_SUMMARIES = {
     DUAL_MONO: "stereo track is dual mono",
     DC_OFFSET: "audio has a DC offset",
     HUM: "mains hum detected in the audio",
+    LOW_LEVEL: "audio drops to a low level inside the programme",
 }
+
+# The per-track signal rows, in report order.
+SIGNAL_CHECKS = (CLIPPING, DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM, LOW_LEVEL)
 
 # Per-check switches (Settings toggles). Loudness and true peak are governed
 # by ``loudness_mode`` instead.
@@ -117,6 +126,7 @@ CHECK_SWITCHES = {
     DUAL_MONO: "audio_dual_mono_check",
     DC_OFFSET: "audio_dc_offset_check",
     HUM: "audio_hum_check",
+    LOW_LEVEL: "audio_low_level_check",
 }
 
 LOUDNESS_PROFILE_CHOICES = (
@@ -155,6 +165,12 @@ DEFAULT_CONFIG = {
     "phase_min_duration": 1.0,
     "dc_offset_max_db": -50.0,
     "hum_min_db": -65.0,
+    # Advisory low-level tier (low_level_row): segments of at least
+    # silence_duration whose peak stays at or below this level (above the
+    # silence level) and 20 dB or more under the track's own gated level.
+    # -40 dBFS is the silence level of EBU QC item 0078B's worked example.
+    "audio_low_level_check": True,
+    "low_level_noise_db": -40.0,
 }
 
 # Validation ranges for presets (values are interpolated into filter graphs).
@@ -167,6 +183,7 @@ VALUE_RANGES = {
     "phase_min_duration": (0.1, 600.0),
     "dc_offset_max_db": (-120.0, 0.0),
     "hum_min_db": (-120.0, 0.0),
+    "low_level_noise_db": (-90.0, 0.0),
 }
 INTEGER_KEYS = frozenset({"clipping_min_events"})
 ENUM_CHOICES = {"loudness_profile": LOUDNESS_PROFILE_CHOICES,
@@ -283,8 +300,7 @@ def check_enabled(cfg: dict, name: str) -> bool:
 
 
 def enabled_signal_checks(cfg: dict) -> List[str]:
-    return [name for name in (CLIPPING, DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM)
-            if check_enabled(cfg, name)]
+    return [name for name in SIGNAL_CHECKS if check_enabled(cfg, name)]
 
 
 def frame_check_names(cfg: dict, loudness: bool) -> List[str]:
@@ -963,7 +979,28 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
     hum = _hum_chains(i, names, cfg, ambisonic, files, lfe)
     if hum:
         units.append(MeasurementUnit(source, f"[a{i}h]", hum))
+    if check_enabled(cfg, LOW_LEVEL):
+        units.append(MeasurementUnit(source, f"[a{i}v]", [_level_chain(i, track, files)]))
     return TrackGraphs(summary, units)
+
+
+# BS.1770's gating block: the level series of the low-level tier uses the
+# same 400 ms blocks the loudness gate does.
+LOW_LEVEL_BLOCK_S = 0.4
+# EBU Tech 3342 (loudness range) treats short-term loudness more than 20 LU
+# below the programme's gated level as not programme (its relative gate):
+# a stretch that far under the track's own gated level is not quiet
+# programme but a drop out of it.
+LOW_LEVEL_MARGIN_DB = 20.0
+
+
+def _level_chain(i: int, track: dict, files: Optional[MeasurementFiles]) -> str:
+    """``[a<N>v]``: per-channel RMS and peak of every 400 ms block, to a file."""
+    rate = _whole(track.get("sample_rate"), 48000) or 48000
+    block = max(1, int(round(LOW_LEVEL_BLOCK_S * rate)))
+    return (f"[a{i}v]asetnsamples=n={block}:p=0,astats@a{i}v=metadata=1:reset=1"
+            f":measure_perchannel=RMS_level+Peak_level:measure_overall=none"
+            + _record(f"astats@a{i}v", files) + ",anullsink")
 
 
 def track_filter_chains(position: int, track: dict, names: Sequence[str], cfg: dict,
@@ -1107,7 +1144,7 @@ _EVIDENCE_RE = re.compile(r"\[astats@a\d+[sp]\d* @ |\[loudnorm@a\d+ @ "
 # are diagnostics, not evidence (with thousands of dropouts they would
 # otherwise crowd the summaries out of the bounded capture).
 _FILE_ROUTED_RE = re.compile(r"\[(?:silencedetect@a\d+[a-z]?\d*|aphasemeter@a\d+p\d+"
-                             r"|astats@a\d+h\d+(?:x\d)?[clu]) @ ")
+                             r"|astats@a\d+h\d+(?:x\d)?[clu]|astats@a\d+v) @ ")
 
 
 def is_file_routed_line(line: str) -> bool:
@@ -2141,6 +2178,104 @@ def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
                                           f"dBFS){note_text}."), 100
 
 
+_BLOCK_RE = re.compile(r"pts_time:(\S+)")
+_CHANNEL_STAT_RE = re.compile(r"lavfi\.astats\.(\d+)\.(RMS_level|Peak_level)=(\S+)")
+
+
+def _level_blocks(evidence: ScanEvidence, ctx: TrackContext) -> List[Tuple[float, Dict[int, Dict[str, float]]]]:
+    """(start s, {channel: {"RMS_level", "Peak_level"}}) per 400 ms block."""
+    instance = f"astats@a{ctx.position}v"
+    text = evidence.files.read(instance) if evidence.files else None
+    if text is None:
+        raise EvidenceMissing(instance)
+    blocks: List[Tuple[float, Dict[int, Dict[str, float]]]] = []
+    for line in text.splitlines():
+        start = _BLOCK_RE.search(line)
+        if start:
+            blocks.append((_to_float(start.group(1)) or 0.0, {}))
+            continue
+        stat = _CHANNEL_STAT_RE.search(line)
+        if stat and blocks:
+            value = _to_float(stat.group(3))
+            blocks[-1][1].setdefault(int(stat.group(1)) - 1, {})[stat.group(2)] = (
+                value if value is not None else -math.inf)
+    return blocks
+
+
+def _gated_level(powers: Sequence[float]) -> Optional[float]:
+    """BS.1770's two-stage gate on block powers (absolute -70, relative -10 dB),
+    in dB; None when no block passes."""
+    def mean_db(values):
+        return 10 * math.log10(sum(values) / len(values)) if values else None
+    absolute = [p for p in powers if p > 10 ** -7]
+    first = mean_db(absolute)
+    if first is None:
+        return None
+    relative = [p for p in absolute if 10 * math.log10(p) > first - 10.0]
+    return mean_db(relative)
+
+
+def low_level_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
+    """Advisory tier below Audio Silence: dead air with a noise floor.
+
+    Silence (essential) is everything at or below ``silence_noise_db``. A
+    stretch above it but with every peak at or below ``low_level_noise_db``
+    (-40 dBFS, EBU QC 0078B's worked example) for at least
+    ``silence_duration`` is reported when it also sits LOW_LEVEL_MARGIN_DB
+    under the track's own gated level and has programme on both sides: a
+    drop out of the programme. Level alone cannot tell dead air from quiet
+    room tone, so a track that is quiet throughout (its gated level is its
+    own floor), a lead-in or a run-out is not flagged. Levels are the
+    unweighted power sum of the non-LFE channels (W for ambisonics), gated
+    like BS.1770, so the reference and the stretch share one scale.
+    """
+    blocks = _level_blocks(evidence, ctx)
+    channels = [0] if ctx.ambisonic else [k for k in range(len(ctx.names)) if k not in ctx.lfe]
+    ceiling = _number(cfg, "low_level_noise_db")
+    floor = float(cfg.get("silence_noise_db", -70.0))
+    longest = float(cfg["silence_duration"])
+    series = []
+    for start, stats in blocks:
+        rms = [stats.get(k, {}).get("RMS_level", -math.inf) for k in channels]
+        peak = max((stats.get(k, {}).get("Peak_level", -math.inf) for k in channels), default=-math.inf)
+        power = sum(10 ** (r / 10.0) for r in rms if math.isfinite(r))
+        series.append((start, power, peak))
+    if not series:
+        return "WARN", _with_label(ctx.label, "Not verified: no level blocks were measured."), 100
+    reference = _gated_level([p for _, p, _ in series])
+    limit_text = (f"peak ≤ {ceiling:g} dBFS and {LOW_LEVEL_MARGIN_DB:g} dB or more under the "
+                  f"programme")
+    if reference is None:
+        return "PASS", _with_label(ctx.label, f"No programme level to compare against ({limit_text})."), 100
+    low = [floor < peak <= ceiling and power > 0 and 10 * math.log10(power) <= reference - LOW_LEVEL_MARGIN_DB
+           for _, power, peak in series]
+    segments = []
+    k = 0
+    while k < len(series):
+        if not low[k]:
+            k += 1
+            continue
+        end = k
+        while end + 1 < len(series) and low[end + 1]:
+            end += 1
+        inside = k > 0 and end < len(series) - 1          # programme on both sides
+        duration = (series[end + 1][0] if end + 1 < len(series) else series[end][0] + LOW_LEVEL_BLOCK_S) \
+            - series[k][0]
+        if inside and duration >= longest:
+            level = 10 * math.log10(sum(p for _, p, _ in series[k:end + 1]) / (end + 1 - k))
+            segments.append((series[k][0], duration, level))
+        k = end + 1
+    if not segments:
+        return "PASS", _with_label(ctx.label, f"No low-level stretch inside the programme ({limit_text}, "
+                                              f"gated level {reference:.1f} dBFS)."), 100
+    shown = ", ".join(f"{_timecode(s)} ({d:.1f}s at {lvl:.1f} dBFS)" for s, d, lvl in segments[:5])
+    if len(segments) > 5:
+        shown += f", +{len(segments) - 5} more"
+    return "WARN", _with_label(ctx.label, f"{len(segments)} low-level stretch(es) inside the programme "
+                                          f"({limit_text}, gated level {reference:.1f} dBFS): {shown}. "
+                                          f"Dead air or an intended pause?"), LOW_CONFIDENCE
+
+
 # ---------------------------------------------------------------------------
 # Whole-file reporting
 # ---------------------------------------------------------------------------
@@ -2178,6 +2313,7 @@ def signal_rows(evidence: ScanEvidence, contexts: List[TrackContext], cfg: dict)
             PHASE: lambda: phase_row(evidence, ctx, cfg),
             DUAL_MONO: lambda: dual_mono_row(evidence, ctx, cfg),
             HUM: lambda: hum_row(evidence, ctx, cfg),
+            LOW_LEVEL: lambda: low_level_row(evidence, ctx, cfg),
         }
         for name in rows:
             if name in LOG_DERIVED and not evidence.log_complete:

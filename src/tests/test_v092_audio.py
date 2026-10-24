@@ -807,3 +807,60 @@ class TestNewSettingsCopy:
                 for _, label in choices:
                     assert "(" not in label and ":" not in label, label
 
+
+# ---------------------------------------------------------------------------
+# R2 item 2. Advisory "low-level audio" tier: dead air with a noise floor
+# ---------------------------------------------------------------------------
+
+PROGRAMME_23 = [TONE_23, tone(1000, MINUS_23)]          # -23 LUFS stereo
+
+
+@needs_ffmpeg
+class TestLowLevelAudio:
+    def test_drop_to_hiss_inside_a_programme_is_flagged(self, media):
+        """4 s of -62 dBFS RMS hiss inside a -23 LUFS programme: above the
+        -70 dBFS silence level, so the essential tier no longer sees it."""
+        def channel(seed):
+            return (f"{_uniform_noise(-62, seed)}*between(t,3,7)"
+                    f"+(1-between(t,3,7))*{TONE_23}")
+        clip = media.get("dead_air_hiss", lambda p: make_audio(p, [channel(1), channel(2)], seconds=10))
+        result = _scan(clip)
+        row = _row(result, "Low-Level Audio")
+        assert row[1] == "WARN" and row[3] <= audio_checks.LOW_CONFIDENCE, row
+        assert "00:00:03" in row[2], row
+        assert result.status != "MISMATCH"
+        assert _row(result, "Audio Silence")[1] == "PASS"
+
+    def test_room_tone_throughout_is_not_flagged(self, media):
+        room = media.get("roomtone64", lambda p: make_audio(
+            p, [_uniform_noise(-64, 1), _uniform_noise(-64, 2)]))
+        result = _scan(room)
+        assert _row(result, "Low-Level Audio")[1] == "PASS"
+        assert result.status != "MISMATCH"
+
+    def test_quiet_lead_in_is_not_dead_air_inside_the_programme(self, media):
+        def channel(seed):
+            return f"{_uniform_noise(-62, seed)}*lt(t,3)+gte(t,3)*{TONE_23}"
+        clip = media.get("hiss_lead_in", lambda p: make_audio(p, [channel(1), channel(2)], seconds=8))
+        assert _row(_scan(clip), "Low-Level Audio")[1] == "PASS"
+
+    def test_threshold_and_switch_are_settings(self, media, qapp):
+        from frameguard import presets
+        from frameguard.gui import SettingsPanel
+        from frameguard.report import spec_rows
+        assert DEFAULT_CONFIG["low_level_noise_db"] == -40.0
+        assert DEFAULT_CONFIG["audio_low_level_check"] is True
+        assert presets.validate_preset_config({"low_level_noise_db": -50}) == {"low_level_noise_db": -50}
+        with pytest.raises(presets.PresetValidationError):
+            presets.validate_preset_config({"low_level_noise_db": "-40dB,anullsink"})
+        panel = SettingsPanel()
+        assert panel.get_config_overrides()["low_level_noise_db"] == -40.0
+        rows = dict(spec_rows(core.config_snapshot(dict(DEFAULT_CONFIG))))
+        assert "low-level below -40 dBFS" in rows["Audio checks"]
+        assert core.CHECK_SEVERITY_WEIGHTS["Low-Level Audio"] < core.CHECK_SEVERITY_WEIGHTS["Audio Clipping"]
+        assert "Low-Level Audio" in core.ADVISORY_CHECKS
+
+    def test_switched_off(self, media):
+        room = media.get("roomtone64", lambda p: make_audio(
+            p, [_uniform_noise(-64, 1), _uniform_noise(-64, 2)]))
+        assert _row(_scan(room, audio_low_level_check=False), "Low-Level Audio")[1] == "SKIP"

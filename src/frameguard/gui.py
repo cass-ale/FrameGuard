@@ -741,6 +741,7 @@ _UI_BACKED_CONFIG_KEYS = frozenset({
     "loudness_profile", "audio_clipping_check", "audio_dropout_check",
     "audio_phase_check", "audio_dual_mono_check", "audio_dc_offset_check",
     "audio_hum_check", "phase_correlation_min", "dialogue_gated_loudness", "dual_mono_allowed",
+    "audio_low_level_check", "low_level_noise_db",
     "black_frames_enabled", "freeze_frames_enabled", "freeze_hold_allowance",
     "signal_levels_mode", "flash_check_enabled", "interlace_check_enabled",
 })
@@ -3881,6 +3882,9 @@ class SettingsPanel(QWidget):
         ("audio", "dual_mono_allowed", "bool", "Allow Dual Mono", "", None),
         ("audio", "audio_dc_offset_check", "bool", "DC Offset", "Warn on a DC offset above -50 dBFS", None),
         ("audio", "audio_hum_check", "bool", "Hum", "Warn on a steady 50 / 60 Hz mains hum", None),
+        ("audio", "audio_low_level_check", "bool", "Low-Level Audio", "", None),
+        ("audio", "low_level_noise_db", "choice", "Low-Level Threshold", "",
+         ((-30.0, "-30 dBFS"), (-40.0, "-40 dBFS"), (-50.0, "-50 dBFS"), (-60.0, "-60 dBFS"))),
         ("picture", "black_frames_enabled", "bool", "Black Frames",
          "Find black sections (0.3 s or longer) and isolated short black flashes", None),
         ("picture", "freeze_frames_enabled", "bool", "Freeze Frames",

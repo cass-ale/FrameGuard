@@ -3424,8 +3424,7 @@ def _report_audio(result: QAResult, plan: _ScanPlan, outcome: _ScanOutcome, cfg:
         _add_audio_row(result, audio_checks.TRUE_PEAK, audio_checks.aggregate(true_peak))
     rows = audio_checks.signal_rows(evidence, contexts, cfg)
     rows.update(audio_checks.disabled_rows(cfg))
-    for name in (audio_checks.CLIPPING, audio_checks.DROPOUTS, audio_checks.PHASE,
-                 audio_checks.DUAL_MONO, audio_checks.DC_OFFSET, audio_checks.HUM):
+    for name in audio_checks.SIGNAL_CHECKS:
         if name in rows:
             _add_audio_row(result, name, rows[name])
 
