@@ -198,10 +198,12 @@ CUSTOM_LOUDNESS_KEYS = ("target_loudness_lufs", "loudness_tolerance_lu", "true_p
 # own error band cannot be called a violation with confidence.
 METER_TOLERANCE_LU = 0.1
 METER_TOLERANCE_TP_DB = 0.2
-# The loudnorm fallback, measured on the darwin-arm64 build with EBU Tech
-# 3341 cases 1-6 (fg092_work/audio_ebu): -0.05 LU on steady tones, -0.07 on
-# cases 3-4 and -0.14 on case 5, i.e. outside Tech 3341's +-0.1 on the
-# gating case. Its readings get a 0.2 LU band.
+# The loudnorm fallback's meter reads EBU Tech 3341 cases 1-6 (generated
+# with the Table 1 10 ms fades) -0.05 LU on steady tones, -0.07 on cases 3-4
+# and -0.14 on case 5, identically on FFmpeg 7.0.2, 7.1.1, 8.0.1 and 9.0.2
+# and in stereo without any remap: a property of loudnorm's meter, not of a
+# build, and outside Tech 3341's +-0.1 on the gating case. Its readings get
+# a 0.2 LU band (the worst measured error, rounded up to the next 0.1).
 METER_TOLERANCE_LOUDNORM_LU = 0.2
 LOW_CONFIDENCE = 60
 
@@ -268,6 +270,8 @@ EDGE_MARGIN_S = 0.05          # dropouts this close to either end are fades
 # line-up. BLITS' per-channel 5.1 sequence is not recognised.
 LINEUP_GAP_S = (0.20, 0.30)
 GLITS_STEP_S = 0.5            # L gap -> first R gap -> second R gap
+# The detectors place a gap edge to within their averaging (10 ms and 40 ms
+# one-pole tone detector, 5 ms dropout joins): 60 ms covers both edges.
 GLITS_STEP_TOLERANCE_S = 0.06
 LINEUP_TONE_MIN_S = 0.08      # shortest steady-tone stretch the detector reports
 LINEUP_BEFORE_S = 0.15        # the tone must end within this of the gap start
@@ -352,7 +356,9 @@ _PROFILES = {
     # (dialogue_gated_loudness).
     "netflix": LoudnessProfile("netflix", "Netflix", -27.0, 2.0, -2.0, True, 48000,
                                "Netflix Sound Mix Specifications"),
-    # Spotify for Artists (-14 LUFS, -1 dBTP); tolerance +-1 LU inferred.
+    # Spotify for Artists (-14 LUFS, -1 dBTP). Spotify publishes no tolerance
+    # (it re-gains playback to -14); +-1 LU is EBU R 128's widest permitted
+    # deviation, the same band as Apple Podcasts / AES TD1006 below.
     "streaming": LoudnessProfile("streaming", "Streaming -14", -14.0, 1.0, -1.0, False, None,
                                  "Spotify for Artists"),
     # Apple Podcasts / AES TD1006 Annex D: -16 LUFS +-1 LU, -1 dBTP.
@@ -948,9 +954,13 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
                 f"pan=stereo|c0=c{left}+c{right}|c1=c{left}-c{right},aformat=sample_fmts=dblp,"
                 f"astats@a{i}p{j}=measure_perchannel={_PAIR_STATS}:measure_overall=none")))
     if loudness and ambisonic:
-        # W only: BS.1770-5 defines no scene-based method; summing B-format
-        # components over-reads by ~3.5 LU (benchmark F13). Head-locked
-        # stereo is an ordinary stereo programme and is measured as one.
+        # W only: BS.1770-5 defines no scene-based method. W is the
+        # omnidirectional pressure; X, Y and Z describe the same field by
+        # direction, and in SN3D their energies sum to W's for any plane
+        # wave (sin^2 + cos^2 = 1), so measuring the four as loudspeaker feeds
+        # counts the field twice: +3.0 dB, more where a component lands on a
+        # channel weighted as a surround (1.41). Head-locked stereo is an ordinary
+        # stereo programme and is measured as one.
         branches.append((f"a{i}w", f"pan=mono|c0=c0,ebur128@a{i}w=peak=true:framelog=quiet"))
         if names[-2:] == ["HL-L", "HL-R"]:
             left, right = len(names) - 2, len(names) - 1
@@ -2140,8 +2150,12 @@ def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
     (HUM_BAND_SHARE) that is continuous at a constant level for most of the
     track (HUM_CONTINUOUS_SHARE). The 2nd and 3rd harmonics, when they stand
     out too, are reported as corroboration. A tone in the band that comes
-    and goes or changes level is a note, not hum. The -65 dBFS floor is
-    inferred, so the result is advisory (confidence below 70).
+    and goes or changes level is a note, not hum. The floor (hum_min_db,
+    -65 dBFS) is where hum stops being audible: at the SMPTE RP 200
+    monitoring calibration (-20 dBFS = 85 dB SPL) -65 dBFS is 40 dB SPL,
+    at the ISO 226 threshold of hearing for 50-63 Hz (about 37-44 dB SPL).
+    Content can mask or mimic hum, so the result is advisory (confidence
+    below 70).
     """
     floor = _number(cfg, "hum_min_db")
     found, measured, notes = [], [], []

@@ -864,3 +864,14 @@ class TestLowLevelAudio:
         room = media.get("roomtone64", lambda p: make_audio(
             p, [_uniform_noise(-64, 1), _uniform_noise(-64, 2)]))
         assert _row(_scan(room, audio_low_level_check=False), "Low-Level Audio")[1] == "SKIP"
+
+
+# ---------------------------------------------------------------------------
+# R3 bug 13. No benchmark / inferred justifications left in the audio module
+# ---------------------------------------------------------------------------
+
+def test_audio_module_cites_no_benchmark_or_inferred_value():
+    import inspect
+    source = inspect.getsource(audio_checks).lower()
+    for word in ("benchmark", "inferred", "corpus"):
+        assert word not in source, word
