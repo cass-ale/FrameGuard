@@ -457,13 +457,36 @@ class TestHumFrequencyAndHarmonics:
         row = _row(_scan(clip), "Audio Hum")
         assert row[1] == "WARN" and "60 Hz" in row[2] and "harmonic" in row[2], row
 
-    def test_a_lone_mains_frequency_sine_is_not_hum(self, media):
-        """No 2f/3f: a test tone or a synth note at 50 Hz, not mains hum."""
-        exprs = [f"{_uniform_noise(-30, 1)}+0.014*sin(2*PI*50*t)",
-                 f"{_uniform_noise(-30, 2)}+0.014*sin(2*PI*50*t)"]
-        clip = media.get("pure50", lambda p: make_audio(p, exprs, seconds=6))
+    def test_a_pure_continuous_60_hz_sine_is_hum(self, media):
+        """Round 2 / review bug 8: a pure 60 Hz sine at -60 dBFS for the whole
+        track, no harmonics (induced hum after filtering or from magnetic
+        pickup), was PASSed "a test tone or note" because harmonics were
+        demanded."""
+        exprs = [f"{_uniform_noise(-30, 1)}+0.001*sin(2*PI*60*t)",
+                 f"{_uniform_noise(-30, 2)}+0.001*sin(2*PI*60*t)"]
+        clip = media.get("pure60_m60", lambda p: make_audio(p, exprs, seconds=10))
         row = _row(_scan(clip), "Audio Hum")
-        assert row[1] == "PASS" and "harmonic" in row[2], row
+        assert row[1] == "WARN" and "60 Hz" in row[2] and row[3] < 70, row
+
+    def test_an_organ_note_with_an_envelope_near_59_5_hz_is_not_hum(self, media):
+        """In the mains band, with harmonics, but played: an attack at 1 s, a
+        decay of about 1 dB/s and a release by 9 s. Hum is continuous at a
+        constant level; a note is not."""
+        envelope = ("if(lt(t,1),0,if(lt(t,1.5),(t-1)/0.5,if(lt(t,8),exp(-(t-1.5)/4),"
+                    "if(lt(t,9),exp(-6.5/4)*(9-t),0))))")
+        note = f"({_harmonic_tone(59.5, (0.05, 0.025, 0.015))})*{envelope}"
+        exprs = [f"{_uniform_noise(-40, 1)}+{note}", f"{_uniform_noise(-40, 2)}+{note}"]
+        clip = media.get("organ595_env", lambda p: make_audio(p, exprs, seconds=10))
+        row = _row(_scan(clip), "Audio Hum")
+        assert row[1] == "PASS" and "59" not in row[2].split("(")[0], row
+
+    @pytest.mark.parametrize("freq", [59.4, 60.6])
+    def test_the_mains_tolerance_is_symmetric(self, media, freq):
+        """EN 50160's +-1 % on either side of 60 Hz: 0.9.2-rc passed 59.4 and warned on 60.6."""
+        exprs = [f"{_uniform_noise(-30, 1)}+0.01*sin(2*PI*{freq}*t)",
+                 f"{_uniform_noise(-30, 2)}+0.01*sin(2*PI*{freq}*t)"]
+        clip = media.get(f"hum_edge_{freq}", lambda p: make_audio(p, exprs, seconds=6))
+        assert _row(_scan(clip), "Audio Hum")[1] == "WARN"
 
 
 # ---------------------------------------------------------------------------
