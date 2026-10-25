@@ -1679,3 +1679,43 @@ class TestPrimingNeedsIdentification:
         ffmpeg("-i", _clean(media), "-c", "copy", "-f", "mpegts", str(ts))
         programs = run_ffprobe(str(ts)).get("programs") or []
         assert any((p.get("tags") or {}).get("service_provider") == "FFmpeg" for p in programs), programs
+
+
+# ---------------------------------------------------------------------------
+# Round 5: DEFAULTS_0_9_1 is pinned to the released v0.9.1
+# ---------------------------------------------------------------------------
+
+class TestDefaults091Pinned:
+    """tests/fixtures/defaults_v0.9.1.json is v0.9.1's DEFAULT_CONFIG for every
+    preset key it knew, generated from the release tag (v0.9.1 = f0bed77; its
+    src/frameguard is identical to 0c4d0c3), from the repository root:
+
+        rm -rf /tmp/v091 && mkdir /tmp/v091 && git archive v0.9.1 src/frameguard | tar -x -C /tmp/v091
+        FRAMEGUARD_TEST_MODE=1 python -c "import sys, json; sys.path.insert(0, '/tmp/v091/src');
+          from frameguard import core, presets;
+          print(json.dumps({k: (sorted(v) if isinstance(v, (set, frozenset, tuple)) else v)
+                for k in presets.PRESET_CONFIG_KEYS if k in core.DEFAULT_CONFIG
+                and k not in core.COMPAT_ONLY_CONFIG_KEYS
+                for v in [core.DEFAULT_CONFIG[k]]}, indent=1, sort_keys=True))" \\
+          > src/tests/fixtures/defaults_v0.9.1.json
+    """
+
+    def _fixture(self):
+        import json
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "defaults_v0.9.1.json")
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_the_table_equals_the_released_defaults(self):
+        from frameguard import presets
+        fixture = self._fixture()
+        assert set(presets.DEFAULTS_0_9_1) == set(fixture)
+        for key, value in fixture.items():
+            frozen = presets.DEFAULTS_0_9_1[key]
+            assert frozen == value and type(frozen) is type(value), (key, frozen, value)
+
+    def test_the_fixture_is_the_release_not_today(self):
+        """Guards against regenerating the fixture from the current tree."""
+        fixture = self._fixture()
+        assert fixture["silence_noise_db"] == -50 and "aac_priming" not in fixture
+        assert len(fixture) == 69
