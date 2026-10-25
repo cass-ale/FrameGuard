@@ -1492,7 +1492,7 @@ def track_sample_peak(evidence: "ScanEvidence", ctx: TrackContext) -> Optional[f
 
 def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
     """Integrated loudness against the delivery profile (for an ambisonic
-    track with head-locked stereo, the W reading and the head-locked pair)."""
+    track, the W reading; a head-locked pair's loudness is reported only)."""
     mode = cfg.get("loudness_mode", "report")
     if not measured or "integrated" not in measured or ctx.meter == METER_NONE:
         reason = _unmeasured_reason(ctx, "loudness summary")
@@ -1506,19 +1506,26 @@ def loudness_row(measured: Optional[dict], ctx: TrackContext, cfg: dict) -> Row:
     if ctx.ambisonic and not ctx.sn3d_signalled:
         row = _unsignalled_normalization_row(row, measured, ctx, cfg)
     head_locked = measured.get("head_locked")
-    if not head_locked:
-        if ctx.ambisonic and ctx.names[-2:] == ["HL-L", "HL-R"]:
-            return ("WARN", f"{row[1].rstrip('.')}; head-locked stereo: Not verified: its loudness "
-                            f"summary was not reported by FFmpeg.", 100)
+    has_pair = ctx.ambisonic and ctx.names[-2:] == ["HL-L", "HL-R"]
+    if not has_pair:
         return row
-    # The head-locked pair as its own stereo programme (exact BS.1770), but
-    # advisory: the listener hears it mixed with the ambisonic render.
-    hl_ctx = TrackContext(position=ctx.position, track=ctx.track, names=["HL-L", "HL-R"],
-                          label="", duration=ctx.duration, meter=METER_EBUR128)
-    hl_status, hl_text, hl_conf = _programme_row(head_locked, hl_ctx, cfg, _HEAD_LOCKED_CAVEAT)
+    # The head-locked pair (narration, music) is part of the delivered mix,
+    # heard on top of the binaural render, and usually sits well below the
+    # programme target on its own. No specification gives it a target of its
+    # own, so its loudness is reported, never judged: the verdict is the
+    # programme's (the advisory W-channel reading). Its true peak and the
+    # per-channel checks still judge it.
     status, text, confidence = row
-    worst = aggregate([(status, "", confidence), (hl_status, "", hl_conf)])
-    return worst[0], f"{text}; head-locked stereo: {hl_text}", worst[2]
+    if head_locked and math.isfinite(head_locked.get("integrated", -math.inf)):
+        lra = head_locked.get("lra")
+        lra_text = f", LRA {lra:.1f} LU" if lra is not None else ""
+        note = (f"head-locked stereo {head_locked['integrated']:.1f} LUFS{lra_text} as its own stereo "
+                f"programme (part of the mix; not judged against the target)")
+    elif head_locked:
+        note = "head-locked stereo silent (not judged against the target)"
+    else:
+        note = "head-locked stereo loudness not reported by FFmpeg (not judged against the target)"
+    return status, f"{text.rstrip('.')}; {note}.", confidence
 
 
 FUMA_W_OFFSET_DB = 20 * math.log10(math.sqrt(2))   # FuMa W = SN3D W / sqrt 2: -3.01 dB
@@ -1542,12 +1549,7 @@ def _unsignalled_normalization_row(row: Row, measured: dict, ctx: TrackContext, 
                                            f"the two readings disagree on the verdict."), 100)
 
 
-_HEAD_LOCKED_CAVEAT = (" (head-locked stereo measured as its own stereo programme; the delivered "
-                       "mix adds the ambisonic render)", LOW_CONFIDENCE)
-
-
-def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
-                   caveat_override: Optional[Tuple[str, int]] = None) -> Row:
+def _programme_row(measured: dict, ctx: TrackContext, cfg: dict) -> Row:
     mode = cfg.get("loudness_mode", "report")
     profile = resolve_profile(cfg)
     integrated = measured["integrated"]
@@ -1564,7 +1566,7 @@ def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
         method = "programme loudness (not dialogue-gated; judged as programme loudness by this spec)"
     else:
         method = "integrated"
-    caveat, cap = caveat_override or _loudness_caveat(ctx)
+    caveat, cap = _loudness_caveat(ctx)
     if estimate:
         cap = LOW_CONFIDENCE if cap is None else min(cap, LOW_CONFIDENCE)
     measured_text = f"{integrated:.1f} LUFS {method}{lra_text}{caveat}"
