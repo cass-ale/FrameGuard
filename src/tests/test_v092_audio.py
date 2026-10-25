@@ -1312,3 +1312,65 @@ class TestMutationSurvivorsRound3:
                                    evidence.files)
         row = audio_checks.phase_row(evidence, audio_checks.TrackContext(**HUM_CTX), dict(DEFAULT_CONFIG))
         assert row[0] == "WARN" and core.NOT_VERIFIED_PREFIX in row[1] and row[2] == 100, row
+
+
+# ---------------------------------------------------------------------------
+# Round 5 C2: Low-Level Audio is informational - it never changes the verdict
+# ---------------------------------------------------------------------------
+
+def _dialogue_with_pauses(seed, freq):
+    """-23 LUFS-ish programme with 2.8 s pauses of -59 dBFS RMS room tone
+    (the reviewer's drama2.mov shape): an ordinary dialogue scene."""
+    pause = "(between(t,3,5.8)+between(t,8,10.8))"
+    return f"{_uniform_noise(-59, seed)}*{pause}+(1-{pause})*{tone(freq, MINUS_23)}"
+
+
+@needs_ffmpeg
+class TestLowLevelAudioIsInformational:
+    @pytest.mark.parametrize("strict", [False, True])
+    def test_dialogue_pauses_never_change_the_verdict(self, media, strict):
+        """0.9.2-rc: default PASS_WITH_WARNINGS, Strict MISMATCH, on a clean
+        dialogue programme (0.9.1 and 2b9d4ef: PASS)."""
+        clip = media.get("dialogue_pauses_stereo", lambda p: make_audio(
+            p, [_dialogue_with_pauses(1, 1000), _dialogue_with_pauses(2, 1250)], seconds=14))
+        cfg = dict(target_width=96, target_height=64, target_fps=10.0, min_bitrate_mbps=0,
+                   accepted_containers=[".mov"], signal_levels_mode="off", warn_untagged_color=False)
+        with_row = core.run_qa_checks(clip, cfg=dict(DEFAULT_CONFIG, **cfg), strict=strict)
+        with_row.finalize()
+        without = core.run_qa_checks(clip, cfg=dict(DEFAULT_CONFIG, audio_low_level_check=False, **cfg),
+                                     strict=strict)
+        without.finalize()
+        row = _row(with_row, "Low-Level Audio")
+        assert row[1] == "WARN" and row[3] <= audio_checks.LOW_CONFIDENCE, row
+        assert with_row.status == without.status, (with_row.status, without.status)
+        assert with_row.status != "MISMATCH"
+        assert "Low-Level Audio" in with_row.metadata.get("informational", [])
+
+    def test_hiss_dropout_still_produces_the_row(self, media):
+        def channel(seed):
+            return (f"{_uniform_noise(-62, seed)}*between(t,3,7)"
+                    f"+(1-between(t,3,7))*{TONE_23}")
+        clip = media.get("dead_air_hiss", lambda p: make_audio(p, [channel(1), channel(2)], seconds=10))
+        result = core.run_qa_checks(clip, cfg=dict(DEFAULT_CONFIG, target_width=96, target_height=64,
+                                                   target_fps=10.0, min_bitrate_mbps=0,
+                                                   accepted_containers=[".mov"]), strict=True)
+        result.finalize()
+        row = _row(result, "Low-Level Audio")
+        assert row[1] == "WARN" and "00:00:03" in row[2], row
+        assert not any(c[0] == "Low-Level Audio" for c in result.checks if c[1] == "FAIL")
+
+    def test_an_informational_row_alone_leaves_a_clean_pass(self):
+        result = core.QAResult("x.mov")
+        result.add_pass("Container Format", "ok")
+        result.add_informational("Low-Level Audio", "1 low-level stretch", 60)
+        for strict in (False, True):
+            assert result.overall_status(strict=strict) == "PASS"
+        assert result.warnings == [] and core.result_severity(result) == (0.0, "")
+        assert result.checks[-1] == ("Low-Level Audio", "WARN", "1 low-level stretch", 60)
+        result.strict = True
+        from frameguard.gui import _result_status
+        assert _result_status(result) == "PASS"       # the unfinalized fallback agrees
+        result.strict = False
+        result.add_warn("Audio Hum", "possible hum", 60)
+        assert result.overall_status() == "PASS_WITH_WARNINGS"
+        assert result.overall_status(strict=True) == "MISMATCH"

@@ -68,6 +68,11 @@ LOW_LEVEL = "Low-Level Audio"
 # Everything else is content-dependent and therefore advisory.
 ESSENTIAL_CHECKS = frozenset({TRUE_PEAK, CLIPPING})
 ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM, LOW_LEVEL})
+# Rows that inform and never change the verdict, in any mode (Strict
+# included): Low-Level Audio cannot tell dead air from an ordinary pause of
+# room tone in dialogue (2-3 s pauses at -60 dBFS are normal drama), so only
+# a person can judge it. core records them with QAResult.add_informational.
+INFORMATIONAL_CHECKS = frozenset({LOW_LEVEL})
 
 # Severity weights (core.check_severity: weight x confidence, WARN at half)
 # rank a row by the risk that the defect gets the delivery rejected, on

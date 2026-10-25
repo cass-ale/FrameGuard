@@ -308,9 +308,12 @@ def result_severity(result: "QAResult") -> tuple:
     """(score, top_check_name) for a whole file: max over its checks."""
     best = 0.0
     top = ""
+    informational = set((getattr(result, "metadata", None) or {}).get("informational") or ())
     for entry in getattr(result, "checks", []):
         name = entry[0] if len(entry) > 0 else ""
         status = entry[1] if len(entry) > 1 else ""
+        if name in informational and status == "WARN":
+            continue
         conf = entry[3] if len(entry) > 3 else 100
         score = check_severity(name, status, conf)
         if score > best:
@@ -616,6 +619,19 @@ class QAResult:
             self.checks.append((check_name, "WARN", detail, confidence))
             self.warnings.append(f"{check_name}: {detail}")
 
+    def add_informational(self, check_name: str, detail: str = "", confidence: int = 60):
+        """A finding shown to the operator that never changes the verdict, in
+        any mode: a recorded WARN row (confidence at most 60) that Strict does
+        not escalate and the verdict and severity ignore. For content
+        observations only a person can judge (a pause or dead air?). It is
+        not added to ``warnings``, which the unfinalized-status fallbacks in
+        gui and report read as "flagged"."""
+        with self._lock:
+            self.checks.append((check_name, "WARN", detail, min(int(confidence), 60)))
+            self.metadata.setdefault("informational", [])
+            if check_name not in self.metadata["informational"]:
+                self.metadata["informational"].append(check_name)
+
     def add_skip(self, check_name: str, detail: str = "", confidence: int = 100):
         """A check that does not apply to this file (e.g. silence with no audio)."""
         with self._lock:
@@ -738,12 +754,13 @@ class QAResult:
         strict = strict or bool(getattr(self, "strict", False))
         flagged = False
         by_choice = set(self.metadata.get("not_run_by_choice") or ()) | set(self.metadata.get("not_verifiable") or ())
+        informational = set(self.metadata.get("informational") or ())
 
         for check_tuple in self.checks:
             name, status = check_tuple[0], check_tuple[1]
             confidence = check_tuple[3] if len(check_tuple) > 3 else 100
 
-            if status in ("PASS", "SKIP"):
+            if status in ("PASS", "SKIP") or (status == "WARN" and name in informational):
                 continue
 
             if name in ("FFprobe", "Internal Error") and status == "FAIL":
@@ -3405,6 +3422,9 @@ def _dead_channel_entry(label: str, track: dict, dead_channels: List[int],
 
 def _add_audio_row(result: QAResult, name: str, row) -> None:
     status, detail, confidence = row
+    if status == "WARN" and name in audio_checks.INFORMATIONAL_CHECKS:
+        result.add_informational(name, detail, confidence)
+        return
     {"FAIL": result.add_fail, "WARN": result.add_warn,
      "PASS": result.add_pass, "SKIP": result.add_skip}[status](name, detail, confidence)
 
