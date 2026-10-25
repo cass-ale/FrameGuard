@@ -580,6 +580,32 @@ class TestR103Filter:
         if siting == "left":
             assert expected > 1.0 and result.metadata.get("levels_max_gamut_pct") > 1.0
 
+    def test_limited_content_tagged_full_is_flagged(self, tmp_path):
+        """Round 7 (corpus gate): limited-range picture (16-235) tagged full
+        range read as plausible from 6c6f471 on - swscale converted the
+        yuvj420p planes to limited (235 -> 217) despite in_range. The tag is
+        set in the bitstream, so the codes are the encoded ones."""
+        clean = tmp_path / "tv.mp4"
+        # Limited-range mastering: black at 16, white at 235 over large areas,
+        # mid-tones between - the pile-up at the clip points the rule reads.
+        lum = "if(lt(X,W/3),16,if(lt(X,2*W/3),40+150*Y/H,235))"
+        ffmpeg("-f", "lavfi", "-i", "color=black:s=640x360:r=30:d=2,format=yuv420p,setparams=range=tv",
+               "-vf", f"geq=lum='{lum}':cb=128:cr=128", *X264, "-an", str(clean))
+        path = str(tmp_path / "tagged_pc.mp4")
+        ffmpeg("-i", str(clean), "-c", "copy", "-bsf:v", "h264_metadata=video_full_range_flag=1", path)
+        result = _scan(path)
+        assert result.metadata.get("range_mismatch_suspected") is True, _row(result, "Signal Levels")
+        assert "tagged full (pc)" in _row(result, "Signal Levels")[2]
+
+    def test_full_range_content_tagged_full_is_plausible(self, tmp_path):
+        path = str(tmp_path / "pc.mp4")
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
+               "-vf", "scale=out_range=pc:out_color_matrix=bt709,format=yuvj420p",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-color_range", "pc",
+               "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-an", path)
+        result = _scan(path)
+        assert not result.metadata.get("range_mismatch_suspected"), _row(result, "Signal Levels")
+
     def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
         """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
         expected = _r103_share(_SMALL)
@@ -1338,6 +1364,65 @@ class TestFreezeUnderFilmGrain:
         graph = _texture_pan(8, 4) + "[pic];" + _film_grain("pic", 8, 40, 1.0)
         path = _graph_clip(tmp_path / "slowfilm.mp4", graph)
         assert _row(_scan(path, target_fps=24.0), "Freeze Frames")[1] == "PASS"
+
+
+@needs_ffmpeg
+class TestSlowPansAreNotFreezes:
+    """Round 7 (sealed scoring of 98562c1): the lag test flagged clean slow
+    camera pans (2-18 px per 0.5 s, grainy or not, one a dark grade) as
+    freezes - a cut-bounded slow pan then read as a held shot over the Title
+    Card Hold. A freeze needs near-zero global displacement."""
+
+    @staticmethod
+    def _two_shots(tmp_path, name, px_per_half_second, grain=0, dark=False):
+        still = _texture(tmp_path / "still.png")
+
+        def shot(x0, speed, seconds):
+            s = (f"movie='{still}',loop=-1:1,fps=24,trim=duration={seconds},"
+                 f"setpts=PTS-STARTPTS,crop=640:360:'{x0}+{speed}*t':300,"
+                 "format=yuv420p,setparams=range=tv")
+            return s + (",lutyuv=y='17+val*24/255':u=128:v=128" if dark else "")
+        graph = (f"{shot(100, 300, 2)}[a];{shot(1000, 2 * px_per_half_second, 6)}[b];"
+                 "[a][b]concat=n=2:v=1:a=0")
+        if grain:
+            graph += "[pic];" + _film_grain("pic", 8, grain, 1.0)
+        return _graph_clip(tmp_path / f"{name}.mp4", graph)
+
+    @pytest.mark.parametrize("px_per_half_second", [2, 5, 10, 18])
+    @pytest.mark.parametrize("grain", [0, 40])
+    def test_slow_pan(self, tmp_path, px_per_half_second, grain):
+        path = self._two_shots(tmp_path, f"pan{px_per_half_second}_{grain}", px_per_half_second, grain)
+        row = _row(_scan(path, target_fps=24.0), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    @pytest.mark.parametrize("px_per_half_second", [2, 5])
+    def test_dark_grade_pan(self, tmp_path, px_per_half_second):
+        path = self._two_shots(tmp_path, f"dark{px_per_half_second}", px_per_half_second, grain=10, dark=True)
+        row = _row(_scan(path, target_fps=24.0), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    @pytest.mark.parametrize("square", [True, False])
+    def test_dark_scene_with_low_contrast_flicker(self, tmp_path, square):
+        """Round 7 (corpus gate): a dark scene flickering at 8 Hz by one code
+        read as a frozen picture once the camera stopped (the 8-bit
+        structural copy rounds such a flicker away). A flickering picture is
+        not a freeze."""
+        still = _texture(tmp_path / "still.png")
+        wave = "(2*lt(mod(T*8,1),0.5)-1)" if square else "sin(2*PI*8*T)"
+        graph = (f"movie='{still}',loop=-1:1,fps=30,trim=duration=20,setpts=PTS-STARTPTS,scale=3840:-2,"
+                 "crop=1280:720:'200+if(lt(t,8),60*t,480)':400,format=yuv420p,setparams=range=tv,"
+                 f"lutyuv=y='17+val*20/255':u=128:v=128,geq=lum='p(X,Y)+{wave}':cb=128:cr=128")
+        path = _graph_clip(tmp_path / f"flicker{square}.mp4", graph)
+        row = _row(_scan(path, target_width=1280, target_height=720), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    def test_global_shift_rule(self):
+        assert vc.global_shift(1.0, 3.0, 3.0, 3.0, 3.0) is True           # zero shift best, symmetric
+        assert vc.global_shift(1.0, 3.0, 2.0, 3.0, 3.0) is True           # vertex 0.17 px: within 0.25
+        assert vc.global_shift(1.0, 3.0, 1.4, 3.0, 3.0) is False          # vertex 0.33 px
+        assert vc.global_shift(1.0, 1.04, 1.04, 3.0, 3.0) is None          # flat in x: undecided
+        assert vc.global_shift(2.0, 1.5, 3.0, 3.0, 3.0) is False          # +1 px is better than 0
+        assert vc.global_shift(None, 1.0, 1.0, 1.0, 1.0) is None
 
 
 @needs_ffmpeg
