@@ -235,7 +235,7 @@ class TestInterlaceAssessment:
         assert status == "WARN" and "mismatch" in detail
 
     def test_vertical_scroll_is_not_combing(self):
-        """Fields measurably simultaneous (row-profile displacement 0): a
+        """Fields from the same instant (field timing 'progressive'): a
         progressive vertical scroll, whatever idet calls it."""
         labels = ["bff"] * 240
         found = vc.assess_interlace(labels, _times(240), FPS, "progressive", labels,
@@ -250,13 +250,55 @@ class TestInterlaceAssessment:
                                     displacement=["woven"] * 240)
         assert found.combed and not found.scrolls
 
-    def test_displacement_decisive_ratio(self):
+    def test_field_timing_rule(self):
         ratio = vc.INTERLACE_DECISIVE_RATIO
-        def verdict(shifted, simultaneous):
-            return vc.field_displacement({-2: 9.0, -1: shifted, 0: simultaneous, 1: 9.0, 2: 9.0})
-        assert verdict(1.0, ratio * 1.01) == "woven" and verdict(1.0, ratio * 0.99) == ""
-        assert verdict(ratio * 1.01, 1.0) == "progressive" and verdict(ratio * 0.99, 1.0) == ""
-        assert vc.field_displacement({-2: 1.0, -1: None, 0: 1.0, 1: 1.0, 2: 1.0}) == ""
+        # woven TFF: the next frame's top field is as near as the own one,
+        # and the top field really moved on that side
+        assert vc.field_timing(1.0, 1.0, 3.0, 2.0, 2.0) == "woven"
+        assert vc.field_timing(1.0, 3.0, 1.0, 2.0, 2.0) == "woven"            # BFF
+        assert vc.field_timing(1.0, ratio * 1.01, 3.0, 2.0, 2.0) == "progressive"
+        assert vc.field_timing(1.0, ratio * 0.99, 3.0, 2.0, 2.0) == "woven"
+        assert vc.field_timing(1.0, 1.2, 1.4) == ""                  # no motion shows
+        assert vc.field_timing(None, 1.0, 1.0) == ""
+        # a repeated frame: the "near" neighbour is the same picture
+        assert vc.field_timing(1.0, 3.0, 1.0, 2.0, 0.0) == ""
+        assert vc.field_timing(1.0, 3.0, 1.0, 2.0, ratio * 0.99) == ""
+
+    def test_vertical_scroll_verdicts(self):
+        scroll = (0.001, 1.0)          # column profile unchanged, rows slide
+        pan = (1.0, 1.0)
+        # slow scroll: no feathering possible
+        assert vc.field_verdict("woven", "woven", *scroll, speed=2) == "progressive"
+        # faster scroll: both measures must say woven
+        assert vc.field_verdict("woven", "woven", *scroll, speed=4) == "woven"
+        assert vc.field_verdict("woven", "progressive", *scroll, speed=4) == "progressive"
+        assert vc.field_verdict("progressive", "woven", *scroll, speed=4) == "progressive"
+        # not a scroll: the timing comparison decides
+        assert vc.field_verdict("woven", "progressive", *pan, speed=0) == "woven"
+        assert vc.field_verdict("woven", "woven", 0.005, 0.005) == "static"
+        assert vc.is_vertical_scroll(0.069, 0.931) and not vc.is_vertical_scroll(0.071, 0.929)
+        assert vc.scroll_speed({-1: 5.0, 0: 3.0, 1: 1.0}) == 1
+        assert vc.scroll_speed({-1: 1.0, 0: 1.0, 1: 1.0}) == 0
+        assert vc.scroll_speed({-1: None, 0: 1.0, 1: 1.0}) is None
+
+    def test_progressive_majority_vetoes_idet(self):
+        labels = ["tff"] * 60
+        timing = ["progressive"] * 40 + ["woven"] * 10 + [""] * 10
+        assert vc.assess_interlace(labels, _times(60), FPS, "progressive", labels,
+                                   displacement=timing).combed == []
+        # a minority of decided frames does not veto ...
+        few = ["progressive"] * 5 + [""] * 55
+        assert vc.assess_interlace(labels, _times(60), FPS, "progressive", labels,
+                                   displacement=few).combed
+        # ... but static frames do not count
+        still = ["progressive"] * 25 + ["static"] * 35
+        assert vc.assess_interlace(labels, _times(60), FPS, "progressive", labels,
+                                   displacement=still).combed == []
+        # a one-second window where timing itself calls most frames woven keeps it
+        mixed = ["woven"] * 35 + ["progressive"] * 45
+        labels = ["tff"] * 80
+        assert vc.assess_interlace(labels, _times(80), FPS, "progressive", labels,
+                                   displacement=mixed).combed
 
     def test_no_measurable_motion_keeps_idet_verdict(self):
         found = vc.assess_interlace(["tff"] * 60, _times(60), FPS, "progressive", ["tff"] * 60,
@@ -469,13 +511,14 @@ class TestRealScan:
         if speed == 2:   # one line per field: idet calls it interlaced
             assert "vertical scroll" in row[2], row
 
-    @pytest.mark.parametrize("speed", [1, 2])
-    def test_woven_credit_roll_is_combed(self, tmp_path, speed):
-        """Review B4: credits rendered at 60 fields/s and woven are combed;
-        0.9.1 certified them as 'a vertical scroll with no combing'."""
-        source = self._credits(60, speed) + ",tinterlace=mode=interleave_top,setfield=prog"
-        path = _clip(tmp_path / f"woven{speed}.mp4", "setfield=prog", source=source,
-                     extra=["-r", "30"])
+    def test_woven_credit_roll_is_combed(self, tmp_path):
+        """Review B4: credits rendered at 60 fields/s, 2 lines per field and
+        woven, are combed; 0.9.1 certified them as 'a vertical scroll with no
+        combing'. (At 1 line per field the fields misregister by one line,
+        the picture's own line pitch: no feathering, see
+        INTERLACE_SCROLL_SLOW.)"""
+        source = self._credits(60, 2) + ",tinterlace=mode=interleave_top,setfield=prog"
+        path = _clip(tmp_path / "woven2.mp4", "setfield=prog", source=source, extra=["-r", "30"])
         row = _row(_scan(path), "Interlace Detection")
         assert row[1] == "WARN" and "combing" in row[2], row
 

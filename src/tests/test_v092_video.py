@@ -243,17 +243,14 @@ class TestFlashScan:
 
 
 # ---------------------------------------------------------------------------
-# Interlace (idet documented defaults; field order; telecine; displacement)
+# Interlace (idet documented defaults; field order; telecine; field timing)
 # ---------------------------------------------------------------------------
 
 class TestInterlaceRules:
     def test_idet_runs_with_its_documented_defaults(self):
-        analysis = vc.VideoAnalysis({"index": 0, "width": 640, "height": 360,
-                                     "avg_frame_rate": "30/1"}, dict(DEFAULT_CONFIG))
-        analysis.paths = {name: f"/tmp/{name}.txt" for name in
-                          ("idet", "idet1", "rep_top", "rep_bottom")
-                          + tuple(vc._disp_name(d) for d in vc.INTERLACE_DISPLACEMENTS)}
-        graph = ";".join(analysis._interlace_chains())
+        with vc.VideoAnalysis({"index": 0, "width": 640, "height": 360, "avg_frame_rate": "30/1"},
+                              dict(DEFAULT_CONFIG)) as analysis:
+            graph = ";".join(analysis._interlace_chains())
         assert "idet@il," in graph and "intl_thres" not in graph
 
     def test_field_order_that_flips_is_not_woven(self):
@@ -926,3 +923,47 @@ class TestNoSummaryIsNotVerified:
         # Black Frames still has blackdetect's own log record (see TestBlackEvidence
         # for the case where that is missing too).
         assert _row(result, vc.BLACK)[1] == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Interlace: progressive test patterns are not woven (integration regression)
+# ---------------------------------------------------------------------------
+
+@needs_ffmpeg
+class TestProgressivePatternsAreNotWoven:
+    """The fixtures' clean clip (progressive testsrc2, 320x240) read as
+    '87 % interlaced, combing' in the merged 0.9.2 suite: idet's 4 %
+    prev/next asymmetry fires on its moving graphics, and a 2 s clip has a
+    single section, so the field-order steadiness rule could not help."""
+
+    @pytest.mark.parametrize("seconds", [2, 10])
+    @pytest.mark.parametrize("size", ["320x240", "640x360"])
+    def test_progressive_testsrc2_is_not_flagged(self, tmp_path, seconds, size):
+        from media_fixtures import make_clip
+        path = make_clip(tmp_path / f"ts_{size}_{seconds}.mp4", duration=seconds, size=size,
+                         audio=())
+        width, height = (int(v) for v in size.split("x"))
+        row = _row(_scan(path, target_width=width, target_height=height), "Interlace Detection")
+        assert row[1] == "PASS", row
+
+
+@needs_ffmpeg
+class TestProgressiveCreditRollsAreNotWoven:
+    """End credits: hard-edged white text bars scrolling up on black, 1-4
+    lines per frame (the merged-candidate corpus gate flagged one as woven)."""
+
+    @pytest.mark.parametrize("speed", [1, 2, 3, 4])
+    def test_text_bar_roll(self, tmp_path, speed):
+        expr = (f"if(lt(mod(Y+{speed}*N,60),12)*between(X,150,490)"
+                f"*lt(mod(X+floor((Y+{speed}*N)/60)*37,90),70),235,16)")
+        path = _clip(tmp_path / f"bars{speed}.mp4", f"geq=lum='{expr}':cb=128:cr=128",
+                     source="color=black:s=640x360:r=30:d=4,format=yuv420p")
+        assert _row(_scan(path), "Interlace Detection")[1] == "PASS"
+
+    @pytest.mark.parametrize("pixels_per_second", [30, 45, 90])
+    def test_single_bar_roll(self, tmp_path, pixels_per_second):
+        graph = ("color=white:s=400x6:r=30:d=4[s];color=black:s=640x360:r=30:d=4[b];"
+                 f"[b][s]overlay=x=120:y='H-mod(t*{pixels_per_second},H+20)',format=yuv420p")
+        path = str(tmp_path / f"roll{pixels_per_second}.mp4")
+        ffmpeg("-filter_complex", graph, *X264, "-an", path)
+        assert _row(_scan(path), "Interlace Detection")[1] == "PASS"
