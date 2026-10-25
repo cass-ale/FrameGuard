@@ -916,7 +916,8 @@ class TestFreezeRules:
         assert found.holds[0][1] == pytest.approx(60 / FPS, abs=0.1)
 
     def test_quiet_night_shot_between_busy_shots_is_not_a_freeze(self):
-        found, (status, _, _) = _freezes([(90, *BUSY), (1, "cut", 0), (90, 0.2, 0.01),
+        # A 3 s shot (its first frame is the cut): within the hold allowance.
+        found, (status, _, _) = _freezes([(90, *BUSY), (1, "cut", 0), (89, 0.2, 0.01),
                                           (1, "cut", 0), (90, *BUSY)])
         assert found.holds == [] and status == "PASS"
 
@@ -1340,16 +1341,38 @@ class TestFreezeUnderFilmGrain:
 
 
 @needs_ffmpeg
+class TestHeldShotAllowance:
+    """Round 6 (corpus gate): a 6 s still shot between two cuts was excused as
+    a held shot with no limit; the Title Card Hold caps it."""
+
+    def _clip(self, tmp_path, still_seconds):
+        still = (f"testsrc2=s=640x360:r=24:d=1,trim=end_frame=1,loop=-1:1,fps=24,"
+                 f"trim=duration={still_seconds},setpts=PTS-STARTPTS,format=yuv420p,setparams=range=tv[st0];"
+                 + _film_grain("st0", still_seconds, 8, 0.5).replace("[gr]", "[gr1]").replace("][gr]", "][gr1]"))
+        graph = (f"{_texture_pan(4, 120)}[a];{still}[b];{_texture_pan(4, 120, x0=700)}[c];"
+                 "[a][b][c]concat=n=3:v=1:a=0")
+        return _graph_clip(tmp_path / f"held{still_seconds}.mp4", graph)
+
+    def test_still_shot_longer_than_the_allowance_warns(self, tmp_path):
+        row = _row(_scan(self._clip(tmp_path, 6), target_fps=24.0), "Freeze Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:04.0" in row[2], row
+
+    def test_still_shot_within_the_allowance_passes(self, tmp_path):
+        row = _row(_scan(self._clip(tmp_path, 2.5), target_fps=24.0), "Freeze Frames")
+        assert row[1] == "PASS" and "hold allowance" in row[2], row
+
+
+@needs_ffmpeg
 class TestNoFalseFreezes:
     """Round 2: a freeze is a static picture, not a slow or interrupted one."""
 
     def test_dips_to_black_between_shots(self, tmp_path):
-        """Moving shot, 1-frame dip, locked-off shot (live grain), 2-frame
-        dip, moving shot."""
+        """Moving shot, 1-frame dip, a 2.5 s locked-off shot (live grain,
+        within the hold allowance), 2-frame dip, moving shot."""
         graph = (f"{_camera_pan(4, 90, 6, shake=0)}[a];"
-                 f"{_camera_pan(4, 0, 6, x0=900, y0=500, shake=0)}[b];"
+                 f"{_camera_pan(2.5, 0, 6, x0=900, y0=500, shake=0)}[b];"
                  f"{_camera_pan(4, 90, 6, x0=600, shake=0)}[c];[a][b][c]concat=n=3:v=1:a=0,"
-                 "drawbox=c=black:t=fill:enable='eq(n,120)+between(n,240,241)'")
+                 "drawbox=c=black:t=fill:enable='eq(n,120)+between(n,195,196)'")
         assert _row(_scan(_graph_clip(tmp_path / "dips.mp4", graph)), "Freeze Frames")[1] == "PASS"
 
     @pytest.mark.parametrize("dark", [False, True])
@@ -1749,12 +1772,12 @@ class TestFreezeHelpersExact:
         """Black frame, then an encoder blip, then a held shot: the frame
         after the black is next to it, so the shot enters on an edit."""
         busy, still = (2.6, 2.0), (0.15, 0.003)
-        rows = [busy] * 90 + [(40.0, 40.0), (40.0, 40.0), (1.0, 0.5)] + [still] * 90
+        rows = [busy] * 90 + [(40.0, 40.0), (40.0, 40.0), (1.0, 0.5)] + [still] * 80
         rows += [(40.0, 40.0), (40.0, 40.0)] + [busy] * 60
         mafd = [r[0] for r in rows]
         structural = [r[1] for r in rows]
         times = _times(len(rows))
-        black = [(90 / 30, 1 / 30), (183 / 30, 1 / 30)]
+        black = [(90 / 30, 1 / 30), (173 / 30, 1 / 30)]
         found = vc.detect_freezes(mafd, times, FPS, 1.0, len(rows) / 30, black,
                                   structural=structural, hold_allowance=3.0)
         assert found.holds == [] and found.composed

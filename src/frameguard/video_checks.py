@@ -2050,9 +2050,8 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
        composed shot - a title card, an end card, a locked-off or quiet
        scene - not a freeze: by definition a freeze is not creative intent.
        A dip through black is an edit too. Such a shot counts as a freeze
-       only when its frames are identical (FREEZE_IDENTICAL_MAFD) and it is
-       held longer than ``hold_allowance`` (a spec setting: a long
-       identical still is worth checking).
+       when it is held longer than ``hold_allowance`` (the spec's Title Card
+       Hold setting).
     4. Any other run is a freeze when the picture stopped dead in mid-shot:
        motion runs up to it (FREEZE_LEAD_FRAMES), or its frames are
        identical. A shot that slows to a standstill is not.
@@ -2132,7 +2131,10 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         enters_on_cut = at_head or edit(frozen_from) or edit(frozen_from - 1)
         leaves_on_cut = at_tail or edit(last + 1)
         if enters_on_cut and leaves_on_cut and not covers_half:
-            if identical and span[1] > hold_allowance + period * 0.5:
+            # A held shot is excused up to the hold allowance (the spec's
+            # Title Card Hold); a still picture held longer is reported,
+            # identical or under live grain alike.
+            if span[1] > hold_allowance + period * 0.5:
                 holds.append(span)
             else:
                 composed.append(span)
@@ -2165,7 +2167,7 @@ def freeze_entry(findings: FreezeFindings, duration: float,
         notes += f" Static picture at the head treated as a slate: {event_list(findings.edge_holds)}."
     if findings.composed:
         notes += (f" Held shot(s) starting and ending on a cut, within the {cfg.freeze_hold:g}s "
-                  f"hold allowance or not identical: {event_list(findings.composed)}.")
+                  f"hold allowance: {event_list(findings.composed)}.")
     if not findings.holds:
         return "PASS", f"No freezes ≥{cfg.freeze_duration:g}s detected.{notes}", 100
     total = sum(d for _, d in findings.holds)
