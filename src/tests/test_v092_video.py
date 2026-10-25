@@ -1160,6 +1160,26 @@ class TestFineFlashPatterns:
                    "Flash Risk")
         assert row[1] == "WARN", row
 
+    def test_fine_checkerboard_on_grey_warns(self, tmp_path):
+        """Darker state above black (Y' 60, about 4 cd/m2): the darker-state
+        test must use the real 160 cd/m2 limit."""
+        lum = ("if(gte(T,1)*lt(T,4),if(eq(mod(floor(X/20)+floor(Y/20),2),"
+               "lt(mod(N,6),3)),235,60),60)")
+        path = _clip(tmp_path / "grey.mp4", f"geq=lum='{lum}':cb=128:cr=128", source=_GREY_720,
+                     extra=("-crf", "12"))
+        row = _row(_scan(path, target_width=1280, target_height=720), "Flash Risk")
+        assert row[1] == "WARN", row
+
+    def test_fine_checkerboard_between_bright_states_passes(self, tmp_path):
+        """BT.1702-3: a flash needs its darker state below 160 cd/m2. Y' 225
+        (~179 cd/m2) against 235 (200 cd/m2) at 5 Hz is not a flash."""
+        lum = ("if(gte(T,1)*lt(T,4),if(eq(mod(floor(X/20)+floor(Y/20),2),"
+               "lt(mod(N,6),3)),235,225),225)")
+        path = _clip(tmp_path / "bright.mp4", f"geq=lum='{lum}':cb=128:cr=128", source=_GREY_720,
+                     extra=("-crf", "12"))
+        row = _row(_scan(path, target_width=1280, target_height=720), "Flash Risk")
+        assert row[1] == "PASS", row
+
     def test_fine_checkerboard_at_2_hz_passes(self, tmp_path):
         row = _row(_scan(self._checker(tmp_path, 20, 8), target_width=1280, target_height=720),
                    "Flash Risk")
@@ -1216,3 +1236,460 @@ class TestCfrNominalRateUnits:
         reference, _, _, _ = core._interval_stats(core.FrameTiming([[k * 0.0335 for k in range(60)]], False, "t"),
                                                    nominal=1 / 30, tick=1 / 15360)
         assert reference == pytest.approx(1 / 30)
+
+
+# ---------------------------------------------------------------------------
+# Mutation gate (review round 3): exact expectations for the new helpers
+# ---------------------------------------------------------------------------
+
+class TestCoverageWeightsExact:
+    @staticmethod
+    def _weights(amplitude):
+        return vc.FlashAccumulator(FPS)._coverage_weights(amplitude)
+
+    def test_diagonal_neighbour(self):
+        assert self._weights({0: 1.0, 17: 8.0}) == {0: 0.125, 17: 1.0}
+
+    def test_upper_left_and_lower_right_neighbours(self):
+        assert self._weights({18: 1.0, 1: 4.0}) == {18: 0.25, 1: 1.0}
+        assert self._weights({1: 2.0, 18: 6.0}) == pytest.approx({1: 1 / 3, 18: 1.0})
+
+    def test_row_and_column_neighbours(self):
+        assert self._weights({5: 1.0, 6: 4.0}) == {5: 0.25, 6: 1.0}
+        assert self._weights({6: 1.0, 5: 4.0}) == {6: 0.25, 5: 1.0}
+        assert self._weights({5: 1.0, 21: 2.0}) == {5: 0.5, 21: 1.0}
+        assert self._weights({21: 1.0, 5: 2.0}) == {21: 0.5, 5: 1.0}
+
+    def test_isolated_and_silent_blocks_count_whole(self):
+        assert self._weights({40: 0.5}) == {40: 1.0}
+        assert self._weights({41: 0.0}) == {41: 1.0}
+        assert self._weights({143: 4.0, 0: 9.0}) == {143: 1.0, 0: 1.0}   # far corners
+
+    def test_last_column_does_not_wrap_to_the_next_row(self):
+        assert self._weights({15: 1.0, 16: 4.0}) == {15: 1.0, 16: 1.0}
+
+    def test_first_column_and_row_neighbours(self):
+        assert self._weights({1: 1.0, 0: 4.0}) == {1: 0.25, 0: 1.0}
+        assert self._weights({17: 1.0, 16: 4.0}) == {17: 0.25, 16: 1.0}
+        assert self._weights({16: 1.0, 0: 4.0}) == {16: 0.25, 0: 1.0}
+
+
+class TestFineFlashAccumulator:
+    """The fine channel's area is the smallest transition share of each block."""
+
+    @staticmethod
+    def _events(share, frames=90, period=3):
+        plane = vc.FlashAccumulator.PLANE
+        acc = vc.FlashAccumulator(FPS, planes=4)
+        grey = bytes([60]) * plane
+        data = b""
+        for f in range(frames):
+            alpha = share if (f % period == 0 and 15 <= f < 75) else 0
+            data += grey * 3 + bytes([alpha]) * plane
+        acc.feed(data)
+        acc.finish()
+        return acc.events(_times(frames), FPS)
+
+    def test_half_of_every_block_in_transition_is_a_hazard(self):
+        events = self._events(128)
+        assert len(events) == 1 and events[0].kind == "general"
+        assert events[0].area == pytest.approx(128 / 255)
+        assert events[0].start == pytest.approx(15 / 30, abs=0.04)
+        assert events[0].end == pytest.approx(73 / 30, abs=0.04)        # last transition 72
+
+    def test_area_at_the_25_percent_rule(self):
+        assert self._events(77)                    # 30 % of every block
+        assert not self._events(51)                # 20 %
+
+    def test_peak_is_the_largest_area_of_the_run(self):
+        """Shares grow over the flashing, so the last frames carry the peak."""
+        plane = vc.FlashAccumulator.PLANE
+        acc = vc.FlashAccumulator(FPS, planes=4)
+        data = b""
+        for f in range(90):
+            alpha = (80 + 2 * (f - 15)) if (f % 3 == 0 and 15 <= f < 75) else 0
+            data += bytes([60]) * plane * 3 + bytes([alpha]) * plane
+        acc.feed(data)
+        acc.finish()
+        events = acc.events(_times(90), FPS)
+        assert len(events) == 1
+        assert events[0].area == pytest.approx((80 + 2 * 39) / 255)    # min of the last 7 shares
+        # shares falling: the first seven transitions carry the peak
+        acc = vc.FlashAccumulator(FPS, planes=4)
+        data = b""
+        for f in range(90):
+            alpha = (200 - 2 * (f - 15)) if (f % 3 == 0 and 15 <= f < 75) else 0
+            data += bytes([60]) * plane * 3 + bytes([alpha]) * plane
+        acc.feed(data)
+        acc.finish()
+        events = acc.events(_times(90), FPS)
+        assert len(events) == 1 and events[0].area == pytest.approx((200 - 2 * 18) / 255)
+
+    def test_buffers_stay_bounded_while_streaming(self):
+        plane = vc.FlashAccumulator.PLANE
+        acc = vc.FlashAccumulator(FPS, planes=4)
+        frame = bytes([60]) * plane * 3 + bytes(plane)
+        for _ in range(20):
+            acc.feed(frame * 30)
+        assert len(acc.recent_rows) <= 4
+        acc.finish()
+
+    def test_three_hertz_pattern_is_not_flagged(self):
+        assert not self._events(255, period=5)     # 6 transitions a second
+
+    def test_offset_maps_grid_frames_to_source_times(self):
+        plane = vc.FlashAccumulator.PLANE
+        acc = vc.FlashAccumulator(FPS, planes=4, offset=1)
+        data = b"".join(bytes([60]) * plane * 3 + bytes([255 if (f % 3 == 0 and f >= 15) else 0]) * plane
+                        for f in range(60))
+        acc.feed(data)
+        acc.finish()
+        events = acc.events(_times(61), FPS)
+        assert events and events[0].start == pytest.approx(16 / 30, abs=1e-6)
+
+
+class TestFreezeHelpersExact:
+    def test_structural_limit(self):
+        assert vc.structural_limit(1.0, 16.0) == pytest.approx(0.02 + 2.0 / 16.0)
+        assert vc.structural_limit(1.0, 0.5) == pytest.approx(0.02 + 2.0)
+
+    def test_step_frames(self):
+        assert vc.freeze_step_frames(30.0, 1.0) == 15
+        assert vc.freeze_step_frames(29.97, 1.0) == 14
+        assert vc.freeze_step_frames(0.0, 1.0) == 12
+        assert vc.freeze_step_frames(30.0, 0.01) == 1
+
+    def test_static_segments(self):
+        assert vc._static_segments(0, 30, []) == [(0, 30)]
+        assert vc._static_segments(0, 30, [(5, 20)]) == [(0, 19), (6, 30)]
+        assert vc._static_segments(0, 30, [(5, 20), (10, 25)]) == [(0, 19), (6, 24), (11, 30)]
+        assert vc._static_segments(0, 30, [(5, 20), (6, 22)]) == [(0, 19), (6, 21), (7, 30)]
+        assert vc._static_segments(0, 30, [(5, 20), (5, 21)]) == [(0, 19), (6, 30)]
+        assert vc._static_segments(10, 30, [(5, 20)]) == [(10, 30)]          # pair outside
+
+    def test_still_runs_do_not_bridge_motion(self):
+        still = [False] + [True] * 10 + [False] + [True] * 9
+        mafd = [5.0] + [0.1] * 10 + [20.0] + [0.1] * 9
+        assert vc._still_runs(still, mafd) == [(1, 10), (12, 20)]
+        mafd[11] = 1.0                                                     # a refresh blip
+        assert vc._still_runs(still, mafd) == [(1, 20)]
+
+    def test_cut_threshold_is_scdets_default(self):
+        assert vc._cut([0.0, 12.0], 1)               # scdet threshold 10
+        assert not vc._cut([0.0, 9.0], 1)
+        assert not vc._cut([12.0, 12.0], 1)           # continuing motion is no cut
+        assert not vc._cut([12.0], 0)
+
+    def test_default_side_factor_is_sixteen(self):
+        """A structural change between the 16x and 24x grain limits."""
+        mafd = [2.6] * 30 + [1.0] * 60 + [2.6] * 30
+        structural = [2.0] * 30 + [0.12] * 60 + [2.0] * 30
+        found = vc.detect_freezes(mafd, _times(120), FPS, 1.0, 4.0, structural=structural)
+        assert found.holds
+
+    def test_three_lead_frames_must_move(self):
+        busy, still = (2.6, 2.0), (0.15, 0.003)
+        rows = [busy] * 60 + [still] + [busy] * 2 + [still] * 60 + [busy] * 30
+        found = vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=[r[1] for r in rows])
+        assert found.holds == []
+
+    def test_stop_test_measures_from_the_frozen_frames_noise(self):
+        """Lead motion just above the grain band after larger motion: a
+        freeze whose copy shows no change at all (noise 0)."""
+        rows = [(2.6, 2.0)] * 60 + [(2.6, 1.03)] * 3 + [(0.01, 0.0)] * 60 + [(2.6, 2.0)] * 30
+        found = vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=[r[1] for r in rows])
+        assert found.holds
+
+    def test_static_run_keeps_its_first_frame(self):
+        """A held picture of exactly the minimum duration, with the
+        accumulated-change series present."""
+        rows = [(2.6, 2.0)] * 60 + [(0.15, 0.003)] * 29 + [(2.6, 2.0)] * 30
+        step = [None] * len(rows)
+        for j in range(15, len(rows), 15):
+            step[j] = 0.003 if 60 <= j - 15 and j <= 88 else 2.0
+        found = vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=[r[1] for r in rows], structural_step=step, step=15)
+        assert found.holds and found.holds[0][1] == pytest.approx(1.0)
+
+    def test_a_short_file_frozen_from_the_start_is_not_a_slate(self):
+        rows = [(0.0, 0.0)] * 24 + [(2.6, 2.0)] * 3
+        found = vc.detect_freezes([r[0] for r in rows], _times(27), FPS, 0.5, 0.9,
+                                  structural=[r[1] for r in rows])
+        assert found.holds and not found.edge_holds
+
+    def test_hold_allowance_boundary_is_half_a_frame(self):
+        rows = [(2.6, 2.0)] * 60 + [(40.0, 40.0)] + [(0.0, 0.0)] * 90 + [(40.0, 40.0)] + [(2.6, 2.0)] * 200
+        mafd, structural = [r[0] for r in rows], [r[1] for r in rows]
+        found = vc.detect_freezes(mafd, _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=structural, hold_allowance=3.01)
+        assert found.holds                     # 91 frames = 3.033 s > 3.01 + half a frame
+
+    def test_head_refinement_must_reach_the_frozen_frame(self):
+        """Frames 1-2 are refinement blips, frame 3 real motion: the held
+        picture after it is not at the head."""
+        rows = [(0.0, 0.0), (0.5, 0.01), (0.5, 0.01), (20.0, 5.0)] + [(0.0, 0.0)] * 60 + [(2.6, 2.0)] * 120
+        found = vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=[r[1] for r in rows])
+        assert found.holds and not found.edge_holds
+
+    def test_steady_motion_under_heavy_grain_stops_dead(self):
+        """Lead motion between one and two grain margins, as steady as the
+        motion half a second earlier: a freeze."""
+        rows = [(5.4, 0.9)] * 57 + [(5.4, 0.8)] * 3 + [(4.4, 0.285)] * 60 + [(5.4, 0.9)] * 30
+        found = vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=[r[1] for r in rows])
+        assert found.holds
+        # earlier motion is the median of three frames
+        # frozen from frame 59; the earlier frames are 42-44 (half a second back)
+        rows[42], rows[43], rows[44] = (5.4, 0.5), (5.4, 3.0), (5.4, 0.5)
+        found = vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                  structural=[r[1] for r in rows])
+        assert found.holds
+
+    def test_dip_through_black_is_an_edit(self):
+        """Black frame, then an encoder blip, then a held shot: the frame
+        after the black is next to it, so the shot enters on an edit."""
+        busy, still = (2.6, 2.0), (0.15, 0.003)
+        rows = [busy] * 90 + [(40.0, 40.0), (40.0, 40.0), (1.0, 0.5)] + [still] * 90
+        rows += [(40.0, 40.0), (40.0, 40.0)] + [busy] * 60
+        mafd = [r[0] for r in rows]
+        structural = [r[1] for r in rows]
+        times = _times(len(rows))
+        black = [(90 / 30, 1 / 30), (183 / 30, 1 / 30)]
+        found = vc.detect_freezes(mafd, times, FPS, 1.0, len(rows) / 30, black,
+                                  structural=structural, hold_allowance=3.0)
+        assert found.holds == [] and found.composed
+        blind = vc.detect_freezes(mafd, times, FPS, 1.0, len(rows) / 30, (),
+                                  structural=structural, hold_allowance=3.0)
+        assert blind.holds
+
+
+class TestBlackHelpersExact:
+    def test_pixel_level(self):
+        assert vc.black_pixel_level(0.02, False) == 20
+        assert vc.black_pixel_level(0.02, True) == 5
+        assert vc.black_pixel_level(0.1, False) == 37
+        assert vc.black_pixel_level(1.0, False) == 235 and vc.black_pixel_level(1.0, True) == 255
+
+    def test_overlay_sample_gaps_split_runs(self):
+        times = _times(61)
+        nonblack = [0.04] * 61
+        nonblack[30] = None
+        static = [0.04 if i % 9 == 0 and i else None for i in range(61)]
+        assert len(vc.overlay_black_runs(nonblack, static, times, 9, 0.98, 1 / 30)) == 2
+        assert len(vc.overlay_black_runs(nonblack, static, times, 9, 0.98, 1 / 30, sample=2)) == 1
+        assert vc.overlay_black_runs(nonblack, static, times, 0, 0.98, 1 / 30) == []
+        every = [0.04] * 30
+        assert vc.overlay_black_runs(every, [None] + [0.04] * 29, times[:30], 1, 0.98, 1 / 30)
+
+    def test_every_pair_up_to_the_last_frame_counts(self):
+        times = _times(19)
+        static = [None] * 19
+        static[9], static[18] = 0.04, 0.5
+        assert vc.overlay_black_runs([0.04] * 19, static, times, 9, 0.98, 1 / 30) == []
+
+    def test_overlay_pairs_stay_inside_the_run(self):
+        times = _times(40)
+        nonblack = [0.04] * 27 + [0.5] * 13            # black ends after frame 26
+        static = [None] * 40
+        static[9], static[18], static[27] = 0.04, 0.04, 0.5
+        assert vc.overlay_black_runs(nonblack, static, times, 9, 0.98, 1 / 30) == \
+            [(0.0, pytest.approx(27 / 30))]
+
+    def test_overlay_allowance_boundary(self):
+        times = _times(30)
+        static = [0.05 if i % 9 == 0 and i else None for i in range(30)]
+        fits = 0.05 + 0.02 * 0.95 - 1e-9          # the rest within 2 % of the rest
+        assert vc.overlay_black_runs([fits] * 30, static, times, 9, 0.98, 1 / 30)
+        assert not vc.overlay_black_runs([fits + 2e-4] * 30, static, times, 9, 0.98, 1 / 30)
+        assert not vc.overlay_black_runs([0.0701] * 30, [0.0701 if v else None for v in static],
+                                         times, 9, 0.98, 1 / 30)             # over the candidate share
+        loose = [0.0501 if v is not None else None for v in static]
+        assert not vc.overlay_black_runs([0.0505] * 30, loose, times, 9, 0.98, 1 / 30)
+
+    def test_sparse_samples(self):
+        times = _times(61)
+        nonblack = [0.04 if i % 3 == 0 else None for i in range(61)]
+        static = [0.04 if i % 15 == 0 and i else None for i in range(61)]
+        runs = vc.overlay_black_runs(nonblack, static, times, 15, 0.98, 1 / 30, sample=3)
+        assert runs == [(0.0, pytest.approx(61 / 30))]
+
+    def test_merge_runs(self):
+        assert vc.merge_runs([(0, 1)], [(1 + 5e-7, 2)]) == [(0, 2)]
+        assert vc.merge_runs([(0, 1)], [(1 + 1e-5, 2)]) == [(0, 1), (1 + 1e-5, 2)]
+
+    def test_hard_side(self):
+        assert vc._hard_side(16, 40, 41)
+        assert vc._hard_side(16, 40, 28)            # far within half the step
+        assert not vc._hard_side(16, 40, 25)
+        assert not vc._hard_side(16, 17, None)       # under BLACK_STEP_CODES
+        assert vc._hard_side(16, 40, None)
+
+    def test_black_runs_from_marks(self, tmp_path):
+        start, end = tmp_path / "s.txt", tmp_path / "e.txt"
+        start.write_text("frame:30   pts:15360 pts_time:1\nlavfi.black_start=1\n"
+                         "frame:150  pts:76800 pts_time:5\nlavfi.black_start=5\n")
+        end.write_text("frame:60   pts:30720 pts_time:2\nlavfi.black_end=2\n")
+        assert vc.black_runs(str(start), str(end)) == [(1.0, 2.0), (5.0, None)]
+        assert vc.black_runs(str(start), str(tmp_path / "missing.txt")) is None
+
+    def test_lead_in_tolerance_is_half_a_frame(self):
+        cfg = vc.VideoCheckConfig.from_cfg({})
+        times = _times(300)
+        opening = vc.classify_black([(0.4 / 30, 2.0)], 10.0, FPS, cfg, times)      # (start, end)
+        late = vc.classify_black([(0.6 / 30, 2.0)], 10.0, FPS, cfg, times)
+        assert opening.edge_segments and not late.edge_segments
+        closing = vc.classify_black([(8.0, 10.0 - 0.4 / 30)], 10.0, FPS, cfg, times)
+        early = vc.classify_black([(8.0, 10.0 - 0.6 / 30)], 10.0, FPS, cfg, times)
+        assert closing.edge_segments == [(9.0, pytest.approx(1.0 - 0.4 / 30))]
+        assert not early.edge_segments
+
+    @staticmethod
+    def _burst(yavg_before, yavg_after):
+        """A 5-frame black burst at frame 100 of 200 (2 s isolation)."""
+        cfg = vc.VideoCheckConfig.from_cfg({})
+        times = _times(200)
+        yavg = list(yavg_before) + [16.0] * 5 + list(yavg_after)
+        return vc.classify_black([(100 / 30, 105 / 30)], 200 / 30, FPS, cfg, times, yavg)
+
+    def test_burst_needs_steady_neighbours_on_both_sides(self):
+        steady = self._burst([90.0] * 100, [90.0] * 95)
+        assert steady.bursts == [(pytest.approx(100 / 30), 5)]
+        # two frames before the burst still fading: a dip, not a cut
+        fading = self._burst([90.0] * 98 + [40.0, 90.0], [90.0] * 95)
+        assert fading.bursts == []
+        # the frame three before may differ (only two are looked at)
+        early = self._burst([90.0] * 97 + [40.0, 90.0, 90.0], [90.0] * 95)
+        assert early.bursts
+        # after the burst: the second frame is compared with the first
+        after = self._burst([90.0] * 100, [90.0, 50.0] + [90.0] * 93)
+        assert after.bursts == []
+
+
+class TestInterlaceAssessmentBoundaries:
+    def test_half_progressive_section_stays_combed(self):
+        labels = ["tff"] * 60
+        verdicts = ["progressive"] * 30 + [""] * 30           # exactly half of the moving frames
+        assert vc.assess_interlace(labels, _times(60), FPS, "progressive", labels,
+                                   displacement=verdicts).combed
+
+    def test_field_order_majority_boundary(self):
+        """12 of 15 decided single-frame calls agree: exactly 0.8 is steady."""
+        labels = ["tff"] * 60
+        singles = (["tff"] * 4 + ["bff"]) * 3 + [""] * 45
+        assert vc.assess_interlace(labels, _times(60), FPS, "progressive", singles).combed
+
+    def test_last_frames_of_a_section_vote(self):
+        labels = ["tff"] * 60
+        verdicts = [""] * 29 + ["progressive"] * 31
+        assert vc.assess_interlace(labels, _times(60), FPS, "progressive", labels,
+                                   displacement=verdicts).combed == []
+
+    def test_field_displacements_are_symmetric(self):
+        """Both field orders: offsets -2..2 lines, each once."""
+        assert sorted(vc.INTERLACE_DISPLACEMENTS) == [-2, -1, 0, 1, 2]
+
+
+class TestInterlaceHelpersExact:
+    def test_vertical_displacement(self):
+        assert vc.vertical_displacement({-1: 1.0, 0: 3.0, 1: 2.0}) == "woven"
+        assert vc.vertical_displacement({-1: 2.0, 0: 1.0, 1: 1.5}) == "progressive"
+        assert vc.vertical_displacement({0: 1.0, 1: 1.4}) == ""
+        assert vc.vertical_displacement({1: 1.0, -1: 2.0}) == ""
+        assert vc.vertical_displacement({0: 1.0, 1: None}) == ""
+
+    def test_displacement_kernels(self):
+        assert vc._displacement_kernel(0) == "0 0 -1 2 -1 0 0"
+        assert vc._displacement_kernel(1) == "0 0 0 2 -2 0 0"
+        assert vc._displacement_kernel(-1) == "0 0 -2 2 0 0 0"
+        assert vc._displacement_kernel(2) == "0 0 0 2 -1 0 -1"
+        assert vc._displacement_kernel(-2) == "-1 0 -1 2 0 0 0"
+
+    def test_field_timings_pairing(self):
+        same = {0: 1.0, 1: 1.0, 2: 1.0, 3: 1.0}
+        top = {1: 3.0, 2: 3.0, 3: 1.0}
+        bottom = {1: 1.0, 2: 3.0, 3: 3.0}
+        move = {1: 2.0, 2: 2.0, 3: 2.0}
+        assert vc.field_timings(4, [0, 1, 2, 3], same, top, bottom, move) == \
+            ["woven", "progressive", "woven", ""]
+        # a repeated frame (no motion to the next) decides nothing
+        assert vc.field_timings(2, [0, 1], {0: 1.0}, {1: 1.0}, {1: 3.0}, {1: 0.5}) == ["", ""]
+        assert vc.field_timings(8, [5, 7], {5: 1.0}, {7: 3.0}, {7: 1.0}, {7: 2.0}) == [""] * 8
+
+    def test_dense_sections(self):
+        times = _times(120)
+        long = vc._dense_sections([True] * 45 + [False] * 75, times, 1 / 30, 30, 0.5)
+        assert len(long) == 1 and long[0][1] == pytest.approx(1.5)
+        assert vc._dense_sections([True] * 25 + [False] * 95, times, 1 / 30, 30, 0.5) == []
+        gap = [True] * 40 + [False] * 10 + [True] * 40 + [False] * 30
+        merged = vc._dense_sections(gap, times, 1 / 30, 30, 0.5)
+        assert len(merged) == 1 and merged[0][1] == pytest.approx(3.0)
+        assert vc._dense_sections([True] * 10, times[:10], 1 / 30, 30, 0.5) == []
+        mixed = [c == "1" for c in "110111101001000111010101110111111110111000111101101101111111111101"
+                                   "100101011100111010000001111010100001111000001100110101"]
+        found = vc._dense_sections(mixed, times, 1 / 30, 30, 0.5)
+        assert found == [(0.0, pytest.approx(95 / 30))]
+
+    def test_telecine_flags_at_the_edges(self):
+        assert vc._telecine_flags(["top", "", "", "", "", "top"]) == [True, False, False, False, False, True]
+        assert vc._telecine_flags(["", "top", "", "", "", ""]) == [False] * 6
+        assert vc._telecine_flags(["top", "", "", "", "", "bottom"]) == [False] * 6
+
+    def test_frame_range(self):
+        times = [k / 10 for k in range(10)]
+        assert vc._frame_range(times, (0.2, 0.3)) == (2, 4)
+        assert vc._frame_range(times, (0.2, 0.01)) == (2, 2)
+
+
+class TestAnalysisGeometryExact:
+    @staticmethod
+    def _analysis(width, height, fps="30/1", **cfg):
+        config = dict(DEFAULT_CONFIG)
+        config.update(cfg)
+        return vc.VideoAnalysis({"index": 0, "width": width, "height": height,
+                                 "avg_frame_rate": fps, "pix_fmt": "yuv420p"}, config)
+
+    def test_structural_side_factor(self):
+        assert self._analysis(1920, 1080).structural_side_factor == 16.0
+        assert self._analysis(640, 360).structural_side_factor == 16.0
+        assert self._analysis(100, 60).structural_side_factor == pytest.approx(100 / 6)
+
+    def test_overlay_frames(self):
+        a = self._analysis(1920, 1080)
+        assert (a.overlay_sample_frames, a.overlay_step_frames) == (3, 15)
+        b = self._analysis(1920, 1080, fps="30000/1001")
+        assert (b.overlay_sample_frames, b.overlay_step_frames) == (2, 14)
+        c = self._analysis(1920, 1080, fps="0/0")
+        assert (c.overlay_sample_frames, c.overlay_step_frames) == (2, 12)
+        assert self._analysis(1920, 1080, fps="10/1").overlay_sample_frames == 1
+
+    def test_tiny_picture_has_no_levels_branch(self):
+        assert not self._analysis(16, 16).needs_levels_branch
+        assert self._analysis(640, 360).needs_levels_branch
+        assert not self._analysis(640, 360, signal_levels_mode="off").needs_levels_branch
+
+    def test_chroma_siting_names(self):
+        for name, expected in (("", True), ("yuv420p", True), ("yuvj420p", True), ("nv12", True),
+                               ("p010le", True), ("yuv422p10le", False), ("yuv444p", False)):
+            assert vc._is_420(name) is expected, name
+
+    def test_black_switched_off_runs_no_detector(self):
+        with self._analysis(640, 360, black_frames_enabled=False) as off:
+            assert off._black_chain() == "null"
+        with self._analysis(640, 360) as on:
+            assert "blackdetect" in on._black_chain()
+
+    def test_lattice_graph_builds(self):
+        """The lattice-only R 103 graph (R103_EXACT = False) is a valid chain list."""
+        chains = vc._r103_lattice("src", "out", "gray16", "gray")
+        assert chains and chains[-1].endswith("[out]")
+        assert vc._mean_tree(["a", "b", "c", "d"], "m", "[o]")[-1].startswith("[m0_0][m0_1]")
+
+    def test_hold_allowance_default(self):
+        assert vc.VideoCheckConfig.from_cfg({}).freeze_hold == 3.0
+
+    def test_partial_tags_only_when_some_are_set(self):
+        assert any("partly" in s for s in vc.colour_tag_advisories("bt709", "unknown", "unknown"))
+        assert not any("partly" in s for s in vc.colour_tag_advisories("unknown", "unknown", "unknown"))

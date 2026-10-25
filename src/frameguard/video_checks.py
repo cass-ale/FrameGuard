@@ -2676,23 +2676,21 @@ def field_timings(frames: int, selected: Sequence[int], same: Dict[int, float],
 
     ``selected``: the analysed frame positions in order (idet's TFF/BFF
     frames). ``same[n]`` is d(Ti_n, B_n). With Z = [Ti; B] and the halves
-    swapped on odd selection indices, tblend at the j-th analysed frame m
-    (previous analysed frame n) pairs, for odd j, B_m with Ti_n (top half)
-    and Ti_m with B_n (bottom); for even j, Ti_m with B_n (top) and B_m
-    with Ti_n (bottom). So n's "following" d(B_n, Ti_m) is the half holding
-    Ti_m and its "other order" d(B_m, Ti_n) the other half; ``move[m]`` is
-    the top-field change from n to m. Only consecutive frames pair.
+    swapped on odd selection indices, tblend at analysed frame m (previous
+    analysed frame n) pairs B_m with Ti_n in one half and Ti_m with B_n in
+    the other: n's comparisons with the next field for either field order.
+    ``move[m]`` is the top-field change from n to m. Only consecutive
+    frames pair.
     """
     out = [""] * frames
     for j in range(len(selected) - 1):
         n, m = selected[j], selected[j + 1]
         if m != n + 1:
             continue
-        if (j + 1) % 2:
-            following, other = bottom.get(m), top.get(m)
-        else:
-            following, other = top.get(m), bottom.get(m)
-        out[n] = field_timing(same.get(n), following, other, move.get(m), move.get(m))
+        # The two halves hold d(Ti_m, B_n) and d(B_m, Ti_n) in an order set
+        # by the selection index's parity; field_timing treats its two
+        # neighbour comparisons alike, so the order does not matter.
+        out[n] = field_timing(same.get(n), top.get(m), bottom.get(m), move.get(m), move.get(m))
     return out
 
 
