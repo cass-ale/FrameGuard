@@ -211,6 +211,9 @@ class TestFlashScan:
         lum = "if(gte(T,1)*lt(T,4),if(eq(lt(X,W/2),lt(mod(N,6),3)),235,16),16)"
         row = _row(_scan(self._geq(tmp_path, "anti.mp4", lum)), "Flash Risk")
         assert row[1] == "WARN", row
+        # The first transition is frame 29 -> 30: the event starts at 1.000 s
+        # (the streamed grid starts one frame late, FLASH_GRID_OFFSET).
+        assert "at 00:00:01.000-" in row[2], row
 
     def test_inverting_checkerboard(self, tmp_path):
         lum = ("if(gte(T,1)*lt(T,4),if(eq(mod(floor(X/80)+floor(Y/90),2),lt(mod(N,6),3)),235,16),16)")
@@ -967,6 +970,15 @@ class TestFreezeScan:
                   "[a][b]freezeframes=first=60:last=135:replace=60,noise=alls=10:allf=t")
         path = _clip(tmp_path / "grainfreeze.mp4", source=source)
         row = _row(_scan(path), "Freeze Frames")
+        assert row[1] == "WARN" and "00:00:02.000" in row[2], row
+
+    def test_freeze_is_found_with_signal_levels_off(self, tmp_path):
+        """The structural series comes from the area branch, which must run
+        for the freeze check alone."""
+        source = (f"testsrc2=s={SIZE}:r=30:d=6,split[a][b];"
+                  "[a][b]freezeframes=first=60:last=135:replace=60,noise=alls=10:allf=t")
+        path = _clip(tmp_path / "freeze_nolevels.mp4", source=source)
+        row = _row(_scan(path, signal_levels_mode="off", black_frames_enabled=False), "Freeze Frames")
         assert row[1] == "WARN" and "00:00:02.000" in row[2], row
 
     def test_freeze_at_the_very_end(self, tmp_path):
@@ -1892,3 +1904,131 @@ class TestAnalysisGeometryExact:
     def test_partial_tags_only_when_some_are_set(self):
         assert any("partly" in s for s in vc.colour_tag_advisories("bt709", "unknown", "unknown"))
         assert not any("partly" in s for s in vc.colour_tag_advisories("unknown", "unknown", "unknown"))
+
+
+# ---------------------------------------------------------------------------
+# Mutation gate, round 5: the reviewer's seed-92 survivors
+# ---------------------------------------------------------------------------
+
+class TestReviewerSurvivors:
+    def test_flash_luminance_uses_all_three_primaries(self):
+        """BT.709 luminance of linear light: Y = 0.2126 R + 0.7152 G + 0.0722 B."""
+        assert vc._rule_value("general", 0, 0, 255) == pytest.approx(200 * 0.0722)
+        assert vc._rule_value("general", 255, 255, 255) == pytest.approx(200.0)
+        assert vc._rule_value("red", 255, 0, 0) == pytest.approx(320.0)
+
+    def test_hard_side_needs_a_neighbour_and_a_two_code_step(self):
+        assert vc._hard_side(16, None, None) is False
+        assert vc._hard_side(16, 18, None) is True          # exactly BLACK_STEP_CODES
+        assert vc._hard_side(16, 17.99, None) is False
+
+    def test_coverage_weights_below_one_candela(self):
+        weights = vc.FlashAccumulator(FPS)._coverage_weights({0: 0.25, 1: 0.5})
+        assert weights == {0: 0.5, 1: 1.0}
+
+    def test_vertical_scroll_needs_both_profiles(self):
+        assert vc.is_vertical_scroll(None, 1.0) is False
+        assert vc.is_vertical_scroll(1.0, None) is False
+
+    def test_interlaced_signal_orders(self):
+        info = vc.PictureInfo.from_stream({"width": 720, "height": 576, "field_order": "tt"})
+        assert info.interlaced is True
+        assert vc.PictureInfo.from_stream({"width": 720, "height": 576, "field_order": "bt"}).interlaced
+        assert not vc.PictureInfo.from_stream({"width": 720, "height": 576,
+                                               "field_order": "progressive"}).interlaced
+
+    def test_short_closing_black_is_listed(self):
+        """Black covering the last 0.6 frame of a 10 s file is a run-out."""
+        cfg = vc.VideoCheckConfig.from_cfg({})
+        found = vc.classify_black([(10.0 - 0.6 / 30, 10.0)], 10.0, FPS, cfg, _times(300))
+        assert found.edge_segments == [(pytest.approx(10.0 - 0.6 / 30), pytest.approx(0.6 / 30))]
+
+    def test_sections_half_a_second_apart_merge(self):
+        times = _times(150)
+        flags = [True] * 45 + [False] * 15 + [True] * 45 + [False] * 45
+        sections = vc._dense_sections(flags, times, 1 / 30, 30, 0.5)
+        assert len(sections) == 1 and sections[0] == (0.0, pytest.approx(3.5))
+
+    def test_pq_with_unsignalled_primaries_is_not_a_contradiction(self):
+        assert not any("BT.2100 defines" in s for s in
+                       vc.colour_tag_advisories("unknown", "smpte2084", "bt2020nc", report_partial=False))
+        assert any("BT.2100 defines" in s for s in
+                   vc.colour_tag_advisories("bt709", "smpte2084", "bt2020nc", report_partial=False))
+
+    def test_freeze_area_branch_runs_for_each_check_alone(self):
+        for only in ("black_frames_enabled", "freeze_frames_enabled"):
+            cfg = dict(DEFAULT_CONFIG, black_frames_enabled=False, freeze_frames_enabled=False,
+                       signal_levels_mode="off", flash_check_enabled=False)
+            cfg[only] = True
+            with vc.VideoAnalysis({"index": 0, "width": 640, "height": 360, "avg_frame_rate": "30/1"},
+                                  cfg) as analysis:
+                chains = analysis._area_chains()
+            assert chains[0].endswith("split=1[ar_mean]"), (only, chains[0])
+
+
+def test_overlay_samples_on_a_square_grid():
+    """The black-overlay mask samples every BLACK_OVERLAY_BLOCK pixels in
+    both directions (an overlay is judged by area)."""
+    with vc.VideoAnalysis({"index": 0, "width": 1920, "height": 1080, "avg_frame_rate": "30/1"},
+                          dict(DEFAULT_CONFIG)) as analysis:
+        graph = ";".join(analysis._area_chains())
+    block = 8 * vc.BLACK_OVERLAY_BLOCK
+    assert f"w='max(8,trunc(iw/{block})*8)':h='max(8,trunc(ih/{block})*8)'" in graph
+
+
+class TestFlashEventPeaks:
+    def test_two_events_in_one_candidate_run_keep_their_own_peaks(self):
+        """Every block flashes at 10 transitions a second throughout; the
+        flashing share of each block is 30 %, then 20 % (below the 25 % rule),
+        then 50 %: two events, 0.3 and 0.5."""
+        plane = vc.FlashAccumulator.PLANE
+        acc = vc.FlashAccumulator(FPS, planes=4)
+        shares = [77] * 10 + [51] * 14 + [128] * 10
+        data, mark = b"", 0
+        for f in range(240):
+            alpha = 0
+            if f % 3 == 0 and f >= 90 and mark < len(shares):
+                alpha, mark = shares[mark], mark + 1
+            data += bytes([60]) * plane * 3 + bytes([alpha]) * plane
+        acc.feed(data)
+        acc.finish()
+        events = acc.events(_times(240), FPS)
+        assert [round(e.area, 3) for e in events] == [round(77 / 255, 3), round(128 / 255, 3)]
+
+
+class TestFreezeEdges:
+    @staticmethod
+    def _found(rows, **kw):
+        return vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                 structural=[r[1] for r in rows], **kw)
+
+    def test_eight_refinement_frames_are_still_the_head(self):
+        """Frames 1-8 change below a refresh blip but above grain: still at the head."""
+        rows = [(0.0, 0.0)] + [(0.5, 0.2)] * 8 + [(0.0, 0.0)] * 60 + [(2.6, 2.0)] * 120
+        found = self._found(rows)
+        assert found.edge_holds and not found.holds
+
+    def test_motion_on_frame_one_is_not_a_head_slate(self):
+        rows = [(0.0, 0.0), (20.0, 5.0)] + [(0.0, 0.0)] * 60 + [(2.6, 2.0)] * 120
+        found = self._found(rows)
+        assert found.holds and not found.edge_holds
+
+    def test_exactly_three_moving_lead_frames_stop_dead(self):
+        rows = [(2.6, 2.0)] * 60 + [(0.15, 0.003)] + [(2.6, 2.0)] * 3 + [(0.15, 0.003)] * 60
+        rows += [(2.6, 2.0)] * 30
+        assert self._found(rows).holds
+
+    def test_steady_motion_boundary_is_inclusive(self):
+        """Lead motion exactly half the motion half a second earlier, between
+        one and two grain margins above the frozen frames' noise (0)."""
+        rows = [(0.05, 0.06)] * 60 + [(0.05, 0.03)] * 3 + [(0.01, 0.0)] * 60 + [(2.6, 2.0)] * 30
+        assert self._found(rows).holds
+
+    def test_accumulated_change_equal_to_the_refresh_limit_is_static(self):
+        rows = [(2.6, 2.0)] * 60 + [(0.15, 0.003)] * 60 + [(2.6, 2.0)] * 30
+        step = [None] * len(rows)
+        refresh = vc.structural_limit(vc.FREEZE_BLIP_MAFD, 16.0)
+        for j in range(15, len(rows), 15):
+            step[j] = refresh if 60 <= j - 15 and j <= 119 else 2.0
+        found = self._found(rows, structural_step=step, step=15)
+        assert found.holds and found.holds[0][1] == pytest.approx(61 / 30)
