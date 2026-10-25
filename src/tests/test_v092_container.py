@@ -991,7 +991,10 @@ class TestUiCopy:
         from frameguard import gui
         panel = gui.SettingsPanel()
         combo = panel._rule_controls["aac_priming"]
-        assert [combo.itemText(i) for i in range(combo.count())] == ["Unknown", "1024 samples", "2112 samples"]
+        # Round 5: every priming in use is offered, with no secondary text.
+        assert [combo.itemText(i) for i in range(combo.count())] == [
+            "Unknown", "1024 samples", "2048 samples", "2112 samples", "2624 samples"]
+        assert [combo.itemData(i) for i in range(combo.count())] == list(cc.AAC_PRIMING_CHOICES)
         row = next(r for r in panel._setting_rows if r[1].text() == "AAC Encoder Priming")
         assert row[4].text() == "" and row[4].isHidden(), row[4].text()
 
