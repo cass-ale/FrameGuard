@@ -17,7 +17,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Interlaced (woven) pictures and 3:2 pulldown in files declared progressive are found in real camera footage, not just test graphics. Progressive test patterns and rolling credits are no longer called interlaced.
 - Signal Levels applies the EBU R 103 filter to every pixel at native resolution, within each field for interlaced video. Violations on UHD and 8K masters are no longer averaged away.
 - File Integrity fails a file missing more than 2 frames or 0.1 s, whatever its length (it allowed 2% before: 144 s of a two-hour master). Decoder errors that FFmpeg conceals are counted.
-- Black Frames ignores a small static graphic such as burnt-in timecode or a channel logo when the rest of the picture is true black, and never calls a dark grade, low-contrast scene or credit roll black.
+- Black Frames ignores a small static graphic such as burnt-in timecode or a channel logo when the rest of the picture is true black, and no longer calls a dark grade, low-contrast scene or credit roll black.
 - Freeze Frames finds freezes under film grain and mid-programme, does not flag slow pans or dips through black, lets title cards and still shots hold up to the Title Card Hold allowance (3 s), and reports a picture that freezes to the end.
 - Quiet room tone no longer fails as silent: whole-track silence is judged at -70 dBFS (Telestream Qualify's default). A clip that is mostly silence fails at any length.
 - Ambisonic true peak is measured on every channel; head-locked stereo is checked for peaks and reported as part of the mix.
@@ -36,11 +36,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - New checks: Low-Level Audio notes stretches 20 dB under the programme between -70 and -40 dBFS without changing the verdict; colour tags that contradict each other or are only partly set are flagged.
 - New settings: Phase Threshold, Dual Mono Allowed, Dialogue-Gated Loudness, Low-Level Audio, Title Card Hold and AAC Encoder Priming, each in Settings, presets and the PDF.
 - Presets from 0.9.1 load leniently: out-of-range values are clamped and contradictions resolved towards the stricter value, and defaults that changed are migrated; every adjustment is shown on import and in the PDF.
-- Measured on three known-answer test sets, against 0.9.1 with the same mapping: [NUMBERS]
+- Measured on three known-answer test sets against 0.9.1, as mean detection per defect type with default / broadcast settings: original set 64.3% → 65.0% / 71.7% → 72.4%; held-out set 67.7% → 73.0% / 76.3% → 81.5%; a sealed set never used for tuning 56.9% → 66.8% / 65.6% → 75.5%. No clean file fails on any of them.
 
 ### Changed
 - FFmpeg 8.1.2 or newer is required for frame-level checks (tested floor; the bundled build is 9.0.2). Older builds show "Not verified" with a startup notice. FRAMEGUARD_TOOLS_DIR selects another FFmpeg build.
-- Deep scans with Signal Levels on take about [SPEED] longer than 0.9.1 at 1080p, because R 103 is now computed exactly. Turning Signal Levels off returns to 0.9.1's speed.
+- Deep scans with Signal Levels on take up to about 3× as long as 0.9.1 at 1080p, because R 103 is now computed exactly. Turning Signal Levels off returns to 0.9.1's speed.
 - Correction to the 0.9.1 notes: their "17 to 31 of 45" benchmark baseline was 0.9.0. Measured against 0.8.3, 0.9.1 raised detected defect types from 12 to 31.
 
 ## [0.9.1] — 2026-10-21 — Signal QC: audio, picture and conformance checks from the benchmark
