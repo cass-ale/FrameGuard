@@ -993,6 +993,28 @@ VP9 = ["-c:v", "libvpx-vp9", "-b:v", "2M", "-deadline", "realtime", "-cpu-used",
 
 
 @needs_ffmpeg
+class TestFreezeRecall:
+    """Round 2 / round 3 (bug 10): freezes under grain and mid-programme."""
+
+    @pytest.mark.parametrize("grain", [8, 12, 20])
+    def test_freeze_under_fresh_grain_is_found(self, tmp_path, grain):
+        """One frame held 2.5 s mid-shot, fresh grain on every frame."""
+        graph = ("testsrc2=s=640x360:r=30:d=8,split[a][b];"
+                 "[a][b]freezeframes=first=60:last=134:replace=60,"
+                 f"noise=alls={grain}:allf=t,format=yuv420p")
+        row = _row(_scan(_graph_clip(tmp_path / f"g{grain}.mp4", graph)), "Freeze Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:02.0" in row[2], row
+
+    def test_mid_programme_freeze_in_vp9_mkv_is_not_a_slate(self, tmp_path):
+        """A 3 s freeze at 8 s of a grainy camera pan, VP9 in Matroska."""
+        graph = (_camera_pan(14, 60, 4) + ",split[a][b];"
+                 "[a][b]freezeframes=first=240:last=329:replace=240")
+        row = _row(_scan(_graph_clip(tmp_path / "vp9.mkv", graph, VP9)), "Freeze Frames")
+        assert row[1] in ("WARN", "FAIL") and "slate" not in row[2], row
+        assert "00:00:07.9" in row[2] or "00:00:08.0" in row[2], row
+
+
+@needs_ffmpeg
 class TestNoFalseFreezes:
     """Round 2: a freeze is a static picture, not a slow or interrupted one."""
 

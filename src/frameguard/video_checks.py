@@ -213,13 +213,15 @@ FREEZE_BLIP_MAFD = 1.5            # long-GOP refresh of a frozen picture
 FREEZE_MAX_BLIP_FRAMES = 8
 FREEZE_IDENTICAL_MAFD = 0.004     # bit-identical up to encoder rounding
 # Structurally still: the change on the averaged copy is no more than grain
-# explains. White grain shrinks by the averaging side factor k; real grain is
-# spatially correlated over up to ~4 px, so 4/k of the full-resolution change
-# is allowed, plus a floor of 1/20 code (0.02 %) for the copy's rounding.
-# Motion is not grain: it survives the averaging, and also accumulates - a static picture shows no more than grain between frames
+# explains. White grain shrinks by the averaging side factor k; film grain
+# at HD is correlated over about 2 px (35 mm grain clumps of 5-15 um against
+# ~11 um per 1080p pixel on a Super 35 frame), so 2/k of the full-resolution
+# change is allowed, plus a floor of 1/20 code (0.02 %) for the copy's
+# rounding. Motion is not grain: it survives the averaging, and also
+# accumulates - a static picture shows no more than grain between frames
 # FREEZE_STEP_FRACTION of the minimum freeze duration apart, where a slow pan
 # has moved by several pixels.
-FREEZE_GRAIN_CORRELATION = 4.0
+FREEZE_GRAIN_CORRELATION = 2.0
 FREEZE_STRUCTURAL_FLOOR = 0.02
 FREEZE_STEP_FRACTION = 0.5
 # A scene change, as FFmpeg's scdet decides it with its documented default
@@ -227,9 +229,16 @@ FREEZE_STEP_FRACTION = 0.5
 FREEZE_CUT_SCORE = 10.0
 # A freeze stops the picture dead: motion runs right up to the frozen frame.
 # Real motion decelerates over several frames (inertia), so each of the
-# FREEZE_LEAD_FRAMES frames before the run must still be moving, at least
-# FREEZE_MOVING_FACTOR times the run's own stillness limit (a shot easing to
-# a stop crosses the limit gradually: its last moving frames sit just above).
+# FREEZE_LEAD_FRAMES frames before the run must still be moving (above the
+# grain limit), and their median change above the frozen frames' own
+# (noise-only) change must be at least FREEZE_MOVING_FACTOR times the margin
+# the grain limit leaves above that noise: clearly outside the noise band
+# right up to the stop. A shot easing to a stop crosses the band gradually,
+# its last moving frames just above the limit. Under heavy grain the band is
+# wide, so motion at least one margin above the noise also counts when it
+# had not declined: at least 1/FREEZE_MOVING_FACTOR of the motion half the
+# minimum freeze duration earlier (a shot easing out loses most of its
+# motion over that time; a freeze cuts off motion at its running level).
 FREEZE_LEAD_FRAMES = 3
 FREEZE_MOVING_FACTOR = 2.0
 
@@ -1803,7 +1812,11 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
             black_holds += 1
             continue
         identical = statistics.median(mafd[first:last + 1]) <= FREEZE_IDENTICAL_MAFD
-        at_head = frozen_from <= 0
+        # At the head: from the first frame, allowing an encoder's opening
+        # refinement of the picture (blips, as within a run).
+        at_head = frozen_from <= 0 or (
+            frozen_from <= FREEZE_MAX_BLIP_FRAMES
+            and all(mafd[i] < FREEZE_BLIP_MAFD for i in range(1, frozen_from + 1)))
         at_tail = last >= count - 2
         covers_half = duration > 0 and span[1] >= 0.5 * duration
         if at_head and not covers_half:
@@ -1820,8 +1833,16 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         lead = range(max(1, frozen_from - FREEZE_LEAD_FRAMES + 1), frozen_from + 1)
         abrupt = bool(lead) and all(not flags[i] for i in lead)
         if abrupt and structure is not None and all(structure[i] is not None for i in lead):
-            stillness = statistics.median(limit(i) for i in range(first, last + 1))
-            abrupt = statistics.median(structure[i] for i in lead) >= FREEZE_MOVING_FACTOR * stillness
+            noise = statistics.median(structure[i] or 0.0 for i in range(first, last + 1))
+            margin = statistics.median(limit(i) for i in range(first, last + 1)) - noise
+            margin = max(margin, FREEZE_STRUCTURAL_FLOOR)
+            motion = statistics.median(structure[i] for i in lead) - noise
+            span_back = step if step > 0 else freeze_step_frames(fps, min_duration)
+            earlier = [structure[i] for i in range(max(1, frozen_from - span_back - FREEZE_LEAD_FRAMES + 1),
+                                                   frozen_from - span_back + 1)
+                       if structure[i] is not None]
+            steady = bool(earlier) and motion >= (statistics.median(earlier) - noise) / FREEZE_MOVING_FACTOR
+            abrupt = motion >= FREEZE_MOVING_FACTOR * margin or (motion >= margin and steady)
         if abrupt or identical:
             holds.append(span)
             if covers_half and (at_head or at_tail):
