@@ -995,3 +995,102 @@ class TestUiCopy:
         monkeypatch.setattr(gui.QMessageBox, "warning", lambda parent, title, text: shown.append((title, text)))
         gui.MainWindow._check_ffmpeg(type("W", (), {})())
         assert shown == [("FFmpeg Too Old", "FFmpeg 8.0.1 is too old.")], shown
+
+
+# ---------------------------------------------------------------------------
+# Round 2 mutation gate: pin the rules the reviewer's surviving mutants changed
+# ---------------------------------------------------------------------------
+
+def _audio_track(edits, track_id=2, timescale=48000):
+    track = cc.TrackInfo(track_id=track_id, handler="soun", timescale=timescale)
+    track.edits = [cc.Edit(segment_duration=1000, media_time=m, rate=1.0) for m in edits]
+    return cc.Structure(family="ISO-BMFF", parsed=True, movie_timescale=1000, tracks=[track])
+
+
+class TestPrimingUnits:
+    def test_only_the_first_media_edit_signals_the_priming(self):
+        """An edit at media_time 0 is the presented start: nothing is hidden there."""
+        stream = {"id": "0x2"}
+        assert cc._edit_list_priming(_audio_track([0, 1024]), stream) is None
+        assert cc._edit_list_priming(_audio_track([-1, 1024]), stream) == pytest.approx(1024 / 48000)
+        assert cc._edit_list_priming(_audio_track([2112]), {"id": "0x3"}) is None     # another track
+
+    def test_signed_offsets_round_to_the_nearest_ms_on_the_right_side(self):
+        assert cc._signed_ms_text(0.7) == "1 ms after it"
+        assert cc._signed_ms_text(-0.7) == "1 ms before it"
+        assert cc._signed_ms_text(0.4) == "with the picture"
+
+    def test_spec_priming_text_shows_the_raw_start(self):
+        check, _ = _sync_row(_sync_probe(-0.9), aac_priming=1024)
+        assert "starts 900 ms before it" in check[2] and "1024-sample" in check[2], check
+
+    def test_signalled_priming_adds_no_priming_text(self):
+        check, _ = _sync_row(_sync_probe(0.003, padding=1024))
+        assert check[1] == "PASS" and "priming" not in check[2], check
+
+    @pytest.mark.parametrize("low,high,status", [
+        (-5.0, 5.0, "PASS"), (-5.01, 5.0, "NOT_VERIFIED"), (-4.0, 5.01, "NOT_VERIFIED"),
+        (-40.0, -5.01, "WARN"), (-40.01, -40.01, "FAIL"), (5.01, 60.0, "WARN"), (60.0, 60.0, "WARN"),
+        (60.01, 70.0, "FAIL"), (-5.0, -5.0, "PASS"), (-50.0, 0.0, "NOT_VERIFIED"),
+    ])
+    def test_range_status_boundaries(self, low, high, status):
+        assert cc._range_status(low, high, 5.0, 40.0, 60.0) == status
+
+    def test_range_text_sides(self):
+        assert cc._range_text(-41.0, 3.0) == "between 41 ms before and 3 ms after"
+        assert cc._range_text(5.0, 60.0) == "between 5 and 60 ms after"
+        assert cc._range_text(-60.0, -5.0) == "between 60 and 5 ms before"
+        assert cc._range_text(0.2, 44.0) == "between 0 and 44 ms after"
+        assert cc._range_text(-44.0, 0.2) == "between 44 ms before and 0 ms after"
+
+
+class TestTableUnits:
+    def _stbl(self, *children):
+        from container_fixtures import box
+        data = box(b"stbl", b"".join(children))
+        parent = cc.Box(b"stbl", 0, len(data), 8, memoryview(data), 8)
+        structure = cc.Structure()
+        parent.children = cc._parse_children(memoryview(data), 8, len(data), 0, 1, b"stbl", "", structure)
+        return parent
+
+    def test_a_table_cut_inside_its_count_field_is_a_problem(self):
+        from container_fixtures import box
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, self._stbl(box(b"stts", b"\0\0\0\0\0\0")))   # 2 of 4 count bytes
+        assert "time-to-sample" in track.table_problem, track.table_problem
+
+    def test_stsc_must_increase_between_every_neighbour(self):
+        import struct as _s
+        from container_fixtures import full_box
+        runs = _s.pack(">I", 3) + b"".join(_s.pack(">III", c, 1, 1) for c in (1, 3, 2))
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, self._stbl(full_box(b"stsc", 0, 0, runs)))
+        assert "increase strictly" in track.table_problem, track.table_problem
+        ok = _s.pack(">I", 3) + b"".join(_s.pack(">III", c, 1, 1) for c in (1, 2, 3))
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, self._stbl(full_box(b"stsc", 0, 0, ok)))
+        assert not track.table_problem and len(track._stsc) == 3
+
+
+class TestStereoUnits:
+    def test_every_block_of_a_textured_frame_is_judged(self):
+        import random as _r
+        rng = _r.Random(5)
+        frame = [rng.uniform(0, 255) for _ in range(384 * 192)]
+        scores = cc.stereo_layout_scores(frame)
+        assert scores is not None and scores[2] == (384 // 12) * (96 // 12), scores
+
+    def test_texture_floor_is_inclusive_at_three_grey_levels(self):
+        """A block whose standard deviation is exactly LAYOUT_MIN_TEXTURE counts;
+        just below it, none do."""
+        def checker(amplitude):
+            return [128 + (amplitude if (x + y) % 2 else -amplitude) for y in range(192) for x in range(384)]
+        assert cc.LAYOUT_MIN_TEXTURE == 3.0
+        assert cc.stereo_layout_scores(checker(3.0)) is not None
+        assert cc.stereo_layout_scores(checker(3.5)) is not None
+        assert cc.stereo_layout_scores(checker(2.9)) is None
+
+    def test_frames_are_grabbed_at_quarter_points(self):
+        assert cc._grab_times(8.0) == [2.0, 4.0, 6.0]
+        assert cc._grab_times(0.5) == [0.0]
+
