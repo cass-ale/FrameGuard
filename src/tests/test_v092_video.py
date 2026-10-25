@@ -1082,3 +1082,38 @@ class TestBlackArea:
                  "format=yuv420p")
         row = _row(_scan(_graph_clip(tmp_path / "tc.mp4", graph)), "Black Frames")
         assert row[1] in ("WARN", "FAIL") and "00:00:02" in row[2], row
+
+
+_GREY_720 = "color=gray:s=1280x720:r=30:d=5,format=yuv420p"
+
+
+@needs_ffmpeg
+class TestFineFlashPatterns:
+    """Round 3 bug 3 (SAFETY): antiphase patterns finer than a grid block
+    (80 x 80 px at 720p) keep every block's mean light constant."""
+
+    @staticmethod
+    def _checker(tmp_path, size, frames_per_state):
+        lum = (f"if(gte(T,1)*lt(T,4),if(eq(mod(floor(X/{size})+floor(Y/{size}),2),"
+               f"lt(mod(N,{2 * frames_per_state}),{frames_per_state})),235,16),16)")
+        return _clip(tmp_path / f"c{size}_{frames_per_state}.mp4",
+                     f"geq=lum='{lum}':cb=128:cr=128", source=_GREY_720,
+                     extra=("-crf", "12"))
+
+    @pytest.mark.parametrize("size", [20, 40, 50])
+    def test_fine_checkerboard_at_5_hz_warns(self, tmp_path, size):
+        row = _row(_scan(self._checker(tmp_path, size, 3), target_width=1280, target_height=720),
+                   "Flash Risk")
+        assert row[1] == "WARN", row
+
+    def test_fine_checkerboard_at_2_hz_passes(self, tmp_path):
+        row = _row(_scan(self._checker(tmp_path, 20, 8), target_width=1280, target_height=720),
+                   "Flash Risk")
+        assert row[1] == "PASS", row
+
+    def test_fast_camera_pan_passes(self, tmp_path):
+        """Motion is not flashing: a fast pan over a high-contrast texture."""
+        graph = (f"{_TEXTURE},loop=-1:1,fps=30,trim=duration=4,setpts=PTS-STARTPTS,"
+                 "crop=640:360:'100+300*t':'200+20*sin(2*PI*2*t)',noise=alls=4:allf=t,format=yuv420p")
+        assert _row(_scan(_graph_clip(tmp_path / "pan.mp4", graph)), "Flash Risk")[1] == "PASS"
+

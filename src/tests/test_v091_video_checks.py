@@ -645,7 +645,7 @@ class TestStreamingAndCancel:
         folder.mkdir()
         reader = vc._FlashSegmentReader(str(folder), FPS, None)
         reader.start()
-        segment = bytes(vc.FlashAccumulator.FRAME_BYTES) * 150
+        segment = bytes(reader.accumulator.FRAME_BYTES) * 150   # gbrap: 4 planes
 
         def write(number):
             with open(reader._segment(number), "wb") as handle:

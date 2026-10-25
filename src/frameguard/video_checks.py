@@ -151,6 +151,9 @@ FLASH_GRID = (16, 9)
 # before block averaging: only those samples mix gamma-coded values, so an
 # edge mis-weights at most one 1/8-block strip (see _area_chains).
 FLASH_SUBSAMPLES = 8
+# The streamed grid is gbrap: alpha holds the fine-transition share (see
+# _area_chains); its first frame is the source's second.
+FLASH_GRID_OFFSET = 1
 
 # ---------------------------------------------------------------------------
 # Thresholds (each cites where it comes from)
@@ -793,7 +796,7 @@ class _FlashSegmentReader(threading.Thread):
         super().__init__(name="frameguard-flash-reader", daemon=True)
         self.directory = directory
         self.template = os.path.join(directory, "flash_").replace("%", "%%") + "%06d.rgb"
-        self.accumulator = FlashAccumulator(fps)
+        self.accumulator = FlashAccumulator(fps, planes=4, offset=FLASH_GRID_OFFSET)
         self.cancel = cancel
         self.error: Optional[str] = None
         self.segments_read = 0
@@ -1202,10 +1205,23 @@ class VideoAnalysis:
             # mix only within one of those samples, i.e. in a strip of at
             # most 1/8 of a block along an edge.
             sub = FLASH_SUBSAMPLES
+            # Patterns finer than a block (an inverting checkerboard) keep
+            # every block's mean light constant. The alpha plane therefore
+            # carries, per sample of the fine copy, whether its luminance
+            # made a flash transition from the previous frame (a change of
+            # FLASH_DELTA_CD with the darker state below FLASH_DARK_CD);
+            # area-averaged to the grid it is each block's share of samples
+            # in transition (FLASH_FINE). tblend's first output is the
+            # second frame: the grid starts one frame late (FLASH_GRID_OFFSET).
+            delta = FLASH_DELTA_CD * 255.0 / FLASH_PEAK_CD
+            dark = FLASH_DARK_CD * 255.0 / FLASH_PEAK_CD
             chains.append(
                 f"[ar_flash]scale=w={cols * sub}:h={rows * sub}:flags=area,"
                 f"scale=in_color_matrix={info.matrix}:in_range={rng}:out_range=pc,"
-                f"format=gbrp,lutrgb=r='{linear}':g='{linear}':b='{linear}',"
+                f"format=gbrap,lutrgb=r='{linear}':g='{linear}':b='{linear}',"
+                "colorchannelmixer=aa=0:ar=0.2126:ag=0.7152:ab=0.0722,"
+                "tblend=c0_expr='A':c1_expr='A':c2_expr='A':"
+                f"c3_expr='if(gte(abs(A-B),{delta:.4g})*lt(min(A,B),{dark:.4g}),255,0)',"
                 f"scale={cols}:{rows}:flags=area[vs_flash]")
         return chains
 
@@ -1284,7 +1300,7 @@ class VideoAnalysis:
             return []
         # -y: the files live in this scan's private directory; never prompt.
         return ["-y", "-map", "[vs_flash]", "-fps_mode", "passthrough",
-                "-c:v", "rawvideo", "-pix_fmt", "gbrp", "-f", "segment",
+                "-c:v", "rawvideo", "-pix_fmt", "gbrap", "-f", "segment",
                 "-segment_format", "rawvideo", "-segment_time", str(FLASH_SEGMENT_SECONDS),
                 self.flash_reader.template]
 
@@ -2198,7 +2214,7 @@ class _ZigZag:
         return 0
 
 
-_FLASH_KINDS = ("general", "red")
+_FLASH_KINDS = ("general", "red", "fine")
 # Per-byte terms of a block's rule quantity, computed once: luminance in
 # cd/m2 (Y = 0.2126 R + 0.7152 G + 0.0722 B of linear light, scaled to the
 # 200 cd/m2 SDR peak) and the WCAG saturated-red measure (R - G - B) x 320.
@@ -2240,9 +2256,13 @@ class FlashAccumulator:
     """
 
     PLANE = FLASH_GRID[0] * FLASH_GRID[1]
-    FRAME_BYTES = 3 * PLANE
+    FRAME_BYTES = 3 * PLANE          # an in-memory gbrp grid; the stream is gbrap (4 planes)
 
-    def __init__(self, fps: float):
+    def __init__(self, fps: float, planes: int = 3, offset: int = 0):
+        self.planes = planes
+        self.FRAME_BYTES = planes * self.PLANE
+        self.offset = offset             # grid frame k is source frame k + offset
+        self.fine_share: List[Dict[int, float]] = [{} for _ in range(self.PLANE)]
         rate = fps if 0 < fps < 1000 else 0.0
         self.span_frames = int(math.ceil(2.0 * rate)) + 2 if rate else 482
         blocks = self.PLANE
@@ -2284,6 +2304,12 @@ class FlashAccumulator:
             for k, (r, g, x) in enumerate(zip(r_series, g_series, b_series)):
                 if red(_RED[r - g - x + 510], r > 0 and r >= FLASH_RED_RATIO * (r + g + x)):
                     self._swing("red", b, start + k)
+            if self.planes == 4:
+                shares = self.fine_share[b]
+                for k, a in enumerate(data[3 * plane + b::stride]):
+                    if a:
+                        shares[start + k] = a / 255.0
+                        self._swing("fine", b, start + k)
         self.frames += count
         self.recent_rows.append((start, data))
         self._finalise(self.frames - 1 - self.span_frames)
@@ -2318,6 +2344,12 @@ class FlashAccumulator:
             if flagged and frame not in self.retained:
                 self.retained[frame] = self._row(frame)
         self.final_through = max(self.final_through, through)
+        horizon = through - self.span_frames
+        for b, shares in enumerate(self.fine_share):
+            if shares and min(shares) < horizon:
+                committed = set(self.committed["fine"][b].values())
+                for f in [f for f in shares if f < horizon and f not in committed]:
+                    del shares[f]
         while self.recent_rows and (self.recent_rows[0][0]
                                     + len(self.recent_rows[0][1]) // self.FRAME_BYTES) <= self.final_through + 1:
             self.recent_rows.popleft()
@@ -2388,6 +2420,7 @@ class FlashAccumulator:
         never changes. A frame is hazardous when the coverage-weighted area
         of its flashing blocks exceeds 25 % of the screen.
         """
+        times = times[self.offset:]
         frames = min(self.frames, len(times))
         if frames < FLASH_MAX_TRANSITIONS + 1:
             return []
@@ -2398,31 +2431,54 @@ class FlashAccumulator:
         events: List[FlashEvent] = []
         for kind in _FLASH_KINDS:
             hazard: Dict[int, List[int]] = {}
+            # fine: a block's weight over a hazardous run is the smallest
+            # share of its samples in transition at any of the run's seven
+            # transitions - the area that flashed every time.
+            fine: Dict[Tuple[int, int], float] = {}
             for b in range(blocks):
                 check_cancel(cancel)
-                for first, last in self._exact_spans(kind, b, times, frames, window):
+                for first, last, marks in self._exact_spans(kind, b, times, frames, window):
+                    weight = (min(self.fine_share[b].get(m, 0.0) for m in marks)
+                              if kind == "fine" else 1.0)
                     for f in range(first, last + 1):
                         members = hazard.setdefault(f, [])
                         if not members or members[-1] != b:
                             members.append(b)
+                        if kind == "fine":
+                            fine[(f, b)] = max(fine.get((f, b), 0.0), weight)
             candidates = sorted(f for f, members in hazard.items()
                                 if len(members) > FLASH_AREA * blocks)
             for first, last in _consecutive_runs(candidates):
                 check_cancel(cancel)
                 members = sorted({b for f in range(first, last + 1) for b in hazard[f]})
-                weights = self._coverage_weights(
-                    self._amplitudes(kind, range(first, last + 1), members))
-                areas = [sum(weights[b] for b in hazard[f]) / blocks
-                         for f in range(first, last + 1)]
+                if kind == "fine":
+                    areas = [sum(fine.get((f, b), 0.0) for b in hazard[f]) / blocks
+                             for f in range(first, last + 1)]
+                else:
+                    weights = self._coverage_weights(
+                        self._amplitudes(kind, range(first, last + 1), members))
+                    areas = [sum(weights[b] for b in hazard[f]) / blocks
+                             for f in range(first, last + 1)]
                 flagged = [first + k for k, area in enumerate(areas) if area > FLASH_AREA]
                 for run_first, run_last in _consecutive_runs(flagged):
                     peak = max(areas[run_first - first:run_last - first + 1])
-                    events.append(FlashEvent(times[run_first], times[run_last] + period, peak, kind))
-        return sorted(events, key=lambda e: e.start)
+                    events.append(FlashEvent(times[run_first], times[run_last] + period, peak,
+                                             "red" if kind == "red" else "general"))
+        # The block-mean and fine channels can both see one flash: merge
+        # overlapping events of a rule.
+        merged: List[FlashEvent] = []
+        for event in sorted(events, key=lambda e: (e.kind, e.start)):
+            last = merged[-1] if merged else None
+            if last is not None and last.kind == event.kind and event.start <= last.end:
+                merged[-1] = FlashEvent(last.start, max(last.end, event.end),
+                                        max(last.area, event.area), last.kind)
+            else:
+                merged.append(event)
+        return sorted(merged, key=lambda e: e.start)
 
     def _exact_spans(self, kind: str, block: int, times: Sequence[float], frames: int,
-                     window: float) -> List[Tuple[int, int]]:
-        """(first, last) frames of each run of seven consecutive swings < 1 s.
+                     window: float) -> List[Tuple[int, int, List[int]]]:
+        """(first, last, swing frames) of each run of seven consecutive swings < 1 s.
 
         More than three flashes is more than six transitions: seven
         transitions spanning less than a second. At exactly 3 Hz seven
@@ -2441,7 +2497,7 @@ class FlashAccumulator:
                 continue
             first, last = committed[seqs[k]], committed[seqs[k + need - 1]]
             if last < frames and times[last] - times[first] < window:
-                spans.append((first, last))
+                spans.append((first, last, [committed[seqs[k + j]] for j in range(need)]))
         return spans
 
 
@@ -2477,8 +2533,9 @@ def assess_flash(series: VideoSeries, fps: float,
     """
     accumulator = series.flash_stream
     if accumulator is None:
-        accumulator = FlashAccumulator(fps)
-        accumulator.feed(b"".join(g + b + r for g, b, r in series.flash))
+        planes = len(series.flash[0]) if series.flash else 3
+        accumulator = FlashAccumulator(fps, planes=planes)
+        accumulator.feed(b"".join(b"".join(frame) for frame in series.flash))
         accumulator.finish()
     return accumulator.events(series.times, fps, cancel)
 
