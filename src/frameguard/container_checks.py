@@ -1703,7 +1703,10 @@ def _tmcd_report(path: str, track: TrackInfo) -> Tuple[Optional[str], Optional[s
 
 def _gop_report(path: str, track: TrackInfo, fps: int) -> Tuple[Optional[str], Optional[str], int]:
     """MPEG-2 GOP-header timecode (ISO/IEC 13818-2 §6.2.2.6) at every sync sample."""
-    sync = track.sync_samples or range(1, min(track.sample_count, MAX_GOP_HEADERS) + 1)
+    # No stss: every sample is a sync sample. An empty stss: none is
+    # (ISO/IEC 14496-12 §8.6.2), so there are no GOP headers to read.
+    sync = (track.sync_samples if track.sync_samples is not None
+            else range(1, min(track.sample_count, MAX_GOP_HEADERS) + 1))
     indices = [n - 1 for n in sync[:MAX_GOP_HEADERS]]
     where = sample_offsets(track, indices)
     found: List[Tuple[int, int, bool]] = []

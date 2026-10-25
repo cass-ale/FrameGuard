@@ -1094,3 +1094,27 @@ class TestStereoUnits:
         assert cc._grab_times(8.0) == [2.0, 4.0, 6.0]
         assert cc._grab_times(0.5) == [0.0]
 
+
+
+class TestEmptySyncTable:
+    def test_an_empty_stss_means_no_sync_samples(self):
+        """ISO/IEC 14496-12 8.6.2: without stss every sample is a sync sample;
+        an stss with zero entries says none is. The GOP walk must not treat
+        the second like the first."""
+        import struct as _s
+        from container_fixtures import full_box
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stss", 0, 0, _s.pack(">I", 0))))
+        assert track.sync_samples is not None and len(track.sync_samples) == 0
+        track.sample_count = 50
+        asked = []
+
+        def offsets(t, wanted):
+            asked.append(list(wanted))
+            return {}
+        import unittest.mock as _m
+        with _m.patch.object(cc, "sample_offsets", offsets):
+            cc._gop_report(__file__, track, 30)
+            track.sync_samples = None
+            cc._gop_report(__file__, track, 30)
+        assert asked == [[], list(range(50))], asked
