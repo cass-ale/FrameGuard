@@ -469,6 +469,19 @@ class TestR103Filter:
         row, share = _levels(path, 640, 360)
         assert row[1] == "WARN" and "Luma" in row[2], row
 
+    @pytest.mark.parametrize("level", [247, 246])
+    def test_one_code_over_the_limit_is_exact(self, tmp_path, level):
+        """A flat 247 is outside R 103 luma (5-246) on every pixel; 246 on
+        none. The 16 -> 8-bit narrowing used to dither and mis-scale (v x 257
+        rounding against swscale's v x 256), reading part of 247 as 246.
+        (Grey 246 is still outside the RGB range: 105.02 %.)"""
+        tile = _Tile(128, 96, [(20, 20, 60, 50)], level=level, background=128)
+        expected = _r103_share(tile)
+        path = _tiled_clip(tmp_path / f"flat{level}.mp4", tile, 1280, 720, frames=3)
+        row, share = _levels(path, 1280, 720)
+        # 2 %: the 3 edge columns and 1 edge line the kernels cannot reach
+        assert (share or 0.0) == pytest.approx(expected * 100, rel=0.02, abs=1e-9), (row, expected)
+
     def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
         """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
         expected = _r103_share(_SMALL)

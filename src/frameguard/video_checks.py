@@ -620,10 +620,17 @@ def _select(key: str, value: str, function: str) -> str:
     return f"metadata=mode=select:key={key}:value={value}:function={function}"
 
 
-# 8-bit codes widen to 16 bits as v x 257 and narrow by dropping the low
-# byte, so a 16-bit mean is first rounded to the nearest v x 257: the 8-bit
-# result is then the rounded filter output, as an 8-bit filter would store.
-_ROUND_TO_8BIT = "lutyuv=y='round(val/257)*257':u='round(val/257)*257':v='round(val/257)*257'"
+# The planes are widened and narrowed with swscale treating them as limited
+# range (in = out, so no level conversion happens): every plane then scales
+# by a power of two (8-bit v -> v x 256, 10-bit v -> v x 64; measured on the
+# bundled build - full-range luma would scale by 257 and convert back
+# inexactly). A 16-bit filter output is rounded to the nearest v x 256 and
+# narrowed without dithering (swscale dithers 16 -> 8-bit by default, which
+# moved about 8 % of a uniform 247 to 246): the 8-bit result is exactly the
+# rounded filter output, as an 8-bit filter would store.
+_ROUND_TO_8BIT = "lutyuv=y='round(val/256)*256':u='round(val/256)*256':v='round(val/256)*256'"
+_TO_8BIT = "scale=in_range=tv:out_range=tv:sws_dither=none:flags=accurate_rnd"
+_WIDEN = "setparams=range=tv,scale=in_range=tv:out_range=tv"
 
 
 def _r103_lattice(source: str, out: str, work: str, final: str) -> List[str]:
@@ -690,7 +697,7 @@ def _r103_exact(source: str, out: str, work: str, final: str) -> List[str]:
         chains += _mean_tree([f"{out}_w{t}q{q}" for q in range(lines)], f"{out}_vt{t}",
                              f"[{out}_vs{t}]")
     chains.append("".join(f"[{out}_vs{t}]" for t in range(lines))
-                  + f"vstack=inputs={lines},format={work},{_ROUND_TO_8BIT},format={final}[{out}]")
+                  + f"vstack=inputs={lines},format={work},{_ROUND_TO_8BIT},{_TO_8BIT},format={final}[{out}]")
     return chains
 
 
@@ -1196,8 +1203,7 @@ class VideoAnalysis:
             # Chroma is interpolated to 4:4:4 (bilinear, the linear
             # interpolation _r103_chroma_420 assumes), then every pixel is
             # filtered exactly like luma.
-            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng}:flags=bilinear"
-                      ",format=yuv444p16[lv_src]"]
+            chains = [f"[0:{self.index}]{fields}{_WIDEN}:flags=bilinear,format=yuv444p16[lv_src]"]
             chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
             chains.append(f"[lv_all]split={len(uses)}{labels}")
         elif info.chroma_420:
