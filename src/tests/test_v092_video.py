@@ -967,3 +967,45 @@ class TestProgressiveCreditRollsAreNotWoven:
         path = str(tmp_path / f"roll{pixels_per_second}.mp4")
         ffmpeg("-filter_complex", graph, *X264, "-an", path)
         assert _row(_scan(path), "Interlace Detection")[1] == "PASS"
+
+
+# Camera-like test texture: smooth blobs (blurred noise), larger than the
+# picture so it can be panned over.
+_TEXTURE = ("color=gray:s=480x270:d=1,noise=alls=100:allf=0:all_seed=7,gblur=sigma=4,"
+            "eq=contrast=3,scale=1920:1080:flags=bicubic")
+
+
+def _camera_pan(seconds, px_per_s, grain, x0=200, y0=200, shake=3):
+    return (f"{_TEXTURE},loop=-1:1,fps=30,trim=duration={seconds},setpts=PTS-STARTPTS,"
+            f"crop=640:360:'{x0}+{px_per_s}*t+{shake}*sin(2*PI*1.3*t)+{shake / 2}*sin(2*PI*3.1*t)':"
+            f"'{y0}+{shake}*sin(2*PI*0.9*t+1)',"
+            f"noise=alls={grain}:allf=t,format=yuv420p")
+
+
+def _graph_clip(path, graph, encoder=X264):
+    ffmpeg("-filter_complex", graph + "[o]", "-map", "[o]", *encoder, "-color_range", "tv",
+           "-an", str(path))
+    return str(path)
+
+
+VP9 = ["-c:v", "libvpx-vp9", "-b:v", "2M", "-deadline", "realtime", "-cpu-used", "8",
+       "-pix_fmt", "yuv420p"]
+
+
+@needs_ffmpeg
+class TestNoFalseFreezes:
+    """Round 2: a freeze is a static picture, not a slow or interrupted one."""
+
+    def test_dips_to_black_between_shots(self, tmp_path):
+        """Moving shot, 1-frame dip, locked-off shot (live grain), 2-frame
+        dip, moving shot."""
+        graph = (f"{_camera_pan(4, 90, 6, shake=0)}[a];"
+                 f"{_camera_pan(4, 0, 6, x0=900, y0=500, shake=0)}[b];"
+                 f"{_camera_pan(4, 90, 6, x0=600, shake=0)}[c];[a][b][c]concat=n=3:v=1:a=0,"
+                 "drawbox=c=black:t=fill:enable='eq(n,120)+between(n,240,241)'")
+        assert _row(_scan(_graph_clip(tmp_path / "dips.mp4", graph)), "Freeze Frames")[1] == "PASS"
+
+    @pytest.mark.parametrize("dark", [False, True])
+    def test_slow_pan_with_light_grain(self, tmp_path, dark):
+        graph = _camera_pan(10, 4, 3) + (",eq=brightness=-0.25:contrast=0.5" if dark else "")
+        assert _row(_scan(_graph_clip(tmp_path / f"pan{dark}.mp4", graph)), "Freeze Frames")[1] == "PASS"

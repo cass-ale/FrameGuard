@@ -216,8 +216,12 @@ FREEZE_IDENTICAL_MAFD = 0.004     # bit-identical up to encoder rounding
 # explains. White grain shrinks by the averaging side factor k; real grain is
 # spatially correlated over up to ~4 px, so 4/k of the full-resolution change
 # is allowed, plus a floor of 1/20 code (0.02 %) for the copy's rounding.
+# Motion is not grain: it survives the averaging, and also accumulates - a static picture shows no more than grain between frames
+# FREEZE_STEP_FRACTION of the minimum freeze duration apart, where a slow pan
+# has moved by several pixels.
 FREEZE_GRAIN_CORRELATION = 4.0
 FREEZE_STRUCTURAL_FLOOR = 0.02
+FREEZE_STEP_FRACTION = 0.5
 # A scene change, as FFmpeg's scdet decides it with its documented default
 # threshold (10): score = min(MAFD, |MAFD - previous MAFD|) >= 10.
 FREEZE_CUT_SCORE = 10.0
@@ -851,7 +855,7 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "struct", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+        names = ("mafd", "struct", "struct_step", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
                  "yavg", "gam_r", "gam_g", "gam_b", "ft_same", "ft_top", "ft_bot", "ft_move", "colmo", "rowmo") + tuple(
                      _disp_name(d) for d in INTERLACE_DISPLACEMENTS) + tuple(
                      _shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1))
@@ -885,6 +889,11 @@ class VideoAnalysis:
         width = self.info.width
         copy = max(2, min(ANALYSIS_MAX_WIDTH, (width // (2 * ANALYSIS_MIN_FACTOR)) * 2))
         return width / max(1, copy // FREEZE_COPY_FACTOR)
+
+    @property
+    def freeze_step_frames(self) -> int:
+        """Frames between the accumulated-change samples (FREEZE_STEP_FRACTION)."""
+        return freeze_step_frames(self.info.fps, self.config.freeze_duration)
 
     @property
     def needs_levels_branch(self) -> bool:
@@ -1120,9 +1129,16 @@ class VideoAnalysis:
             chains.append(
                 f"[ar_mean]scale=w='max(1,trunc(iw/{FREEZE_COPY_FACTOR}))':"
                 f"h='max(1,trunc(ih/{FREEZE_COPY_FACTOR}))':flags=area,split=2[ar_mean_y][ar_mean_d]")
+            # And to the frame freeze_step_frames earlier (every that many
+            # frames): accumulated change, which a slow pan shows.
+            step = self.freeze_step_frames
+            chains.append("[ar_mean_d]split=2[ar_d1][ar_d2]")
             chains.append(
-                "[ar_mean_d]tblend=all_mode=difference,signalstats,"
+                "[ar_d1]tblend=all_mode=difference,signalstats,"
                 f"{_print('lavfi.signalstats.YAVG', self.paths['struct'])},nullsink")
+            chains.append(
+                f"[ar_d2]select='not(mod(n,{step}))',tblend=all_mode=difference,signalstats,"
+                f"{_print('lavfi.signalstats.YAVG', self.paths['struct_step'])},nullsink")
             # Every frame's mean luma: the edit-gap test compares black
             # frames with their neighbours at whatever level the scene sits.
             chains.append(
@@ -1295,6 +1311,8 @@ class VideoAnalysis:
             # tblend's frame k (k >= 1) carries frame k's pts: matched by pts,
             # in % of full scale like scdet's MAFD.
             series.structural = sparse("struct", None, lambda v: _to_float(v, 0.0) / 2.55, by_pts, 1)
+            series.structural_step = sparse("struct_step", None, lambda v: _to_float(v, 0.0) / 2.55,
+                                            by_pts, 1)
         if self.config.black:
             series.black_runs = black_runs(self.paths["black_start"], self.paths["black_end"],
                                            cancel)
@@ -1389,6 +1407,8 @@ class VideoSeries:
     band2: List[float] = field(default_factory=list)
     yavg: List[float] = field(default_factory=list)
     structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
+    # freeze: averaged-copy change to the frame freeze_step_frames earlier (on those frames)
+    structural_step: List[Optional[float]] = field(default_factory=list)
     flash: List[tuple] = field(default_factory=list)   # in-memory grid (tests, batch use)
     flash_stream: Optional["FlashAccumulator"] = None   # streamed grid (scans)
     flash_error: Optional[str] = None
@@ -1406,7 +1426,7 @@ class VideoSeries:
         common prefix is the part every branch measured.
         """
         names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
-                 "gam", "band1", "band2", "yavg", "structural", "flash")
+                 "gam", "band1", "band2", "yavg", "structural", "structural_step", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1666,6 +1686,33 @@ def structural_limit(mafd: float, side_factor: float) -> float:
     return FREEZE_STRUCTURAL_FLOOR + mafd * FREEZE_GRAIN_CORRELATION / max(side_factor, 1.0)
 
 
+def freeze_step_frames(fps: float, min_duration: float) -> int:
+    """Frames between accumulated-change samples: FREEZE_STEP_FRACTION of the
+    minimum freeze duration, rounded down so two steps never exceed it."""
+    if fps <= 0:
+        fps = 25.0
+    return max(1, int(fps * min_duration * FREEZE_STEP_FRACTION + 1e-9))
+
+
+def _static_segments(first: int, last: int, moved: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Maximal sub-runs of [first, last] that contain no moved pair (a, b) entirely."""
+    inside = sorted((a, b) for a, b in moved if first <= a and b <= last)
+    segments = []
+    start = first
+    for a, b in inside:
+        if a >= start:
+            segments.append((start, b - 1))
+            start = a + 1
+    segments.append((start, last))
+    # Drop segments contained in a neighbour (overlapping windows).
+    return [seg for k, seg in enumerate(segments)
+            if not any(o != seg and o[0] <= seg[0] and seg[1] <= o[1] for o in segments)]
+
+
+def _in_black(t: float, black: Sequence[Interval], tolerance: float) -> bool:
+    return any(start - tolerance <= t <= start + length + tolerance for start, length in black)
+
+
 def _cut(mafd: Sequence[float], i: int) -> bool:
     """True when frame i is a scene change (scdet's score at its default threshold)."""
     if i <= 0 or i >= len(mafd):
@@ -1678,25 +1725,30 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
                    black: Sequence[Interval] = (),
                    structural: Optional[Sequence[Optional[float]]] = None,
                    side_factor: float = 16.0,
-                   hold_allowance: float = 0.0) -> FreezeFindings:
+                   hold_allowance: float = 0.0,
+                   structural_step: Optional[Sequence[Optional[float]]] = None,
+                   step: int = 0) -> FreezeFindings:
     """Frozen pictures, told apart from held shots and quiet scenes.
 
     1. Still frames: no structural change beyond what grain explains
        (structural_limit), so a freeze under finishing grain is still
        found; without the structural series, MAFD under FREEZE_STILL_MAFD.
-       Runs bridge long-GOP refresh blips (_still_runs) and must last
-       ``min_duration``.
-    2. A run that starts on a cut and ends on a cut (or at the end) is a
+       Runs bridge long-GOP refresh blips (_still_runs).
+    2. A frozen picture is static, not just slow: within a run, frames
+       ``step`` apart (``structural_step``, sampled every ``step`` frames)
+       must also differ by no more than grain. A run is cut where they do,
+       so a slow pan never forms a run of ``min_duration``.
+    3. A run that starts on a cut and ends on a cut (or at the end) is a
        composed shot - a title card, an end card, a locked-off or quiet
        scene - not a freeze: by definition a freeze is not creative intent.
-       Such a shot counts as a freeze only when its frames are identical
-       (FREEZE_IDENTICAL_MAFD) and it is held longer than
-       ``hold_allowance`` (a spec setting: a long identical still is worth
-       checking).
-    3. Any other run is a freeze when the picture stopped dead in mid-shot:
+       A dip through black is an edit too. Such a shot counts as a freeze
+       only when its frames are identical (FREEZE_IDENTICAL_MAFD) and it is
+       held longer than ``hold_allowance`` (a spec setting: a long
+       identical still is worth checking).
+    4. Any other run is a freeze when the picture stopped dead in mid-shot:
        motion runs up to it (FREEZE_LEAD_FRAMES), or its frames are
        identical. A shot that slows to a standstill is not.
-    4. Runs at the very head are slates (unless they cover half the file);
+    5. Runs at the very head are slates (unless they cover half the file);
        a run reaching the end is judged like any other, so a render that
        ran out of media and froze its last seconds is reported.
     Runs mostly covered by black are left to Black Frames.
@@ -1720,8 +1772,29 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
             return structure[i] <= limit(i)
         return mafd[i] < FREEZE_STILL_MAFD
 
+    def edit(i: int) -> bool:
+        """Frame i changes picture by an edit: a cut, or it is (next to) black."""
+        if _cut(mafd, i):
+            return True
+        return 0 <= i < count and bool(black) and _in_black(times[i], black, period * 0.5)
+
     flags = [still(i) for i in range(count)]
+    runs = []
     for first, last in _still_runs(flags, mafd[:count]):
+        if structural_step is None or step <= 0:
+            runs.append((first, last))
+            continue
+        frozen_from = first - 1
+        # Between frames j-step and j a static picture changes by no more
+        # than the noisiest frame in between explains, and by no more than
+        # an encoder's re-coding of a held picture (one refresh blip,
+        # FREEZE_BLIP_MAFD, as the averaged copy sees it).
+        recode = structural_limit(FREEZE_BLIP_MAFD, side_factor)
+        moved = [(j - step, j) for j in range(max(step, frozen_from + step), last + 1)
+                 if j < len(structural_step) and structural_step[j] is not None
+                 and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))]
+        runs += [(a + 1, b) for a, b in _static_segments(frozen_from, last, moved) if b > a]
+    for first, last in runs:
         frozen_from = first - 1
         span = _interval_of(times, frozen_from, last, period)
         if span[1] < min_duration - period * 0.5:
@@ -1736,8 +1809,8 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         if at_head and not covers_half:
             edges.append(span)
             continue
-        enters_on_cut = at_head or _cut(mafd, frozen_from)
-        leaves_on_cut = at_tail or _cut(mafd, last + 1)
+        enters_on_cut = at_head or edit(frozen_from) or edit(frozen_from - 1)
+        leaves_on_cut = at_tail or edit(last + 1)
         if enters_on_cut and leaves_on_cut and not covers_half:
             if identical and span[1] > hold_allowance + period * 0.5:
                 holds.append(span)
@@ -2689,7 +2762,9 @@ def _report_freeze(result, config, series, duration, fps, black, decoded, reason
     side = analysis.structural_side_factor if analysis is not None else 16.0
     findings = detect_freezes(series.mafd, series.times, fps, config.freeze_duration,
                               duration, black, structural=series.structural or None,
-                              side_factor=side, hold_allowance=config.freeze_hold)
+                              side_factor=side, hold_allowance=config.freeze_hold,
+                              structural_step=series.structural_step or None,
+                              step=analysis.freeze_step_frames if analysis is not None else 0)
     if findings.holds:
         result.set_metadata("freeze_frame_count", len(findings.holds))
         result.set_metadata("freeze_frame_total_seconds",
