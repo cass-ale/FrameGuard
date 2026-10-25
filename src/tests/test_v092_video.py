@@ -634,10 +634,16 @@ class TestDecoderMessages:
 class TestDecoderMessagesScan:
     def test_hevc_slice_corruption_fails(self, tmp_path):
         """Held-out review case: FFmpeg prints a decoder error for damaged
-        HEVC slice data but its accounting shows 0 decode errors."""
+        HEVC slice data but its accounting shows 0 decode errors.
+
+        Encoder-independent (review round 3, bug 9): the slice NAL units are
+        located by parsing the samples (4-byte length prefixes, HEVC NAL
+        header type 0-31 = VCL), only slice payload bytes are damaged, and
+        the test first asserts that FFmpeg itself reports a decoder error,
+        so it cannot pass vacuously on another x265 build."""
         import random
         import subprocess
-        from frameguard.tools import get_ffprobe_path
+        from frameguard.tools import get_ffmpeg_path, get_ffprobe_path
         clean = tmp_path / "hevc.mp4"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=8", "-c:v", "libx265",
                "-x265-params", "log-level=error:keyint=60", "-tag:v", "hvc1",
@@ -646,14 +652,36 @@ class TestDecoderMessagesScan:
         packets = subprocess.run([get_ffprobe_path(), "-v", "error", "-select_streams", "v",
                                   "-show_entries", "packet=pos,size", "-of", "csv=p=0", str(clean)],
                                  capture_output=True, text=True).stdout.split()
-        data = bytearray(clean.read_bytes())
-        rng = random.Random(1)
-        for entry in packets[70:75]:
-            size, pos = (int(v) for v in entry.split(","))
-            for k in range(pos + 40, min(pos + 60, pos + size)):
-                data[k] = rng.randrange(256)
+        original = clean.read_bytes()
+
+        def slices(pos, size):
+            """(start, end) of each VCL NAL unit's payload in one sample."""
+            found, offset = [], pos
+            while offset + 6 <= pos + size:
+                length = int.from_bytes(original[offset:offset + 4], "big")
+                nal_type = (original[offset + 4] >> 1) & 0x3F
+                if nal_type < 32 and length > 16:
+                    found.append((offset + 4 + 2, offset + 4 + length))
+                offset += 4 + length
+            return found
+
         damaged = tmp_path / "damaged.mp4"
-        damaged.write_bytes(bytes(data))
+        rng = random.Random(1)
+        for attempt in range(8):
+            data = bytearray(original)
+            for entry in packets[70 + 5 * attempt:75 + 5 * attempt]:
+                size, pos = (int(v) for v in entry.split(","))
+                for start, end in slices(pos, size):
+                    # Slice data, past the slice header: the middle third.
+                    third = (end - start) // 3
+                    for k in range(start + third, start + 2 * third):
+                        data[k] = rng.randrange(256)
+            damaged.write_bytes(bytes(data))
+            report = subprocess.run([get_ffmpeg_path(), "-v", "error", "-i", str(damaged),
+                                     "-f", "null", "-"], capture_output=True, text=True).stderr
+            if "hevc" in report.lower():
+                break
+        assert "hevc" in report.lower(), "FFmpeg reported no HEVC decoder error for the damage"
         result = _scan(str(damaged), audio_required=False)
         row = _row(result, "File Integrity")
         assert row[1] == "FAIL" and "decoder error" in row[2], row
