@@ -427,21 +427,32 @@ class TestR103Filter:
         path = _tiled_clip(tmp_path / "uhd.mp4", _SPECULAR, 3840, 2160)
         row, share = _levels(path, 3840, 2160)
         assert row[1] == "WARN" and "Luma" in row[2], row
-        assert share == pytest.approx(expected * 100, rel=0.1)
+        assert share == pytest.approx(expected * 100, rel=0.03)
 
     def test_8k_speculars_are_caught(self, tmp_path):
         expected = _r103_share(_SPECULAR)
         path = _tiled_clip(tmp_path / "8k.mp4", _SPECULAR, 7680, 3840, frames=3)
         row, share = _levels(path, 7680, 3840)
         assert row[1] == "WARN" and "Luma" in row[2], row
-        assert share == pytest.approx(expected * 100, rel=0.1)
+        assert share == pytest.approx(expected * 100, rel=0.03)
 
     def test_uhd_thin_rules_are_caught(self, tmp_path):
         expected = _r103_share(_RULES)
         path = _tiled_clip(tmp_path / "rules.mp4", _RULES, 3840, 2160)
         row, share = _levels(path, 3840, 2160)
         assert row[1] == "WARN", row
-        assert share == pytest.approx(expected * 100, rel=0.1)
+        assert share == pytest.approx(expected * 100, rel=0.03)
+
+    def test_grid_aligned_thin_bars_are_measured_exactly(self, tmp_path):
+        """Round 3 bug 5: 3 px super-white bars on a 235 background, on a
+        4 px-aligned grid; only their centre column exceeds 246 after the
+        filter. Sampling one phase in eight misses them all."""
+        tile = _Tile(128, 96, [(k * 40 + 3, 0, 3, 96) for k in range(3)], background=235)
+        expected = _r103_share(tile)
+        path = _tiled_clip(tmp_path / "bars.mp4", tile, 1920, 1080)
+        row, share = _levels(path, 1920, 1080)
+        assert row[1] == "WARN", row
+        assert share == pytest.approx(expected * 100, rel=0.03)
 
     def test_interlaced_signal_is_filtered_intra_field(self, tmp_path):
         """Round 3 bug 4: R 103's vertical filter is "applied intra field for
@@ -464,7 +475,7 @@ class TestR103Filter:
         path = _tiled_clip(tmp_path / "hd.mp4", _SMALL, 1920, 1080)
         row, share = _levels(path, 1920, 1080)
         assert row[1] == "PASS", row
-        assert share == pytest.approx(expected * 100, rel=0.1)
+        assert share == pytest.approx(expected * 100, rel=0.03)
 
 
 # ---------------------------------------------------------------------------

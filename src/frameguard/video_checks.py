@@ -132,6 +132,13 @@ ANALYSIS_MIN_FACTOR = 4
 # The filtered luma is evaluated on a lattice of every 4th column and 2nd
 # line (see VideoAnalysis._levels_chains for why that is exact there).
 R103_LATTICE = (4, 2)
+# The lattice alone samples one filtered pixel in eight; the violating share
+# it gives is unbiased only for regions much larger than its cell (thin or
+# small violations read about a quarter low in review). R103_EXACT evaluates
+# all eight phases of the cell - every native pixel, filtered exactly - from
+# the same four column reductions (see _r103_exact); the lattice-only graph
+# remains for the speed comparison (fix_video.md).
+R103_EXACT = True
 # Interlace analysis keeps every line (fields must stay separate) but
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
@@ -627,6 +634,50 @@ def _r103_lattice(source: str, out: str, work: str, final: str) -> List[str]:
     return chains
 
 
+def _r103_exact(source: str, out: str, work: str, final: str) -> List[str]:
+    """``[source]`` R 103-filtered at every native pixel -> ``[out]``.
+
+    With h_p the 4:1 column area reductions starting at column p (as in
+    _r103_lattice), the horizontally filtered value at column 4m + 3 + s is
+    the mean of h_s..h_3 at m and h_0..h_(s-1) at m + 1. The four offsets s
+    are laid side by side (hstack), then the same is done for the two line
+    offsets of the 2:1 line reductions (vstack): the tiles hold every native
+    pixel's filtered value once (columns and lines regrouped by phase, which
+    a share does not see), except the outermost 3 columns and 1 line the
+    kernels cannot reach.
+    """
+    columns, lines = R103_LATTICE
+    width = f"trunc((iw-{columns - 1})/{columns})*{columns}"
+    height = f"trunc((ih-{lines - 1})/{lines})*{lines}"
+    chains = [f"[{source}]split={columns}" + "".join(f"[{out}_c{p}]" for p in range(columns))]
+    for p in range(columns):
+        chains.append(f"[{out}_c{p}]crop=w='{width}':h=ih:x={p}:y=0,"
+                      f"scale=w=iw/{columns}:h=ih:flags=area,format={work},"
+                      f"split={columns}" + "".join(f"[{out}_h{p}s{t}]" for t in range(columns)))
+    for t in range(columns):            # offset t uses h_p shifted by one for p < t
+        for p in range(columns):
+            chains.append(f"[{out}_h{p}s{t}]crop=w=iw-1:h=ih:x={1 if p < t else 0}:y=0"
+                          f"[{out}_o{t}p{p}]")
+        chains += _mean_tree([f"{out}_o{t}p{p}" for p in range(columns)], f"{out}_ht{t}",
+                             f"[{out}_hs{t}]")
+    chains.append("".join(f"[{out}_hs{t}]" for t in range(columns))
+                  + f"hstack=inputs={columns},split={lines}"
+                  + "".join(f"[{out}_r{q}]" for q in range(lines)))
+    for q in range(lines):
+        chains.append(f"[{out}_r{q}]crop=w=iw:h='{height}':x=0:y={q},"
+                      f"scale=w=iw:h=ih/{lines}:flags=area,split={lines}"
+                      + "".join(f"[{out}_v{q}s{t}]" for t in range(lines)))
+    for t in range(lines):
+        for q in range(lines):
+            chains.append(f"[{out}_v{q}s{t}]crop=w=iw:h=ih-1:x=0:y={1 if q < t else 0}"
+                          f"[{out}_w{t}q{q}]")
+        chains += _mean_tree([f"{out}_w{t}q{q}" for q in range(lines)], f"{out}_vt{t}",
+                             f"[{out}_vs{t}]")
+    chains.append("".join(f"[{out}_vs{t}]" for t in range(lines))
+                  + f"vstack=inputs={lines},format={work},{_ROUND_TO_8BIT},format={final}[{out}]")
+    return chains
+
+
 def _r103_chroma_420(source: str, out: str) -> List[str]:
     """A 4:2:0 chroma plane R 103-filtered at the luma lattice -> ``[out]``.
 
@@ -1117,7 +1168,15 @@ class VideoAnalysis:
         # an interlaced picture is filtered with its fields stacked (il), so
         # no tap reaches into the other field.
         fields = "il=l=d:c=d:a=d," if info.interlaced else ""
-        if info.chroma_420:
+        if R103_EXACT:
+            # Chroma is interpolated to 4:4:4 (bilinear, the linear
+            # interpolation _r103_chroma_420 assumes), then every pixel is
+            # filtered exactly like luma.
+            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng}:flags=bilinear"
+                      ",format=yuv444p16[lv_src]"]
+            chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
+            chains.append(f"[lv_all]split={len(uses)}{labels}")
+        elif info.chroma_420:
             chains = [f"[0:{self.index}]{fields}extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
             chains += _r103_lattice("lv_luma", "lv_yl", "gray16", "gray")
             chains.append("[lv_yl]crop=w=iw:h=ih-1:x=0:y=1[lv_y]")
