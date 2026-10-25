@@ -1330,6 +1330,30 @@ class TestBlackArea:
         row = _row(_scan(_graph_clip(tmp_path / "dark.mp4", graph, fine)), "Black Frames")
         assert row[1] == "PASS", row
 
+    @pytest.mark.parametrize("lift,spread", [(1, 4), (0, 3)])
+    def test_locked_off_dark_grade_with_soft_practicals(self, tmp_path, lift, spread):
+        """Round 6 (corpus gate): a locked-off dark grade - a static noise
+        texture just above black (mean Y about 20-21) with two soft practical
+        lights (about 2-4 % of the frame) - read as black with a static
+        overlay. The lights are soft blobs, not a graphic."""
+        texture = ("color=gray:s=640x360:d=1,noise=alls=100:allf=0:all_seed=3,gblur=sigma=2,format=yuv420p,"
+                   f"lutyuv=y='16+{lift}+val*{spread}/255',setparams=range=tv,"
+                   "loop=-1:1,fps=30,trim=duration=4,setpts=PTS-STARTPTS")
+        lights = ("color=c=black:s=640x360:r=30:d=4,"
+                  "drawbox=x=140:y=90:w=40:h=40:c=white:t=fill,drawbox=x=440:y=210:w=36:h=36:c=0xFFE0A0:t=fill,"
+                  "gblur=sigma=9,format=yuv420p,setparams=range=tv")
+        graph = f"{texture}[bg];{lights}[li];[bg][li]blend=all_mode=lighten,format=yuv420p"
+        fine = [e if e != "18" else "6" for e in X264]
+        row = _row(_scan(_graph_clip(tmp_path / f"lockoff{lift}.mp4", graph, fine)), "Black Frames")
+        assert row[1] == "PASS", row
+
+    def test_black_with_burnt_in_timecode_only(self, tmp_path):
+        graph = ("testsrc2=s=640x360:r=30:d=6,drawbox=c=black:t=fill:enable='between(t,2,4)',"
+                 "drawtext=timecode='00\\:00\\:00\\:00':rate=30:x=230:y=310:fontsize=36:fontcolor=white,"
+                 "format=yuv420p")
+        row = _row(_scan(_graph_clip(tmp_path / "tconly.mp4", graph)), "Black Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:02" in row[2], row
+
     def test_end_credits_on_black(self, tmp_path):
         """About 6 % white text bars rolling up over black at 1 px/frame."""
         bars = "".join(f"drawbox=x={170 + 37 * (k % 3)}:y={60 * k}:w={220 - 30 * (k % 3)}:h=9:"
@@ -1745,6 +1769,22 @@ class TestBlackHelpersExact:
         static = [0.04 if i % 15 == 0 and i else None for i in range(61)]
         runs = vc.overlay_black_runs(nonblack, static, times, 15, 0.98, 1 / 30, sample=3)
         assert runs == [(0.0, pytest.approx(61 / 30))]
+
+    def test_overlay_must_be_a_graphic_on_true_black(self):
+        times = _times(30)
+        nonblack = [0.04] * 30
+        static = [0.04 if i % 9 == 0 and i else None for i in range(30)]
+        black = [16.5 * 0.96] * 30                       # rest mean 16.5: true black
+        args = (nonblack, static, times, 9, 0.98, 1 / 30)
+        assert vc.overlay_black_runs(*args, bright=[0.02] * 30, black_sum=black)      # half at fill
+        assert not vc.overlay_black_runs(*args, bright=[0.0199] * 30, black_sum=black)  # soft light
+        assert vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[17.0 * 0.96] * 30)
+        assert not vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[17.01 * 0.96] * 30)
+        assert not vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[None] * 30)
+        assert vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[1.0 * 0.96] * 30,
+                                     black_level=0.0)                               # full range
+        assert vc.overlay_black_runs([0.0] * 30, [0.0 if v is not None else None for v in static],
+                                     times, 9, 0.98, 1 / 30, bright=[0.0] * 30, black_sum=[16.0] * 30)
 
     def test_merge_runs(self):
         assert vc.merge_runs([(0, 1)], [(1 + 5e-7, 2)]) == [(0, 2)]
