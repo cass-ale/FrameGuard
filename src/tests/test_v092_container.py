@@ -878,7 +878,9 @@ class TestRetiredDefaultsMigrate:
         assert preset["config"]["black_detect_picture_threshold"] == DEFAULT_CONFIG["black_detect_picture_threshold"]
         assert preset["config"]["target_fps"] == 25
         notes = " ".join(preset["notices"])
-        assert "silence_noise_db -50 -> -70" in notes and "black_detect_picture_threshold" in notes, notes
+        assert "silence_noise_db -50 -> -70" in notes, notes
+        # Black migrates only while its default differs from 0.9.1's (derived, not listed).
+        assert ("black_detect_picture_threshold" in notes) == (DEFAULT_CONFIG["black_detect_picture_threshold"] != 0.98)
 
     def test_a_value_the_author_chose_is_kept(self, tmp_path):
         from frameguard import presets
@@ -1541,3 +1543,52 @@ class TestRound2Units:
         text = "ffmpeg version 9.0.2\nlibavutil      61.  1.102 / 61.  1.102\nlibavfilter    12.  1.102 / 12.  1.102\n"
         assert tools.libavfilter_line(text) == "libavfilter    12.  1.102 / 12.  1.102"
         assert tools.libavfilter_line("ffmpeg version 9.0.2") == ""
+
+
+class TestGenericDefaultMigration:
+    """Integrator follow-up: migrate exactly the keys whose default changed
+    since 0.9.1, derived from DEFAULT_CONFIG, so the table cannot drift."""
+
+    def _expected(self):
+        from frameguard import presets
+        return {k: DEFAULT_CONFIG[k] for k, old in presets.DEFAULTS_0_9_1.items()
+                if k in DEFAULT_CONFIG and DEFAULT_CONFIG[k] != old}
+
+    def test_a_full_0_9_1_export_imports_as_today_s_defaults(self, tmp_path):
+        from frameguard import presets
+        old = _write_091_preset(tmp_path / "all.fg", dict(presets.DEFAULTS_0_9_1))
+        preset = presets.import_preset(old, raise_errors=True)
+        expected = self._expected()
+        for key in presets.DEFAULTS_0_9_1:
+            assert preset["config"][key] == DEFAULT_CONFIG[key], key
+        migrated = {n.split(" ", 1)[0] for n in preset["notices"]}
+        assert migrated == set(expected), (migrated, set(expected))
+
+    def test_an_unchanged_default_never_migrates(self, tmp_path, monkeypatch):
+        """The video fixer restores black_detect_picture_threshold to 0.98: a
+        0.9.1 file holding 0.98 must then keep it, with no notice."""
+        from frameguard import presets
+        from frameguard import core
+        monkeypatch.setitem(core.DEFAULT_CONFIG, "black_detect_picture_threshold", 0.98)
+        old = _write_091_preset(tmp_path / "b.fg", {"black_detect_picture_threshold": 0.98})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["black_detect_picture_threshold"] == 0.98 and preset["notices"] == [], preset
+
+    def test_any_changed_default_migrates_including_non_numbers(self, tmp_path, monkeypatch):
+        from frameguard import presets
+        from frameguard import core
+        monkeypatch.setitem(core.DEFAULT_CONFIG, "loudness_mode", "advisory")
+        monkeypatch.setitem(core.DEFAULT_CONFIG, "accepted_containers", [".mp4", ".mov"])
+        old = _write_091_preset(tmp_path / "c.fg", {"loudness_mode": "report",
+                                                    "accepted_containers": [".mp4", ".mov", ".mkv", ".mxf"]})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["loudness_mode"] == "advisory"
+        assert preset["config"]["accepted_containers"] == [".mp4", ".mov"]
+        assert any(n.startswith("loudness_mode report -> advisory") for n in preset["notices"]), preset["notices"]
+
+    def test_the_table_holds_only_preset_keys_and_no_machine_dependent_ones(self):
+        from frameguard import presets
+        from frameguard.core import COMPAT_ONLY_CONFIG_KEYS
+        assert set(presets.DEFAULTS_0_9_1) <= set(presets.PRESET_CONFIG_KEYS)
+        assert not set(presets.DEFAULTS_0_9_1) & COMPAT_ONLY_CONFIG_KEYS
+        assert len(presets.DEFAULTS_0_9_1) == 69

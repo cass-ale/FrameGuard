@@ -187,20 +187,105 @@ def validate_preset_config(config: dict) -> dict:
     return audio_checks.normalize_custom_profile(out)
 
 
-# Defaults FrameGuard 0.9.1 wrote into every exported preset (its export
-# fills each key) that 0.9.2 replaced: track silence at -70 dBFS instead of
-# -50 (quiet room tone read as "no audio", 0.9.1 review bug 3) and black at
-# 90 % of the picture instead of 98 % (burnt-in timecode hid black). A file
-# older than format 3 holding exactly the old default never chose it; it
-# gets the current default, recorded.
-RETIRED_DEFAULTS_0_9_1 = {
-    "silence_noise_db": -50,
-    "black_detect_picture_threshold": 0.98,
+# FrameGuard 0.9.1's default for every preset key it knew (its
+# core.DEFAULT_CONFIG at release 0c4d0c3; compatibility-only keys left out).
+# 0.9.1's export_preset writes every key, so a 0.9.1 preset holding exactly
+# one of these values did not choose it. On import of a pre-0.9.2 file
+# (format 1-2), such a value becomes the CURRENT default wherever that
+# default has since changed, and the change is recorded; where 0.9.2's
+# default is still 0.9.1's, nothing happens. Which keys migrate is therefore
+# derived from DEFAULT_CONFIG, never listed by hand (e.g. silence -50 -> -70
+# dBFS today). This is a frozen record of a released version: never edit it.
+DEFAULTS_0_9_1 = {
+    'target_width': 3840,
+    'target_height': 2160,
+    'allow_larger_resolution': False,
+    'target_fps': 30.0,
+    'fps_tolerance': 0.5,
+    'allow_fps_multiples': False,
+    'min_bitrate_mbps': 20,
+    'accepted_codecs': ['h264', 'hevc', 'h265', 'av1', 'prores', 'prores_ks', 'prores_aw'],
+    'accepted_containers': ['.mp4', '.mov', '.mkv', '.mxf'],
+    'accepted_audio_codecs': [   'aac',
+                                 'pcm_s16le',
+                                 'pcm_s24le',
+                                 'pcm_s32le',
+                                 'pcm_s24be',
+                                 'pcm_s32be',
+                                 'pcm_f32le',
+                                 'opus',
+                                 'flac'],
+    'audio_required': True,
+    'min_audio_sample_rate': 44100,
+    'require_cfr': True,
+    'require_progressive': True,
+    'min_bit_depth': 'any',
+    'required_transfer': 'any',
+    'required_projection': 'any',
+    'required_stereo_mode': 'any',
+    'max_decode_errors': 0,
+    'silence_duration': 2.0,
+    'silence_noise_db': -50,
+    'loudness_mode': 'report',
+    'target_loudness_lufs': -23.0,
+    'loudness_tolerance_lu': 2.0,
+    'true_peak_max_dbtp': -1.0,
+    'allow_ntsc_rate_match': False,
+    'duration_mismatch_threshold': 0.5,
+    'av_short_tolerance_frames': 2,
+    'av_long_tolerance_s': 2.0,
+    'av_offset_warn_ms': 5.0,
+    'av_offset_max_early_ms': 40.0,
+    'av_offset_max_late_ms': 60.0,
+    'allow_display_rotation': False,
+    'spatial_audio': 'any',
+    'require_square_pixels': False,
+    'warn_untagged_color': True,
+    'allowed_video_profiles': ['any'],
+    'allowed_pix_fmts': ['any'],
+    'max_frame_pixels': 0,
+    'max_pixel_rate': 0,
+    'require_faststart': False,
+    'allow_trim_edit_lists': True,
+    'max_audio_tracks': 0,
+    'disabled_checks': [],
+    'black_frames_enabled': True,
+    'black_detect_duration': 0.3,
+    'black_detect_pix_threshold': 0.02,
+    'black_detect_picture_threshold': 0.98,
+    'black_short_min_frames': 3,
+    'freeze_frames_enabled': True,
+    'freeze_detect_duration': 1.0,
+    'signal_levels_mode': 'advisory',
+    'flash_check_enabled': True,
+    'interlace_check_enabled': True,
+    'loudness_profile': 'ebu_r128',
+    'channel_silence_noise_db': -70.0,
+    'audio_clipping_check': True,
+    'audio_dropout_check': True,
+    'audio_phase_check': True,
+    'audio_dual_mono_check': True,
+    'audio_dc_offset_check': True,
+    'audio_hum_check': True,
+    'dropout_noise_db': -90.0,
+    'dropout_min_ms': 5.0,
+    'clipping_min_events': 3,
+    'phase_correlation_min': -0.2,
+    'phase_min_duration': 1.0,
+    'dc_offset_max_db': -50.0,
+    'hum_min_db': -65.0,
 }
 
 
+def _shown(value) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return json.dumps(value)[:80].strip('"')
+    return f"{value:g}"
+
+
 def migrate_retired_defaults(config: dict, format_version) -> List[str]:
-    """In place: replace 0.9.1 defaults in a pre-0.9.2 preset, recorded."""
+    """In place: replace 0.9.1 defaults that have since changed in a
+    pre-0.9.2 preset or saved settings, recorded in preset_adjustments."""
     from frameguard.core import DEFAULT_CONFIG
     try:
         version = int(format_version or 0)
@@ -209,11 +294,15 @@ def migrate_retired_defaults(config: dict, format_version) -> List[str]:
     if version >= 3:
         return []
     notes = []
-    for key, old in RETIRED_DEFAULTS_0_9_1.items():
-        new = DEFAULT_CONFIG.get(key)
-        if key in config and config[key] == old and new != old:
-            config[key] = new
-            notes.append(f"{key} {old:g} -> {new:g} (the FrameGuard 0.9.1 default, replaced in 0.9.2)")
+    for key, old in DEFAULTS_0_9_1.items():
+        if key not in config or key not in DEFAULT_CONFIG:
+            continue
+        new = DEFAULT_CONFIG[key]
+        if isinstance(new, (set, frozenset, tuple)):
+            new = sorted(new)
+        if config[key] == old and new != old:
+            config[key] = list(new) if isinstance(new, list) else new
+            notes.append(f"{key} {_shown(old)} -> {_shown(new)} (the FrameGuard 0.9.1 default, replaced in 0.9.2)")
     if notes:
         config["preset_adjustments"] = list(config.get("preset_adjustments") or []) + notes
     return notes
