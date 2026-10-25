@@ -1120,12 +1120,26 @@ class TestCfrTimestampRounding:
         assert row[1] == "WARN" and "dropped" in row[2] and "Variable" not in row[2], row
         assert meta.get("dropped_frames") == 1
 
-    def test_dropped_frames_are_not_variable_frame_rate(self):
+    def test_dropped_frames_beyond_the_threshold_are_variable_frame_rate(self):
         times = [k / 30 for k in range(300) if k not in (50, 100, 101, 200, 250)]
         row, meta = _cfr(times)
-        # 4 gaps in 295 intervals (> vfr_threshold 1 %): a FAIL, named as drops
-        assert row[1] == "FAIL" and "5 dropped" in row[2] and "Variable" not in row[2], row
+        # 4 gaps in 295 intervals (> vfr_threshold 1 %): variable frame rate,
+        # with the drops named in the detail
+        assert row[1] == "FAIL" and row[2].startswith("Variable frame rate") and "5 dropped" in row[2], row
         assert meta.get("dropped_frames") == 5
+
+    def test_every_fifth_frame_dropped_is_variable_frame_rate(self):
+        """Round 6 (corpus gate): phone-style VFR - every 5th frame missing,
+        timestamps kept - read only as 'N dropped frame(s)'."""
+        times = [k / 30 for k in range(300) if k % 5 != 4]
+        row, meta = _cfr(times)
+        assert row[1] == "FAIL" and row[2].startswith("Variable frame rate"), row
+        assert "dropped" in row[2] and meta.get("vfr_detected") is True, row
+
+    def test_two_isolated_drops_under_the_threshold_stay_dropped(self):
+        times = [k / 30 for k in range(600) if k not in (150, 400)]
+        row, _ = _cfr(times)
+        assert row[1] == "WARN" and "2 dropped" in row[2] and "Variable" not in row[2], row
 
     def test_repeated_timestamp_is_a_duplicated_frame(self):
         times = [k / 30 for k in range(300)]
@@ -1148,6 +1162,13 @@ class TestCfrRemux:
         ffmpeg("-i", str(source), "-c", "copy", str(remux))
         row = _row(_scan(str(remux), target_width=320, target_height=240), "CFR Check")
         assert row[1] == "PASS", row
+
+    def test_every_fifth_frame_dropped_is_variable_frame_rate(self, tmp_path):
+        path = tmp_path / "phone.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=6", "-vf", "select='mod(n\\,5)-4'",
+               "-fps_mode", "passthrough", *X264, "-an", str(path))
+        row = _row(_scan(str(path), target_width=320, target_height=240), "CFR Check")
+        assert row[1] == "FAIL" and row[2].startswith("Variable frame rate") and "dropped" in row[2], row
 
     def test_one_dropped_frame_is_reported_as_dropped(self, tmp_path):
         path = tmp_path / "drop.mkv"
