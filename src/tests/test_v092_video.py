@@ -1296,6 +1296,49 @@ class TestFreezeRecall:
         assert "00:00:07.9" in row[2] or "00:00:08.0" in row[2], row
 
 
+def _film_grain(graph_label, seconds, strength, sigma, size="640x360", rate=24):
+    """Film-like grain: fresh noise every frame, spatially correlated (gblur),
+    merged over [graph_label]."""
+    return (f"color=gray:s={size}:r={rate}:d={seconds},format=yuv420p,noise=alls={strength}:allf=t,"
+            f"gblur=sigma={sigma},setparams=range=tv[gr];"
+            f"[{graph_label}][gr]blend=all_mode=grainmerge:c1_mode=normal:c2_mode=normal,format=yuv420p")
+
+
+def _texture_pan(seconds, px_per_s, rate=24, x0=200):
+    return (f"{_TEXTURE},loop=-1:1,fps={rate},trim=duration={seconds},setpts=PTS-STARTPTS,"
+            f"crop=640:360:'{x0}+{px_per_s}*t+3*sin(2*PI*1.3*t)':'200+3*sin(2*PI*0.9*t+1)',"
+            "format=yuv420p,setparams=range=tv")
+
+
+@needs_ffmpeg
+class TestFreezeUnderFilmGrain:
+    """Round 6 (corpus gate): a 2 s freeze in the middle of a moving shot
+    with live, spatially correlated grain over the frozen picture passed."""
+
+    @pytest.mark.parametrize("strength,sigma", [(30, 1.0), (60, 2.0)])
+    def test_mid_shot_freeze_under_film_grain(self, tmp_path, strength, sigma):
+        pan = _texture_pan(6, 120) + ",split[a][b];[a][b]freezeframes=first=48:last=95:replace=48[pic]"
+        graph = pan + ";" + _film_grain("pic", 6, strength, sigma)
+        path = _graph_clip(tmp_path / f"film{strength}.mp4", graph)
+        row = _row(_scan(path, target_fps=24.0), "Freeze Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:02.0" in row[2], row
+
+    def test_lag_rule(self):
+        grain = [0.6] * 30                      # correlated grain: 0.6 % after averaging
+        mafd = [4.0] * 30
+        step = [None] * 30
+        step[15], step[29] = 0.7, 3.0           # static window, then motion
+        assert vc._lag_static_windows(grain, step, 15, 30, mafd, 16.0) == {15}
+        # a flicker survives the averaging whole: not grain, never static
+        assert vc._lag_static_windows([3.9] * 30, [None] * 15 + [3.9] + [None] * 14, 15, 30, mafd, 16.0) == set()
+        assert vc._extend_static(10, 20, [9.0] * 5 + [0.6] * 25, [20.0] * 5 + [4.0] * 25, 30) == (5, 29)
+
+    def test_slow_pan_under_film_grain_is_not_a_freeze(self, tmp_path):
+        graph = _texture_pan(8, 4) + "[pic];" + _film_grain("pic", 8, 40, 1.0)
+        path = _graph_clip(tmp_path / "slowfilm.mp4", graph)
+        assert _row(_scan(path, target_fps=24.0), "Freeze Frames")[1] == "PASS"
+
+
 @needs_ffmpeg
 class TestNoFalseFreezes:
     """Round 2: a freeze is a static picture, not a slow or interrupted one."""

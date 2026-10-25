@@ -248,6 +248,16 @@ FREEZE_IDENTICAL_MAFD = 0.004
 FREEZE_GRAIN_CORRELATION = 2.0
 FREEZE_STRUCTURAL_FLOOR = 0.02
 FREEZE_STEP_FRACTION = 0.5
+# Lag test (see _lag_static_windows): independent grain gives the same mean
+# change at any lag. On the averaged copy (thousands of samples) the two
+# means agree within a few per cent; 1.25 leaves a wide margin for that
+# sampling noise while motion over half the minimum duration changes the
+# picture several times more than over one frame.
+FREEZE_LAG_RATIO = 1.25
+# Grain is spatially correlated over a few pixels at most (film grain clumps
+# of 5-15 um, softened by the scan, span up to about 4 px of an HD frame);
+# twice that, 8 px, bounds what of a frame-to-frame change can be grain.
+FREEZE_GRAIN_MAX_PX = 8.0
 # A scene change, as FFmpeg's scdet decides it with its documented default
 # threshold (10): score = min(MAFD, |MAFD - previous MAFD|) >= 10.
 FREEZE_CUT_SCORE = 10.0
@@ -1925,6 +1935,65 @@ def structural_limit(mafd: float, side_factor: float) -> float:
     return FREEZE_STRUCTURAL_FLOOR + mafd * FREEZE_GRAIN_CORRELATION / max(side_factor, 1.0)
 
 
+def _lag_static_windows(structure: Optional[Sequence[Optional[float]]],
+                        structural_step: Optional[Sequence[Optional[float]]],
+                        step: int, count: int, mafd: Sequence[float] = (),
+                        side_factor: float = 16.0) -> set:
+    """Sample frames j whose window (j - step, j] is static by the lag test.
+
+    Grain is independent from frame to frame, so a static picture differs
+    from the frame ``step`` back by no more than from the previous frame -
+    whatever the grain's strength or spatial correlation (film grain at HD is
+    correlated well beyond the white-grain allowance of structural_limit).
+    Motion accumulates instead: ``step`` frames of it change the picture far
+    more than one. The window is static when the ``step``-frame change is
+    at most FREEZE_LAG_RATIO times the median frame-to-frame change in it,
+    and that change is grain-like: no more of the full-resolution change
+    survives the averaging than grain correlated over FREEZE_GRAIN_MAX_PX
+    pixels allows (a flicker or a strobe survives it whole).
+    """
+    out = set()
+    if structure is None or structural_step is None or step <= 1:
+        return out
+    for j in range(step, min(count, len(structural_step))):
+        lagged = structural_step[j]
+        if lagged is None:
+            continue
+        window = [structure[i] for i in range(j - step + 1, j + 1) if structure[i] is not None]
+        if len(window) != step:
+            continue
+        change = statistics.median(window)
+        if mafd:
+            full = statistics.median(mafd[j - step + 1:j + 1])
+            if change > FREEZE_STRUCTURAL_FLOOR + full * FREEZE_GRAIN_MAX_PX / max(side_factor, 1.0):
+                continue
+        if lagged <= FREEZE_LAG_RATIO * change:
+            out.add(j)
+    return out
+
+
+def _extend_static(first: int, last: int, structure: Sequence[Optional[float]],
+                   mafd: Sequence[float], count: int) -> Tuple[int, int]:
+    """Grow a still run over neighbours whose change is the run's grain.
+
+    The lag test marks whole windows, so a freeze's first and last frames
+    can fall outside them; a neighbour belongs to the run while its change
+    is within FREEZE_LAG_RATIO of the run's median (frame-to-frame grain)
+    and it is not a cut.
+    """
+    values = [structure[i] for i in range(first, last + 1) if structure[i] is not None]
+    if not values:
+        return first, last
+    bound = FREEZE_LAG_RATIO * statistics.median(values)
+    while first > 1 and structure[first - 1] is not None and structure[first - 1] <= bound \
+            and not _cut(mafd, first - 1):
+        first -= 1
+    while last + 1 < count and structure[last + 1] is not None and structure[last + 1] <= bound \
+            and not _cut(mafd, last + 1):
+        last += 1
+    return first, last
+
+
 def freeze_step_frames(fps: float, min_duration: float) -> int:
     """Frames between accumulated-change samples: FREEZE_STEP_FRACTION of the
     minimum freeze duration, rounded down so two steps never exceed it."""
@@ -2018,20 +2087,28 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         return 0 <= i < count and bool(black) and _in_black(times[i], black, period * 0.5)
 
     flags = [still(i) for i in range(count)]
+    lag_static = _lag_static_windows(structure, structural_step, step, count, mafd, side_factor)
+    for j in lag_static:
+        for i in range(j - step + 1, j + 1):
+            flags[i] = True
+    recode = structural_limit(FREEZE_BLIP_MAFD, side_factor)
     runs = []
     for first, last in _still_runs(flags, mafd[:count]):
+        if structure is not None and lag_static:
+            first, last = _extend_static(first, last, structure, mafd, count)
         if structural_step is None or step <= 0:
             runs.append((first, last))
             continue
         frozen_from = first - 1
         # Between frames j-step and j a static picture changes by no more
-        # than the noisiest frame in between explains, and by no more than
-        # an encoder's re-coding of a held picture (one refresh blip,
-        # FREEZE_BLIP_MAFD, as the averaged copy sees it).
-        recode = structural_limit(FREEZE_BLIP_MAFD, side_factor)
+        # than the noisiest frame in between explains, by no more than an
+        # encoder's re-coding of a held picture (one refresh blip,
+        # FREEZE_BLIP_MAFD, as the averaged copy sees it), or by no more
+        # than its frame-to-frame grain (FREEZE_LAG_RATIO).
         moved = [(j - step, j) for j in range(max(step, frozen_from + step), last + 1)
                  if j < len(structural_step) and structural_step[j] is not None
-                 and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))]
+                 and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))
+                 and j not in lag_static]
         runs += [(a + 1, b) for a, b in _static_segments(frozen_from, last, moved) if b > a]
     for first, last in runs:
         frozen_from = first - 1
