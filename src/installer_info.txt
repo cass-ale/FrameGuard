@@ -1,4 +1,4 @@
-FrameGuard Desktop v0.9.1
+FrameGuard Desktop v0.9.2
 Video QA for XR Deliverables
 
 
@@ -22,28 +22,23 @@ WHAT THIS INSTALLS
     presets can be saved and shared with your team as .fg files.
 
 
-WHAT'S NEW IN v0.9.1
+WHAT'S NEW IN v0.9.2
 
-  Broadcast-grade signal checks
-    - Loudness and true peak against EBU R 128, ATSC A/85, Netflix or
-      streaming targets, plus clipping, dropouts, phase, dual mono, DC offset
-      and hum.
-    - EBU R 103 signal levels and gamut, flash screening, interlace and
-      field-order detection, and better black and freeze detection.
-    - Container, codec profile, edit list, A/V offset, timecode, HDR and 360
-      (spatial video and audio) conformance.
-
-  A native Windows window
-    - Themed native title bar with full-size, unclipped window buttons,
-      smooth resizing, and taskbar and Start menu icons in the theme colour.
+  Fixes from an independent review
+    - Flash screening judges every region of the screen, down to fine
+      patterns; HDR video shows "Not verified" instead of skipping.
+    - Interlacing and 3:2 pulldown are found in real camera footage.
+    - Picture levels follow EBU R 103 exactly, at full resolution.
+    - Truncated files, quiet room tone, hum, phase and ambisonic peaks are
+      judged correctly; anything FFmpeg could not measure says so.
 
   Stricter where it matters
-    - 29.97 fps no longer passes a 30 fps spec silently: it warns unless
-      you allow NTSC rate matching.
+    - Disguised containers fail, and an unread file structure is never a
+      pass. Presets from 0.9.1 load, with every adjustment shown.
 
-  Also in v0.9.0
-    - A new FrameGuard icon, stricter file-integrity verdicts, and JSON and
-      CSV data next to every PDF report.
+  Also in v0.9.1
+    - Broadcast-grade loudness, picture and conformance checks, and a
+      native Windows window.
 
 
 BEFORE YOU INSTALL

@@ -10,6 +10,39 @@ GitHub Release proves them; tagged-but-unpublished versions are marked as such.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.2] — 2026-10-25 — Review fixes: safer flash screening, real-footage interlace, exact picture levels, cleaner audio verdicts
+
+### Fixed
+- Flash screening now judges each region of the screen, down to fine patterns: flashing that alternates between halves, checkerboards, turning patterns or red/blue lights is flagged (ITU-R BT.1702-3 combined area). It remains a screening, not a certificate; HDR (PQ/HLG) video shows "Not verified" instead of skipping.
+- Interlaced (woven) pictures and 3:2 pulldown in files declared progressive are found in real camera footage, not just test graphics. Progressive test patterns and rolling credits are no longer called interlaced.
+- Signal Levels applies the EBU R 103 filter to every pixel at native resolution, within each field for interlaced video. Violations on UHD and 8K masters are no longer averaged away.
+- File Integrity fails a file missing more than 2 frames or 0.1 s, whatever its length (it allowed 2% before: 144 s of a two-hour master). Decoder errors that FFmpeg conceals are counted.
+- Black Frames ignores a small static graphic such as burnt-in timecode or a channel logo when the rest of the picture is true black, and never calls a dark grade, low-contrast scene or credit roll black.
+- Freeze Frames finds freezes under film grain and mid-programme, does not flag slow pans or dips through black, lets title cards and still shots hold up to the Title Card Hold allowance (3 s), and reports a picture that freezes to the end.
+- Quiet room tone no longer fails as silent: whole-track silence is judged at -70 dBFS (Telestream Qualify's default). A clip that is mostly silence fails at any length.
+- Ambisonic true peak is measured on every channel; head-locked stereo is checked for peaks and reported as part of the mix.
+- On Apple Silicon, the fallback loudness meter places channels by their layout; layouts it cannot place show "Not verified".
+- Out-of-phase sections end where they end; a whole track in reverse polarity is caught.
+- Mains hum is judged on a steady tone within 1% of 50/60 Hz (EN 50160); bass notes and organ tones no longer read as hum. The LFE channel is recognised by position in every layout.
+- Any loudness, true peak, phase or picture measurement FFmpeg did not produce shows "Not verified", never PASS.
+- A file whose content is not what its extension says (a renamed or junk-prefixed MPEG-TS, FLV or PS) fails Container Format; an unrecognised file is "Not verified".
+- Top-bottom 360 pictures tagged mono are found at any disparity; 180-degree files are checked for square eyes.
+- An unread or oversized moov makes the container, XR, spatial audio and timecode rows "Not verified" instead of passing. The MP4/MOV parser is hardened against hostile files.
+- A/V Sync Offset reads AAC encoder priming from the audio track's edit list or the identified encoder. When neither tells it, the offset is "Not verified" unless no priming could explain it; Strict Mode does not escalate that.
+- A remuxed file whose timestamps are rounded to its container's timebase is no longer called variable frame rate; isolated whole-frame gaps are reported as dropped frames, and frequent ones as variable frame rate.
+- The Quest 360 presets accept HEVC and AV1 Main only (Meta Horizon media requirements). 8K 360 is labelled as the Horizon OS streaming target; a new 360 Mono 7200 preset matches Media Studio's maximum.
+
+### Improved
+- New checks: Low-Level Audio notes stretches 20 dB under the programme between -70 and -40 dBFS without changing the verdict; colour tags that contradict each other or are only partly set are flagged.
+- New settings: Phase Threshold, Dual Mono Allowed, Dialogue-Gated Loudness, Low-Level Audio, Title Card Hold and AAC Encoder Priming, each in Settings, presets and the PDF.
+- Presets from 0.9.1 load leniently: out-of-range values are clamped and contradictions resolved towards the stricter value, and defaults that changed are migrated; every adjustment is shown on import and in the PDF.
+- Measured on three known-answer test sets, against 0.9.1 with the same mapping: [NUMBERS]
+
+### Changed
+- FFmpeg 8.1.2 or newer is required for frame-level checks (tested floor; the bundled build is 9.0.2). Older builds show "Not verified" with a startup notice. FRAMEGUARD_TOOLS_DIR selects another FFmpeg build.
+- Deep scans with Signal Levels on take about [SPEED] longer than 0.9.1 at 1080p, because R 103 is now computed exactly. Turning Signal Levels off returns to 0.9.1's speed.
+- Correction to the 0.9.1 notes: their "17 to 31 of 45" benchmark baseline was 0.9.0. Measured against 0.8.3, 0.9.1 raised detected defect types from 12 to 31.
+
 ## [0.9.1] — 2026-10-21 — Signal QC: audio, picture and conformance checks from the benchmark
 
 ### Fixed
