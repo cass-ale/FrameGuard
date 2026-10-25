@@ -463,7 +463,8 @@ class TestRealScan:
         video = core._primary_video_stream(core.run_ffprobe(path))
         with vc.VideoAnalysis(video, dict(DEFAULT_CONFIG)) as analysis:
             graph = ";".join(analysis._levels_chains())
-        assert "[ar_gamut1]" not in graph and "[ar_gamut0]" in graph
+        # one candidate matrix: one set of gamut masks (0.9.2: per plane)
+        assert "[g1_r]" not in graph and "[g0_r]" in graph
 
     def test_luma_patch_inside_the_area_tolerance(self, tmp_path):
         path = _clip(tmp_path / "small.mp4",

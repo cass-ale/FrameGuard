@@ -141,6 +141,10 @@ R103_PHASES = (4, 2)
 # centre (_CENTRE_SITED_CODECS).
 _CHROMA_LOCATIONS = ("left", "center", "topleft", "top", "bottomleft", "bottom")
 _CENTRE_SITED_CODECS = {"mpeg1video", "mjpeg", "jpeg2000", "jpegls", "mjpegb", "ljpeg"}
+# The R 103 graph runs as up to LEVELS_PARTS_MAX parallel copies (see
+# VideoAnalysis.levels_parts); LEVELS_SERIES are the series it writes.
+LEVELS_PARTS_MAX = 4
+LEVELS_SERIES = ("luma", "band1", "band2", "gam_r", "gam_g", "gam_b")
 # Interlace analysis keeps every line (fields must stay separate) but
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
@@ -904,6 +908,12 @@ class VideoAnalysis:
         self.config = VideoCheckConfig.from_cfg(cfg)
         self.index = int(video["index"])
         self.cancel = cancel
+        # The exact R 103 graph is the costliest per frame; frames are dealt
+        # round-robin to this many copies of it, each its own filtergraph
+        # thread (FFmpeg runs filtergraphs in parallel, filters within one
+        # in series). Same work per frame, so the same results.
+        threads = int(cfg.get("filter_threads", 4) or 4)
+        self.levels_parts = max(1, min(LEVELS_PARTS_MAX, threads // 2))
         self.directory: Optional[str] = None
         self.paths: Dict[str, str] = {}
         self.flash_reader: Optional[_FlashSegmentReader] = None
@@ -923,6 +933,7 @@ class VideoAnalysis:
                  "yavg", "gam_r", "gam_g", "gam_b", "ft_same", "ft_top", "ft_bot", "ft_move", "colmo", "rowmo") + tuple(
                      _disp_name(d) for d in INTERLACE_DISPLACEMENTS) + tuple(
                      _shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1))
+        names += tuple(f"{name}@{part}" for name in LEVELS_SERIES for part in range(self.levels_parts))
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         if self.flash_enabled:
             self.flash_reader = _FlashSegmentReader(self.directory, self.info.fps, self.cancel)
@@ -1022,7 +1033,8 @@ class VideoAnalysis:
         if self.needs_interlace_branch:
             graphs.append((";".join(self._interlace_chains()), "[vs_il]"))
         if self.needs_levels_branch:
-            graphs.append((";".join(self._levels_chains()), "[vs_lv]"))
+            for part in range(self.levels_parts):
+                graphs.append((";".join(self._levels_part(part)), f"[vs_lv{part}]"))
         if self.needs_area_branch:
             label = None if self.flash_enabled else "[vs_area]"
             graphs.append((";".join(self._area_chains()), label))
@@ -1122,6 +1134,32 @@ class VideoAnalysis:
         ]
         return chains
 
+    def _levels_part(self, part: int) -> List[str]:
+        """The levels graph for every levels_parts-th frame from ``part``.
+
+        Labels get the part as a suffix, prints go to the part's files
+        (``name@part``), and the output is ``[vs_lv<part>]``.
+        """
+        # The prints are built with the part's files (and FFmpeg's escaping
+        # of their paths) by pointing the series names at them meanwhile.
+        saved = {name: self.paths[name] for name in LEVELS_SERIES}
+        try:
+            for name in LEVELS_SERIES:
+                self.paths[name] = self.paths[f"{name}@{part}"]
+            chains = self._levels_chains()
+        finally:
+            self.paths.update(saved)
+        if self.levels_parts == 1 and part == 0:
+            text = ";".join(chains)
+        else:
+            text = ";".join(chains).replace(
+                f"[0:{self.index}]",
+                f"[0:{self.index}]select='eq(mod(n\\,{self.levels_parts})\\,{part})',", 1)
+        text = re.sub(r"\[([A-Za-z_][A-Za-z0-9_]*)\]",
+                      lambda m: f"[{m.group(1)}{part}]" if m.group(1) == "vs_lv" else f"[{m.group(1)}_p{part}]",
+                      text)
+        return text.split(";")
+
     def _levels_chains(self) -> List[str]:
         """EBU R 103 luma and RGB gamut masks of the R 103-filtered picture.
 
@@ -1133,15 +1171,12 @@ class VideoAnalysis:
         reconstructs, and mis-sited chroma would misplace every colour edge
         against its luma edge (reading gamut about 2x low on 4:2:0 edges).
 
-        The planes are reordered with single-input mergeplanes and processed
-        three at a time by lutyuv/lut2; each packed mask frame gives three
-        area fractions from one signalstats call. The graph ends in
-        ``[vs_lv]``.
+        The masks are computed plane by plane with lut/lut2, reduced, then
+        packed three to a frame for one signalstats call each. The graph
+        ends in ``[vs_lv]``.
         """
         info = self.info
         matrices = info.gamut_matrices
-        uses = ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
-        labels = "".join(f"[ar_{u}]" for u in uses)
         # R 103: the filter is "applied intra field for interlace signals":
         # an interlaced picture is filtered with its fields stacked (il), so
         # no tap reaches into the other field.
@@ -1149,18 +1184,39 @@ class VideoAnalysis:
         chains = [f"[0:{self.index}]{fields}{_WIDEN}:in_chroma_loc={info.chroma_loc}:"
                   "flags=bilinear+full_chroma_int+accurate_rnd,format=yuv444p16[lv_src]"]
         chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
-        chains.append(f"[lv_all]split={len(uses)}{labels}")
-        # Masks are area-reduced 4:1 before signalstats: a 0/255 mask's mean
-        # (the violating share) is preserved exactly.
+        # Masks are computed per plane (no plane re-packing at full size)
+        # and area-reduced 4:1 before they are packed for one signalstats
+        # call: a 0/255 mask's mean (the violating share) survives.
         reduce4 = "scale=w='max(1,trunc(iw/4))':h='max(1,trunc(ih/4))':flags=area"
-        m1, m2, m3 = _luma_mask_expressions(info)
+        count = len(matrices)
+        chains.append("[lv_all]extractplanes=y+u+v[lv_y][lv_u][lv_v]")
+        chains.append(f"[lv_y]split={3 * count + 3}" + "".join(f"[y{i}]" for i in range(3 * count + 3)))
+        chains.append(f"[lv_u]split={2 * count}" + "".join(f"[u{i}]" for i in range(2 * count)))
+        chains.append(f"[lv_v]split={2 * count}" + "".join(f"[v{i}]" for i in range(2 * count)))
         for k, matrix in enumerate(matrices):
-            chains += self._gamut_chains(k, matrix)
-        chains += self._gamut_combined(len(matrices), reduce4)
-        chains += [
-            f"[ar_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p,lutyuv=y='{m1}':u='{m2}':v='{m3}',"
-            f"{reduce4},signalstats,{','.join(self._luma_prints())},null[vs_lv]",
-        ]
+            red, blue, helper, green = _rgb_mask_expressions(info, matrix)
+            chains += [
+                f"[y{3 * k}][v{2 * k}]lut2=c0='{red}'[g{k}_r]",
+                f"[y{3 * k + 1}][u{2 * k}]lut2=c0='{blue}'[g{k}_b]",
+                f"[u{2 * k + 1}][v{2 * k + 1}]lut2=c0='{helper}'[g{k}_w]",
+                f"[g{k}_w][y{3 * k + 2}]lut2=c0='{green}'[g{k}_g]",
+            ]
+        planes = []
+        for c in "rgb":
+            # A pixel counts only if outside under every candidate matrix.
+            label = f"[g0_{c}]"
+            for k in range(1, count):
+                chains.append(f"{label}[g{k}_{c}]lut2=c0='min(x,y)'[gand{k}_{c}]")
+                label = f"[gand{k}_{c}]"
+            chains.append(f"{label}{reduce4}[gr_{c}]")
+            planes.append(f"[gr_{c}]")
+        pack = "mergeplanes=map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0:format=yuv444p"
+        chains.append("".join(planes) + f"{pack},signalstats,{self._share_print('Y', 'gam_r')},"
+                      f"{self._share_print('U', 'gam_g')},{self._share_print('V', 'gam_b')},nullsink")
+        m1, m2, m3 = _luma_mask_expressions(info)
+        for i, mask in enumerate((m1, m2, m3)):
+            chains.append(f"[y{3 * count + i}]lut=c0='{mask}',{reduce4}[lm{i}]")
+        chains.append(f"[lm0][lm1][lm2]{pack},signalstats,{','.join(self._luma_prints())},null[vs_lv]")
         return chains
 
     def _area_chains(self) -> List[str]:
@@ -1303,40 +1359,6 @@ class VideoAnalysis:
                     self._share_print("V", "band2", R103_AREA)]
         return [self._share_print("Y", "luma"), self._share_print("U", "band1", R103_AREA)]
 
-    def _gamut_chains(self, k: int, matrix: str) -> List[str]:
-        """Packed (R, G, B) gamut masks of ``[ar_gamut<k>]`` under ``matrix`` -> ``[g<k>_rgb]``."""
-        red, blue, helper, green = _rgb_mask_expressions(self.info, matrix)
-        g = f"g{k}"
-        return [
-            f"[ar_gamut{k}]split=3[{g}_src][{g}_alt][{g}_luma]",
-            f"[{g}_src]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=1"
-            f":format=yuv444p[{g}_a]",
-            f"[{g}_alt]mergeplanes=map0s=0:map0p=2:map1s=0:map1p=1:map2s=0:map2p=2"
-            f":format=yuv444p[{g}_b]",
-            f"[{g}_a][{g}_b]lut2=c0='{red}':c1='{blue}':c2='{helper}',"
-            f"mergeplanes=map0s=0:map0p=0:map1s=0:map1p=2:map2s=0:map2p=1:format=yuv444p[{g}_rwb]",
-            f"[{g}_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0"
-            f":format=yuv444p[{g}_yyy]",
-            f"[{g}_rwb][{g}_yyy]lut2=c0='x':c1='{green}':c2='x'[{g}_rgb]",
-        ]
-
-    def _gamut_combined(self, count: int, reduce4: str) -> List[str]:
-        """R, G and B shares, a pixel counting only if outside under every matrix.
-
-        With one (signalled) matrix this is that matrix's masks. Without a
-        tag, the candidate matrices' masks are intersected per pixel
-        (minimum of 0/255 masks), so the shares are already "outside R 103
-        under every candidate" - and an untagged file that is in gamut under
-        one standard matrix writes nothing.
-        """
-        chains, label = [], "[g0_rgb]"
-        for k in range(1, count):
-            chains.append(f"{label}[g{k}_rgb]lut2=c0='min(x,y)':c1='min(x,y)':c2='min(x,y)'[gand{k}]")
-            label = f"[gand{k}]"
-        chains.append(f"{label}{reduce4},signalstats,{self._share_print('Y', 'gam_r')},"
-                      f"{self._share_print('U', 'gam_g')},{self._share_print('V', 'gam_b')},nullsink")
-        return chains
-
     def extra_outputs(self) -> List[str]:
         """Arguments for the raw flash-grid output (after the main output).
 
@@ -1412,7 +1434,14 @@ class VideoAnalysis:
                                    for t, v, c, r, sp in zip(timing, vertical, col, row, speed)]
         if self.needs_levels_branch:
             def fraction(name: str) -> List[float]:
-                return sparse(name, 0.0, lambda v: _to_float(v) / 255.0)
+                # Each frame went to one part (by pts: frames were selected).
+                merged = [0.0] * len(master)
+                for part in range(self.levels_parts):
+                    values = sparse(f"{name}@{part}", 0.0, lambda v: _to_float(v) / 255.0, by_pts, 1)
+                    if f"{name}@{part}" in series.missing:
+                        series.missing.add(name)
+                    merged = [a + b for a, b in zip(merged, values)]
+                return merged
             series.luma, series.band1, series.band2 = fraction("luma"), fraction("band1"), fraction("band2")
             # The largest single-component share: never above the union of
             # R, G and B violations, so it can only under-report.
