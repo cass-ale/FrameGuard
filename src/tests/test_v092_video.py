@@ -916,7 +916,8 @@ class TestFreezeRules:
         assert found.holds[0][1] == pytest.approx(60 / FPS, abs=0.1)
 
     def test_quiet_night_shot_between_busy_shots_is_not_a_freeze(self):
-        found, (status, _, _) = _freezes([(90, *BUSY), (1, "cut", 0), (90, 0.2, 0.01),
+        # A 3 s shot (its first frame is the cut): within the hold allowance.
+        found, (status, _, _) = _freezes([(90, *BUSY), (1, "cut", 0), (89, 0.2, 0.01),
                                           (1, "cut", 0), (90, *BUSY)])
         assert found.holds == [] and status == "PASS"
 
@@ -1120,12 +1121,26 @@ class TestCfrTimestampRounding:
         assert row[1] == "WARN" and "dropped" in row[2] and "Variable" not in row[2], row
         assert meta.get("dropped_frames") == 1
 
-    def test_dropped_frames_are_not_variable_frame_rate(self):
+    def test_dropped_frames_beyond_the_threshold_are_variable_frame_rate(self):
         times = [k / 30 for k in range(300) if k not in (50, 100, 101, 200, 250)]
         row, meta = _cfr(times)
-        # 4 gaps in 295 intervals (> vfr_threshold 1 %): a FAIL, named as drops
-        assert row[1] == "FAIL" and "5 dropped" in row[2] and "Variable" not in row[2], row
+        # 4 gaps in 295 intervals (> vfr_threshold 1 %): variable frame rate,
+        # with the drops named in the detail
+        assert row[1] == "FAIL" and row[2].startswith("Variable frame rate") and "5 dropped" in row[2], row
         assert meta.get("dropped_frames") == 5
+
+    def test_every_fifth_frame_dropped_is_variable_frame_rate(self):
+        """Round 6 (corpus gate): phone-style VFR - every 5th frame missing,
+        timestamps kept - read only as 'N dropped frame(s)'."""
+        times = [k / 30 for k in range(300) if k % 5 != 4]
+        row, meta = _cfr(times)
+        assert row[1] == "FAIL" and row[2].startswith("Variable frame rate"), row
+        assert "dropped" in row[2] and meta.get("vfr_detected") is True, row
+
+    def test_two_isolated_drops_under_the_threshold_stay_dropped(self):
+        times = [k / 30 for k in range(600) if k not in (150, 400)]
+        row, _ = _cfr(times)
+        assert row[1] == "WARN" and "2 dropped" in row[2] and "Variable" not in row[2], row
 
     def test_repeated_timestamp_is_a_duplicated_frame(self):
         times = [k / 30 for k in range(300)]
@@ -1148,6 +1163,13 @@ class TestCfrRemux:
         ffmpeg("-i", str(source), "-c", "copy", str(remux))
         row = _row(_scan(str(remux), target_width=320, target_height=240), "CFR Check")
         assert row[1] == "PASS", row
+
+    def test_every_fifth_frame_dropped_is_variable_frame_rate(self, tmp_path):
+        path = tmp_path / "phone.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=6", "-vf", "select='mod(n\\,5)-4'",
+               "-fps_mode", "passthrough", *X264, "-an", str(path))
+        row = _row(_scan(str(path), target_width=320, target_height=240), "CFR Check")
+        assert row[1] == "FAIL" and row[2].startswith("Variable frame rate") and "dropped" in row[2], row
 
     def test_one_dropped_frame_is_reported_as_dropped(self, tmp_path):
         path = tmp_path / "drop.mkv"
@@ -1275,17 +1297,82 @@ class TestFreezeRecall:
         assert "00:00:07.9" in row[2] or "00:00:08.0" in row[2], row
 
 
+def _film_grain(graph_label, seconds, strength, sigma, size="640x360", rate=24):
+    """Film-like grain: fresh noise every frame, spatially correlated (gblur),
+    merged over [graph_label]."""
+    return (f"color=gray:s={size}:r={rate}:d={seconds},format=yuv420p,noise=alls={strength}:allf=t,"
+            f"gblur=sigma={sigma},setparams=range=tv[gr];"
+            f"[{graph_label}][gr]blend=all_mode=grainmerge:c1_mode=normal:c2_mode=normal,format=yuv420p")
+
+
+def _texture_pan(seconds, px_per_s, rate=24, x0=200):
+    return (f"{_TEXTURE},loop=-1:1,fps={rate},trim=duration={seconds},setpts=PTS-STARTPTS,"
+            f"crop=640:360:'{x0}+{px_per_s}*t+3*sin(2*PI*1.3*t)':'200+3*sin(2*PI*0.9*t+1)',"
+            "format=yuv420p,setparams=range=tv")
+
+
+@needs_ffmpeg
+class TestFreezeUnderFilmGrain:
+    """Round 6 (corpus gate): a 2 s freeze in the middle of a moving shot
+    with live, spatially correlated grain over the frozen picture passed."""
+
+    @pytest.mark.parametrize("strength,sigma", [(30, 1.0), (60, 2.0)])
+    def test_mid_shot_freeze_under_film_grain(self, tmp_path, strength, sigma):
+        pan = _texture_pan(6, 120) + ",split[a][b];[a][b]freezeframes=first=48:last=95:replace=48[pic]"
+        graph = pan + ";" + _film_grain("pic", 6, strength, sigma)
+        path = _graph_clip(tmp_path / f"film{strength}.mp4", graph)
+        row = _row(_scan(path, target_fps=24.0), "Freeze Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:02.0" in row[2], row
+
+    def test_lag_rule(self):
+        grain = [0.6] * 30                      # correlated grain: 0.6 % after averaging
+        mafd = [4.0] * 30
+        step = [None] * 30
+        step[15], step[29] = 0.7, 3.0           # static window, then motion
+        assert vc._lag_static_windows(grain, step, 15, 30, mafd, 16.0) == {15}
+        # a flicker survives the averaging whole: not grain, never static
+        assert vc._lag_static_windows([3.9] * 30, [None] * 15 + [3.9] + [None] * 14, 15, 30, mafd, 16.0) == set()
+        assert vc._extend_static(10, 20, [9.0] * 5 + [0.6] * 25, [20.0] * 5 + [4.0] * 25, 30) == (5, 29)
+
+    def test_slow_pan_under_film_grain_is_not_a_freeze(self, tmp_path):
+        graph = _texture_pan(8, 4) + "[pic];" + _film_grain("pic", 8, 40, 1.0)
+        path = _graph_clip(tmp_path / "slowfilm.mp4", graph)
+        assert _row(_scan(path, target_fps=24.0), "Freeze Frames")[1] == "PASS"
+
+
+@needs_ffmpeg
+class TestHeldShotAllowance:
+    """Round 6 (corpus gate): a 6 s still shot between two cuts was excused as
+    a held shot with no limit; the Title Card Hold caps it."""
+
+    def _clip(self, tmp_path, still_seconds):
+        still = (f"testsrc2=s=640x360:r=24:d=1,trim=end_frame=1,loop=-1:1,fps=24,"
+                 f"trim=duration={still_seconds},setpts=PTS-STARTPTS,format=yuv420p,setparams=range=tv[st0];"
+                 + _film_grain("st0", still_seconds, 8, 0.5).replace("[gr]", "[gr1]").replace("][gr]", "][gr1]"))
+        graph = (f"{_texture_pan(4, 120)}[a];{still}[b];{_texture_pan(4, 120, x0=700)}[c];"
+                 "[a][b][c]concat=n=3:v=1:a=0")
+        return _graph_clip(tmp_path / f"held{still_seconds}.mp4", graph)
+
+    def test_still_shot_longer_than_the_allowance_warns(self, tmp_path):
+        row = _row(_scan(self._clip(tmp_path, 6), target_fps=24.0), "Freeze Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:04.0" in row[2], row
+
+    def test_still_shot_within_the_allowance_passes(self, tmp_path):
+        row = _row(_scan(self._clip(tmp_path, 2.5), target_fps=24.0), "Freeze Frames")
+        assert row[1] == "PASS" and "hold allowance" in row[2], row
+
+
 @needs_ffmpeg
 class TestNoFalseFreezes:
     """Round 2: a freeze is a static picture, not a slow or interrupted one."""
 
     def test_dips_to_black_between_shots(self, tmp_path):
-        """Moving shot, 1-frame dip, locked-off shot (live grain), 2-frame
-        dip, moving shot."""
+        """Moving shot, 1-frame dip, a 2.5 s locked-off shot (live grain,
+        within the hold allowance), 2-frame dip, moving shot."""
         graph = (f"{_camera_pan(4, 90, 6, shake=0)}[a];"
-                 f"{_camera_pan(4, 0, 6, x0=900, y0=500, shake=0)}[b];"
+                 f"{_camera_pan(2.5, 0, 6, x0=900, y0=500, shake=0)}[b];"
                  f"{_camera_pan(4, 90, 6, x0=600, shake=0)}[c];[a][b][c]concat=n=3:v=1:a=0,"
-                 "drawbox=c=black:t=fill:enable='eq(n,120)+between(n,240,241)'")
+                 "drawbox=c=black:t=fill:enable='eq(n,120)+between(n,195,196)'")
         assert _row(_scan(_graph_clip(tmp_path / "dips.mp4", graph)), "Freeze Frames")[1] == "PASS"
 
     @pytest.mark.parametrize("dark", [False, True])
@@ -1308,6 +1395,30 @@ class TestBlackArea:
         fine = [e if e != "18" else "6" for e in X264]
         row = _row(_scan(_graph_clip(tmp_path / "dark.mp4", graph, fine)), "Black Frames")
         assert row[1] == "PASS", row
+
+    @pytest.mark.parametrize("lift,spread", [(1, 4), (0, 3)])
+    def test_locked_off_dark_grade_with_soft_practicals(self, tmp_path, lift, spread):
+        """Round 6 (corpus gate): a locked-off dark grade - a static noise
+        texture just above black (mean Y about 20-21) with two soft practical
+        lights (about 2-4 % of the frame) - read as black with a static
+        overlay. The lights are soft blobs, not a graphic."""
+        texture = ("color=gray:s=640x360:d=1,noise=alls=100:allf=0:all_seed=3,gblur=sigma=2,format=yuv420p,"
+                   f"lutyuv=y='16+{lift}+val*{spread}/255',setparams=range=tv,"
+                   "loop=-1:1,fps=30,trim=duration=4,setpts=PTS-STARTPTS")
+        lights = ("color=c=black:s=640x360:r=30:d=4,"
+                  "drawbox=x=140:y=90:w=40:h=40:c=white:t=fill,drawbox=x=440:y=210:w=36:h=36:c=0xFFE0A0:t=fill,"
+                  "gblur=sigma=9,format=yuv420p,setparams=range=tv")
+        graph = f"{texture}[bg];{lights}[li];[bg][li]blend=all_mode=lighten,format=yuv420p"
+        fine = [e if e != "18" else "6" for e in X264]
+        row = _row(_scan(_graph_clip(tmp_path / f"lockoff{lift}.mp4", graph, fine)), "Black Frames")
+        assert row[1] == "PASS", row
+
+    def test_black_with_burnt_in_timecode_only(self, tmp_path):
+        graph = ("testsrc2=s=640x360:r=30:d=6,drawbox=c=black:t=fill:enable='between(t,2,4)',"
+                 "drawtext=timecode='00\\:00\\:00\\:00':rate=30:x=230:y=310:fontsize=36:fontcolor=white,"
+                 "format=yuv420p")
+        row = _row(_scan(_graph_clip(tmp_path / "tconly.mp4", graph)), "Black Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:02" in row[2], row
 
     def test_end_credits_on_black(self, tmp_path):
         """About 6 % white text bars rolling up over black at 1 px/frame."""
@@ -1661,12 +1772,12 @@ class TestFreezeHelpersExact:
         """Black frame, then an encoder blip, then a held shot: the frame
         after the black is next to it, so the shot enters on an edit."""
         busy, still = (2.6, 2.0), (0.15, 0.003)
-        rows = [busy] * 90 + [(40.0, 40.0), (40.0, 40.0), (1.0, 0.5)] + [still] * 90
+        rows = [busy] * 90 + [(40.0, 40.0), (40.0, 40.0), (1.0, 0.5)] + [still] * 80
         rows += [(40.0, 40.0), (40.0, 40.0)] + [busy] * 60
         mafd = [r[0] for r in rows]
         structural = [r[1] for r in rows]
         times = _times(len(rows))
-        black = [(90 / 30, 1 / 30), (183 / 30, 1 / 30)]
+        black = [(90 / 30, 1 / 30), (173 / 30, 1 / 30)]
         found = vc.detect_freezes(mafd, times, FPS, 1.0, len(rows) / 30, black,
                                   structural=structural, hold_allowance=3.0)
         assert found.holds == [] and found.composed
@@ -1724,6 +1835,22 @@ class TestBlackHelpersExact:
         static = [0.04 if i % 15 == 0 and i else None for i in range(61)]
         runs = vc.overlay_black_runs(nonblack, static, times, 15, 0.98, 1 / 30, sample=3)
         assert runs == [(0.0, pytest.approx(61 / 30))]
+
+    def test_overlay_must_be_a_graphic_on_true_black(self):
+        times = _times(30)
+        nonblack = [0.04] * 30
+        static = [0.04 if i % 9 == 0 and i else None for i in range(30)]
+        black = [16.5 * 0.96] * 30                       # rest mean 16.5: true black
+        args = (nonblack, static, times, 9, 0.98, 1 / 30)
+        assert vc.overlay_black_runs(*args, bright=[0.02] * 30, black_sum=black)      # half at fill
+        assert not vc.overlay_black_runs(*args, bright=[0.0199] * 30, black_sum=black)  # soft light
+        assert vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[17.0 * 0.96] * 30)
+        assert not vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[17.01 * 0.96] * 30)
+        assert not vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[None] * 30)
+        assert vc.overlay_black_runs(*args, bright=[0.04] * 30, black_sum=[1.0 * 0.96] * 30,
+                                     black_level=0.0)                               # full range
+        assert vc.overlay_black_runs([0.0] * 30, [0.0 if v is not None else None for v in static],
+                                     times, 9, 0.98, 1 / 30, bright=[0.0] * 30, black_sum=[16.0] * 30)
 
     def test_merge_runs(self):
         assert vc.merge_runs([(0, 1)], [(1 + 5e-7, 2)]) == [(0, 2)]

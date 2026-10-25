@@ -141,6 +141,10 @@ R103_PHASES = (4, 2)
 # centre (_CENTRE_SITED_CODECS).
 _CHROMA_LOCATIONS = ("left", "center", "topleft", "top", "bottomleft", "bottom")
 _CENTRE_SITED_CODECS = {"mpeg1video", "mjpeg", "jpeg2000", "jpegls", "mjpegb", "ljpeg"}
+# The R 103 graph runs as up to LEVELS_PARTS_MAX parallel copies (see
+# VideoAnalysis.levels_parts); LEVELS_SERIES are the series it writes.
+LEVELS_PARTS_MAX = 4
+LEVELS_SERIES = ("luma", "band1", "band2", "gam_r", "gam_g", "gam_b")
 # Interlace analysis keeps every line (fields must stay separate) but
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
@@ -244,6 +248,16 @@ FREEZE_IDENTICAL_MAFD = 0.004
 FREEZE_GRAIN_CORRELATION = 2.0
 FREEZE_STRUCTURAL_FLOOR = 0.02
 FREEZE_STEP_FRACTION = 0.5
+# Lag test (see _lag_static_windows): independent grain gives the same mean
+# change at any lag. On the averaged copy (thousands of samples) the two
+# means agree within a few per cent; 1.25 leaves a wide margin for that
+# sampling noise while motion over half the minimum duration changes the
+# picture several times more than over one frame.
+FREEZE_LAG_RATIO = 1.25
+# Grain is spatially correlated over a few pixels at most (film grain clumps
+# of 5-15 um, softened by the scan, span up to about 4 px of an HD frame);
+# twice that, 8 px, bounds what of a frame-to-frame change can be grain.
+FREEZE_GRAIN_MAX_PX = 8.0
 # A scene change, as FFmpeg's scdet decides it with its documented default
 # threshold (10): score = min(MAFD, |MAFD - previous MAFD|) >= 10.
 FREEZE_CUT_SCORE = 10.0
@@ -296,6 +310,20 @@ BLACK_OVERLAY_MAX = 0.05
 BLACK_OVERLAY_BLOCK = 8
 BLACK_OVERLAY_STEP = 0.5
 BLACK_OVERLAY_SAMPLE = 0.1
+# Only a graphic overlay is excluded (round 6: soft practical lights in a
+# locked-off dark grade were swallowed). A burnt-in timecode or a logo is a
+# near-uniform fill bounded by a sharp edge, so at least BLACK_GRAPHIC_SHARE
+# (a majority) of its non-black samples sit at its fill, at or above
+# BLACK_GRAPHIC_LEVEL (half of nominal white); a soft light is mostly
+# fall-off (a Gaussian blob of peak P above black has only (r_half/r_black)^2,
+# under a fifth at P >= 100 codes, of its non-black area above half white).
+# And the rest must be true black: its mean code within BLACK_TRUE_MARGIN
+# (one 8-bit code, about 0.5 % of nominal) of the R 103 / BT.709 black level,
+# not merely dark (a lifted dark grade sits a few codes above it; grain on
+# black averages to it).
+BLACK_GRAPHIC_LEVEL = 0.5
+BLACK_GRAPHIC_SHARE = 0.5
+BLACK_TRUE_MARGIN = 1.0
 
 # Interlace (see assess_interlace). idet runs with FFmpeg's documented
 # defaults (intl_thres 1.04, prog_thres 1.5, rep_thres 3.0; FFmpeg filters
@@ -890,6 +918,12 @@ class VideoAnalysis:
         self.config = VideoCheckConfig.from_cfg(cfg)
         self.index = int(video["index"])
         self.cancel = cancel
+        # The exact R 103 graph is the costliest per frame; frames are dealt
+        # round-robin to this many copies of it, each its own filtergraph
+        # thread (FFmpeg runs filtergraphs in parallel, filters within one
+        # in series). Same work per frame, so the same results.
+        threads = int(cfg.get("filter_threads", 4) or 4)
+        self.levels_parts = max(1, min(LEVELS_PARTS_MAX, threads // 2))
         self.directory: Optional[str] = None
         self.paths: Dict[str, str] = {}
         self.flash_reader: Optional[_FlashSegmentReader] = None
@@ -905,10 +939,11 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "struct", "struct_step", "blk_n", "blk_s", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+        names = ("mafd", "struct", "struct_step", "blk_n", "blk_s", "blk_b", "blk_k", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
                  "yavg", "gam_r", "gam_g", "gam_b", "ft_same", "ft_top", "ft_bot", "ft_move", "colmo", "rowmo") + tuple(
                      _disp_name(d) for d in INTERLACE_DISPLACEMENTS) + tuple(
                      _shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1))
+        names += tuple(f"{name}@{part}" for name in LEVELS_SERIES for part in range(self.levels_parts))
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         if self.flash_enabled:
             self.flash_reader = _FlashSegmentReader(self.directory, self.info.fps, self.cancel)
@@ -1008,7 +1043,8 @@ class VideoAnalysis:
         if self.needs_interlace_branch:
             graphs.append((";".join(self._interlace_chains()), "[vs_il]"))
         if self.needs_levels_branch:
-            graphs.append((";".join(self._levels_chains()), "[vs_lv]"))
+            for part in range(self.levels_parts):
+                graphs.append((";".join(self._levels_part(part)), f"[vs_lv{part}]"))
         if self.needs_area_branch:
             label = None if self.flash_enabled else "[vs_area]"
             graphs.append((";".join(self._area_chains()), label))
@@ -1108,6 +1144,32 @@ class VideoAnalysis:
         ]
         return chains
 
+    def _levels_part(self, part: int) -> List[str]:
+        """The levels graph for every levels_parts-th frame from ``part``.
+
+        Labels get the part as a suffix, prints go to the part's files
+        (``name@part``), and the output is ``[vs_lv<part>]``.
+        """
+        # The prints are built with the part's files (and FFmpeg's escaping
+        # of their paths) by pointing the series names at them meanwhile.
+        saved = {name: self.paths[name] for name in LEVELS_SERIES}
+        try:
+            for name in LEVELS_SERIES:
+                self.paths[name] = self.paths[f"{name}@{part}"]
+            chains = self._levels_chains()
+        finally:
+            self.paths.update(saved)
+        if self.levels_parts == 1 and part == 0:
+            text = ";".join(chains)
+        else:
+            text = ";".join(chains).replace(
+                f"[0:{self.index}]",
+                f"[0:{self.index}]select='eq(mod(n\\,{self.levels_parts})\\,{part})',", 1)
+        text = re.sub(r"\[([A-Za-z_][A-Za-z0-9_]*)\]",
+                      lambda m: f"[{m.group(1)}{part}]" if m.group(1) == "vs_lv" else f"[{m.group(1)}_p{part}]",
+                      text)
+        return text.split(";")
+
     def _levels_chains(self) -> List[str]:
         """EBU R 103 luma and RGB gamut masks of the R 103-filtered picture.
 
@@ -1119,15 +1181,12 @@ class VideoAnalysis:
         reconstructs, and mis-sited chroma would misplace every colour edge
         against its luma edge (reading gamut about 2x low on 4:2:0 edges).
 
-        The planes are reordered with single-input mergeplanes and processed
-        three at a time by lutyuv/lut2; each packed mask frame gives three
-        area fractions from one signalstats call. The graph ends in
-        ``[vs_lv]``.
+        The masks are computed plane by plane with lut/lut2, reduced, then
+        packed three to a frame for one signalstats call each. The graph
+        ends in ``[vs_lv]``.
         """
         info = self.info
         matrices = info.gamut_matrices
-        uses = ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
-        labels = "".join(f"[ar_{u}]" for u in uses)
         # R 103: the filter is "applied intra field for interlace signals":
         # an interlaced picture is filtered with its fields stacked (il), so
         # no tap reaches into the other field.
@@ -1135,18 +1194,39 @@ class VideoAnalysis:
         chains = [f"[0:{self.index}]{fields}{_WIDEN}:in_chroma_loc={info.chroma_loc}:"
                   "flags=bilinear+full_chroma_int+accurate_rnd,format=yuv444p16[lv_src]"]
         chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
-        chains.append(f"[lv_all]split={len(uses)}{labels}")
-        # Masks are area-reduced 4:1 before signalstats: a 0/255 mask's mean
-        # (the violating share) is preserved exactly.
+        # Masks are computed per plane (no plane re-packing at full size)
+        # and area-reduced 4:1 before they are packed for one signalstats
+        # call: a 0/255 mask's mean (the violating share) survives.
         reduce4 = "scale=w='max(1,trunc(iw/4))':h='max(1,trunc(ih/4))':flags=area"
-        m1, m2, m3 = _luma_mask_expressions(info)
+        count = len(matrices)
+        chains.append("[lv_all]extractplanes=y+u+v[lv_y][lv_u][lv_v]")
+        chains.append(f"[lv_y]split={3 * count + 3}" + "".join(f"[y{i}]" for i in range(3 * count + 3)))
+        chains.append(f"[lv_u]split={2 * count}" + "".join(f"[u{i}]" for i in range(2 * count)))
+        chains.append(f"[lv_v]split={2 * count}" + "".join(f"[v{i}]" for i in range(2 * count)))
         for k, matrix in enumerate(matrices):
-            chains += self._gamut_chains(k, matrix)
-        chains += self._gamut_combined(len(matrices), reduce4)
-        chains += [
-            f"[ar_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0:format=yuv444p,lutyuv=y='{m1}':u='{m2}':v='{m3}',"
-            f"{reduce4},signalstats,{','.join(self._luma_prints())},null[vs_lv]",
-        ]
+            red, blue, helper, green = _rgb_mask_expressions(info, matrix)
+            chains += [
+                f"[y{3 * k}][v{2 * k}]lut2=c0='{red}'[g{k}_r]",
+                f"[y{3 * k + 1}][u{2 * k}]lut2=c0='{blue}'[g{k}_b]",
+                f"[u{2 * k + 1}][v{2 * k + 1}]lut2=c0='{helper}'[g{k}_w]",
+                f"[g{k}_w][y{3 * k + 2}]lut2=c0='{green}'[g{k}_g]",
+            ]
+        planes = []
+        for c in "rgb":
+            # A pixel counts only if outside under every candidate matrix.
+            label = f"[g0_{c}]"
+            for k in range(1, count):
+                chains.append(f"{label}[g{k}_{c}]lut2=c0='min(x,y)'[gand{k}_{c}]")
+                label = f"[gand{k}_{c}]"
+            chains.append(f"{label}{reduce4}[gr_{c}]")
+            planes.append(f"[gr_{c}]")
+        pack = "mergeplanes=map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0:format=yuv444p"
+        chains.append("".join(planes) + f"{pack},signalstats,{self._share_print('Y', 'gam_r')},"
+                      f"{self._share_print('U', 'gam_g')},{self._share_print('V', 'gam_b')},nullsink")
+        m1, m2, m3 = _luma_mask_expressions(info)
+        for i, mask in enumerate((m1, m2, m3)):
+            chains.append(f"[y{3 * count + i}]lut=c0='{mask}',{reduce4}[lm{i}]")
+        chains.append(f"[lm0][lm1][lm2]{pack},signalstats,{','.join(self._luma_prints())},null[vs_lv]")
         return chains
 
     def _area_chains(self) -> List[str]:
@@ -1196,7 +1276,17 @@ class VideoAnalysis:
                     f"[0:{self.index}]select='not(mod(n,{self.overlay_sample_frames}))',extractplanes=y,"
                     f"scale=w='max(8,trunc(iw/{8 * BLACK_OVERLAY_BLOCK})*8)':"
                     f"h='max(8,trunc(ih/{8 * BLACK_OVERLAY_BLOCK})*8)':flags=neighbor,"
-                    f"lut=c0='if(gt(val,{level}),255,0)',split=2[bk_n][bk_s]",
+                    "split=3[bk_y][bk_b][bk_k]",
+                    f"[bk_y]lut=c0='if(gt(val,{level}),255,0)',split=2[bk_n][bk_s]",
+                    # Graphic-like test: the share of samples at or above a
+                    # graphic's fill (BLACK_GRAPHIC_LEVEL); true-black test:
+                    # the mean code of the black samples (sum over all
+                    # samples of the black ones' codes).
+                    f"[bk_b]lut=c0='if(gt(val,{black_pixel_level(BLACK_GRAPHIC_LEVEL, rng == 'pc')}),255,0)',"
+                    f"scale=w=iw/8:h=ih/8:flags=area,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths['blk_b'])},nullsink",
+                    f"[bk_k]lut=c0='if(gt(val,{level}),0,val)',scale=w=iw/8:h=ih/8:flags=area,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths['blk_k'])},nullsink",
                     f"[bk_n]scale=w=iw/8:h=ih/8:flags=area,signalstats,"
                     f"{_print('lavfi.signalstats.YAVG', self.paths['blk_n'])},nullsink",
                     f"[bk_s]select='not(mod(n,{self.overlay_step_frames // self.overlay_sample_frames}))',"
@@ -1279,40 +1369,6 @@ class VideoAnalysis:
                     self._share_print("V", "band2", R103_AREA)]
         return [self._share_print("Y", "luma"), self._share_print("U", "band1", R103_AREA)]
 
-    def _gamut_chains(self, k: int, matrix: str) -> List[str]:
-        """Packed (R, G, B) gamut masks of ``[ar_gamut<k>]`` under ``matrix`` -> ``[g<k>_rgb]``."""
-        red, blue, helper, green = _rgb_mask_expressions(self.info, matrix)
-        g = f"g{k}"
-        return [
-            f"[ar_gamut{k}]split=3[{g}_src][{g}_alt][{g}_luma]",
-            f"[{g}_src]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=1"
-            f":format=yuv444p[{g}_a]",
-            f"[{g}_alt]mergeplanes=map0s=0:map0p=2:map1s=0:map1p=1:map2s=0:map2p=2"
-            f":format=yuv444p[{g}_b]",
-            f"[{g}_a][{g}_b]lut2=c0='{red}':c1='{blue}':c2='{helper}',"
-            f"mergeplanes=map0s=0:map0p=0:map1s=0:map1p=2:map2s=0:map2p=1:format=yuv444p[{g}_rwb]",
-            f"[{g}_luma]mergeplanes=map0s=0:map0p=0:map1s=0:map1p=0:map2s=0:map2p=0"
-            f":format=yuv444p[{g}_yyy]",
-            f"[{g}_rwb][{g}_yyy]lut2=c0='x':c1='{green}':c2='x'[{g}_rgb]",
-        ]
-
-    def _gamut_combined(self, count: int, reduce4: str) -> List[str]:
-        """R, G and B shares, a pixel counting only if outside under every matrix.
-
-        With one (signalled) matrix this is that matrix's masks. Without a
-        tag, the candidate matrices' masks are intersected per pixel
-        (minimum of 0/255 masks), so the shares are already "outside R 103
-        under every candidate" - and an untagged file that is in gamut under
-        one standard matrix writes nothing.
-        """
-        chains, label = [], "[g0_rgb]"
-        for k in range(1, count):
-            chains.append(f"{label}[g{k}_rgb]lut2=c0='min(x,y)':c1='min(x,y)':c2='min(x,y)'[gand{k}]")
-            label = f"[gand{k}]"
-        chains.append(f"{label}{reduce4},signalstats,{self._share_print('Y', 'gam_r')},"
-                      f"{self._share_print('U', 'gam_g')},{self._share_print('V', 'gam_b')},nullsink")
-        return chains
-
     def extra_outputs(self) -> List[str]:
         """Arguments for the raw flash-grid output (after the main output).
 
@@ -1388,7 +1444,14 @@ class VideoAnalysis:
                                    for t, v, c, r, sp in zip(timing, vertical, col, row, speed)]
         if self.needs_levels_branch:
             def fraction(name: str) -> List[float]:
-                return sparse(name, 0.0, lambda v: _to_float(v) / 255.0)
+                # Each frame went to one part (by pts: frames were selected).
+                merged = [0.0] * len(master)
+                for part in range(self.levels_parts):
+                    values = sparse(f"{name}@{part}", 0.0, lambda v: _to_float(v) / 255.0, by_pts, 1)
+                    if f"{name}@{part}" in series.missing:
+                        series.missing.add(name)
+                    merged = [a + b for a, b in zip(merged, values)]
+                return merged
             series.luma, series.band1, series.band2 = fraction("luma"), fraction("band1"), fraction("band2")
             # The largest single-component share: never above the union of
             # R, G and B violations, so it can only under-report.
@@ -1400,6 +1463,9 @@ class VideoAnalysis:
                 share = lambda v: _to_float(v, 0.0) / 255.0
                 series.nonblack = sparse("blk_n", None, share, by_pts, 1)
                 series.nonblack_static = sparse("blk_s", None, share, by_pts, 1)
+                series.bright = sparse("blk_b", None, share, by_pts, 1)
+                series.black_sum = sparse("blk_k", None, lambda v: _to_float(v, 0.0), by_pts, 1)
+                series.black_level = black_pixel_level(0.0, self.info.full_range)
                 series.overlay_step = self.overlay_step_frames
                 series.overlay_sample = self.overlay_sample_frames
             # tblend's frame k (k >= 1) carries frame k's pts: matched by pts,
@@ -1504,6 +1570,9 @@ class VideoSeries:
     # frame and the one overlay_step frames earlier (on those frames)
     nonblack: List[Optional[float]] = field(default_factory=list)
     nonblack_static: List[Optional[float]] = field(default_factory=list)
+    bright: List[Optional[float]] = field(default_factory=list)      # share at a graphic's fill level
+    black_sum: List[Optional[float]] = field(default_factory=list)   # mean over samples of black codes
+    black_level: int = 16
     overlay_step: int = 0
     overlay_sample: int = 1
     structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
@@ -1527,7 +1596,7 @@ class VideoSeries:
         """
         names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
                  "gam", "band1", "band2", "yavg", "structural", "structural_step", "nonblack",
-                 "nonblack_static", "flash")
+                 "nonblack_static", "bright", "black_sum", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1641,12 +1710,17 @@ def black_pixel_level(pix_th: float, full_range: bool) -> int:
 
 def overlay_black_runs(nonblack: Sequence[Optional[float]], static: Sequence[Optional[float]],
                        times: Sequence[float], step: int, pic_th: float,
-                       period: float, sample: int = 1) -> List[Tuple[float, float]]:
+                       period: float, sample: int = 1,
+                       bright: Optional[Sequence[Optional[float]]] = None,
+                       black_sum: Optional[Sequence[Optional[float]]] = None,
+                       black_level: float = 16.0) -> List[Tuple[float, float]]:
     """(start, end) runs that are black apart from a static overlay.
 
     ``nonblack`` holds a value on every ``sample``-th frame (None between).
     A measured frame qualifies when its non-black share is at most
-    BLACK_OVERLAY_MAX plus the picture threshold's allowance; consecutive
+    BLACK_OVERLAY_MAX plus the picture threshold's allowance, the overlay is
+    graphic-like and the rest is true black (``bright`` / ``black_sum``, see
+    BLACK_GRAPHIC_SHARE and BLACK_TRUE_MARGIN; not tested when absent); consecutive
     qualifying measurements form a run, which counts when every pair of
     frames ``step`` apart inside it shows the overlay in place: the share
     non-black in both (``static``) is at most BLACK_OVERLAY_MAX and what is
@@ -1658,15 +1732,32 @@ def overlay_black_runs(nonblack: Sequence[Optional[float]], static: Sequence[Opt
     allowance = 1.0 - pic_th
     count = min(len(nonblack), len(times))
     measured = [i for i in range(count) if nonblack[i] is not None]
+
+    def candidate(i: int) -> bool:
+        share = nonblack[i]
+        if share > BLACK_OVERLAY_MAX + allowance:
+            return False
+        if black_sum is not None:
+            total = black_sum[i] if i < len(black_sum) else None
+            if total is None or share >= 1.0:
+                return False
+            if total / (1.0 - share) > black_level + BLACK_TRUE_MARGIN:
+                return False                    # dark, not true black
+        if bright is not None and share > 0:
+            fill = bright[i] if i < len(bright) else None
+            if fill is None or fill < BLACK_GRAPHIC_SHARE * share:
+                return False                    # soft light, not a graphic
+        return True
+
     runs = []
     k = 0
     while k < len(measured):
-        if nonblack[measured[k]] > BLACK_OVERLAY_MAX + allowance:
+        if not candidate(measured[k]):
             k += 1
             continue
         j = k
         while (j + 1 < len(measured) and measured[j + 1] - measured[j] <= sample
-               and nonblack[measured[j + 1]] <= BLACK_OVERLAY_MAX + allowance):
+               and candidate(measured[j + 1])):
             j += 1
         first, last = measured[k], measured[j]
         pairs = [i for i in range(first + step, last + 1)
@@ -1844,6 +1935,65 @@ def structural_limit(mafd: float, side_factor: float) -> float:
     return FREEZE_STRUCTURAL_FLOOR + mafd * FREEZE_GRAIN_CORRELATION / max(side_factor, 1.0)
 
 
+def _lag_static_windows(structure: Optional[Sequence[Optional[float]]],
+                        structural_step: Optional[Sequence[Optional[float]]],
+                        step: int, count: int, mafd: Sequence[float] = (),
+                        side_factor: float = 16.0) -> set:
+    """Sample frames j whose window (j - step, j] is static by the lag test.
+
+    Grain is independent from frame to frame, so a static picture differs
+    from the frame ``step`` back by no more than from the previous frame -
+    whatever the grain's strength or spatial correlation (film grain at HD is
+    correlated well beyond the white-grain allowance of structural_limit).
+    Motion accumulates instead: ``step`` frames of it change the picture far
+    more than one. The window is static when the ``step``-frame change is
+    at most FREEZE_LAG_RATIO times the median frame-to-frame change in it,
+    and that change is grain-like: no more of the full-resolution change
+    survives the averaging than grain correlated over FREEZE_GRAIN_MAX_PX
+    pixels allows (a flicker or a strobe survives it whole).
+    """
+    out = set()
+    if structure is None or structural_step is None or step <= 1:
+        return out
+    for j in range(step, min(count, len(structural_step))):
+        lagged = structural_step[j]
+        if lagged is None:
+            continue
+        window = [structure[i] for i in range(j - step + 1, j + 1) if structure[i] is not None]
+        if len(window) != step:
+            continue
+        change = statistics.median(window)
+        if mafd:
+            full = statistics.median(mafd[j - step + 1:j + 1])
+            if change > FREEZE_STRUCTURAL_FLOOR + full * FREEZE_GRAIN_MAX_PX / max(side_factor, 1.0):
+                continue
+        if lagged <= FREEZE_LAG_RATIO * change:
+            out.add(j)
+    return out
+
+
+def _extend_static(first: int, last: int, structure: Sequence[Optional[float]],
+                   mafd: Sequence[float], count: int) -> Tuple[int, int]:
+    """Grow a still run over neighbours whose change is the run's grain.
+
+    The lag test marks whole windows, so a freeze's first and last frames
+    can fall outside them; a neighbour belongs to the run while its change
+    is within FREEZE_LAG_RATIO of the run's median (frame-to-frame grain)
+    and it is not a cut.
+    """
+    values = [structure[i] for i in range(first, last + 1) if structure[i] is not None]
+    if not values:
+        return first, last
+    bound = FREEZE_LAG_RATIO * statistics.median(values)
+    while first > 1 and structure[first - 1] is not None and structure[first - 1] <= bound \
+            and not _cut(mafd, first - 1):
+        first -= 1
+    while last + 1 < count and structure[last + 1] is not None and structure[last + 1] <= bound \
+            and not _cut(mafd, last + 1):
+        last += 1
+    return first, last
+
+
 def freeze_step_frames(fps: float, min_duration: float) -> int:
     """Frames between accumulated-change samples: FREEZE_STEP_FRACTION of the
     minimum freeze duration, rounded down so two steps never exceed it."""
@@ -1900,9 +2050,8 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
        composed shot - a title card, an end card, a locked-off or quiet
        scene - not a freeze: by definition a freeze is not creative intent.
        A dip through black is an edit too. Such a shot counts as a freeze
-       only when its frames are identical (FREEZE_IDENTICAL_MAFD) and it is
-       held longer than ``hold_allowance`` (a spec setting: a long
-       identical still is worth checking).
+       when it is held longer than ``hold_allowance`` (the spec's Title Card
+       Hold setting).
     4. Any other run is a freeze when the picture stopped dead in mid-shot:
        motion runs up to it (FREEZE_LEAD_FRAMES), or its frames are
        identical. A shot that slows to a standstill is not.
@@ -1937,20 +2086,28 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         return 0 <= i < count and bool(black) and _in_black(times[i], black, period * 0.5)
 
     flags = [still(i) for i in range(count)]
+    lag_static = _lag_static_windows(structure, structural_step, step, count, mafd, side_factor)
+    for j in lag_static:
+        for i in range(j - step + 1, j + 1):
+            flags[i] = True
+    recode = structural_limit(FREEZE_BLIP_MAFD, side_factor)
     runs = []
     for first, last in _still_runs(flags, mafd[:count]):
+        if structure is not None and lag_static:
+            first, last = _extend_static(first, last, structure, mafd, count)
         if structural_step is None or step <= 0:
             runs.append((first, last))
             continue
         frozen_from = first - 1
         # Between frames j-step and j a static picture changes by no more
-        # than the noisiest frame in between explains, and by no more than
-        # an encoder's re-coding of a held picture (one refresh blip,
-        # FREEZE_BLIP_MAFD, as the averaged copy sees it).
-        recode = structural_limit(FREEZE_BLIP_MAFD, side_factor)
+        # than the noisiest frame in between explains, by no more than an
+        # encoder's re-coding of a held picture (one refresh blip,
+        # FREEZE_BLIP_MAFD, as the averaged copy sees it), or by no more
+        # than its frame-to-frame grain (FREEZE_LAG_RATIO).
         moved = [(j - step, j) for j in range(max(step, frozen_from + step), last + 1)
                  if j < len(structural_step) and structural_step[j] is not None
-                 and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))]
+                 and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))
+                 and j not in lag_static]
         runs += [(a + 1, b) for a, b in _static_segments(frozen_from, last, moved) if b > a]
     for first, last in runs:
         frozen_from = first - 1
@@ -1974,7 +2131,10 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         enters_on_cut = at_head or edit(frozen_from) or edit(frozen_from - 1)
         leaves_on_cut = at_tail or edit(last + 1)
         if enters_on_cut and leaves_on_cut and not covers_half:
-            if identical and span[1] > hold_allowance + period * 0.5:
+            # A held shot is excused up to the hold allowance (the spec's
+            # Title Card Hold); a still picture held longer is reported,
+            # identical or under live grain alike.
+            if span[1] > hold_allowance + period * 0.5:
                 holds.append(span)
             else:
                 composed.append(span)
@@ -2007,7 +2167,7 @@ def freeze_entry(findings: FreezeFindings, duration: float,
         notes += f" Static picture at the head treated as a slate: {event_list(findings.edge_holds)}."
     if findings.composed:
         notes += (f" Held shot(s) starting and ending on a cut, within the {cfg.freeze_hold:g}s "
-                  f"hold allowance or not identical: {event_list(findings.composed)}.")
+                  f"hold allowance: {event_list(findings.composed)}.")
     if not findings.holds:
         return "PASS", f"No freezes ≥{cfg.freeze_duration:g}s detected.{notes}", 100
     total = sum(d for _, d in findings.holds)
@@ -2948,7 +3108,9 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
     if series.nonblack and series.overlay_step:
         overlay = overlay_black_runs(series.nonblack, series.nonblack_static, series.times,
                                      series.overlay_step, config.black_pic_th,
-                                     _frame_period(fps, series.times), series.overlay_sample)
+                                     _frame_period(fps, series.times), series.overlay_sample,
+                                     bright=series.bright or None, black_sum=series.black_sum or None,
+                                     black_level=series.black_level)
         events = merge_runs(events, overlay)
     findings = classify_black(events, duration, fps, config, series.times, series.yavg)
     if findings.segments:

@@ -1676,55 +1676,59 @@ def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
         result.add_not_verified("CFR Check", f"too few frames to measure timing ({timing.packet_count} packets).")
         return
     measured_fps = 1.0 / dominant
-    ratio = irregular / total
     result.set_metadata("measured_frame_interval_ms", round(dominant * 1000, 3))
     result.set_metadata("measured_fps", round(measured_fps, 3))
-    result.set_metadata("irregular_frame_intervals", irregular)
-    result.set_metadata("fps_deviation", round(ratio, 4))
     scope = f"; {timing.description}" if timing.sampled else ""
-    where = ", ".join(f"{_timecode(t)} ({d * 1000:.0f} ms)" for t, d in samples[:6])
     lost = sum(int(round(d / dominant)) - 1 for _, d in dropped)
     if dropped or duplicated:
         result.set_metadata("dropped_frames", lost)
         result.set_metadata("duplicated_frames", len(duplicated))
-    if irregular == 0 and (dropped or duplicated):
-        # Whole-frame gaps or repeated timestamps on an otherwise constant
-        # cadence: frames lost or doubled, not a variable rate. Judged like
-        # irregular intervals: one is a warning, more than vfr_threshold of
-        # the intervals fails (when the spec requires a constant rate).
-        parts = []
-        if dropped:
-            parts.append(f"{lost} dropped frame(s) (timestamp gaps of whole frames)")
-        if duplicated:
-            parts.append(f"{len(duplicated)} duplicated frame(s) (repeated timestamps)")
-        events = sorted(dropped + duplicated)
-        where = ", ".join(f"{_timecode(t)} ({d * 1000:.0f} ms)" for t, d in events[:6])
-        detail = (f"{' and '.join(parts)} in a constant {measured_fps:.3f} fps cadence. "
-                  f"First at: {where}{scope}")
-        share = len(events) / total
-        if len(events) > 1 and share > float(cfg.get("vfr_threshold", 0.01)) and cfg.get("require_cfr", True):
-            result.add_fail("CFR Check", detail[0].upper() + detail[1:])
-        else:
-            result.add_warn("CFR Check", detail[0].upper() + detail[1:], confidence=85)
-        return
-    if irregular == 0:
+    threshold = float(cfg.get("vfr_threshold", 0.01))
+    # Every interval off the constant cadence counts towards the variable-
+    # rate share - a whole-frame gap and a repeated timestamp too: a phone
+    # recording that drops every fifth frame is variable frame rate and is
+    # reported as such; the drops are named in the detail.
+    events = irregular + len(dropped) + len(duplicated)
+    deviating = sorted(samples + dropped + duplicated)
+    where = ", ".join(f"{_timecode(t)} ({d * 1000:.0f} ms)" for t, d in deviating[:6])
+    ratio = events / total
+    result.set_metadata("irregular_frame_intervals", events)
+    result.set_metadata("fps_deviation", round(ratio, 4))
+    parts = []
+    if dropped:
+        parts.append(f"{lost} dropped frame(s) (timestamp gaps of whole frames)")
+    if duplicated:
+        parts.append(f"{len(duplicated)} duplicated frame(s) (repeated timestamps)")
+    named = f"; {' and '.join(parts)}" if parts else ""
+    if events == 0:
         result.add_pass("CFR Check", f"Constant frame rate: {total} intervals of "
                                      f"{dominant * 1000:.2f} ms ({measured_fps:.3f} fps){scope}")
         return
-    if irregular == 1:
+    if events > 1 and ratio > threshold:
+        result.set_metadata("vfr_detected", True)
+        detail = (f"{events} of {total} frame intervals ({ratio * 100:.1f}%) deviate from "
+                  f"{dominant * 1000:.2f} ms ({measured_fps:.3f} fps){named}. First at: {where}{scope}")
+        if cfg.get("require_cfr", True):
+            result.add_fail("CFR Check", f"Variable frame rate: {detail}")
+        else:
+            result.add_warn("CFR Check", f"Variable frame rate (allowed by this spec): {detail}")
+        return
+    result.set_metadata("vfr_detected", False)
+    if irregular == 0:
+        # Isolated drops or repeats on a constant cadence, at or below the
+        # variable-rate share: frames lost or doubled.
+        detail = f"{' and '.join(parts)} in a constant {measured_fps:.3f} fps cadence. First at: {where}{scope}"
+        result.add_warn("CFR Check", detail[0].upper() + detail[1:], confidence=85)
+        return
+    if events == 1:
         result.add_warn("CFR Check", f"1 irregular frame interval at {where} against "
                                      f"{dominant * 1000:.2f} ms (possible dropped or held frame){scope}",
                         confidence=80)
         return
-    result.set_metadata("vfr_detected", ratio > float(cfg.get("vfr_threshold", 0.01)))
-    detail = (f"{irregular} of {total} frame intervals ({ratio * 100:.1f}%) deviate from "
-              f"{dominant * 1000:.2f} ms ({measured_fps:.3f} fps). First at: {where}{scope}")
-    if ratio <= float(cfg.get("vfr_threshold", 0.01)):
-        result.add_warn("CFR Check", f"Minor timing irregularity: {detail}", confidence=75)
-    elif cfg.get("require_cfr", True):
-        result.add_fail("CFR Check", f"Variable frame rate: {detail}")
-    else:
-        result.add_warn("CFR Check", f"Variable frame rate (allowed by this spec): {detail}")
+    result.add_warn("CFR Check", f"Minor timing irregularity: {events} of {total} frame intervals "
+                                 f"({ratio * 100:.1f}%) deviate from {dominant * 1000:.2f} ms "
+                                 f"({measured_fps:.3f} fps){named}. First at: {where}{scope}",
+                    confidence=75)
 
 
 _INTERLACED_FIELD_ORDERS = {"tt", "bb", "tb", "bt"}

@@ -75,7 +75,12 @@ class TestFileIntegrity:
         integrity = _row(result, "File Integrity")
         assert integrity[1] == "PASS", integrity
         assert result.metadata["decode_errors"] == 0
-        assert result.status == "PASS", [c for c in result.checks if c[1] != "PASS"]
+        # Signal Levels is content: testsrc2's 100 % colour bars, chroma-sited
+        # left as x265 signals it, really exceed R 103's RGB range on > 1 % of
+        # some frames (0.9.2 round 5, C1: checked against an independent
+        # reference); this test is about decoding.
+        others = [c for c in result.checks if c[1] != "PASS" and c[0] != "Signal Levels"]
+        assert not [c for c in others if c[1] in ("WARN", "FAIL")], others
 
     def test_truncated_copy_fails(self, media, tmp_path):
         source = media.get("faststart.mp4", lambda p: make_clip(
