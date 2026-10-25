@@ -14,8 +14,8 @@ picture measurements to that one pass and turns them into verdict rows:
 * **Flash Risk** - an ITU-R BT.1702-3 general/red flash counter (advisory
   only; certification needs a Harding FPA class analyser).
 * **Interlace Detection** - woven fields (``idet`` at its documented
-  defaults, confirmed by field-order steadiness and a vertical field
-  displacement test) and 3:2 pulldown in progressive-flagged video, and
+  defaults, confirmed by field-order steadiness and a field
+  timing test) and 3:2 pulldown in progressive-flagged video, and
   field-order disagreement with the stream's metadata.
 
 Measurements leave FFmpeg as small per-frame text files (``metadata``
@@ -132,11 +132,18 @@ ANALYSIS_MIN_FACTOR = 4
 # The filtered luma is evaluated on a lattice of every 4th column and 2nd
 # line (see VideoAnalysis._levels_chains for why that is exact there).
 R103_LATTICE = (4, 2)
+# The lattice alone samples one filtered pixel in eight; the violating share
+# it gives is unbiased only for regions much larger than its cell (thin or
+# small violations read about a quarter low in review). R103_EXACT evaluates
+# all eight phases of the cell - every native pixel, filtered exactly - from
+# the same four column reductions (see _r103_exact); the lattice-only graph
+# remains for the speed comparison (fix_video.md).
+R103_EXACT = True
 # Interlace analysis keeps every line (fields must stay separate) but
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
 # sample (320 columns still give idet >= 100,000 comparisons a frame at
-# 720 lines; natural woven and telecined pans read 97-100 % at 320 columns).
+# 720 lines, so its counts are not noise-limited).
 INTERLACE_MAX_WIDTH = 320
 # Pictures smaller than this are not analysed for levels/flash.
 MIN_ANALYSIS_DIMENSION = 32
@@ -151,6 +158,9 @@ FLASH_GRID = (16, 9)
 # before block averaging: only those samples mix gamma-coded values, so an
 # edge mis-weights at most one 1/8-block strip (see _area_chains).
 FLASH_SUBSAMPLES = 8
+# The streamed grid is gbrap: alpha holds the fine-transition share (see
+# _area_chains); its first frame is the source's second.
+FLASH_GRID_OFFSET = 1
 
 # ---------------------------------------------------------------------------
 # Thresholds (each cites where it comes from)
@@ -208,24 +218,45 @@ FLASH_RED_DELTA = 20.0
 #   independent temporal grain shrinks by the side factor while moving
 #   picture structure, down to objects of ~1/30 of the picture, survives.
 FREEZE_COPY_FACTOR = 4
-FREEZE_STILL_MAFD = 0.20          # still, when no structural series exists
-FREEZE_BLIP_MAFD = 1.5            # long-GOP refresh of a frozen picture
+# Without the structural series, still is a MAFD under 0.2 % of full scale:
+# half an 8-bit code on average, below any visible change.
+FREEZE_STILL_MAFD = 0.20
+# A long-GOP encoder re-codes a held picture at every I-frame; the change is
+# requantisation noise, at most about one quantiser step of the residual
+# (1-1.5 % of full scale at broadcast QPs), far under real motion (5-50 %).
+# It lasts at most the encoder's lookahead/refinement, 8 frames.
+FREEZE_BLIP_MAFD = 1.5
 FREEZE_MAX_BLIP_FRAMES = 8
-FREEZE_IDENTICAL_MAFD = 0.004     # bit-identical up to encoder rounding
+# Identical: a mean change of 0.004 % of full scale - one code on one pixel
+# in a hundred - i.e. bit-identical up to encoder rounding.
+FREEZE_IDENTICAL_MAFD = 0.004
 # Structurally still: the change on the averaged copy is no more than grain
-# explains. White grain shrinks by the averaging side factor k; real grain is
-# spatially correlated over up to ~4 px, so 4/k of the full-resolution change
-# is allowed, plus a floor of 1/20 code (0.02 %) for the copy's rounding.
-FREEZE_GRAIN_CORRELATION = 4.0
+# explains. White grain shrinks by the averaging side factor k; film grain
+# at HD is correlated over about 2 px (35 mm grain clumps of 5-15 um against
+# ~11 um per 1080p pixel on a Super 35 frame), so 2/k of the full-resolution
+# change is allowed, plus a floor of 1/20 code (0.02 %) for the copy's
+# rounding. Motion is not grain: it survives the averaging, and also
+# accumulates - a static picture shows no more than grain between frames
+# FREEZE_STEP_FRACTION of the minimum freeze duration apart, where a slow pan
+# has moved by several pixels.
+FREEZE_GRAIN_CORRELATION = 2.0
 FREEZE_STRUCTURAL_FLOOR = 0.02
+FREEZE_STEP_FRACTION = 0.5
 # A scene change, as FFmpeg's scdet decides it with its documented default
 # threshold (10): score = min(MAFD, |MAFD - previous MAFD|) >= 10.
 FREEZE_CUT_SCORE = 10.0
 # A freeze stops the picture dead: motion runs right up to the frozen frame.
 # Real motion decelerates over several frames (inertia), so each of the
-# FREEZE_LEAD_FRAMES frames before the run must still be moving, at least
-# FREEZE_MOVING_FACTOR times the run's own stillness limit (a shot easing to
-# a stop crosses the limit gradually: its last moving frames sit just above).
+# FREEZE_LEAD_FRAMES frames before the run must still be moving (above the
+# grain limit), and their median change above the frozen frames' own
+# (noise-only) change must be at least FREEZE_MOVING_FACTOR times the margin
+# the grain limit leaves above that noise: clearly outside the noise band
+# right up to the stop. A shot easing to a stop crosses the band gradually,
+# its last moving frames just above the limit. Under heavy grain the band is
+# wide, so motion at least one margin above the noise also counts when it
+# had not declined: at least 1/FREEZE_MOVING_FACTOR of the motion half the
+# minimum freeze duration earlier (a shot easing out loses most of its
+# motion over that time; a freeze cuts off motion at its running level).
 FREEZE_LEAD_FRAMES = 3
 FREEZE_MOVING_FACTOR = 2.0
 
@@ -248,6 +279,21 @@ YAVG_ABSENT = 255.0
 BLACK_ISOLATION_SECONDS = 1.0
 BLACK_STEP_CODES = 2.0
 BLACK_EDGE_ALLOWANCE = 1.0
+# A burnt-in timecode or a channel logo keeps a black picture under the
+# picture threshold (Telestream VQ-101 documents 100 % of the frame; FFmpeg's
+# blackdetect default is 98 %). Such an overlay is small and does not move:
+# frames whose non-black pixels (above the black pixel level, on the
+# analysis copy) are at most BLACK_OVERLAY_MAX of the picture and stay in
+# place - non-black in both frames BLACK_OVERLAY_STEP apart - while the rest
+# meets the picture threshold, are black too. Credits or a dark scene move
+# or exceed the share, and stay picture. The mask is sampled every
+# BLACK_OVERLAY_BLOCK px and compared BLACK_OVERLAY_STEP seconds apart:
+# credits roll at one or more pixels per frame (>= 25 px/s), so in 0.5 s
+# their text has moved off the sampled points it covered.
+BLACK_OVERLAY_MAX = 0.05
+BLACK_OVERLAY_BLOCK = 8
+BLACK_OVERLAY_STEP = 0.5
+BLACK_OVERLAY_SAMPLE = 0.1
 
 # Interlace (see assess_interlace). idet runs with FFmpeg's documented
 # defaults (intl_thres 1.04, prog_thres 1.5, rep_thres 3.0; FFmpeg filters
@@ -263,10 +309,39 @@ INTERLACE_MIN_SECONDS = 1.0
 # asymmetry between its two cross-field comparisons (it needs only 4 %), but
 # its sign then follows the content and flips; such a section is not combed.
 # The same majority decides the field order of declared-interlaced streams.
+# 0.8 is a chance bound, not a fitted value: a call whose sign is a coin
+# toss reaches 80 % agreement over 15 decided frames (half a second at
+# 30 frame/s) with probability 1.8 % (binomial, P[X >= 12 of 15]), while a
+# real field order agrees on every frame whose motion idet can see.
 FIELD_ORDER_MAJORITY = 0.8
 FIELD_ORDER_MIN_FRAMES = 30
-# Vertical field displacement, judged on the row profile (the mean of each
-# line), so horizontal motion cannot affect it. In a progressive frame both
+# Field timing (see field_timing()). In a progressive frame both fields
+# show the same instant; in a woven frame the second field was sampled half
+# a frame later. So the bottom field of frame n is compared with the top
+# field (interpolated to the bottom field's lines, so the half-line offset
+# cancels) of frames n-1, n and n+1: a progressive bottom field matches its
+# own frame's top field far better than either neighbour's; a woven one
+# matches its own frame's top field no better than the neighbour on its
+# temporal side. idet's own progressive ratio (prog_thres 1.5) is the margin.
+# Before comparing, the idet copy (at most 320 point-sampled columns) is
+# area-averaged over FIELD_TIMING_COLUMNS columns, a span of 36 source
+# columns at 1080p: temporal grain is independent sample to sample and
+# shrinks by sqrt(6) ~ 2.4x, while picture motion of a pixel or more per
+# field moves structure larger than that. Lines are not averaged: the
+# fields' vertical alignment is what the comparison is about.
+INTERLACE_DECISIVE_RATIO = 1.5
+FIELD_TIMING_COLUMNS = 6
+# Vertical scrolls (credits) are judged on the row profile (the mean of each
+# line) instead: hard-edged graphics moving vertically defeat the field
+# interpolation the timing comparison relies on. A frame is a vertical
+# scroll when its column profile (each column's mean) changes by less than
+# INTERLACE_VERTICAL_SHARE of the total profile change: a pure vertical
+# translation changes column means only through the few lines entering and
+# leaving the picture (d of H lines: under 1 % for d <= 4, H >= 480), while
+# horizontal or 2-D motion moves both profiles alike (about half each); the
+# threshold is the geometric mean of those two orders, 7 %. Profile change
+# below INTERLACE_MOTION_FLOOR (a fiftieth of a code) is no motion.
+# Vertical field displacement on the row profile: In a progressive frame both
 # fields are sampled at the same instant: the bottom field is best predicted
 # from the top field interpolated at its own lines (displacement 0). In a
 # woven frame whose content moves vertically, the bottom field was sampled
@@ -274,15 +349,27 @@ FIELD_ORDER_MIN_FRAMES = 30
 # whole lines (end credits) can make idet call a progressive picture TFF/BFF,
 # while a woven scroll is combed; the displacement tells the two apart. The
 # winner must be better by idet's own progressive ratio (prog_thres 1.5);
-# otherwise the frame is undecided and idet's verdict stands.
+# otherwise the frame is undecided.
 INTERLACE_DISPLACEMENTS = (-2, -1, 0, 1, 2)
-INTERLACE_DECISIVE_RATIO = 1.5
+INTERLACE_VERTICAL_SHARE = 0.07
+INTERLACE_MOTION_FLOOR = 0.02
+# A woven vertical scroll misregisters its fields by half the frame-to-frame
+# speed. At up to INTERLACE_SCROLL_SLOW lines per frame that is at most one
+# line, the line pitch of the picture itself: a woven and a progressive
+# scroll then look alike and show no feathering, so such frames are not
+# counted as combed. The speed is the shift k (|k| <= INTERLACE_SCROLL_RANGE
+# lines) that best maps one frame's row profile onto the next.
+INTERLACE_SCROLL_SLOW = 2
+INTERLACE_SCROLL_RANGE = 4
 # 3:2 pulldown, the film-to-30 frame/s transfer cadence: four film frames
 # become ten fields (3 + 2 + 3 + 2), so two of every five video frames repeat
 # a field of the frame before, top and bottom alternately, and idet's
 # repeated-field call recurs with a period of five frames.
 # A one-second window holding at least half of the expected repeats (two in
-# five) is a cadence window.
+# five) is a cadence window: idet can only call a repeat where the picture
+# moved between the film frames, so on slow film motion it sees one of the
+# two repeats per cycle, and the period-five recurrence is still
+# unambiguous at one in five.
 TELECINE_PERIOD = 5
 TELECINE_REPEAT_SHARE = 0.4
 
@@ -424,6 +511,11 @@ class PictureInfo:
                    chroma_420=_is_420(str(video.get("pix_fmt") or "")))
 
     @property
+    def interlaced(self) -> bool:
+        """Signalled as interlaced (field_order tt/bb/tb/bt)."""
+        return self.field_order in ("tt", "bb", "tb", "bt")
+
+    @property
     def gamut_matrices(self) -> Tuple[str, ...]:
         """Matrices the RGB gamut is judged under: the signalled one, or, when
         none is signalled, the size-based guess first and then the other
@@ -457,7 +549,7 @@ class VideoCheckConfig:
     black: bool = True
     black_duration: float = 0.3
     black_pix_th: float = 0.02
-    black_pic_th: float = 0.90
+    black_pic_th: float = 0.98
     black_short_frames: int = 3
     freeze: bool = True
     freeze_duration: float = 1.0
@@ -473,7 +565,7 @@ class VideoCheckConfig:
             black=bool(cfg.get("black_frames_enabled", True)),
             black_duration=float(cfg.get("black_detect_duration", 0.3)),
             black_pix_th=float(cfg.get("black_detect_pix_threshold", 0.02)),
-            black_pic_th=float(cfg.get("black_detect_picture_threshold", 0.90)),
+            black_pic_th=float(cfg.get("black_detect_picture_threshold", 0.98)),
             black_short_frames=int(cfg.get("black_short_min_frames", 3)),
             freeze=bool(cfg.get("freeze_frames_enabled", True)),
             freeze_duration=float(cfg.get("freeze_detect_duration", 1.0)),
@@ -558,6 +650,50 @@ def _r103_lattice(source: str, out: str, work: str, final: str) -> List[str]:
     return chains
 
 
+def _r103_exact(source: str, out: str, work: str, final: str) -> List[str]:
+    """``[source]`` R 103-filtered at every native pixel -> ``[out]``.
+
+    With h_p the 4:1 column area reductions starting at column p (as in
+    _r103_lattice), the horizontally filtered value at column 4m + 3 + s is
+    the mean of h_s..h_3 at m and h_0..h_(s-1) at m + 1. The four offsets s
+    are laid side by side (hstack), then the same is done for the two line
+    offsets of the 2:1 line reductions (vstack): the tiles hold every native
+    pixel's filtered value once (columns and lines regrouped by phase, which
+    a share does not see), except the outermost 3 columns and 1 line the
+    kernels cannot reach.
+    """
+    columns, lines = R103_LATTICE
+    width = f"trunc((iw-{columns - 1})/{columns})*{columns}"
+    height = f"trunc((ih-{lines - 1})/{lines})*{lines}"
+    chains = [f"[{source}]split={columns}" + "".join(f"[{out}_c{p}]" for p in range(columns))]
+    for p in range(columns):
+        chains.append(f"[{out}_c{p}]crop=w='{width}':h=ih:x={p}:y=0,"
+                      f"scale=w=iw/{columns}:h=ih:flags=area,format={work},"
+                      f"split={columns}" + "".join(f"[{out}_h{p}s{t}]" for t in range(columns)))
+    for t in range(columns):            # offset t uses h_p shifted by one for p < t
+        for p in range(columns):
+            chains.append(f"[{out}_h{p}s{t}]crop=w=iw-1:h=ih:x={1 if p < t else 0}:y=0"
+                          f"[{out}_o{t}p{p}]")
+        chains += _mean_tree([f"{out}_o{t}p{p}" for p in range(columns)], f"{out}_ht{t}",
+                             f"[{out}_hs{t}]")
+    chains.append("".join(f"[{out}_hs{t}]" for t in range(columns))
+                  + f"hstack=inputs={columns},split={lines}"
+                  + "".join(f"[{out}_r{q}]" for q in range(lines)))
+    for q in range(lines):
+        chains.append(f"[{out}_r{q}]crop=w=iw:h='{height}':x=0:y={q},"
+                      f"scale=w=iw:h=ih/{lines}:flags=area,split={lines}"
+                      + "".join(f"[{out}_v{q}s{t}]" for t in range(lines)))
+    for t in range(lines):
+        for q in range(lines):
+            chains.append(f"[{out}_v{q}s{t}]crop=w=iw:h=ih-1:x=0:y={1 if q < t else 0}"
+                          f"[{out}_w{t}q{q}]")
+        chains += _mean_tree([f"{out}_w{t}q{q}" for q in range(lines)], f"{out}_vt{t}",
+                             f"[{out}_vs{t}]")
+    chains.append("".join(f"[{out}_vs{t}]" for t in range(lines))
+                  + f"vstack=inputs={lines},format={work},{_ROUND_TO_8BIT},format={final}[{out}]")
+    return chains
+
+
 def _r103_chroma_420(source: str, out: str) -> List[str]:
     """A 4:2:0 chroma plane R 103-filtered at the luma lattice -> ``[out]``.
 
@@ -619,6 +755,10 @@ def _mean_tree(labels: List[str], prefix: str, tail: str) -> List[str]:
 
 def _disp_name(d: int) -> str:
     return f"disp_{'m' if d < 0 else 'p'}{abs(d)}"
+
+
+def _shift_name(k: int) -> str:
+    return f"shift_{'m' if k < 0 else 'p'}{abs(k)}"
 
 
 def _displacement_kernel(d: int) -> str:
@@ -728,7 +868,7 @@ class _FlashSegmentReader(threading.Thread):
         super().__init__(name="frameguard-flash-reader", daemon=True)
         self.directory = directory
         self.template = os.path.join(directory, "flash_").replace("%", "%%") + "%06d.rgb"
-        self.accumulator = FlashAccumulator(fps)
+        self.accumulator = FlashAccumulator(fps, planes=4, offset=FLASH_GRID_OFFSET)
         self.cancel = cancel
         self.error: Optional[str] = None
         self.segments_read = 0
@@ -813,8 +953,10 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "struct", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
-                 "yavg", "gam_r", "gam_g", "gam_b") + tuple(_disp_name(d) for d in INTERLACE_DISPLACEMENTS)
+        names = ("mafd", "struct", "struct_step", "blk_n", "blk_s", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+                 "yavg", "gam_r", "gam_g", "gam_b", "ft_same", "ft_top", "ft_bot", "ft_move", "colmo", "rowmo") + tuple(
+                     _disp_name(d) for d in INTERLACE_DISPLACEMENTS) + tuple(
+                     _shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1))
         self.paths = {name: os.path.join(self.directory, f"{name}.txt") for name in names}
         if self.flash_enabled:
             self.flash_reader = _FlashSegmentReader(self.directory, self.info.fps, self.cancel)
@@ -845,6 +987,25 @@ class VideoAnalysis:
         width = self.info.width
         copy = max(2, min(ANALYSIS_MAX_WIDTH, (width // (2 * ANALYSIS_MIN_FACTOR)) * 2))
         return width / max(1, copy // FREEZE_COPY_FACTOR)
+
+    @property
+    def overlay_sample_frames(self) -> int:
+        """Frames between non-black measurements (BLACK_OVERLAY_SAMPLE)."""
+        fps = self.info.fps if self.info.fps > 0 else 25.0
+        return max(1, int(fps * BLACK_OVERLAY_SAMPLE + 1e-9))
+
+    @property
+    def overlay_step_frames(self) -> int:
+        """Frames between the static-overlay comparisons (BLACK_OVERLAY_STEP),
+        a multiple of overlay_sample_frames."""
+        fps = self.info.fps if self.info.fps > 0 else 25.0
+        sample = self.overlay_sample_frames
+        return sample * max(1, int(fps * BLACK_OVERLAY_STEP / sample + 1e-9))
+
+    @property
+    def freeze_step_frames(self) -> int:
+        """Frames between the accumulated-change samples (FREEZE_STEP_FRACTION)."""
+        return freeze_step_frames(self.info.fps, self.config.freeze_duration)
 
     @property
     def needs_levels_branch(self) -> bool:
@@ -902,17 +1063,16 @@ class VideoAnalysis:
         return graphs
 
     def _interlace_chains(self) -> List[str]:
-        """idet labels plus the vertical field displacement of interlaced frames.
+        """idet labels plus the field-timing comparison (see field_timing()).
 
         idet's multiple-frame, single-frame and repeated-field calls are
         printed only where they say something (TFF/BFF, a repeated field):
-        progressive footage writes nothing. For frames the multiple-frame
-        detector calls interlaced, the row profile (each line's mean, from
-        area reductions of at most 20x per step) is compared with the top
-        field interpolated at the bottom field's lines, offset by each
-        candidate displacement d (see INTERLACE_DISPLACEMENTS): a column
-        convolution gives 2 x (bottom line - prediction) per line, the odd
-        lines are kept, and their mean |value| is printed per d.
+        progressive footage writes nothing. For idet's TFF/BFF frames the
+        column and row profiles' change, the row profile's gradient and its
+        field displacement are written (vertical scrolls, field_verdict).
+        The field-timing branch averages the idet copy over
+        FIELD_TIMING_COLUMNS columns and compares successive fields (see
+        field_timings).
         """
         multi, single = "lavfi.idet.multiple.current_frame", "lavfi.idet.single.current_frame"
         repeated = "lavfi.idet.repeated.current_frame"
@@ -920,21 +1080,80 @@ class VideoAnalysis:
                   _print(single, self.paths["idet1"], "ff", "ends_with"),
                   _print(repeated, self.paths["rep_top"], "top", "same_str"),
                   _print(repeated, self.paths["rep_bottom"], "bottom", "same_str")]
-        count = len(INTERLACE_DISPLACEMENTS)
-        labels = "".join(f"[il_d{k}]" for k in range(count))
+        interlaced = _select(multi, "ff", "ends_with")
+        reduce16 = "scale=w={w}:h='max(1,trunc(ih/16))':flags=area"
+        avg = "YAVG"
+
+        def stat(name: str) -> str:
+            return f"signalstats,{_print(f'lavfi.signalstats.{avg}', self.paths[name])}"
+
+        span = INTERLACE_SCROLL_RANGE
+        shifts = range(-span, span + 1)
         chains = [
-            f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,"
-            "idet@il,split=2[il_det][il_prof]",
+            f"[0:{self.index}]scale=w='min({INTERLACE_MAX_WIDTH},iw)':h=ih:flags=neighbor,idet@il,"
+            "split=4[il_det][il_col][il_row][il_ft]",
             f"[il_det]{','.join(prints)}[vs_il]",
-            f"[il_prof]{_select(multi, 'ff', 'ends_with')},format=gray,"
-            "scale=w='max(1,trunc(iw/16))':h=ih:flags=area,scale=w=1:h=ih:flags=area,"
-            f"crop=w=1:h='trunc(ih/2)*2':x=0:y=0,split={count}{labels}",
+            # Column and row profiles (vertical scrolls, field_verdict).
+            f"[il_col]format=gray,{reduce16.format(w=64)},{reduce16.format(w=64)},"
+            f"scale=w=64:h=1:flags=area,tblend=all_mode=difference,{interlaced},{stat('colmo')},nullsink",
+            "[il_row]format=gray,scale=w='max(1,trunc(iw/16))':h=ih:flags=area,"
+            "scale=w=1:h=ih:flags=area,split=3[il_rmo][il_prof][il_shf]",
+            f"[il_rmo]format=gray,tblend=all_mode=difference,{interlaced},{stat('rowmo')},nullsink",
+            f"[il_prof]format=gray,{interlaced},crop=w=1:h='trunc(ih/2)*2':x=0:y=0,"
+            f"split={len(INTERLACE_DISPLACEMENTS)}"
+            + "".join(f"[il_d{k}]" for k in range(len(INTERLACE_DISPLACEMENTS))),
         ]
-        for k, d in enumerate(INTERLACE_DISPLACEMENTS):
-            chains.append(
-                f"[il_d{k}]convolution=0m='{_displacement_kernel(d)}':0rdiv=1:0bias=128:"
-                "0mode=column,lutyuv=y='abs(val-128)',il=l=d,crop=w=1:h='ih/2':x=0:y='ih/2',"
-                f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths[_disp_name(d)])},nullsink")
+        chains += [
+            f"[il_d{k}]convolution=0m='{_displacement_kernel(d)}':0rdiv=1:0bias=128:"
+            "0mode=column,lutyuv=y='abs(val-128)',il=l=d,crop=w=1:h='ih/2':x=0:y='ih/2',"
+            f"{stat(_disp_name(d))},nullsink"
+            for k, d in enumerate(INTERLACE_DISPLACEMENTS)
+        ]
+        # Scroll speed. The row profile is widened to one column per shift k;
+        # on odd frames column k holds the profile moved by k lines (geq), on
+        # even frames the profile itself. tblend then pairs, column by column,
+        # one frame's profile with its neighbour's moved by k:
+        # |P_n(y) - P_n-1(y + k)| for even n, |P_n(y + k) - P_n-1(y)| for odd
+        # n (see scroll_speed). Only idet's TFF/BFF frames are analysed (the
+        # select comes first, so progressive footage costs nothing here);
+        # frame parity is their position in that selection.
+        width = len(shifts)
+        move = f"if(mod(N,2),X-{span},0)"
+        chains += [
+            f"[il_shf]{interlaced},format=gray16,scale=w={width}:h=ih:flags=neighbor,"
+            f"geq=lum='p(0,clip(Y+{move},0,H-1))',crop=w=iw:h=ih-{2 * span}:x=0:y={span},"
+            "tblend=all_mode=difference,"
+            f"split={width}" + "".join(f"[sc_d{i}]" for i in range(width)),
+        ]
+        chains += [f"[sc_d{i}]crop=w=1:h=ih:x={i}:y=0,{stat(_shift_name(k))},nullsink"
+                   for i, k in enumerate(shifts)]
+        # Field timing (see field_timings), on the idet copy, for idet's
+        # TFF/BFF frames only (selected first, as above). Per frame Z = [Ti; B] (Ti: the top
+        # field interpolated to the bottom field's lines). geq gives
+        # |Ti_n - B_n| in its top half; with the halves swapped on odd frames
+        # tblend pairs each frame's B with its neighbour's Ti (see
+        # field_timings); tblend on the unswapped Z gives the top-field
+        # motion. 16 bits throughout: an 8-bit gray -> gray16 conversion
+        # after splitting fields mixed them (measured on the bundled build).
+        chains += [
+            f"[il_ft]{interlaced},extractplanes=y,format=gray16,"
+            f"scale=w='max(1,trunc(iw/{FIELD_TIMING_COLUMNS}))':h=ih:flags=area,"
+            "crop=w=iw:h='trunc(ih/4)*4':x=0:y=0,il=l=d,split=2[ft_top][ft_bot]",
+            "[ft_top]crop=w=iw:h=ih/2:x=0:y=0,split=2[ft_t1][ft_t2]",
+            "[ft_t1]crop=w=iw:h=ih-2:x=0:y=0[ft_tu]",
+            "[ft_t2]crop=w=iw:h=ih-2:x=0:y=1[ft_td]",
+            "[ft_tu][ft_td]blend=all_mode=average[ft_ti]",
+            "[ft_bot]crop=w=iw:h=ih/2-2:x=0:y=ih/2[ft_b]",
+            "[ft_ti][ft_b]vstack,split=3[ft_z1][ft_z2][ft_z3]",
+            "[ft_z1]geq=lum='abs(p(X,Y)-p(X,Y+H/2))',crop=w=iw:h=ih/2:x=0:y=0,"
+            f"{stat('ft_same')},nullsink",
+            "[ft_z2]geq=lum='p(X,mod(Y+if(mod(N,2),H/2,0),H))',tblend=all_mode=difference,"
+            "split=2[ft_h1][ft_h2]",
+            f"[ft_h1]crop=w=iw:h=ih/2:x=0:y=0,{stat('ft_top')},nullsink",
+            f"[ft_h2]crop=w=iw:h=ih/2:x=0:y=ih/2,{stat('ft_bot')},nullsink",
+            "[ft_z3]tblend=all_mode=difference,crop=w=iw:h=ih/2:x=0:y=0,"
+            f"{stat('ft_move')},nullsink",
+        ]
         return chains
 
     def _levels_chains(self) -> List[str]:
@@ -969,8 +1188,20 @@ class VideoAnalysis:
         matrices = info.gamut_matrices
         uses = ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
         labels = "".join(f"[ar_{u}]" for u in uses)
-        if info.chroma_420:
-            chains = [f"[0:{self.index}]extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
+        # R 103: the filter is "applied intra field for interlace signals":
+        # an interlaced picture is filtered with its fields stacked (il), so
+        # no tap reaches into the other field.
+        fields = "il=l=d:c=d:a=d," if info.interlaced else ""
+        if R103_EXACT:
+            # Chroma is interpolated to 4:4:4 (bilinear, the linear
+            # interpolation _r103_chroma_420 assumes), then every pixel is
+            # filtered exactly like luma.
+            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng}:flags=bilinear"
+                      ",format=yuv444p16[lv_src]"]
+            chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
+            chains.append(f"[lv_all]split={len(uses)}{labels}")
+        elif info.chroma_420:
+            chains = [f"[0:{self.index}]{fields}extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
             chains += _r103_lattice("lv_luma", "lv_yl", "gray16", "gray")
             chains.append("[lv_yl]crop=w=iw:h=ih-1:x=0:y=1[lv_y]")
             chains += _r103_chroma_420("lv_cb", "lv_u")
@@ -979,7 +1210,7 @@ class VideoAnalysis:
                           f":format=yuv444p,split={len(uses)}{labels}")
         else:
             # 4:4:4 first, so the odd column phases crop exact pixels.
-            chains = [f"[0:{self.index}]scale=in_range={rng}:out_range={rng},format=yuv444p16[lv_src]"]
+            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng},format=yuv444p16[lv_src]"]
             chains += _r103_lattice("lv_src", "lv_all", "yuv444p16", "yuv444p")
             chains.append(f"[lv_all]split={len(uses)}{labels}")
         # Masks are area-reduced 4:1 before signalstats: a 0/255 mask's mean
@@ -1022,9 +1253,44 @@ class VideoAnalysis:
             chains.append(
                 f"[ar_mean]scale=w='max(1,trunc(iw/{FREEZE_COPY_FACTOR}))':"
                 f"h='max(1,trunc(ih/{FREEZE_COPY_FACTOR}))':flags=area,split=2[ar_mean_y][ar_mean_d]")
+            if c.black:
+                # Non-black share per frame, and the share non-black in both
+                # this frame and the one overlay_step_frames earlier (every
+                # that many frames): a static overlay (BLACK_OVERLAY_MAX).
+                # The mask is taken on native pixels, as blackdetect sees
+                # them, point-sampled every BLACK_OVERLAY_BLOCK pixels: an
+                # unbiased sample of the shares (averaging would hide the
+                # grain that keeps a dark scene above black), at 1/64 of
+                # the work.
+                level = black_pixel_level(c.black_pix_th, rng == "pc")
+                chains += [
+                    # The sampled mask is then area-reduced by an exact 8:1
+                    # per side before signalstats (a mask's mean survives),
+                    # which keeps signalstats' per-frame cost negligible.
+                    # Only every overlay_sample_frames-th frame is measured
+                    # (a tenth of a second): the rule needs a run's extent,
+                    # not every frame, and filters cost per frame.
+                    f"[0:{self.index}]select='not(mod(n,{self.overlay_sample_frames}))',extractplanes=y,"
+                    f"scale=w='max(8,trunc(iw/{8 * BLACK_OVERLAY_BLOCK})*8)':"
+                    f"h='max(8,trunc(ih/{8 * BLACK_OVERLAY_BLOCK})*8)':flags=neighbor,"
+                    f"lut=c0='if(gt(val,{level}),255,0)',split=2[bk_n][bk_s]",
+                    f"[bk_n]scale=w=iw/8:h=ih/8:flags=area,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths['blk_n'])},nullsink",
+                    f"[bk_s]select='not(mod(n,{self.overlay_step_frames // self.overlay_sample_frames}))',"
+                    "tblend=all_expr='min(A,B)',"
+                    f"scale=w=iw/8:h=ih/8:flags=area,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths['blk_s'])},nullsink",
+                ]
+            # And to the frame freeze_step_frames earlier (every that many
+            # frames): accumulated change, which a slow pan shows.
+            step = self.freeze_step_frames
+            chains.append("[ar_mean_d]split=2[ar_d1][ar_d2]")
             chains.append(
-                "[ar_mean_d]tblend=all_mode=difference,signalstats,"
+                "[ar_d1]tblend=all_mode=difference,signalstats,"
                 f"{_print('lavfi.signalstats.YAVG', self.paths['struct'])},nullsink")
+            chains.append(
+                f"[ar_d2]select='not(mod(n,{step}))',tblend=all_mode=difference,signalstats,"
+                f"{_print('lavfi.signalstats.YAVG', self.paths['struct_step'])},nullsink")
             # Every frame's mean luma: the edit-gap test compares black
             # frames with their neighbours at whatever level the scene sits.
             chains.append(
@@ -1041,10 +1307,23 @@ class VideoAnalysis:
             # mix only within one of those samples, i.e. in a strip of at
             # most 1/8 of a block along an edge.
             sub = FLASH_SUBSAMPLES
+            # Patterns finer than a block (an inverting checkerboard) keep
+            # every block's mean light constant. The alpha plane therefore
+            # carries, per sample of the fine copy, whether its luminance
+            # made a flash transition from the previous frame (a change of
+            # FLASH_DELTA_CD with the darker state below FLASH_DARK_CD);
+            # area-averaged to the grid it is each block's share of samples
+            # in transition (FLASH_FINE). tblend's first output is the
+            # second frame: the grid starts one frame late (FLASH_GRID_OFFSET).
+            delta = FLASH_DELTA_CD * 255.0 / FLASH_PEAK_CD
+            dark = FLASH_DARK_CD * 255.0 / FLASH_PEAK_CD
             chains.append(
-                f"[ar_flash]scale=w={cols * sub}:h={rows * sub}:flags=area,"
-                f"scale=in_color_matrix={info.matrix}:in_range={rng}:out_range=pc,"
-                f"format=gbrp,lutrgb=r='{linear}':g='{linear}':b='{linear}',"
+                f"[ar_flash]scale=w={cols * sub}:h={rows * sub}:flags=area:"
+                f"in_color_matrix={info.matrix}:in_range={rng}:out_range=pc,"
+                f"format=gbrap,lutrgb=r='{linear}':g='{linear}':b='{linear}',"
+                "colorchannelmixer=aa=0:ar=0.2126:ag=0.7152:ab=0.0722,"
+                "tblend=c0_mode=normal:c1_mode=normal:c2_mode=normal:"
+                f"c3_expr='if(gte(abs(A-B),{delta:.4g})*lt(min(A,B),{dark:.4g}),255,0)',"
                 f"scale={cols}:{rows}:flags=area[vs_flash]")
         return chains
 
@@ -1123,7 +1402,7 @@ class VideoAnalysis:
             return []
         # -y: the files live in this scan's private directory; never prompt.
         return ["-y", "-map", "[vs_flash]", "-fps_mode", "passthrough",
-                "-c:v", "rawvideo", "-pix_fmt", "gbrp", "-f", "segment",
+                "-c:v", "rawvideo", "-pix_fmt", "gbrap", "-f", "segment",
                 "-segment_format", "rawvideo", "-segment_time", str(FLASH_SEGMENT_SECONDS),
                 self.flash_reader.template]
 
@@ -1159,10 +1438,31 @@ class VideoAnalysis:
             series.idet_single = sparse("idet1", "", str)
             top, bottom = sparse("rep_top", "", str), sparse("rep_bottom", "", str)
             series.repeated = [t or b for t, b in zip(top, bottom)]
+            def keyed(name: str) -> Dict[int, float]:
+                values = {}
+                for position, value in enumerate(sparse(name, None, lambda v: _to_float(v, None),
+                                                        by_pts, 1)):
+                    if value is not None:
+                        values[position] = value
+                return values
+            same, top, bottom, move = keyed("ft_same"), keyed("ft_top"), keyed("ft_bot"), keyed("ft_move")
+            # The analysed frames, in order: tblend pairs each with the one
+            # before it in this selection, and parity is the selection index.
+            selected = sorted(same)
+            timing = field_timings(len(master), selected, same, top, bottom, move)
+            col = sparse("colmo", None, lambda v: _to_float(v, None), by_pts, 1)
+            row = sparse("rowmo", None, lambda v: _to_float(v, None), by_pts, 1)
             errors = [sparse(_disp_name(d), None, lambda v: _to_float(v, None), by_pts, 1)
                       for d in INTERLACE_DISPLACEMENTS]
-            series.displacement = [field_displacement(dict(zip(INTERLACE_DISPLACEMENTS, values)))
-                                   for values in zip(*errors)]
+            vertical = [vertical_displacement(dict(zip(INTERLACE_DISPLACEMENTS, values)))
+                        for values in zip(*errors)]
+            shift = {k: keyed(_shift_name(k))
+                     for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1)}
+            order = {position: index for index, position in enumerate(selected)}
+            speed = [scroll_speed({k: v.get(n) for k, v in shift.items()}, order[n])
+                     if n in order else None for n in range(len(master))]
+            series.displacement = [field_verdict(t, v, c, r, sp)
+                                   for t, v, c, r, sp in zip(timing, vertical, col, row, speed)]
         if self.needs_levels_branch:
             def fraction(name: str) -> List[float]:
                 return sparse(name, 0.0, lambda v: _to_float(v) / 255.0)
@@ -1173,9 +1473,17 @@ class VideoAnalysis:
                           zip(fraction("gam_r"), fraction("gam_g"), fraction("gam_b"))]
         if self.needs_area_branch and (self.config.black or self.config.levels or self.config.freeze):
             series.yavg = sparse("yavg", YAVG_ABSENT, _to_float)
+            if self.config.black:
+                share = lambda v: _to_float(v, 0.0) / 255.0
+                series.nonblack = sparse("blk_n", None, share, by_pts, 1)
+                series.nonblack_static = sparse("blk_s", None, share, by_pts, 1)
+                series.overlay_step = self.overlay_step_frames
+                series.overlay_sample = self.overlay_sample_frames
             # tblend's frame k (k >= 1) carries frame k's pts: matched by pts,
             # in % of full scale like scdet's MAFD.
             series.structural = sparse("struct", None, lambda v: _to_float(v, 0.0) / 2.55, by_pts, 1)
+            series.structural_step = sparse("struct_step", None, lambda v: _to_float(v, 0.0) / 2.55,
+                                            by_pts, 1)
         if self.config.black:
             series.black_runs = black_runs(self.paths["black_start"], self.paths["black_end"],
                                            cancel)
@@ -1263,13 +1571,21 @@ class VideoSeries:
     idet: List[str] = field(default_factory=list)          # multiple-frame call
     idet_single: List[str] = field(default_factory=list)   # single-frame call
     repeated: List[str] = field(default_factory=list)      # "top"/"bottom"/""
-    displacement: List[str] = field(default_factory=list)  # "woven"/"progressive"/""
+    displacement: List[str] = field(default_factory=list)  # field timing: "woven"/"progressive"/""
     luma: List[float] = field(default_factory=list)   # tv: outside R 103; pc: extremes used
     gam: List[float] = field(default_factory=list)       # outside under every candidate matrix
     band1: List[float] = field(default_factory=list)
     band2: List[float] = field(default_factory=list)
     yavg: List[float] = field(default_factory=list)
+    # black: non-black share per frame, and the share non-black in both the
+    # frame and the one overlay_step frames earlier (on those frames)
+    nonblack: List[Optional[float]] = field(default_factory=list)
+    nonblack_static: List[Optional[float]] = field(default_factory=list)
+    overlay_step: int = 0
+    overlay_sample: int = 1
     structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
+    # freeze: averaged-copy change to the frame freeze_step_frames earlier (on those frames)
+    structural_step: List[Optional[float]] = field(default_factory=list)
     flash: List[tuple] = field(default_factory=list)   # in-memory grid (tests, batch use)
     flash_stream: Optional["FlashAccumulator"] = None   # streamed grid (scans)
     flash_error: Optional[str] = None
@@ -1287,7 +1603,8 @@ class VideoSeries:
         common prefix is the part every branch measured.
         """
         names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
-                 "gam", "band1", "band2", "yavg", "structural", "flash")
+                 "gam", "band1", "band2", "yavg", "structural", "structural_step", "nonblack",
+                 "nonblack_static", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1392,6 +1709,63 @@ def _hard_side(inside: float, near: Optional[float], far: Optional[float]) -> bo
     if step < BLACK_STEP_CODES:
         return False
     return far is None or abs(near - far) <= step / 2
+
+
+def black_pixel_level(pix_th: float, full_range: bool) -> int:
+    """8-bit code at and below which a pixel is black (blackdetect's scaling)."""
+    return int(pix_th * 255) if full_range else int(16 + pix_th * (235 - 16))
+
+
+def overlay_black_runs(nonblack: Sequence[Optional[float]], static: Sequence[Optional[float]],
+                       times: Sequence[float], step: int, pic_th: float,
+                       period: float, sample: int = 1) -> List[Tuple[float, float]]:
+    """(start, end) runs that are black apart from a static overlay.
+
+    ``nonblack`` holds a value on every ``sample``-th frame (None between).
+    A measured frame qualifies when its non-black share is at most
+    BLACK_OVERLAY_MAX plus the picture threshold's allowance; consecutive
+    qualifying measurements form a run, which counts when every pair of
+    frames ``step`` apart inside it shows the overlay in place: the share
+    non-black in both (``static``) is at most BLACK_OVERLAY_MAX and what is
+    non-black beyond it fits the picture threshold's allowance of the rest
+    of the picture. A run too short to hold one pair cannot show that and
+    does not count. A run spans its first to its last measured frame (up to
+    a sample short at each end, never longer than the black).
+    """
+    allowance = 1.0 - pic_th
+    count = min(len(nonblack), len(times))
+    measured = [i for i in range(count) if nonblack[i] is not None]
+    runs = []
+    k = 0
+    while k < len(measured):
+        if nonblack[measured[k]] > BLACK_OVERLAY_MAX + allowance:
+            k += 1
+            continue
+        j = k
+        while (j + 1 < len(measured) and measured[j + 1] - measured[j] <= sample
+               and nonblack[measured[j + 1]] <= BLACK_OVERLAY_MAX + allowance):
+            j += 1
+        first, last = measured[k], measured[j]
+        pairs = [i for i in range(first + step, last + 1)
+                 if i < len(static) and static[i] is not None and nonblack[i - step] is not None]
+        if step > 0 and pairs and all(
+                static[i] <= BLACK_OVERLAY_MAX
+                and max(nonblack[i], nonblack[i - step]) - static[i] <= allowance * (1.0 - static[i])
+                for i in pairs):
+            runs.append((times[first], times[last] + period))
+        k = j + 1
+    return runs
+
+
+def merge_runs(*groups: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Union of (start, end) runs."""
+    merged: List[List[float]] = []
+    for start, end in sorted(r for group in groups for r in group):
+        if merged and start <= merged[-1][1] + 1e-6:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
 
 
 def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: float,
@@ -1508,8 +1882,8 @@ def _still_runs(still: Sequence[bool], mafd: Sequence[float]) -> List[Tuple[int,
     ``still[i]`` says frame i shows no change from frame i-1. A digitally
     frozen picture re-encoded by a long-GOP encoder is not bit identical:
     every I-frame re-codes it, which shows as one to three frames of small
-    change (measured up to 1.0 % MAFD on 10 Mbit/s CBR H.264 and HEVC), and a
-    starved CBR encoder spends the first few frames refining the picture.
+    change (requantisation noise, see FREEZE_BLIP_MAFD), and a starved CBR
+    encoder spends the first few frames refining the picture.
     Up to FREEZE_MAX_BLIP_FRAMES consecutive moderate-change frames (below
     FREEZE_BLIP_MAFD, far under real motion) do not end a run. Returns
     (first, last) indices; the frozen picture itself starts one frame earlier.
@@ -1547,6 +1921,33 @@ def structural_limit(mafd: float, side_factor: float) -> float:
     return FREEZE_STRUCTURAL_FLOOR + mafd * FREEZE_GRAIN_CORRELATION / max(side_factor, 1.0)
 
 
+def freeze_step_frames(fps: float, min_duration: float) -> int:
+    """Frames between accumulated-change samples: FREEZE_STEP_FRACTION of the
+    minimum freeze duration, rounded down so two steps never exceed it."""
+    if fps <= 0:
+        fps = 25.0
+    return max(1, int(fps * min_duration * FREEZE_STEP_FRACTION + 1e-9))
+
+
+def _static_segments(first: int, last: int, moved: Sequence[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    """Maximal sub-runs of [first, last] that contain no moved pair (a, b) entirely."""
+    inside = sorted((a, b) for a, b in moved if first <= a and b <= last)
+    segments = []
+    start = first
+    for a, b in inside:
+        if a >= start:
+            segments.append((start, b - 1))
+            start = a + 1
+    segments.append((start, last))
+    # Drop segments contained in a neighbour (overlapping windows).
+    return [seg for k, seg in enumerate(segments)
+            if not any(o != seg and o[0] <= seg[0] and seg[1] <= o[1] for o in segments)]
+
+
+def _in_black(t: float, black: Sequence[Interval], tolerance: float) -> bool:
+    return any(start - tolerance <= t <= start + length + tolerance for start, length in black)
+
+
 def _cut(mafd: Sequence[float], i: int) -> bool:
     """True when frame i is a scene change (scdet's score at its default threshold)."""
     if i <= 0 or i >= len(mafd):
@@ -1559,25 +1960,30 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
                    black: Sequence[Interval] = (),
                    structural: Optional[Sequence[Optional[float]]] = None,
                    side_factor: float = 16.0,
-                   hold_allowance: float = 0.0) -> FreezeFindings:
+                   hold_allowance: float = 0.0,
+                   structural_step: Optional[Sequence[Optional[float]]] = None,
+                   step: int = 0) -> FreezeFindings:
     """Frozen pictures, told apart from held shots and quiet scenes.
 
     1. Still frames: no structural change beyond what grain explains
        (structural_limit), so a freeze under finishing grain is still
        found; without the structural series, MAFD under FREEZE_STILL_MAFD.
-       Runs bridge long-GOP refresh blips (_still_runs) and must last
-       ``min_duration``.
-    2. A run that starts on a cut and ends on a cut (or at the end) is a
+       Runs bridge long-GOP refresh blips (_still_runs).
+    2. A frozen picture is static, not just slow: within a run, frames
+       ``step`` apart (``structural_step``, sampled every ``step`` frames)
+       must also differ by no more than grain. A run is cut where they do,
+       so a slow pan never forms a run of ``min_duration``.
+    3. A run that starts on a cut and ends on a cut (or at the end) is a
        composed shot - a title card, an end card, a locked-off or quiet
        scene - not a freeze: by definition a freeze is not creative intent.
-       Such a shot counts as a freeze only when its frames are identical
-       (FREEZE_IDENTICAL_MAFD) and it is held longer than
-       ``hold_allowance`` (a spec setting: a long identical still is worth
-       checking).
-    3. Any other run is a freeze when the picture stopped dead in mid-shot:
+       A dip through black is an edit too. Such a shot counts as a freeze
+       only when its frames are identical (FREEZE_IDENTICAL_MAFD) and it is
+       held longer than ``hold_allowance`` (a spec setting: a long
+       identical still is worth checking).
+    4. Any other run is a freeze when the picture stopped dead in mid-shot:
        motion runs up to it (FREEZE_LEAD_FRAMES), or its frames are
        identical. A shot that slows to a standstill is not.
-    4. Runs at the very head are slates (unless they cover half the file);
+    5. Runs at the very head are slates (unless they cover half the file);
        a run reaching the end is judged like any other, so a render that
        ran out of media and froze its last seconds is reported.
     Runs mostly covered by black are left to Black Frames.
@@ -1601,8 +2007,29 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
             return structure[i] <= limit(i)
         return mafd[i] < FREEZE_STILL_MAFD
 
+    def edit(i: int) -> bool:
+        """Frame i changes picture by an edit: a cut, or it is (next to) black."""
+        if _cut(mafd, i):
+            return True
+        return 0 <= i < count and bool(black) and _in_black(times[i], black, period * 0.5)
+
     flags = [still(i) for i in range(count)]
+    runs = []
     for first, last in _still_runs(flags, mafd[:count]):
+        if structural_step is None or step <= 0:
+            runs.append((first, last))
+            continue
+        frozen_from = first - 1
+        # Between frames j-step and j a static picture changes by no more
+        # than the noisiest frame in between explains, and by no more than
+        # an encoder's re-coding of a held picture (one refresh blip,
+        # FREEZE_BLIP_MAFD, as the averaged copy sees it).
+        recode = structural_limit(FREEZE_BLIP_MAFD, side_factor)
+        moved = [(j - step, j) for j in range(max(step, frozen_from + step), last + 1)
+                 if j < len(structural_step) and structural_step[j] is not None
+                 and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))]
+        runs += [(a + 1, b) for a, b in _static_segments(frozen_from, last, moved) if b > a]
+    for first, last in runs:
         frozen_from = first - 1
         span = _interval_of(times, frozen_from, last, period)
         if span[1] < min_duration - period * 0.5:
@@ -1611,14 +2038,18 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
             black_holds += 1
             continue
         identical = statistics.median(mafd[first:last + 1]) <= FREEZE_IDENTICAL_MAFD
-        at_head = frozen_from <= 0
+        # At the head: from the first frame, allowing an encoder's opening
+        # refinement of the picture (blips, as within a run).
+        at_head = frozen_from <= 0 or (
+            frozen_from <= FREEZE_MAX_BLIP_FRAMES
+            and all(mafd[i] < FREEZE_BLIP_MAFD for i in range(1, frozen_from + 1)))
         at_tail = last >= count - 2
         covers_half = duration > 0 and span[1] >= 0.5 * duration
         if at_head and not covers_half:
             edges.append(span)
             continue
-        enters_on_cut = at_head or _cut(mafd, frozen_from)
-        leaves_on_cut = at_tail or _cut(mafd, last + 1)
+        enters_on_cut = at_head or edit(frozen_from) or edit(frozen_from - 1)
+        leaves_on_cut = at_tail or edit(last + 1)
         if enters_on_cut and leaves_on_cut and not covers_half:
             if identical and span[1] > hold_allowance + period * 0.5:
                 holds.append(span)
@@ -1628,8 +2059,16 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
         lead = range(max(1, frozen_from - FREEZE_LEAD_FRAMES + 1), frozen_from + 1)
         abrupt = bool(lead) and all(not flags[i] for i in lead)
         if abrupt and structure is not None and all(structure[i] is not None for i in lead):
-            stillness = statistics.median(limit(i) for i in range(first, last + 1))
-            abrupt = statistics.median(structure[i] for i in lead) >= FREEZE_MOVING_FACTOR * stillness
+            noise = statistics.median(structure[i] or 0.0 for i in range(first, last + 1))
+            margin = statistics.median(limit(i) for i in range(first, last + 1)) - noise
+            margin = max(margin, FREEZE_STRUCTURAL_FLOOR)
+            motion = statistics.median(structure[i] for i in lead) - noise
+            span_back = step if step > 0 else freeze_step_frames(fps, min_duration)
+            earlier = [structure[i] for i in range(max(1, frozen_from - span_back - FREEZE_LEAD_FRAMES + 1),
+                                                   frozen_from - span_back + 1)
+                       if structure[i] is not None]
+            steady = bool(earlier) and motion >= (statistics.median(earlier) - noise) / FREEZE_MOVING_FACTOR
+            abrupt = motion >= FREEZE_MOVING_FACTOR * margin or (motion >= margin and steady)
         if abrupt or identical:
             holds.append(span)
             if covers_half and (at_head or at_tail):
@@ -1884,7 +2323,7 @@ class _ZigZag:
         return 0
 
 
-_FLASH_KINDS = ("general", "red")
+_FLASH_KINDS = ("general", "red", "fine")
 # Per-byte terms of a block's rule quantity, computed once: luminance in
 # cd/m2 (Y = 0.2126 R + 0.7152 G + 0.0722 B of linear light, scaled to the
 # 200 cd/m2 SDR peak) and the WCAG saturated-red measure (R - G - B) x 320.
@@ -1926,9 +2365,13 @@ class FlashAccumulator:
     """
 
     PLANE = FLASH_GRID[0] * FLASH_GRID[1]
-    FRAME_BYTES = 3 * PLANE
+    FRAME_BYTES = 3 * PLANE          # an in-memory gbrp grid; the stream is gbrap (4 planes)
 
-    def __init__(self, fps: float):
+    def __init__(self, fps: float, planes: int = 3, offset: int = 0):
+        self.planes = planes
+        self.FRAME_BYTES = planes * self.PLANE
+        self.offset = offset             # grid frame k is source frame k + offset
+        self.fine_share: List[Dict[int, float]] = [{} for _ in range(self.PLANE)]
         rate = fps if 0 < fps < 1000 else 0.0
         self.span_frames = int(math.ceil(2.0 * rate)) + 2 if rate else 482
         blocks = self.PLANE
@@ -1970,6 +2413,12 @@ class FlashAccumulator:
             for k, (r, g, x) in enumerate(zip(r_series, g_series, b_series)):
                 if red(_RED[r - g - x + 510], r > 0 and r >= FLASH_RED_RATIO * (r + g + x)):
                     self._swing("red", b, start + k)
+            if self.planes == 4:
+                shares = self.fine_share[b]
+                for k, a in enumerate(data[3 * plane + b::stride]):
+                    if a:
+                        shares[start + k] = a / 255.0
+                        self._swing("fine", b, start + k)
         self.frames += count
         self.recent_rows.append((start, data))
         self._finalise(self.frames - 1 - self.span_frames)
@@ -2004,6 +2453,12 @@ class FlashAccumulator:
             if flagged and frame not in self.retained:
                 self.retained[frame] = self._row(frame)
         self.final_through = max(self.final_through, through)
+        horizon = through - self.span_frames
+        for b, shares in enumerate(self.fine_share):
+            if shares and min(shares) < horizon:
+                committed = set(self.committed["fine"][b].values())
+                for f in [f for f in shares if f < horizon and f not in committed]:
+                    del shares[f]
         while self.recent_rows and (self.recent_rows[0][0]
                                     + len(self.recent_rows[0][1]) // self.FRAME_BYTES) <= self.final_through + 1:
             self.recent_rows.popleft()
@@ -2074,6 +2529,7 @@ class FlashAccumulator:
         never changes. A frame is hazardous when the coverage-weighted area
         of its flashing blocks exceeds 25 % of the screen.
         """
+        times = times[self.offset:]
         frames = min(self.frames, len(times))
         if frames < FLASH_MAX_TRANSITIONS + 1:
             return []
@@ -2084,31 +2540,54 @@ class FlashAccumulator:
         events: List[FlashEvent] = []
         for kind in _FLASH_KINDS:
             hazard: Dict[int, List[int]] = {}
+            # fine: a block's weight over a hazardous run is the smallest
+            # share of its samples in transition at any of the run's seven
+            # transitions - the area that flashed every time.
+            fine: Dict[Tuple[int, int], float] = {}
             for b in range(blocks):
                 check_cancel(cancel)
-                for first, last in self._exact_spans(kind, b, times, frames, window):
+                for first, last, marks in self._exact_spans(kind, b, times, frames, window):
+                    weight = (min(self.fine_share[b].get(m, 0.0) for m in marks)
+                              if kind == "fine" else 1.0)
                     for f in range(first, last + 1):
                         members = hazard.setdefault(f, [])
                         if not members or members[-1] != b:
                             members.append(b)
+                        if kind == "fine":
+                            fine[(f, b)] = max(fine.get((f, b), 0.0), weight)
             candidates = sorted(f for f, members in hazard.items()
                                 if len(members) > FLASH_AREA * blocks)
             for first, last in _consecutive_runs(candidates):
                 check_cancel(cancel)
                 members = sorted({b for f in range(first, last + 1) for b in hazard[f]})
-                weights = self._coverage_weights(
-                    self._amplitudes(kind, range(first, last + 1), members))
-                areas = [sum(weights[b] for b in hazard[f]) / blocks
-                         for f in range(first, last + 1)]
+                if kind == "fine":
+                    areas = [sum(fine.get((f, b), 0.0) for b in hazard[f]) / blocks
+                             for f in range(first, last + 1)]
+                else:
+                    weights = self._coverage_weights(
+                        self._amplitudes(kind, range(first, last + 1), members))
+                    areas = [sum(weights[b] for b in hazard[f]) / blocks
+                             for f in range(first, last + 1)]
                 flagged = [first + k for k, area in enumerate(areas) if area > FLASH_AREA]
                 for run_first, run_last in _consecutive_runs(flagged):
                     peak = max(areas[run_first - first:run_last - first + 1])
-                    events.append(FlashEvent(times[run_first], times[run_last] + period, peak, kind))
-        return sorted(events, key=lambda e: e.start)
+                    events.append(FlashEvent(times[run_first], times[run_last] + period, peak,
+                                             "red" if kind == "red" else "general"))
+        # The block-mean and fine channels can both see one flash: merge
+        # overlapping events of a rule.
+        merged: List[FlashEvent] = []
+        for event in sorted(events, key=lambda e: (e.kind, e.start)):
+            last = merged[-1] if merged else None
+            if last is not None and last.kind == event.kind and event.start <= last.end:
+                merged[-1] = FlashEvent(last.start, max(last.end, event.end),
+                                        max(last.area, event.area), last.kind)
+            else:
+                merged.append(event)
+        return sorted(merged, key=lambda e: e.start)
 
     def _exact_spans(self, kind: str, block: int, times: Sequence[float], frames: int,
-                     window: float) -> List[Tuple[int, int]]:
-        """(first, last) frames of each run of seven consecutive swings < 1 s.
+                     window: float) -> List[Tuple[int, int, List[int]]]:
+        """(first, last, swing frames) of each run of seven consecutive swings < 1 s.
 
         More than three flashes is more than six transitions: seven
         transitions spanning less than a second. At exactly 3 Hz seven
@@ -2127,7 +2606,7 @@ class FlashAccumulator:
                 continue
             first, last = committed[seqs[k]], committed[seqs[k + need - 1]]
             if last < frames and times[last] - times[first] < window:
-                spans.append((first, last))
+                spans.append((first, last, [committed[seqs[k + j]] for j in range(need)]))
         return spans
 
 
@@ -2163,8 +2642,9 @@ def assess_flash(series: VideoSeries, fps: float,
     """
     accumulator = series.flash_stream
     if accumulator is None:
-        accumulator = FlashAccumulator(fps)
-        accumulator.feed(b"".join(g + b + r for g, b, r in series.flash))
+        planes = len(series.flash[0]) if series.flash else 3
+        accumulator = FlashAccumulator(fps, planes=planes)
+        accumulator.feed(b"".join(b"".join(frame) for frame in series.flash))
         accumulator.finish()
     return accumulator.events(series.times, fps, cancel)
 
@@ -2189,8 +2669,64 @@ def flash_entry(events: Sequence[FlashEvent]) -> Tuple[str, str, int]:
 _FIELD_ORDER_NAMES = {"tt": "tff", "tb": "tff", "bb": "bff", "bt": "bff"}
 
 
-def field_displacement(errors: Dict[int, Optional[float]]) -> str:
-    """'woven', 'progressive' or '' from one frame's displacement errors.
+def field_timings(frames: int, selected: Sequence[int], same: Dict[int, float],
+                  top: Dict[int, float], bottom: Dict[int, float],
+                  move: Dict[int, float]) -> List[str]:
+    """field_timing() per frame position from the field-timing series.
+
+    ``selected``: the analysed frame positions in order (idet's TFF/BFF
+    frames). ``same[n]`` is d(Ti_n, B_n). With Z = [Ti; B] and the halves
+    swapped on odd selection indices, tblend at analysed frame m (previous
+    analysed frame n) pairs B_m with Ti_n in one half and Ti_m with B_n in
+    the other: n's comparisons with the next field for either field order.
+    ``move[m]`` is the top-field change from n to m. Only consecutive
+    frames pair.
+    """
+    out = [""] * frames
+    for j in range(len(selected) - 1):
+        n, m = selected[j], selected[j + 1]
+        if m != n + 1:
+            continue
+        # The two halves hold d(Ti_m, B_n) and d(B_m, Ti_n) in an order set
+        # by the selection index's parity; field_timing treats its two
+        # neighbour comparisons alike, so the order does not matter.
+        out[n] = field_timing(same.get(n), top.get(m), bottom.get(m), move.get(m), move.get(m))
+    return out
+
+
+def field_timing(same: Optional[float], following: Optional[float],
+                 other_order: Optional[float], moved_after: Optional[float] = None,
+                 moved_before: Optional[float] = None) -> str:
+    """'woven', 'progressive' or '' for one frame (see FIELD_TIMING_COLUMNS).
+
+    ``same`` is d(T_n, B_n), the frame's own two fields; ``following`` is
+    d(B_n, T_n+1) and ``other_order`` d(T_n, B_n+1): the next field in time
+    if the source is top-first or bottom-first respectively. In a woven
+    frame one of them is half a frame from its neighbour, like ``same``; in
+    a progressive frame both are a whole frame away. ``moved_after`` /
+    ``moved_before`` is the picture's change to the frame that the nearer
+    comparison uses: a repeated frame decides nothing.
+
+    Motion must show (the larger comparison exceeds ``same`` by
+    INTERLACE_DECISIVE_RATIO). Progressive: both exceed ``same`` by that
+    ratio. Woven: the nearer one is within that ratio of ``same`` and the
+    picture really changed on that side by as much. Otherwise undecided.
+    """
+    if same is None or following is None or other_order is None:
+        return ""
+    near, far = min(following, other_order), max(following, other_order)
+    if far < INTERLACE_DECISIVE_RATIO * same:
+        return ""
+    if near >= INTERLACE_DECISIVE_RATIO * same:
+        return "progressive"
+    moved = moved_after if following <= other_order else moved_before
+    if moved is not None and moved < INTERLACE_DECISIVE_RATIO * same:
+        return ""
+    return "woven"
+
+
+def vertical_displacement(errors: Dict[int, Optional[float]]) -> str:
+    """'woven', 'progressive' or '' from one frame's row-profile displacement errors.
 
     ``errors[d]`` is the mean |bottom field - top field interpolated at an
     offset of d lines| on the row profile (missing for frames idet did not
@@ -2208,6 +2744,47 @@ def field_displacement(errors: Dict[int, Optional[float]]) -> str:
     if simultaneous * INTERLACE_DECISIVE_RATIO <= shifted:
         return "progressive"
     return ""
+
+
+def is_vertical_scroll(col: Optional[float], row: Optional[float]) -> bool:
+    """True when a frame's motion is a vertical translation (see INTERLACE_VERTICAL_SHARE)."""
+    if col is None or row is None or col + row <= INTERLACE_MOTION_FLOOR:
+        return False
+    return col / (col + row) < INTERLACE_VERTICAL_SHARE
+
+
+def scroll_speed(errors: Dict[int, Optional[float]], position: int = 0) -> Optional[int]:
+    """Lines per frame the row profile moved since the previous frame, or None.
+
+    ``errors[k]`` is the mean |difference| of the pairing at selection index
+    ``position`` for shift k (see _interlace_chains): the profile of the odd
+    frame of the pair was moved by k, so the sign depends on the parity.
+    """
+    if not errors or any(v is None for v in errors.values()):
+        return None
+    best = min(errors, key=lambda k: (errors[k], abs(k)))
+    return -best if position % 2 else best
+
+
+def field_verdict(timing: str, vertical: str, col: Optional[float], row: Optional[float],
+                  speed: Optional[int] = None) -> str:
+    """The frame's woven/progressive verdict.
+
+    Not a vertical scroll: the field-timing comparison. A vertical scroll
+    (credits): hard-edged graphics defeat field interpolation, so woven
+    needs both the timing comparison and the row-profile displacement to
+    say so, and a scroll of at most INTERLACE_SCROLL_SLOW lines per frame
+    cannot show feathering at all (progressive). A frame whose profiles did
+    not change is "static": it cannot show combing and does not vote."""
+    if col is not None and row is not None and col + row <= INTERLACE_MOTION_FLOOR:
+        return "static"
+    if not is_vertical_scroll(col, row):
+        return timing
+    if speed is not None and abs(speed) <= INTERLACE_SCROLL_SLOW:
+        return "progressive"
+    if timing == "woven" and vertical == "woven":
+        return "woven"
+    return "progressive" if "progressive" in (timing, vertical) else ""
 
 
 @dataclass
@@ -2274,17 +2851,21 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
     """Woven or telecined pictures in progressive-flagged video; field order.
 
     ``labels``/``singles`` are idet's multiple- and single-frame calls,
-    ``repeated`` its repeated-field call, ``displacement`` the row-profile
-    verdict per frame (field_displacement).
+    ``repeated`` its repeated-field call, ``displacement`` the field-timing
+    verdict per frame (field_timing).
 
     * Combing: more than half the frames of a one-second window called
       TFF/BFF by the multiple-frame detector, for a second or more.
     * Sections are not woven when idet's single-frame calls in them flip
       between TFF and BFF (no FIELD_ORDER_MAJORITY over all of them: one
-      source has one field order), or a section whose frames' fields are
-      measurably simultaneous (displacement 'progressive' on at
-      least FIELD_ORDER_MAJORITY of the decided frames) - a progressive
-      vertical scroll. A woven scroll shows a displacement and stays.
+      source has one field order), or a section where more than half the
+      frames, and more than show fields half a frame apart, show fields from
+      the same instant (field_timing), unless the timing comparison itself calls more than
+      half the frames of some one-second window woven (the R5b rule applied
+      to the timing evidence): idet's 4 % prev/next asymmetry also fires on
+      progressive motion (moving graphics, whole-line scrolls), the timing
+      comparison does not. Static or noise-dominated frames do not vote, so
+      idet's evidence stands where timing cannot be measured.
     * Telecine: one-second windows where a repeated field recurs every five
       frames in at least half of the 3:2 cadence's positions.
     * Field order: idet's TFF/BFF majority against the declared order of an
@@ -2317,13 +2898,19 @@ def assess_interlace(labels: Sequence[str], times: Sequence[float], fps: float,
                 continue
             verdicts = displacement[first:last + 1]
             progressive, woven = verdicts.count("progressive"), verdicts.count("woven")
-            if progressive and progressive >= FIELD_ORDER_MAJORITY * (progressive + woven):
+            confirmed = _dense_sections([v == "woven" for v in verdicts], frame_times[first:last + 1],
+                                        period, window, INTERLACE_WINDOW_SHARE)
+            # Simultaneous fields must be the majority view of the section's
+            # moving frames (more than half, as R5b asks of combing itself).
+            moving = len(verdicts) - verdicts.count("static")
+            if progressive > max(woven, INTERLACE_WINDOW_SHARE * moving) and not confirmed:
                 scrolls.append(section)
                 continue
             combed.append(section)
         cadence = _telecine_flags(repeated)
+        # "At least half the expected repeats": >= (the share test is strict).
         telecine = _dense_sections(cadence, frame_times, period, window,
-                                   TELECINE_REPEAT_SHARE * 0.5)
+                                   TELECINE_REPEAT_SHARE * 0.5 - 1e-9)
     tff, bff = labels.count("tff"), labels.count("bff")
     content = None
     if tff + bff >= FIELD_ORDER_MIN_FRAMES:
@@ -2365,7 +2952,8 @@ def interlace_entry(findings: InterlaceFindings) -> Tuple[str, str, int]:
         return "WARN", ". ".join(problems) + f" ({share}).", 70
     notes = []
     if findings.scrolls:
-        notes.append(f"progressive vertical scroll at {event_list(findings.scrolls)}")
+        notes.append(f"both fields from the same instant (progressive motion, e.g. a vertical "
+                     f"scroll) at {event_list(findings.scrolls)}")
     if findings.unsteady:
         notes.append(f"field order flips, not woven, at {event_list(findings.unsteady)}")
     note = "; " + "; ".join(notes) if notes else ""
@@ -2434,6 +3022,11 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
         result.add_not_verified(BLACK, "FFmpeg's black-frame report is missing or incomplete "
                                        "(its log overflowed or used an unrecognised form).")
         return []
+    if series.nonblack and series.overlay_step:
+        overlay = overlay_black_runs(series.nonblack, series.nonblack_static, series.times,
+                                     series.overlay_step, config.black_pic_th,
+                                     _frame_period(fps, series.times), series.overlay_sample)
+        events = merge_runs(events, overlay)
     findings = classify_black(events, duration, fps, config, series.times, series.yavg)
     if findings.segments:
         result.set_metadata("black_frame_sequences", len(findings.segments))
@@ -2460,7 +3053,9 @@ def _report_freeze(result, config, series, duration, fps, black, decoded, reason
     side = analysis.structural_side_factor if analysis is not None else 16.0
     findings = detect_freezes(series.mafd, series.times, fps, config.freeze_duration,
                               duration, black, structural=series.structural or None,
-                              side_factor=side, hold_allowance=config.freeze_hold)
+                              side_factor=side, hold_allowance=config.freeze_hold,
+                              structural_step=series.structural_step or None,
+                              step=analysis.freeze_step_frames if analysis is not None else 0)
     if findings.holds:
         result.set_metadata("freeze_frame_count", len(findings.holds))
         result.set_metadata("freeze_frame_total_seconds",
@@ -2505,8 +3100,10 @@ def _report_flash(result, config, series, analysis, fps, decoded, reason,
         result.add_skip(FLASH, "Switched off in the settings.")
         return
     if analysis is not None and analysis.info.hdr:
-        result.add_skip(FLASH, "Not assessed for PQ/HLG video: the BT.1702-3 thresholds "
-                               "used here assume an SDR display.")
+        # Switched on but not measurable here: never a SKIP that reads as
+        # "not asked for" (review round 3, bug 14).
+        result.add_not_verified(FLASH, "PQ/HLG video: the BT.1702-3 thresholds used here "
+                                       "assume an SDR display, so flashes were not screened.")
         return
     if analysis is not None and not analysis.info.analysable:
         result.add_skip(FLASH, "Picture too small to analyse.")
@@ -2537,8 +3134,11 @@ def _report_interlace(result, config, series, analysis, video, fps, decoded, rea
     if decoded and not series.idet:
         result.add_not_verified(INTERLACE, reason)
         return
-    lost = series.missing & ({"idet", "idet1", "rep_top", "rep_bottom"}
-                             | {_disp_name(d) for d in INTERLACE_DISPLACEMENTS})
+    lost = series.missing & ({"idet", "idet1", "rep_top", "rep_bottom", "ft_same", "ft_top", "ft_bot", "ft_move",
+                              "colmo", "rowmo"}
+                             | {_disp_name(d) for d in INTERLACE_DISPLACEMENTS}
+                             | {_shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE,
+                                                              INTERLACE_SCROLL_RANGE + 1)})
     if decoded and lost:
         result.add_not_verified(INTERLACE, "FFmpeg wrote no field measurements "
                                            f"({', '.join(sorted(lost))}).")

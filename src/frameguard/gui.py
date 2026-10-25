@@ -3892,8 +3892,7 @@ class SettingsPanel(QWidget):
          "Find black sections (0.3 s or longer) and isolated short black flashes", None),
         ("picture", "freeze_frames_enabled", "bool", "Freeze Frames",
          "Find held pictures of a second or longer, including in long-GOP encodes", None),
-        ("picture", "freeze_hold_allowance", "choice", "Title Card Hold",
-         "A still shot cut in and out (title or end card) passes when held up to this long",
+        ("picture", "freeze_hold_allowance", "choice", "Title Card Hold", "",
          ((0.0, "None"), (1.0, "1 s"), (2.0, "2 s"), (3.0, "3 s"), (5.0, "5 s"), (10.0, "10 s"))),
         ("picture", "signal_levels_mode", "choice", "Signal Levels (EBU R 103)",
          "Luma outside 5-246 or RGB outside -5…105% on more than 1% of the picture. "
@@ -3903,8 +3902,7 @@ class SettingsPanel(QWidget):
          "Warn on more than three large flashes in a second. A screening aid, not a "
          "photosensitivity certificate (that needs a Harding FPA test)", None),
         ("picture", "interlace_check_enabled", "bool", "Interlace Detection",
-         "Warn on combing or 3:2 pulldown in video declared progressive and on a wrong "
-         "field order", None),
+         "Warn on combing in video declared progressive and on a wrong field order", None),
         ("verdicts", "max_decode_errors", "int", "Allowed Decode Errors",
          "Decoder errors tolerated before File Integrity fails (0 = none)", (0, 1_000_000)),
     )

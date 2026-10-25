@@ -419,14 +419,15 @@ DEFAULT_CONFIG = {
     # Picture checks (video_checks.py). Black: a picture with at least
     # black_detect_picture_threshold of its pixels at or below the level
     # black_detect_pix_threshold (0.02 = Y <= 20 at 8-bit limited range) for
-    # black_detect_duration seconds (the 0.90 share leaves room for a
-    # burnt-in timecode or a channel bug: Oct 21 recommendation R2b,
-    # Telestream VQ-101 practice); bursts from black_short_min_frames
-    # frames up to that are reported only when cut in hard (0 disables).
+    # black_detect_duration seconds (FFmpeg blackdetect's default share;
+    # Telestream VQ-101 documents 100 %); a small static overlay - burnt-in
+    # timecode, channel logo - is excluded by video_checks.BLACK_OVERLAY_MAX.
+    # Bursts from black_short_min_frames frames up to that are reported only
+    # when cut in hard (0 disables).
     "black_frames_enabled": True,
     "black_detect_duration": 0.3,
     "black_detect_pix_threshold": 0.02,
-    "black_detect_picture_threshold": 0.90,
+    "black_detect_picture_threshold": 0.98,
     "black_short_min_frames": 3,
     # Freeze: a held picture at least this long (EBU QC 0044B example: 25 frames).
     "freeze_frames_enabled": True,
