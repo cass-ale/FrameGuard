@@ -258,6 +258,36 @@ FREEZE_LAG_RATIO = 1.25
 # of 5-15 um, softened by the scan, span up to about 4 px of an HD frame);
 # twice that, 8 px, bounds what of a frame-to-frame change can be grain.
 FREEZE_GRAIN_MAX_PX = 8.0
+# Global displacement (see global_shift): a frozen picture does not move.
+# Frames FREEZE_STEP_FRACTION of the minimum duration apart are compared on
+# a luma copy area-reduced FREEZE_SHIFT_FACTOR times per side (grain, even
+# film grain correlated over a few pixels, averages down by about that
+# factor while picture structure larger than a few pixels stays, so the
+# match is not drowned in grain) at shifts of -1, 0 and +1 copy pixels per
+# axis; the parabola through the three mean differences
+# locates the displacement to a fraction of a pixel (grain, independent
+# between the frames, adds about equally to all three). The picture is
+# static when the vertex lies within FREEZE_SHIFT_TOLERANCE copy pixels of
+# zero on both axes - a quarter pixel, half the smallest whole-pixel step
+# the comparison resolves either way - and the zero shift is the best of
+# the three. Without texture the parabola is flat and the frame pair
+# decides nothing: its curvature must reach FREEZE_SHIFT_CURVATURE of the
+# zero-shift difference.
+FREEZE_SHIFT_FACTOR = 4
+FREEZE_SHIFT_TOLERANCE = 0.25
+FREEZE_SHIFT_CURVATURE = 0.1
+# A frozen picture's mean luma does not change: grain averages out over the
+# whole frame and an encoder's requantisation of a held picture moves the
+# mean by a fraction of a code, while a flicker, a lamp or a fade moves it by
+# its full amplitude. A still run whose mean luma spreads (10th to 90th
+# percentile) over more than FREEZE_LUMA_SPREAD - one 8-bit code, the
+# smallest step a picture change can take - is a live picture, not a freeze.
+# (The 8-bit structural copy can round a one-code flicker away; the mean of
+# the whole frame keeps it.)
+FREEZE_LUMA_SPREAD = 1.0
+# At least half of a frozen run's frames are still; blips (re-coded frames)
+# are the minority - at most a few per GOP.
+FREEZE_STILL_SHARE = 0.5
 # A scene change, as FFmpeg's scdet decides it with its documented default
 # threshold (10): score = min(MAFD, |MAFD - previous MAFD|) >= 10.
 FREEZE_CUT_SCORE = 10.0
@@ -941,7 +971,7 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "struct", "struct_step", "blk_n", "blk_s", "blk_b", "blk_k", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+        names = ("mafd", "struct", "struct_step", "gd_0", "gd_xp", "gd_xm", "gd_yp", "gd_ym", "blk_n", "blk_s", "blk_b", "blk_k", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
                  "yavg", "gam_r", "gam_g", "gam_b", "ft_same", "ft_top", "ft_bot", "ft_move", "colmo", "rowmo") + tuple(
                      _disp_name(d) for d in INTERLACE_DISPLACEMENTS) + tuple(
                      _shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1))
@@ -1319,6 +1349,21 @@ class VideoAnalysis:
             chains.append(
                 f"[ar_d2]select='not(mod(n,{step}))',tblend=all_mode=difference,signalstats,"
                 f"{_print('lavfi.signalstats.YAVG', self.paths['struct_step'])},nullsink")
+            # Global displacement between the same frame pairs (global_shift):
+            # every other selected frame is cropped one pixel off, so tblend
+            # compares each pair at that shift (its sign alternates, which
+            # the parabola's vertex magnitude does not see).
+            shifts = (("gd_0", "1", "1"), ("gd_xp", "'1+mod(n,2)'", "1"), ("gd_xm", "'1-mod(n,2)'", "1"),
+                      ("gd_yp", "1", "'1+mod(n,2)'"), ("gd_ym", "1", "'1-mod(n,2)'"))
+            chains.append(
+                f"[0:{self.index}]select='not(mod(n,{step}))',extractplanes=y,"
+                f"scale=w='max(16,trunc(iw/{2 * FREEZE_SHIFT_FACTOR})*2)':"
+                f"h='max(16,trunc(ih/{2 * FREEZE_SHIFT_FACTOR})*2)':flags=area,format=gray,"
+                f"split={len(shifts)}" + "".join(f"[{name}]" for name, _, _ in shifts))
+            for name, x, y in shifts:
+                chains.append(
+                    f"[{name}]crop=w=iw-2:h=ih-2:x={x}:y={y},tblend=all_mode=difference,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths[name])},nullsink")
             # Every frame's mean luma: the edit-gap test compares black
             # frames with their neighbours at whatever level the scene sits.
             chains.append(
@@ -1488,6 +1533,9 @@ class VideoAnalysis:
             series.structural = sparse("struct", None, lambda v: _to_float(v, 0.0) / 2.55, by_pts, 1)
             series.structural_step = sparse("struct_step", None, lambda v: _to_float(v, 0.0) / 2.55,
                                             by_pts, 1)
+            shift_series = [sparse(name, None, lambda v: _to_float(v, None), by_pts, 1)
+                            for name in ("gd_0", "gd_xp", "gd_xm", "gd_yp", "gd_ym")]
+            series.global_shift = [global_shift(*values) for values in zip(*shift_series)]
         if self.config.black:
             series.black_runs = black_runs(self.paths["black_start"], self.paths["black_end"],
                                            cancel)
@@ -1593,6 +1641,8 @@ class VideoSeries:
     structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
     # freeze: averaged-copy change to the frame freeze_step_frames earlier (on those frames)
     structural_step: List[Optional[float]] = field(default_factory=list)
+    # freeze: per sampled frame pair, True static / False moving / None undecided
+    global_shift: List[Optional[bool]] = field(default_factory=list)
     flash: List[tuple] = field(default_factory=list)   # in-memory grid (tests, batch use)
     flash_stream: Optional["FlashAccumulator"] = None   # streamed grid (scans)
     flash_error: Optional[str] = None
@@ -1611,7 +1661,7 @@ class VideoSeries:
         """
         names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
                  "gam", "band1", "band2", "yavg", "structural", "structural_step", "nonblack",
-                 "nonblack_static", "bright", "black_sum", "flash")
+                 "nonblack_static", "bright", "black_sum", "global_shift", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1950,6 +2000,26 @@ def structural_limit(mafd: float, side_factor: float) -> float:
     return FREEZE_STRUCTURAL_FLOOR + mafd * FREEZE_GRAIN_CORRELATION / max(side_factor, 1.0)
 
 
+def global_shift(e0: Optional[float], xp: Optional[float], xm: Optional[float],
+                 yp: Optional[float], ym: Optional[float]) -> Optional[bool]:
+    """Static (True), moving (False) or undecided (None) from the mean
+    differences of a frame pair at shifts 0, +-1 pixel per axis (see
+    FREEZE_SHIFT_TOLERANCE)."""
+    if None in (e0, xp, xm, yp, ym):
+        return None
+    static = True
+    for plus, minus in ((xp, xm), (yp, ym)):
+        curvature = plus + minus - 2.0 * e0
+        if curvature < FREEZE_SHIFT_CURVATURE * e0 or curvature <= 0:
+            return None
+        if e0 > min(plus, minus):
+            return False
+        vertex = (minus - plus) / (2.0 * curvature)
+        if abs(vertex) > FREEZE_SHIFT_TOLERANCE:
+            static = False
+    return static
+
+
 def _lag_static_windows(structure: Optional[Sequence[Optional[float]]],
                         structural_step: Optional[Sequence[Optional[float]]],
                         step: int, count: int, mafd: Sequence[float] = (),
@@ -2050,7 +2120,9 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
                    side_factor: float = 16.0,
                    hold_allowance: float = 0.0,
                    structural_step: Optional[Sequence[Optional[float]]] = None,
-                   step: int = 0) -> FreezeFindings:
+                   step: int = 0,
+                   global_shift: Optional[Sequence[Optional[bool]]] = None,
+                   mean_luma: Optional[Sequence[float]] = None) -> FreezeFindings:
     """Frozen pictures, told apart from held shots and quiet scenes.
 
     1. Still frames: no structural change beyond what grain explains
@@ -2059,8 +2131,9 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
        Runs bridge long-GOP refresh blips (_still_runs).
     2. A frozen picture is static, not just slow: within a run, frames
        ``step`` apart (``structural_step``, sampled every ``step`` frames)
-       must also differ by no more than grain. A run is cut where they do,
-       so a slow pan never forms a run of ``min_duration``.
+       must also differ by no more than grain, and must not be displaced
+       (``global_shift``). A run is cut where they do, so a slow pan never
+       forms a run of ``min_duration``.
     3. A run that starts on a cut and ends on a cut (or at the end) is a
        composed shot - a title card, an end card, a locked-off or quiet
        scene - not a freeze: by definition a freeze is not creative intent.
@@ -2102,6 +2175,16 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
 
     flags = [still(i) for i in range(count)]
     lag_static = _lag_static_windows(structure, structural_step, step, count, mafd, side_factor)
+    shift = list(global_shift or [])
+
+    def shift_at(j: int) -> Optional[bool]:
+        return shift[j] if j < len(shift) else None
+
+    # A frozen picture does not move: the lag test needs the global
+    # displacement to be measured as zero, and a measured displacement
+    # cuts any run.
+    if global_shift is not None:
+        lag_static = {j for j in lag_static if shift_at(j) is True}
     for j in lag_static:
         for i in range(j - step + 1, j + 1):
             flags[i] = True
@@ -2123,9 +2206,27 @@ def detect_freezes(mafd: Sequence[float], times: Sequence[float], fps: float,
                  if j < len(structural_step) and structural_step[j] is not None
                  and structural_step[j] > max(recode, max(limit(i) for i in range(j - step + 1, j + 1)))
                  and j not in lag_static]
+        moved += [(j - step, j) for j in range(max(step, frozen_from + step), last + 1)
+                  if shift_at(j) is False and (j - step, j) not in moved]
         runs += [(a + 1, b) for a, b in _static_segments(frozen_from, last, moved) if b > a]
+    def flickers(first: int, last: int) -> bool:
+        if mean_luma is None:
+            return False
+        values = sorted(mean_luma[i] for i in range(max(0, first - 1), min(last + 1, len(mean_luma)))
+                        if mean_luma[i] != YAVG_ABSENT)
+        if len(values) < 10:
+            return False
+        spread = values[(9 * len(values)) // 10] - values[len(values) // 10]
+        return spread > FREEZE_LUMA_SPREAD
+
     for first, last in runs:
         frozen_from = first - 1
+        # Refresh blips are bridged, but they are the exception in a frozen
+        # picture (a few frames per GOP); a run made mostly of small changes
+        # is a live picture changing a little all the time (a flicker).
+        still_share = sum(flags[first:last + 1]) / max(1, last + 1 - first)
+        if still_share < FREEZE_STILL_SHARE or flickers(first, last):
+            continue
         span = _interval_of(times, frozen_from, last, period)
         if span[1] < min_duration - period * 0.5:
             continue
@@ -3155,7 +3256,9 @@ def _report_freeze(result, config, series, duration, fps, black, decoded, reason
                               duration, black, structural=series.structural or None,
                               side_factor=side, hold_allowance=config.freeze_hold,
                               structural_step=series.structural_step or None,
-                              step=analysis.freeze_step_frames if analysis is not None else 0)
+                              step=analysis.freeze_step_frames if analysis is not None else 0,
+                              global_shift=series.global_shift or None,
+                              mean_luma=series.yavg or None)
     if findings.holds:
         result.set_metadata("freeze_frame_count", len(findings.holds))
         result.set_metadata("freeze_frame_total_seconds",

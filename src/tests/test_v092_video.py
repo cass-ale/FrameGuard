@@ -1367,6 +1367,65 @@ class TestFreezeUnderFilmGrain:
 
 
 @needs_ffmpeg
+class TestSlowPansAreNotFreezes:
+    """Round 7 (sealed scoring of 98562c1): the lag test flagged clean slow
+    camera pans (2-18 px per 0.5 s, grainy or not, one a dark grade) as
+    freezes - a cut-bounded slow pan then read as a held shot over the Title
+    Card Hold. A freeze needs near-zero global displacement."""
+
+    @staticmethod
+    def _two_shots(tmp_path, name, px_per_half_second, grain=0, dark=False):
+        still = _texture(tmp_path / "still.png")
+
+        def shot(x0, speed, seconds):
+            s = (f"movie='{still}',loop=-1:1,fps=24,trim=duration={seconds},"
+                 f"setpts=PTS-STARTPTS,crop=640:360:'{x0}+{speed}*t':300,"
+                 "format=yuv420p,setparams=range=tv")
+            return s + (",lutyuv=y='17+val*24/255':u=128:v=128" if dark else "")
+        graph = (f"{shot(100, 300, 2)}[a];{shot(1000, 2 * px_per_half_second, 6)}[b];"
+                 "[a][b]concat=n=2:v=1:a=0")
+        if grain:
+            graph += "[pic];" + _film_grain("pic", 8, grain, 1.0)
+        return _graph_clip(tmp_path / f"{name}.mp4", graph)
+
+    @pytest.mark.parametrize("px_per_half_second", [2, 5, 10, 18])
+    @pytest.mark.parametrize("grain", [0, 40])
+    def test_slow_pan(self, tmp_path, px_per_half_second, grain):
+        path = self._two_shots(tmp_path, f"pan{px_per_half_second}_{grain}", px_per_half_second, grain)
+        row = _row(_scan(path, target_fps=24.0), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    @pytest.mark.parametrize("px_per_half_second", [2, 5])
+    def test_dark_grade_pan(self, tmp_path, px_per_half_second):
+        path = self._two_shots(tmp_path, f"dark{px_per_half_second}", px_per_half_second, grain=10, dark=True)
+        row = _row(_scan(path, target_fps=24.0), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    @pytest.mark.parametrize("square", [True, False])
+    def test_dark_scene_with_low_contrast_flicker(self, tmp_path, square):
+        """Round 7 (corpus gate): a dark scene flickering at 8 Hz by one code
+        read as a frozen picture once the camera stopped (the 8-bit
+        structural copy rounds such a flicker away). A flickering picture is
+        not a freeze."""
+        still = _texture(tmp_path / "still.png")
+        wave = "(2*lt(mod(T*8,1),0.5)-1)" if square else "sin(2*PI*8*T)"
+        graph = (f"movie='{still}',loop=-1:1,fps=30,trim=duration=20,setpts=PTS-STARTPTS,scale=3840:-2,"
+                 "crop=1280:720:'200+if(lt(t,8),60*t,480)':400,format=yuv420p,setparams=range=tv,"
+                 f"lutyuv=y='17+val*20/255':u=128:v=128,geq=lum='p(X,Y)+{wave}':cb=128:cr=128")
+        path = _graph_clip(tmp_path / f"flicker{square}.mp4", graph)
+        row = _row(_scan(path, target_width=1280, target_height=720), "Freeze Frames")
+        assert row[1] == "PASS", row
+
+    def test_global_shift_rule(self):
+        assert vc.global_shift(1.0, 3.0, 3.0, 3.0, 3.0) is True           # zero shift best, symmetric
+        assert vc.global_shift(1.0, 3.0, 2.0, 3.0, 3.0) is True           # vertex 0.17 px: within 0.25
+        assert vc.global_shift(1.0, 3.0, 1.4, 3.0, 3.0) is False          # vertex 0.33 px
+        assert vc.global_shift(1.0, 1.04, 1.04, 3.0, 3.0) is None          # flat in x: undecided
+        assert vc.global_shift(2.0, 1.5, 3.0, 3.0, 3.0) is False          # +1 px is better than 0
+        assert vc.global_shift(None, 1.0, 1.0, 1.0, 1.0) is None
+
+
+@needs_ffmpeg
 class TestHeldShotAllowance:
     """Round 6 (corpus gate): a 6 s still shot between two cuts was excused as
     a held shot with no limit; the Title Card Hold caps it."""
