@@ -2993,8 +2993,10 @@ def _report_flash(result, config, series, analysis, fps, decoded, reason,
         result.add_skip(FLASH, "Switched off in the settings.")
         return
     if analysis is not None and analysis.info.hdr:
-        result.add_skip(FLASH, "Not assessed for PQ/HLG video: the BT.1702-3 thresholds "
-                               "used here assume an SDR display.")
+        # Switched on but not measurable here: never a SKIP that reads as
+        # "not asked for" (review round 3, bug 14).
+        result.add_not_verified(FLASH, "PQ/HLG video: the BT.1702-3 thresholds used here "
+                                       "assume an SDR display, so flashes were not screened.")
         return
     if analysis is not None and not analysis.info.analysable:
         result.add_skip(FLASH, "Picture too small to analyse.")

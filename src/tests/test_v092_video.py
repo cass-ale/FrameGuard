@@ -1117,3 +1117,13 @@ class TestFineFlashPatterns:
                  "crop=640:360:'100+300*t':'200+20*sin(2*PI*2*t)',noise=alls=4:allf=t,format=yuv420p")
         assert _row(_scan(_graph_clip(tmp_path / "pan.mp4", graph)), "Flash Risk")[1] == "PASS"
 
+
+@needs_ffmpeg
+def test_hdr_flash_is_not_verified(tmp_path):
+    """Round 3 bug 14: switched on but unmeasurable is Not verified, not SKIP."""
+    path = str(tmp_path / "pq.mp4")
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
+           "-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv",
+           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-an", path)
+    row = _row(_scan(path), "Flash Risk")
+    assert row[1] not in ("SKIP", "PASS") and "not" in row[2].lower(), row
