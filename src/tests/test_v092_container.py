@@ -1719,3 +1719,100 @@ class TestDefaults091Pinned:
         fixture = self._fixture()
         assert fixture["silence_noise_db"] == -50 and "aac_priming" not in fixture
         assert len(fixture) == 69
+
+
+# ---------------------------------------------------------------------------
+# Round 5 mutation gate (reviewer's seed-92 set and fresh seed 4242)
+# ---------------------------------------------------------------------------
+
+class TestRound5Units:
+    def test_inferred_lead_text_names_the_raw_start(self):
+        check, _ = _sync_row(_identified_probe(1024, provider="FFmpeg"))
+        assert "the track starts 21 ms before it, exactly the 1024-sample priming of FFmpeg" in check[2], check
+        probe = _identified_probe(0, provider="FFmpeg")             # 7038 Hz: 145.496 ms, rounds to 145
+        probe["streams"][1].update(sample_rate="7038", start_time=str(-1024 / 7038))
+        check, _ = _sync_row(probe)
+        assert "the track starts 145 ms before it" in check[2], check
+
+    def test_not_verified_detail_keeps_its_last_character(self):
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(-0.050), rows, _cfg())
+        assert rows.checks[0][2].endswith("for a whole broadcast chain)."), rows.checks[0][2]
+
+    def test_range_bound_text_shows_the_largest_priming(self):
+        check, _ = _sync_row(_sync_probe(-0.050))
+        assert "up to 55 ms" in check[2], check
+
+    def test_exactly_at_tolerance_still_starts_together(self):
+        check, _ = _sync_row(_sync_probe(0.005, padding=1024))
+        assert check[1] == "PASS" and "Audio and video start together (+5.0 ms" in check[2], check
+
+    def test_range_text_at_half_a_millisecond(self):
+        assert cc._range_text(-0.5, 44.0) == "between 0 ms before and 44 ms after"
+
+    def test_quicktime_v1_entry_in_an_iso_branded_file_falls_back(self, tmp_path):
+        """The brand picks 28 bytes, but only the 44-byte QuickTime offset starts a box."""
+        structure = cc.read_structure(_iso_audio_v1_file(tmp_path / "qt_in_iso.mp4", b"isom", True))
+        assert structure.tracks[0].entries[0].sa3d is not None, structure.tracks[0].entries
+
+    def test_sa3d_in_a_version_2_sound_description(self):
+        import struct as _s
+        from container_fixtures import sa3d
+        head = bytearray(64)
+        head[8:10] = _s.pack(">H", 2)
+        entry = cc.Box(b"mp4a", 0, 8 + 64 + 40, 8, bytes(head) + sa3d(4), 0)
+        assert cc._entry_header_size("soun", entry.payload) == 64
+        assert cc._starts_box(entry.payload, 64)
+
+    def test_loose_first_box_with_three_boxes(self):
+        import struct as _s
+        three = _s.pack(">I4s", 8, b"abcd") + _s.pack(">I4s", 8, b"free") + _s.pack(">I4s", 8, b"free") + bytes(64)
+        assert cc._loose_first_box(three) == "abcd"
+
+    def test_first_sample_past_with_variable_sizes(self):
+        track = cc.TrackInfo()
+        track._sizes = [10, 20, 30, 40, 50]
+        assert cc._first_sample_past(100, 1, 4, 145, track) == 2      # 100+20 fits, +30 = 150 does not
+        assert cc._first_sample_past(100, 0, 5, 1000, track) == 5
+
+    def test_chunk_layout_with_several_runs(self):
+        track = cc.TrackInfo()
+        track._chunk_offsets = [100, 200, 300, 400]
+        track._stsc = [(1, 2, 1), (3, 1, 1)]
+        assert list(cc._chunk_layout(track)) == [(100, 0, 2), (200, 2, 2), (300, 4, 1), (400, 5, 1)]
+
+    def test_short_missing_media_span(self):
+        track = cc.TrackInfo(track_id=1, handler="vide", timescale=1000, duration=3300, sample_count=100,
+                             first_missing_sample=90)
+        track.stts = [(100, 33)]
+        text = cc._missing_media_text(cc.Structure(family="ISO-BMFF", tracks=[track]))[0]
+        assert "0.33 s) lie beyond" in text, text
+
+    def test_identical_halves_correlate_at_one(self):
+        import random as _r
+        rng = _r.Random(9)
+        half = [rng.uniform(0, 255) for _ in range(384 * 96)]
+        match, control, _ = cc.stereo_layout_scores(half + half)
+        assert abs(match - 1.0) < 1e-9 and control < 0.5, (match, control)
+
+    def test_version_probe_timeout_is_ten_seconds(self, monkeypatch):
+        from frameguard import tools
+        seen = {}
+
+        def run(cmd, **kwargs):
+            seen.update(kwargs)
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        import subprocess
+        monkeypatch.setattr(tools.subprocess, "run", run)
+        assert tools._ffmpeg_version_text("/x/ffmpeg") is None and seen["timeout"] == 10
+
+    def test_saved_settings_clamp_a_0_9_1_value(self):
+        from frameguard import presets
+        out = presets.normalize_preset_config({"av_offset_max_early_ms": 2000})
+        assert out["av_offset_max_early_ms"] == 1000 and out["preset_adjustments"], out
+
+    def test_migration_returns_its_notes(self):
+        from frameguard import presets
+        config = {"silence_noise_db": -50}
+        notes = presets.migrate_retired_defaults(config, 2)
+        assert notes == config["preset_adjustments"] and "silence_noise_db" in notes[0], notes
