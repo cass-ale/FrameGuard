@@ -101,19 +101,29 @@ DOWNLOAD_URLS = {
 # Directory searched before the bundled tools (see _find_executable).
 TOOLS_DIR_ENV = "FRAMEGUARD_TOOLS_DIR"
 
-# Oldest FFmpeg the engine test suite passes on (0.9.2 version matrix: the
-# 525 engine, audio, video, container and XR tests run against conda-forge
-# 7.0.2, 7.1.1 and 8.0.1 and the bundled martin-riedl 9.0.2):
+# Oldest FFmpeg the engine test suite passes on. 0.9.2 version matrix (the
+# 581 engine, audio, video, container and XR tests, run with
+# FRAMEGUARD_TOOLS_DIR against conda-forge builds and the bundled
+# martin-riedl 9.0.2):
 #   * 7.0.2 and 7.1.1 abort the one-pass scan's multi-graph command
-#     ("Assertion best_input >= 0 failed", fftools/ffmpeg_filter.c), so every
-#     frame-level check is unmeasured (80+ failures);
-#   * 8.0.1 runs it but reports no black segments where there are some and
-#     counts decode errors in clean Matroska files (11 failures, several of
-#     them silent false PASSes);
+#     ("Assertion best_input >= 0 failed", fftools/ffmpeg_filter.c);
+#   * 8.0.1 runs it but differs on the analyser side: loudness and the AAC
+#     start in Matroska come out differently (and, in round 1, black
+#     segments went unreported);
+#   * 8.1.2, 9.0.0 and 9.0.1 fail only two HEVC fixture tests, whose Signal
+#     Levels verdict follows the x265 build that ENCODED the fixture (the
+#     same file analysed by 9.0.2 and by 9.0.1 gives the same verdict);
 #   * 9.0.2 passes all of them.
-# Below this the deep scan is refused (Not verified), never run on a build
-# whose output FrameGuard cannot read correctly.
-FFMPEG_MIN_VERSION = (9, 0, 2)
+# This is a TESTED floor: 8.1.0 and 8.1.1 have not been run and are refused
+# rather than assumed to work. Below it the deep scan is refused (Not
+# verified), never run on a build whose output FrameGuard cannot vouch for.
+FFMPEG_MIN_VERSION = (8, 1, 2)
+# Git builds carry no release number ("N-118000-g1234abcd",
+# "2026-09-30-git-0123456789-..."); their libavfilter version places them on
+# the release line instead. Filters are what the deep scan's parsing depends
+# on. 11.14 is 8.1.2's libavfilter (11.14.102); later master builds report
+# 11.14 or above.
+FFMPEG_MIN_LIBAVFILTER = (11, 14)
 
 # Minimum versions (semver-style, compared as tuples)
 MIN_VERSIONS = {
@@ -494,24 +504,66 @@ def version_text(version: Tuple[int, ...]) -> str:
 
 
 def ffmpeg_banner_problem(banner: Optional[str]) -> Optional[str]:
-    """Why an ``ffmpeg -version`` banner is below FFMPEG_MIN_VERSION, else None.
+    """Why ``ffmpeg -version`` output is below the tested floor, else None.
 
-    Only a release number right after "version" counts ("9.0.2-<vendor>",
-    "n9.1"); git builds ("N-118000-g1234abcd") carry none and are taken as
-    current, as _detect_tool does.
+    A release number right after "version" ("9.0.2-<vendor>", "n9.1") is
+    compared with FFMPEG_MIN_VERSION. A git build has none and is judged by
+    its libavfilter version against FFMPEG_MIN_LIBAVFILTER; a git build that
+    reports neither cannot be placed and is refused. Empty output (the binary
+    did not run) returns None: the scan then reports what failed.
     """
     import re
-    first = (banner or "").splitlines()[0] if banner else ""
-    match = re.search(r"version\s+n?(\d+(?:\.\d+)+)", first)
-    if not match:
+    text = banner or ""
+    if not text.strip():
         return None
-    version = tuple(int(part) for part in match.group(1).split("."))
-    if version >= FFMPEG_MIN_VERSION:
-        return None
+    first = text.splitlines()[0]
     minimum = version_text(FFMPEG_MIN_VERSION)
-    return (f"FFmpeg {match.group(1)} is older than {minimum}, the oldest version FrameGuard's frame-level "
-            f"analysis is verified on (older builds abort or misreport it); use the bundled FFmpeg or "
-            f"FFmpeg {minimum} or newer")
+    advice = f"use the bundled FFmpeg or FFmpeg {minimum} or newer"
+    match = re.search(r"version\s+n?(\d+(?:\.\d+)+)", first)
+    if match:
+        # "9.0" (as 9.0.0 reports itself) is 9.0.0: pad before comparing,
+        # since (9, 0) < (9, 0, 0) as tuples.
+        version = tuple(int(part) for part in match.group(1).split("."))
+        version += (0,) * (3 - len(version))
+        if version >= FFMPEG_MIN_VERSION:
+            return None
+        return (f"FFmpeg {match.group(1)} is older than {minimum}, the oldest FFmpeg FrameGuard's "
+                f"frame-level analysis has been tested on; {advice}")
+    build = re.search(r"version\s+(\S+)", first)
+    if not build:
+        # Not an FFmpeg banner at all (a wrapper, a stub): nothing to judge;
+        # the scan reports whatever the binary then fails to do.
+        return None
+    name = build.group(1)
+    lib = re.search(r"^\s*libavfilter\s+(\d+)\.\s*(\d+)\.\s*(\d+)", text, re.M)
+    if not lib:
+        return (f"FFmpeg build {name} reports no release number or libavfilter version to compare with "
+                f"the tested {minimum}; {advice}")
+    found = (int(lib.group(1)), int(lib.group(2)))
+    if found >= FFMPEG_MIN_LIBAVFILTER:
+        return None
+    return (f"FFmpeg build {name} has libavfilter {found[0]}.{found[1]}, older than FFmpeg {minimum}'s "
+            f"{version_text(FFMPEG_MIN_LIBAVFILTER)}, the oldest FrameGuard's frame-level analysis has been "
+            f"tested on; {advice}")
+
+
+def libavfilter_line(text: Optional[str]) -> str:
+    """The libavfilter line of ``ffmpeg -version`` output, or ""."""
+    for line in (text or "").splitlines():
+        if line.strip().startswith("libavfilter"):
+            return line.strip()
+    return ""
+
+
+def _ffmpeg_version_text(path: str) -> Optional[str]:
+    """Full ``ffmpeg -version`` output (banner and library lines), or None."""
+    try:
+        result = subprocess.run([path, "-version"], capture_output=True, text=True, timeout=10,
+                                env=_get_clean_env(), **_subprocess_kwargs())
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.warning(f"Could not get version for ffmpeg: {exc}")
+        return None
+    return result.stdout if result.returncode == 0 else None
 
 
 def banner_version(banner: Optional[str]) -> Optional[str]:
@@ -538,7 +590,7 @@ def ffmpeg_version_problem(ffmpeg_path: Optional[str] = None) -> Optional[str]:
     with _gate_lock:
         if key in _gate_cache:
             return _gate_cache[key][1]
-    banner, _ = _get_tool_version(path, "ffmpeg")
+    banner = _ffmpeg_version_text(path)
     problem = ffmpeg_banner_problem(banner)
     with _gate_lock:
         _gate_cache[key] = (banner, problem)

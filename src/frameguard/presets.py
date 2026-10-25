@@ -25,8 +25,9 @@ from typing import Optional, Dict, List
 
 from frameguard import audio_checks
 
-# Preset file format
-PRESET_FORMAT_VERSION = 2
+# Preset file format. 3 = written with FrameGuard 0.9.2's defaults (files
+# of format 1-2 predate them and have retired defaults migrated on import).
+PRESET_FORMAT_VERSION = 3
 FG_EXTENSION = ".fg"
 LEGACY_EXTENSION = ".json"
 MAX_PRESET_BYTES = 1_000_000
@@ -83,6 +84,9 @@ PRESET_CONFIG_KEYS = (
     "allow_trim_edit_lists",
     "max_audio_tracks",
     "disabled_checks",
+    # What FrameGuard changed when it loaded this preset (a record, not a
+    # setting): kept with the stored copy and listed in the PDF spec table.
+    "preset_adjustments",
     # Picture checks (video_checks.py, 0.9.1).
     "black_frames_enabled",
     "black_detect_duration",
@@ -156,6 +160,10 @@ def validate_preset_config(config: dict) -> dict:
     wrote without anyone being told. Every problem is now collected and the
     preset is rejected with the full list. Retired and machine-local keys are
     ignored, not rejected, so older presets still load.
+
+    Values FrameGuard 0.9.1 accepted are never refused (_lenient_adjustments):
+    a value 0.9.2 narrowed is clamped, a contradiction is resolved towards the
+    stricter value, and every change is recorded in ``preset_adjustments``.
     """
     if not isinstance(config, dict):
         raise PresetValidationError(["config block is not an object"], [])
@@ -167,15 +175,175 @@ def validate_preset_config(config: dict) -> dict:
                 unknown.append(str(raw_key))
             continue
         coerced, problem = _coerce_preset_value(key, value)
+        if problem and key in _RANGES_0_9_1:
+            coerced, problem = _coerce_number(key, value, 0.0, _RANGES_0_9_1[key])
         if problem:
             problems.append(f"{raw_key}={value!r} ({problem})")
         else:
             out[key] = coerced
-    for _keys, problem in _cross_field_problems(out):
-        problems.append(problem)
     if problems or unknown:
         raise PresetValidationError(problems, unknown)
+    _lenient_adjustments(out)
     return audio_checks.normalize_custom_profile(out)
+
+
+# FrameGuard 0.9.1's default for every preset key it knew (its
+# core.DEFAULT_CONFIG at release 0c4d0c3; compatibility-only keys left out).
+# 0.9.1's export_preset writes every key, so a 0.9.1 preset holding exactly
+# one of these values did not choose it. On import of a pre-0.9.2 file
+# (format 1-2), such a value becomes the CURRENT default wherever that
+# default has since changed, and the change is recorded; where 0.9.2's
+# default is still 0.9.1's, nothing happens. Which keys migrate is therefore
+# derived from DEFAULT_CONFIG, never listed by hand (e.g. silence -50 -> -70
+# dBFS today). This is a frozen record of a released version: never edit it.
+DEFAULTS_0_9_1 = {
+    'target_width': 3840,
+    'target_height': 2160,
+    'allow_larger_resolution': False,
+    'target_fps': 30.0,
+    'fps_tolerance': 0.5,
+    'allow_fps_multiples': False,
+    'min_bitrate_mbps': 20,
+    'accepted_codecs': ['h264', 'hevc', 'h265', 'av1', 'prores', 'prores_ks', 'prores_aw'],
+    'accepted_containers': ['.mp4', '.mov', '.mkv', '.mxf'],
+    'accepted_audio_codecs': [   'aac',
+                                 'pcm_s16le',
+                                 'pcm_s24le',
+                                 'pcm_s32le',
+                                 'pcm_s24be',
+                                 'pcm_s32be',
+                                 'pcm_f32le',
+                                 'opus',
+                                 'flac'],
+    'audio_required': True,
+    'min_audio_sample_rate': 44100,
+    'require_cfr': True,
+    'require_progressive': True,
+    'min_bit_depth': 'any',
+    'required_transfer': 'any',
+    'required_projection': 'any',
+    'required_stereo_mode': 'any',
+    'max_decode_errors': 0,
+    'silence_duration': 2.0,
+    'silence_noise_db': -50,
+    'loudness_mode': 'report',
+    'target_loudness_lufs': -23.0,
+    'loudness_tolerance_lu': 2.0,
+    'true_peak_max_dbtp': -1.0,
+    'allow_ntsc_rate_match': False,
+    'duration_mismatch_threshold': 0.5,
+    'av_short_tolerance_frames': 2,
+    'av_long_tolerance_s': 2.0,
+    'av_offset_warn_ms': 5.0,
+    'av_offset_max_early_ms': 40.0,
+    'av_offset_max_late_ms': 60.0,
+    'allow_display_rotation': False,
+    'spatial_audio': 'any',
+    'require_square_pixels': False,
+    'warn_untagged_color': True,
+    'allowed_video_profiles': ['any'],
+    'allowed_pix_fmts': ['any'],
+    'max_frame_pixels': 0,
+    'max_pixel_rate': 0,
+    'require_faststart': False,
+    'allow_trim_edit_lists': True,
+    'max_audio_tracks': 0,
+    'disabled_checks': [],
+    'black_frames_enabled': True,
+    'black_detect_duration': 0.3,
+    'black_detect_pix_threshold': 0.02,
+    'black_detect_picture_threshold': 0.98,
+    'black_short_min_frames': 3,
+    'freeze_frames_enabled': True,
+    'freeze_detect_duration': 1.0,
+    'signal_levels_mode': 'advisory',
+    'flash_check_enabled': True,
+    'interlace_check_enabled': True,
+    'loudness_profile': 'ebu_r128',
+    'channel_silence_noise_db': -70.0,
+    'audio_clipping_check': True,
+    'audio_dropout_check': True,
+    'audio_phase_check': True,
+    'audio_dual_mono_check': True,
+    'audio_dc_offset_check': True,
+    'audio_hum_check': True,
+    'dropout_noise_db': -90.0,
+    'dropout_min_ms': 5.0,
+    'clipping_min_events': 3,
+    'phase_correlation_min': -0.2,
+    'phase_min_duration': 1.0,
+    'dc_offset_max_db': -50.0,
+    'hum_min_db': -65.0,
+}
+
+
+def _shown(value) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return json.dumps(value)[:80].strip('"')
+    return f"{value:g}"
+
+
+def migrate_retired_defaults(config: dict, format_version) -> List[str]:
+    """In place: replace 0.9.1 defaults that have since changed in a
+    pre-0.9.2 preset or saved settings, recorded in preset_adjustments."""
+    from frameguard.core import DEFAULT_CONFIG
+    try:
+        version = int(format_version or 0)
+    except (TypeError, ValueError):
+        version = 0
+    if version >= 3:
+        return []
+    notes = []
+    for key, old in DEFAULTS_0_9_1.items():
+        if key not in config or key not in DEFAULT_CONFIG:
+            continue
+        new = DEFAULT_CONFIG[key]
+        if isinstance(new, (set, frozenset, tuple)):
+            new = sorted(new)
+        if config[key] == old and new != old:
+            config[key] = list(new) if isinstance(new, list) else new
+            notes.append(f"{key} {_shown(old)} -> {_shown(new)} (the FrameGuard 0.9.1 default, replaced in 0.9.2)")
+    if notes:
+        config["preset_adjustments"] = list(config.get("preset_adjustments") or []) + notes
+    return notes
+
+
+# Ranges 0.9.2 narrowed. A value inside the 0.9.1 range was valid in a 0.9.1
+# preset; it is clamped to the 0.9.2 range (and recorded), never refused.
+_RANGES_0_9_1 = {
+    "av_offset_max_early_ms": (0.0, 10000.0),
+    "av_offset_max_late_ms": (0.0, 10000.0),
+}
+
+
+def _lenient_adjustments(config: dict) -> List[str]:
+    """Resolve, in place, what 0.9.1 accepted but 0.9.2 judges contradictory,
+    and record each change in ``config["preset_adjustments"]``.
+
+    * a value inside its 0.9.1 range but outside 0.9.2's is clamped;
+    * an A/V warning threshold above a FAIL threshold is lowered to it (the
+      engine never lifts a FAIL threshold, so the warning band ends there);
+    * a decoder ceiling below the target size or rate is kept (dropping it
+      would loosen the spec) and recorded: no file at the target can pass.
+    """
+    notes = []
+    for key, (low, high) in _RANGES_0_9_1.items():
+        value = config.get(key)
+        new_low, new_high = _PRESET_VALUE_RANGES[key]
+        if value is not None and low <= value <= high and not new_low <= value <= new_high:
+            clamped = min(max(value, new_low), new_high)
+            config[key] = int(clamped) if float(clamped).is_integer() else clamped
+            notes.append(f"{key} {value:g} -> {clamped:g} (FrameGuard 0.9.2 caps it at {new_high:g})")
+    for keys, problem in _cross_field_problems(config):
+        if keys[0] == "av_offset_warn_ms":
+            limit = config[keys[1]]
+            notes.append(f"av_offset_warn_ms {config['av_offset_warn_ms']:g} -> {limit:g} ({problem})")
+            config["av_offset_warn_ms"] = limit
+        else:
+            notes.append(f"{keys[0]} kept: {problem}")
+    if notes:
+        config["preset_adjustments"] = list(config.get("preset_adjustments") or []) + notes
+    return notes
 
 
 def _cross_field_problems(config: dict) -> List[tuple]:
@@ -226,10 +394,13 @@ def normalize_preset_config(config: dict) -> dict:
         coerced, problem = _coerce_preset_value(key, value)
         if not problem:
             out[key] = coerced
-    # A contradiction drops the value that would loosen the spec (the warning
-    # threshold, the decoder ceiling), never the FAIL threshold.
-    for keys, _problem in _cross_field_problems(out):
-        out.pop(keys[0], None)
+        elif key in _RANGES_0_9_1:
+            # A 0.9.1-valid value 0.9.2 narrowed: keep it for clamping below.
+            number, _ = _coerce_number(key, value, 0.0, _RANGES_0_9_1[key])
+            if number is not None:
+                out[key] = number
+    # Contradictions resolve towards the stricter value, never the looser.
+    _lenient_adjustments(out)
     return audio_checks.normalize_custom_profile(out)
 
 
@@ -280,7 +451,7 @@ _LOWERCASE_LIST_KEYS = ("accepted_codecs", "accepted_audio_codecs", "accepted_co
                         "allowed_video_profiles", "allowed_pix_fmts")
 # Lists that may legitimately be empty (an empty acceptance list would fail
 # every file, but an empty disabled-check list just runs every check).
-_EMPTY_OK_LIST_KEYS = frozenset({"disabled_checks"})
+_EMPTY_OK_LIST_KEYS = frozenset({"disabled_checks", "preset_adjustments"})
 # Only these are genuinely whole numbers. Everything else numeric accepts a
 # fraction even when its default happens to be written as an int.
 _INTEGER_PRESET_KEYS = frozenset({
@@ -343,7 +514,7 @@ def _coerce_preset_value(key: str, value):
     return None, "unsupported type"
 
 
-def _coerce_number(key: str, value, default):
+def _coerce_number(key: str, value, default, bounds=None):
     if isinstance(value, bool):
         return None, "must be a number"
     try:
@@ -352,7 +523,7 @@ def _coerce_number(key: str, value, default):
         return None, "must be a number"
     if not math.isfinite(number):
         return None, "must be a finite number"
-    low, high = _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
+    low, high = bounds or _PRESET_VALUE_RANGES.get(key, (-math.inf, math.inf))
     if not low <= number <= high:
         return None, f"out of range {low:g}..{high:g}"
     if key in _INTEGER_PRESET_KEYS:
@@ -372,6 +543,9 @@ def _coerce_list(key: str, value):
         return None, "every entry must be non-empty text"
     if key == "disabled_checks":
         return _coerce_check_names(items)
+    if key == "preset_adjustments":
+        # A record shown in the PDF: bounded so a hand-edited file cannot flood it.
+        return [item[:300] for item in items[-32:]], None
     if not items and key not in _EMPTY_OK_LIST_KEYS:
         # An empty acceptance list fails every file.
         return None, "must not be empty"
@@ -575,14 +749,19 @@ def import_preset(filepath: str, raise_errors: bool = False) -> Optional[Dict]:
                 raise PresetValidationError(["file has no 'config' object"], [])
             return None
         config = validate_preset_config(data["config"])
+        migrate_retired_defaults(config, data.get("format_version", 0))
         if not config:
             raise PresetValidationError(["config contains no scan settings"], [])
+        previous = list(data["config"].get("preset_adjustments") or []) \
+            if isinstance(data["config"].get("preset_adjustments"), list) else []
         return {
             "name": str(data.get("name") or Path(filepath).stem),
             "config": config,
             "description": data.get("description", ""),
             "format_version": data.get("format_version", 0),
             "source_path": filepath,
+            # What this import changed (earlier imports' records stay in config).
+            "notices": [n for n in config.get("preset_adjustments", []) if n not in previous],
         }
     except PresetValidationError:
         if raise_errors:

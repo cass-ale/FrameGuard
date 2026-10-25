@@ -78,7 +78,7 @@ from frameguard.core import (
 )
 from frameguard.worker import ScanWorker
 from frameguard.presets import (
-    export_preset, list_available_presets,
+    export_preset, list_available_presets, migrate_retired_defaults, PRESET_FORMAT_VERSION,
     save_imported_preset, is_preset_file, FG_EXTENSION,
     get_presets_dir, get_user_presets_dir
 )
@@ -3614,9 +3614,11 @@ class SettingsPanel(QWidget):
                 self._apply_preset_config(preset["config"])
                 # Notify parent to add this preset to the dropdown
                 self.preset_imported.emit(preset["name"], preset["config"])
+                adjusted = "".join(f"\n{note}" for note in preset.get("notices") or [])
                 QMessageBox.information(
                     self, "Preset Imported",
                     f"Loaded: {preset['name']}\n\nThis preset is now saved and will appear in the Scan page dropdown."
+                    + (f"\n\nAdjusted on import:{adjusted}" if adjusted else "")
                 )
             else:
                 QMessageBox.warning(self, "Import Failed", _preset_rejection_reason(filepath))
@@ -3782,6 +3784,7 @@ class SettingsPanel(QWidget):
         """
         settings = QSettings(_SETTINGS_ORG, _SETTINGS_APP)
         settings.setValue("scan/config", json.dumps(self.get_config_overrides()))
+        settings.setValue("scan/config_format", PRESET_FORMAT_VERSION)
         settings.setValue("scan/strict", self.strict_cb.isChecked())
         settings.setValue("scan/reset_results", self.reset_results_cb.isChecked())
         settings.setValue("scan/advanced_mode", bool(getattr(self, "_advanced_mode", False)))
@@ -3796,6 +3799,9 @@ class SettingsPanel(QWidget):
             except (json.JSONDecodeError, TypeError):
                 config = None
             if isinstance(config, dict):
+                # Settings saved before 0.9.2 carry its retired defaults
+                # (e.g. silence at -50 dBFS from an imported 0.9.1 preset).
+                migrate_retired_defaults(config, settings.value("scan/config_format", 0))
                 # normalize drops any key the current engine no longer reads,
                 # so an old saved blob can never reintroduce the key mismatch.
                 self._apply_preset_config(config)
@@ -3841,11 +3847,8 @@ class SettingsPanel(QWidget):
         ("delivery", "spatial_audio", "choice", "Spatial Audio",
          "Require an ambisonic track with valid spatial (SA3D) metadata for 360 deliverables",
          (("any", "Not required"), ("required", "Required"))),
-        ("delivery", "aac_priming", "choice", "AAC Encoder Priming",
-         "Priming of the AAC encoder, used to judge the A/V start offset where the container "
-         "does not signal it (MPEG-TS, MP4 without an edit list)",
-         (("unknown", "Unknown (judge 0-2112 samples)"), (1024, "1024 samples (FFmpeg)"),
-          (2112, "2112 samples (Apple)"))),
+        ("delivery", "aac_priming", "choice", "AAC Encoder Priming", "",
+         (("unknown", "Unknown"), (1024, "1024 samples"), (2112, "2112 samples"))),
         ("delivery", "warn_untagged_color", "bool", "Warn on Untagged Colour",
          "Warn when a file carries no colour primaries, transfer or matrix tags, so players "
          "have to guess", None),
@@ -4049,10 +4052,10 @@ class SettingsPanel(QWidget):
         cell_lay.setSpacing(0)
         cell_lay.addWidget(control, 1, Qt.AlignVCenter)
 
-        # --- Description (floating text, subdued) ---
-        desc = QLabel(description)
-        if not description:
-            desc.hide()   # a setting without a helper line (AGENTS.md)
+        # --- Description (floating text, subdued; none for newer settings,
+        # per AGENTS.md: no helper text) ---
+        desc = QLabel(description or "")
+        desc.setVisible(bool(description))
         desc.setWordWrap(True)
         desc.setFont(ui_font(D.FONT_SMALL))
         _set_role(desc, "muted")
@@ -5728,8 +5731,7 @@ class MainWindow(QMainWindow):
         from frameguard.tools import ffmpeg_version_problem
         too_old = ffmpeg_version_problem()
         if too_old:
-            QMessageBox.warning(self, "FFmpeg Too Old",
-                                f"{too_old}.\n\nFrame-level checks will be reported as Not verified.")
+            QMessageBox.warning(self, "FFmpeg Too Old", f"{too_old}.")
 
 
     def _sync_preset_from_settings(self):

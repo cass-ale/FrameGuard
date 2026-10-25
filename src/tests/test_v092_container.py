@@ -189,8 +189,10 @@ class _Rows:
     def add_skip(self, name, detail="", confidence=100):
         self.checks.append((name, "SKIP", detail, confidence))
 
-    def add_not_verified(self, name, reason, by_choice=False):
+    def add_not_verified(self, name, reason, by_choice=False, inherent=False):
         self.checks.append((name, "WARN", "Not verified: " + reason, 100))
+        if by_choice or inherent:
+            self.metadata.setdefault("strict_exempt", []).append(name)
 
     def set_metadata(self, key, value):
         self.metadata[key] = value
@@ -210,8 +212,9 @@ class TestAacPrimingRange:
         ffmpeg("-i", _clean(media), "-itsoffset", "-0.020", "-i", _clean(media), "-map", "0:v",
                "-map", "1:a", "-c", "copy", "-f", "mpegts", str(early))
         check = _row(_scan(early, accepted_containers=[".ts"]), "A/V Sync Offset")
-        assert check[1] == "WARN", check
-        assert "priming" in check[2] and "not signalled" in check[2], check
+        # A -41 ms lead is no priming in use, and compliant sync is still possible
+        # inside the unknown range: Not verified (round 2, bug 6), never PASS.
+        assert _not_verified(check) and "not signalled" in check[2], check
         known = _row(_scan(early, accepted_containers=[".ts"], aac_priming=1024), "A/V Sync Offset")
         assert known[1] == "WARN" and "20 ms before" in known[2], known
 
@@ -230,17 +233,19 @@ class TestAacPrimingRange:
             presets.validate_preset_config({"aac_priming": 999})
         assert presets.normalize_preset_config({"av_offset_warn_ms": 5}) == {"av_offset_warn_ms": 5}
         rows = dict(spec_rows(dict(DEFAULT_CONFIG)))
-        assert "0-2112 samples" in rows["A/V start offset"], rows
+        assert "0-2624 samples" in rows["A/V start offset"], rows
 
     def test_he_aac_window_no_longer_hides_88_ms(self):
-        check, meta = _sync_row(_sync_probe(-0.088, profile="HE-AAC"))
-        assert check[1] == "WARN" and "88" in check[2], check
-        assert meta["av_start_offset_range_ms"] == [-88.0, 0.0], meta
+        # 90 ms is no HE priming in use (88 ms = 2 x 2112 is, and is inferred:
+        # TestAacPrimingDefault): it is never "start together".
+        check, meta = _sync_row(_sync_probe(-0.090, profile="HE-AAC"))
+        assert _not_verified(check) and "90" in check[2], check
+        assert meta["av_start_offset_range_ms"][0] == -90.0, meta
 
     def test_whole_range_beyond_r37_fails_and_whole_range_late_fails(self):
-        assert _sync_row(_sync_probe(-0.090))[0][1] == "FAIL"     # -90 .. -46 ms: all beyond 40 early
+        assert _sync_row(_sync_probe(-0.110))[0][1] == "FAIL"     # -110 .. -55 ms: all beyond 40 early
         assert _sync_row(_sync_probe(0.070))[0][1] == "FAIL"      # priming only makes late later
-        assert _sync_row(_sync_probe(-0.060))[0][1] == "WARN"     # -60 .. -16 ms straddles the limit
+        assert _sync_row(_sync_probe(-0.060))[0][1] == "WARN"     # -60 .. -5.3 ms: no compliant value
 
     def test_priming_is_read_from_the_audio_edit_list(self, media, monkeypatch):
         """ffprobe 6/7 report initial_padding=0 for an edit-listed AAC MP4;
@@ -447,31 +452,43 @@ class TestUnreadMoov:
 # ---------------------------------------------------------------------------
 
 class TestPresetCrossFields:
-    @pytest.mark.parametrize("config", [
-        {"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40},       # review repro
-        {"av_offset_warn_ms": 70, "av_offset_max_late_ms": 60},
-        {"av_offset_max_late_ms": 5000},                                 # beyond the sane cap
-        {"max_frame_pixels": 1000, "target_width": 3840, "target_height": 2160},
-        {"max_pixel_rate": 1_000_000, "target_width": 1920, "target_height": 1080, "target_fps": 30},
+    @pytest.mark.parametrize("config,key,value", [
+        ({"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40}, "av_offset_warn_ms", 40),   # review repro
+        ({"av_offset_warn_ms": 70, "av_offset_max_late_ms": 60}, "av_offset_warn_ms", 60),
+        ({"av_offset_max_late_ms": 5000}, "av_offset_max_late_ms", 1000),                       # above the cap
+        ({"max_frame_pixels": 1000, "target_width": 3840, "target_height": 2160}, "max_frame_pixels", 1000),
+        ({"max_pixel_rate": 1_000_000, "target_width": 1920, "target_height": 1080, "target_fps": 30},
+         "max_pixel_rate", 1_000_000),
     ])
-    def test_contradictory_presets_are_rejected(self, config):
+    def test_contradictory_presets_load_adjusted_with_a_recorded_notice(self, config, key, value):
+        """Round 2, bug 7: 0.9.1 loaded these; refusing them broke 'old presets
+        still load'. The loosening value is clamped (a contradiction that
+        loosens nothing is kept) and every change is recorded."""
         from frameguard import presets
-        with pytest.raises(presets.PresetValidationError):
-            presets.validate_preset_config(config)
+        out = presets.validate_preset_config(config)
+        assert out[key] == value, out
+        assert out["preset_adjustments"] and key in out["preset_adjustments"][0], out
+
+    def test_values_0_9_1_also_refused_are_still_refused(self):
+        from frameguard import presets
+        for bad in ({"av_offset_max_late_ms": 20000}, {"av_offset_warn_ms": "loud"}, {"no_such_key": 1}):
+            with pytest.raises(presets.PresetValidationError):
+                presets.validate_preset_config(bad)
 
     def test_consistent_presets_still_load(self):
         from frameguard import presets
         from frameguard.core import PRESETS, preset_config
-        assert presets.validate_preset_config({"av_offset_warn_ms": 5, "av_offset_max_early_ms": 40,
-                                               "av_offset_max_late_ms": 60})
+        out = presets.validate_preset_config({"av_offset_warn_ms": 5, "av_offset_max_early_ms": 40,
+                                              "av_offset_max_late_ms": 60})
+        assert "preset_adjustments" not in out, out
         for key in PRESETS:
-            presets.validate_preset_config(preset_config(key))
+            assert "preset_adjustments" not in presets.validate_preset_config(preset_config(key)), key
 
-    def test_saved_settings_drop_a_contradiction_instead_of_loosening(self):
+    def test_saved_settings_adjust_a_contradiction_instead_of_loosening(self):
         from frameguard import presets
         out = presets.normalize_preset_config({"av_offset_warn_ms": 500, "av_offset_max_early_ms": 40,
                                                "target_fps": 25})
-        assert out == {"av_offset_max_early_ms": 40, "target_fps": 25}, out
+        assert out["av_offset_warn_ms"] == 40 and out["av_offset_max_early_ms"] == 40, out
 
     def test_engine_never_lifts_the_fail_threshold_to_the_warn_threshold(self):
         check, _ = _sync_row(_sync_probe(-0.045, padding=1024), av_offset_warn_ms=500,
@@ -561,15 +578,17 @@ class TestQuestMonoPresets:
 # 7. FFmpeg version gate
 # ---------------------------------------------------------------------------
 
-def _fake_ffmpeg(directory, version: str) -> str:
-    """An ffmpeg that reports ``version`` for -version and runs the real one
-    otherwise, so the gate is tested without installing old builds."""
+def _fake_ffmpeg(directory, version: str, libavfilter: str = "") -> str:
+    """An ffmpeg that reports ``version`` (and a libavfilter line) for
+    -version and runs the real one otherwise, so the gate is tested without
+    installing old builds."""
     from media_fixtures import FFMPEG
     path = os.path.join(str(directory), "ffmpeg")
+    lib = f'; echo "libavfilter    {libavfilter} / {libavfilter}"' if libavfilter else ""
     with open(path, "w") as handle:
         handle.write("#!/bin/sh\n"
                      f'if [ "$1" = "-version" ]; then echo "ffmpeg version {version} Copyright (c) the FFmpeg '
-                     f'developers"; exit 0; fi\nexec "{FFMPEG}" "$@"\n')
+                     f'developers"{lib}; exit 0; fi\nexec "{FFMPEG}" "$@"\n')
     os.chmod(path, 0o755)
     return path
 
@@ -580,7 +599,8 @@ needs_posix = pytest.mark.skipif(os.name == "nt", reason="shell-script FFmpeg st
 class TestFFmpegVersionGate:
     def test_minimum_is_the_oldest_build_the_suite_passes_on(self):
         from frameguard import tools
-        assert tools.MIN_VERSIONS["ffmpeg"] == tools.MIN_VERSIONS["ffprobe"] == (9, 0, 2)
+        assert tools.MIN_VERSIONS["ffmpeg"] == tools.MIN_VERSIONS["ffprobe"] == (8, 1, 2)
+        assert tools.FFMPEG_MIN_LIBAVFILTER == (11, 14)
 
     @pytest.mark.parametrize("banner,ok", [
         ("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright", False),
@@ -589,7 +609,6 @@ class TestFFmpegVersionGate:
         ("ffmpeg version 8.0.1 Copyright (c) 2000-2025", False),
         ("ffmpeg version 9.0.2-https://www.martin-riedl.de Copyright", True),
         ("ffmpeg version n9.1 Copyright", True),
-        ("ffmpeg version N-118000-g1234abcd Copyright", True),     # git build: current
     ])
     def test_banner_against_the_minimum(self, banner, ok):
         from frameguard import tools
@@ -602,7 +621,7 @@ class TestFFmpegVersionGate:
         monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
         result = _scan(_clean(media), quick=False)
         integrity = _row(result, "File Integrity")
-        assert _not_verified(integrity) and "7.1.1" in integrity[2] and "9.0.2" in integrity[2], integrity
+        assert _not_verified(integrity) and "7.1.1" in integrity[2] and "8.1.2" in integrity[2], integrity
         for name in ("Black Frames", "Audio Silence", "Audio Hum"):
             assert _not_verified(_row(result, name)), _row(result, name)
         assert result.status == "PASS_WITH_WARNINGS"
@@ -625,7 +644,7 @@ class TestFFmpegVersionGate:
                                 "ffprobe": {"version": "ffprobe version 7.1.1 Copyright (c) 2000-2025"}}
         result.set_metadata("ffmpeg_below_minimum", "7.1.1")
         line = _tools_line([result])
-        assert "ffmpeg version 7.1.1" in line and "below the 9.0.2 minimum" in line, line
+        assert "ffmpeg version 7.1.1" in line and "below the 8.1.2 minimum" in line, line
 
 
 # ---------------------------------------------------------------------------
@@ -740,3 +759,836 @@ class TestQuickTimeBrandNamedMp4:
         ffmpeg("-i", _clean(media), "-c", "copy", str(mov))
         for path in (_clean(media), mov):
             assert _row(_scan(path), "Container Structure")[1] == "PASS", path
+
+
+# ---------------------------------------------------------------------------
+# Round 2, bug 6: the unknown-priming default
+# ---------------------------------------------------------------------------
+
+class TestAacPrimingDefault:
+    """WARN/FAIL only when no priming value in use can explain the offset;
+    a range that allows compliant sync is Not verified and Strict does not
+    escalate it; a PTS lead that equals a priming in use is that priming."""
+
+    def test_ffmpeg_transport_stream_passes_by_its_pts_lead(self, media, tmp_path):
+        ts = tmp_path / "cam.ts"
+        ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "mpegts", str(ts))
+        result = _scan(ts, strict=True, accepted_containers=[".ts"])
+        check = _row(result, "A/V Sync Offset")
+        assert check[1] == "PASS" and "inferred" in check[2] and "1024" in check[2], check
+
+    @pytest.mark.parametrize("samples", [1024, 2048, 2112, 2624])
+    def test_every_priming_in_use_is_inferred_from_an_exact_lead(self, samples):
+        check, meta = _sync_row(_sync_probe(-samples / 48000))
+        assert check[1] == "PASS" and str(samples) in check[2], check
+        assert meta["av_start_offset_range_ms"] == [0.0, 0.0], meta
+
+    def test_he_aac_lead_is_inferred_at_twice_the_core_priming(self):
+        check, _ = _sync_row(_sync_probe(-2 * 2112 / 48000, profile="HE-AAC"))
+        assert check[1] == "PASS", check
+
+    def test_a_lead_that_is_no_priming_in_use_is_not_inferred(self):
+        check, _ = _sync_row(_sync_probe(-1500 / 48000))
+        assert _not_verified(check) and "not signalled" in check[2], check
+        off_by_two = _sync_row(_sync_probe(-1026 / 48000))[0]
+        assert _not_verified(off_by_two), off_by_two
+
+    def test_compliant_range_is_not_verified_and_strict_exempt(self):
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(-0.050), rows, _cfg())   # -50 .. +4.7 ms
+        assert _not_verified(rows.checks[0]), rows.checks
+        assert rows.metadata["strict_exempt"] == ["A/V Sync Offset"], rows.metadata
+
+    def test_strict_mode_does_not_escalate_unsignalled_priming(self, media, tmp_path):
+        early = tmp_path / "early30.ts"
+        ffmpeg("-i", _clean(media), "-itsoffset", "-0.030", "-i", _clean(media), "-map", "0:v",
+               "-map", "1:a", "-c", "copy", "-f", "mpegts", str(early))
+        result = _scan(early, strict=True, accepted_containers=[".ts"])
+        assert _not_verified(_row(result, "A/V Sync Offset"))
+        assert "A/V Sync Offset" in result.metadata.get("not_verifiable", []), result.metadata
+        escalating = [c[:3] for c in result.checks if c[1] in ("WARN", "FAIL") and c[0] not in
+                      set(result.metadata.get("not_verifiable", [])) | set(result.metadata.get("not_run_by_choice", []))]
+        assert result.status != "MISMATCH" or escalating, escalating
+
+    def test_no_compliant_value_warns_and_whole_range_beyond_r37_fails(self):
+        assert _sync_row(_sync_probe(0.020))[0][1] == "WARN"      # +20 .. +75 ms: never within 5 ms
+        assert _sync_row(_sync_probe(-0.070))[0][1] == "WARN"     # -70 .. -15 ms
+        assert _sync_row(_sync_probe(-0.120))[0][1] == "FAIL"     # -120 .. -65 ms
+        assert _sync_row(_sync_probe(0.061))[0][1] == "FAIL"      # later than R37's 60 ms whatever the priming
+
+    def test_signalled_priming_stays_exact(self):
+        assert _sync_row(_sync_probe(-0.030, padding=1024))[0][1] == "WARN"
+        assert _sync_row(_sync_probe(0.003, padding=1024))[0][1] == "PASS"
+
+
+# ---------------------------------------------------------------------------
+# Round 2, bug 7: 0.9.1 presets load leniently, with every change recorded
+# ---------------------------------------------------------------------------
+
+def _write_091_preset(path, config):
+    """A preset as FrameGuard 0.9.1 wrote it (format_version 2)."""
+    import json
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"format_version": 2, "type": "frameguard_preset", "name": os.path.basename(str(path)),
+                   "description": "", "config": config}, handle)
+    return str(path)
+
+
+class TestOldPresetsLoad:
+    @pytest.mark.parametrize("config,expected", [
+        ({"av_offset_max_early_ms": 2000.0}, {"av_offset_max_early_ms": 1000}),
+        ({"av_offset_warn_ms": 50.0, "av_offset_max_early_ms": 40.0}, {"av_offset_warn_ms": 40}),
+        ({"target_width": 7680, "target_height": 3840, "max_frame_pixels": 8192 * 2160},
+         {"max_frame_pixels": 8192 * 2160}),
+    ], ids=["early2000", "warn_gt_fail", "decoder_ceiling"])
+    def test_the_three_kinds_0_9_2_refused_now_load(self, tmp_path, config, expected):
+        from frameguard import presets
+        preset = presets.import_preset(_write_091_preset(tmp_path / "old.fg", config), raise_errors=True)
+        for key, value in expected.items():
+            assert preset["config"][key] == value, preset
+        assert preset["notices"] and preset["notices"] == preset["config"]["preset_adjustments"], preset
+
+    def test_adjustments_reach_the_pdf_spec_table(self, tmp_path):
+        from frameguard import presets
+        from frameguard.report import spec_rows
+        preset = presets.import_preset(_write_091_preset(tmp_path / "old.fg", {"av_offset_max_early_ms": 2000}))
+        rows = dict(spec_rows(dict(DEFAULT_CONFIG, **preset["config"])))
+        assert "av_offset_max_early_ms" in rows["Preset adjusted on import"], rows
+
+    def test_the_stored_copy_keeps_the_record(self, tmp_path):
+        from frameguard import presets
+        stored = presets.save_imported_preset(_write_091_preset(tmp_path / "old.fg",
+                                                                {"av_offset_max_early_ms": 2000}))
+        again = presets.import_preset(stored["path"], raise_errors=True)
+        assert again["config"]["av_offset_max_early_ms"] == 1000
+        assert any("av_offset_max_early_ms" in n for n in again["config"]["preset_adjustments"]), again
+
+
+class TestRetiredDefaultsMigrate:
+    """Round 2, bug 7b: 0.9.1's export writes every key, so a 0.9.1 preset
+    carries silence_noise_db=-50 (the room-tone MISMATCH, 0.9.1 bug 3) and
+    black_detect_picture_threshold=0.98 although its author chose neither."""
+
+    def test_0_9_1_defaults_become_0_9_2_defaults(self, tmp_path):
+        from frameguard import presets
+        old = _write_091_preset(tmp_path / "full.fg", {"silence_noise_db": -50, "black_detect_picture_threshold": 0.98,
+                                                       "target_fps": 25})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["silence_noise_db"] == DEFAULT_CONFIG["silence_noise_db"] == -70
+        assert preset["config"]["black_detect_picture_threshold"] == DEFAULT_CONFIG["black_detect_picture_threshold"]
+        assert preset["config"]["target_fps"] == 25
+        notes = " ".join(preset["notices"])
+        assert "silence_noise_db -50 -> -70" in notes, notes
+        # Black migrates only while its default differs from 0.9.1's (derived, not listed).
+        assert ("black_detect_picture_threshold" in notes) == (DEFAULT_CONFIG["black_detect_picture_threshold"] != 0.98)
+
+    def test_a_value_the_author_chose_is_kept(self, tmp_path):
+        from frameguard import presets
+        old = _write_091_preset(tmp_path / "chosen.fg", {"silence_noise_db": -60})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["silence_noise_db"] == -60 and not preset["notices"], preset
+
+    def test_a_0_9_2_preset_is_not_migrated(self, tmp_path):
+        from frameguard import presets
+        import json
+        written = presets.export_preset("new", {"silence_noise_db": -50}, str(tmp_path / "new.fg"))
+        assert json.load(open(written))["format_version"] == presets.PRESET_FORMAT_VERSION == 3
+        preset = presets.import_preset(written, raise_errors=True)
+        assert preset["config"]["silence_noise_db"] == -50 and not preset["notices"], preset
+
+    def test_migration_is_listed_in_the_pdf(self, tmp_path):
+        from frameguard import presets
+        from frameguard.report import spec_rows
+        preset = presets.import_preset(_write_091_preset(tmp_path / "f.fg", {"silence_noise_db": -50}))
+        rows = dict(spec_rows(dict(DEFAULT_CONFIG, **preset["config"])))
+        assert "silence_noise_db -50 -> -70" in rows["Preset adjusted on import"], rows
+
+    def test_settings_saved_before_0_9_2_migrate_too(self, qapp):
+        from PySide6.QtCore import QSettings
+        from frameguard import gui
+        import json
+        store = QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP)
+        store.setValue("scan/config", json.dumps({"silence_noise_db": -50, "target_fps": 25.0}))
+        store.remove("scan/config_format")
+        store.sync()
+        panel = gui.SettingsPanel()
+        panel.restore_settings()
+        config = panel.get_config_overrides()
+        assert config["silence_noise_db"] == -70, config
+        assert any("silence_noise_db" in n for n in config["preset_adjustments"]), config
+        panel.save_settings()
+        assert int(QSettings(gui._SETTINGS_ORG, gui._SETTINGS_APP).value("scan/config_format")) == 3
+
+
+# ---------------------------------------------------------------------------
+# Round 2, bug 11: version gate for git builds, the tested floor, the cache
+# ---------------------------------------------------------------------------
+
+class TestVersionGateRound2:
+    @pytest.mark.parametrize("banner,ok", [
+        ("ffmpeg version N-118000-g1234abcd Copyright\nlibavfilter    10.  4.100 / 10.  4.100", False),
+        ("ffmpeg version N-121000-g9abcdef Copyright\nlibavfilter    12.  3.100 / 12.  3.100", True),
+        ("ffmpeg version 2024-11-03-git-df00705e00-full_build-www.gyan.dev Copyright\n"
+         "libavfilter    10.  6.101 / 10.  6.101", False),
+        ("ffmpeg version 2026-09-30-git-0123456789-full_build-www.gyan.dev Copyright\n"
+         "libavfilter    12.  1.100 / 12.  1.100", True),
+        ("ffmpeg version N-119500-g0abc123 Copyright\nlibavfilter    11. 14.100 / 11. 14.100", True),
+        ("ffmpeg version N-119000-g0abc123 Copyright\nlibavfilter    11. 13.100 / 11. 13.100", False),
+        ("ffmpeg version N-118000-g1234abcd Copyright", False),     # no version to compare: not passed
+        ("Usage: wrapper", True),                                   # not an FFmpeg banner: nothing to judge
+    ])
+    def test_git_builds_are_judged_by_their_libavfilter_base(self, banner, ok):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem(banner)
+        assert (problem is None) == ok, problem
+
+    def test_a_two_part_release_number_is_padded(self, monkeypatch):
+        """9.0.0 reports itself as 'ffmpeg version 9.0'; (9, 0) < (9, 0, 0) as tuples."""
+        from frameguard import tools
+        monkeypatch.setattr(tools, "FFMPEG_MIN_VERSION", (9, 0, 0))
+        assert tools.ffmpeg_banner_problem("ffmpeg version 9.0 Copyright") is None
+        assert tools.ffmpeg_banner_problem("ffmpeg version 8.1 Copyright")
+
+    def test_below_the_floor_says_it_is_the_tested_floor(self):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem("ffmpeg version 8.1.1 Copyright")
+        assert "8.1.1" in problem and "tested" in problem, problem
+
+    def test_the_cached_gate_answers_without_reprobing(self, monkeypatch, tmp_path):
+        from frameguard import tools
+        fake = tmp_path / "ffmpeg"
+        fake.write_text("x")
+        calls = []
+
+        def probe(path):
+            calls.append(path)
+            return "ffmpeg version 8.0.1 Copyright\nlibavfilter    11.  4.100 / 11.  4.100"
+        monkeypatch.setattr(tools, "_ffmpeg_version_text", probe)
+        monkeypatch.setattr(tools, "_gate_cache", {})
+        first = tools.ffmpeg_version_problem(str(fake))
+        second = tools.ffmpeg_version_problem(str(fake))
+        assert first and second == first and len(calls) == 1, (first, second, calls)
+
+    @needs_posix
+    def test_an_old_git_build_is_refused_in_a_scan(self, media, tmp_path, monkeypatch):
+        from frameguard import core
+        fake = _fake_ffmpeg(tmp_path, "N-110000-gabcdef0", libavfilter=" 9. 12.100")
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
+        result = _scan(_clean(media), quick=False)
+        integrity = _row(result, "File Integrity")
+        assert _not_verified(integrity) and "libavfilter" in integrity[2], integrity
+
+
+# ---------------------------------------------------------------------------
+# Round 2: AGENTS.md UI copy for this fixer's new setting and dialog
+# ---------------------------------------------------------------------------
+
+class TestUiCopy:
+    def test_aac_priming_has_no_helper_line_and_plain_option_labels(self, qapp):
+        from frameguard import gui
+        panel = gui.SettingsPanel()
+        combo = panel._rule_controls["aac_priming"]
+        assert [combo.itemText(i) for i in range(combo.count())] == ["Unknown", "1024 samples", "2112 samples"]
+        row = next(r for r in panel._setting_rows if r[1].text() == "AAC Encoder Priming")
+        assert row[4].text() == "" and row[4].isHidden(), row[4].text()
+
+    def test_ffmpeg_too_old_dialog_is_one_plain_sentence(self, qapp, monkeypatch):
+        from frameguard import gui, tools
+        shown = []
+        monkeypatch.setattr(gui, "check_ffmpeg_available", lambda: (True, ""))
+        monkeypatch.setattr(tools, "ffmpeg_version_problem", lambda path=None: "FFmpeg 8.0.1 is too old")
+        monkeypatch.setattr(gui.QMessageBox, "warning", lambda parent, title, text: shown.append((title, text)))
+        gui.MainWindow._check_ffmpeg(type("W", (), {})())
+        assert shown == [("FFmpeg Too Old", "FFmpeg 8.0.1 is too old.")], shown
+
+
+# ---------------------------------------------------------------------------
+# Round 2 mutation gate: pin the rules the reviewer's surviving mutants changed
+# ---------------------------------------------------------------------------
+
+def _audio_track(edits, track_id=2, timescale=48000):
+    track = cc.TrackInfo(track_id=track_id, handler="soun", timescale=timescale)
+    track.edits = [cc.Edit(segment_duration=1000, media_time=m, rate=1.0) for m in edits]
+    return cc.Structure(family="ISO-BMFF", parsed=True, movie_timescale=1000, tracks=[track])
+
+
+class TestPrimingUnits:
+    def test_only_the_first_media_edit_signals_the_priming(self):
+        """An edit at media_time 0 is the presented start: nothing is hidden there."""
+        stream = {"id": "0x2"}
+        assert cc._edit_list_priming(_audio_track([0, 1024]), stream) is None
+        assert cc._edit_list_priming(_audio_track([-1, 1024]), stream) == pytest.approx(1024 / 48000)
+        assert cc._edit_list_priming(_audio_track([2112]), {"id": "0x3"}) is None     # another track
+
+    def test_signed_offsets_round_to_the_nearest_ms_on_the_right_side(self):
+        assert cc._signed_ms_text(0.7) == "1 ms after it"
+        assert cc._signed_ms_text(-0.7) == "1 ms before it"
+        assert cc._signed_ms_text(0.4) == "with the picture"
+
+    def test_spec_priming_text_shows_the_raw_start(self):
+        check, _ = _sync_row(_sync_probe(-0.9), aac_priming=1024)
+        assert "starts 900 ms before it" in check[2] and "1024-sample" in check[2], check
+
+    def test_signalled_priming_adds_no_priming_text(self):
+        check, _ = _sync_row(_sync_probe(0.003, padding=1024))
+        assert check[1] == "PASS" and "priming" not in check[2], check
+
+    @pytest.mark.parametrize("low,high,status", [
+        (-5.0, 5.0, "PASS"), (-5.01, 5.0, "NOT_VERIFIED"), (-4.0, 5.01, "NOT_VERIFIED"),
+        (-40.0, -5.01, "WARN"), (-40.01, -40.01, "FAIL"), (5.01, 60.0, "WARN"), (60.0, 60.0, "WARN"),
+        (60.01, 70.0, "FAIL"), (-5.0, -5.0, "PASS"), (-50.0, 0.0, "NOT_VERIFIED"),
+    ])
+    def test_range_status_boundaries(self, low, high, status):
+        assert cc._range_status(low, high, 5.0, 40.0, 60.0) == status
+
+    def test_range_text_sides(self):
+        assert cc._range_text(-41.0, 3.0) == "between 41 ms before and 3 ms after"
+        assert cc._range_text(5.0, 60.0) == "between 5 and 60 ms after"
+        assert cc._range_text(-60.0, -5.0) == "between 60 and 5 ms before"
+        assert cc._range_text(0.2, 44.0) == "between 0 and 44 ms after"
+        assert cc._range_text(-44.0, 0.2) == "between 44 ms before and 0 ms after"
+
+
+class TestTableUnits:
+    def _stbl(self, *children):
+        from container_fixtures import box
+        data = box(b"stbl", b"".join(children))
+        parent = cc.Box(b"stbl", 0, len(data), 8, memoryview(data), 8)
+        structure = cc.Structure()
+        parent.children = cc._parse_children(memoryview(data), 8, len(data), 0, 1, b"stbl", "", structure)
+        return parent
+
+    def test_a_table_cut_inside_its_count_field_is_a_problem(self):
+        from container_fixtures import box
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, self._stbl(box(b"stts", b"\0\0\0\0\0\0")))   # 2 of 4 count bytes
+        assert "time-to-sample" in track.table_problem, track.table_problem
+
+    def test_stsc_must_increase_between_every_neighbour(self):
+        import struct as _s
+        from container_fixtures import full_box
+        runs = _s.pack(">I", 3) + b"".join(_s.pack(">III", c, 1, 1) for c in (1, 3, 2))
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, self._stbl(full_box(b"stsc", 0, 0, runs)))
+        assert "increase strictly" in track.table_problem, track.table_problem
+        ok = _s.pack(">I", 3) + b"".join(_s.pack(">III", c, 1, 1) for c in (1, 2, 3))
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, self._stbl(full_box(b"stsc", 0, 0, ok)))
+        assert not track.table_problem and len(track._stsc) == 3
+
+
+class TestStereoUnits:
+    def test_every_block_of_a_textured_frame_is_judged(self):
+        import random as _r
+        rng = _r.Random(5)
+        frame = [rng.uniform(0, 255) for _ in range(384 * 192)]
+        scores = cc.stereo_layout_scores(frame)
+        assert scores is not None and scores[2] == (384 // 12) * (96 // 12), scores
+
+    def test_texture_floor_is_inclusive_at_three_grey_levels(self):
+        """A block whose standard deviation is exactly LAYOUT_MIN_TEXTURE counts;
+        just below it, none do."""
+        def checker(amplitude):
+            return [128 + (amplitude if (x + y) % 2 else -amplitude) for y in range(192) for x in range(384)]
+        assert cc.LAYOUT_MIN_TEXTURE == 3.0
+        assert cc.stereo_layout_scores(checker(3.0)) is not None
+        assert cc.stereo_layout_scores(checker(3.5)) is not None
+        assert cc.stereo_layout_scores(checker(2.9)) is None
+
+    def test_frames_are_grabbed_at_quarter_points(self):
+        assert cc._grab_times(8.0) == [2.0, 4.0, 6.0]
+        assert cc._grab_times(0.5) == [0.0]
+
+
+
+class TestEmptySyncTable:
+    def test_an_empty_stss_means_no_sync_samples(self):
+        """ISO/IEC 14496-12 8.6.2: without stss every sample is a sync sample;
+        an stss with zero entries says none is. The GOP walk must not treat
+        the second like the first."""
+        import struct as _s
+        from container_fixtures import full_box
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stss", 0, 0, _s.pack(">I", 0))))
+        assert track.sync_samples is not None and len(track.sync_samples) == 0
+        track.sample_count = 50
+        asked = []
+
+        def offsets(t, wanted):
+            asked.append(list(wanted))
+            return {}
+        import unittest.mock as _m
+        with _m.patch.object(cc, "sample_offsets", offsets):
+            cc._gop_report(__file__, track, 30)
+            track.sync_samples = None
+            cc._gop_report(__file__, track, 30)
+        assert asked == [[], list(range(50))], asked
+
+
+class TestSniffUnits:
+    def _write(self, tmp_path, data, name="x.mp4"):
+        path = tmp_path / name
+        path.write_bytes(data)
+        return str(path)
+
+    def test_flv_program_stream_and_ts_offsets(self, media, tmp_path):
+        flv = tmp_path / "a.flv"
+        ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "flv", str(flv))
+        assert cc.sniff_container(str(flv)) == ("FLV", "")
+        vob = tmp_path / "a.vob"
+        ffmpeg("-i", _clean(media), "-c:v", "mpeg2video", "-c:a", "mp2", "-f", "vob", str(vob))
+        assert cc.sniff_container(str(vob)) == ("MPEG-PS", "")
+        family, detail = cc.sniff_container(self._write(tmp_path, _ts_packets(188, 5)))
+        assert detail == "188-byte packets, 5 junk byte(s) before the first packet", detail
+        family, detail = cc.sniff_container(self._write(tmp_path, _ts_packets(192, 9)))
+        assert detail == "192-byte (M2TS) packets, 9 junk byte(s) before the first packet", detail
+
+    def test_flv_version_byte_and_program_stream_pack_markers(self, tmp_path):
+        assert cc.sniff_container(self._write(tmp_path, b"FLV\x01\x05" + bytes(64)))[0] == "FLV"
+        assert cc.sniff_container(self._write(tmp_path, b"FLV\x02\x01" + bytes(64)))[0] == "unknown"
+        pack2 = b"\x00\x00\x01\xba\x44" + bytes(9)                    # MPEG-2 pack, exactly 14 bytes
+        assert cc.sniff_container(self._write(tmp_path, pack2))[0] == "MPEG-PS"
+        pack1 = b"\x00\x00\x01\xba\x21" + bytes(9)                    # MPEG-1 pack ('0010')
+        assert cc.sniff_container(self._write(tmp_path, pack1))[0] == "MPEG-PS"
+        assert cc.sniff_container(self._write(tmp_path, b"\x00\x00\x01\xba\x00" + bytes(9)))[0] == "unknown"
+        assert cc.sniff_container(self._write(tmp_path, b"\x00\x00\x01\xba\x44" + bytes(8)))[0] == "unknown"
+
+    def test_quicktime_with_an_unlisted_first_atom(self, tmp_path):
+        import struct as _s
+        eight = _s.pack(">I4s", 8, b"abcd") + _s.pack(">I4s", 1000, b"mdat")         # second header at the end
+        assert cc.sniff_container(self._write(tmp_path, eight)) == ("ISO-BMFF", "first box 'abcd'")
+        big = _s.pack(">I4s", 16, b"abcd") + bytes(8) + _s.pack(">I4s", 8, b"free")
+        assert cc.sniff_container(self._write(tmp_path, big))[0] == "ISO-BMFF"
+        large = _s.pack(">I4s", 8, b"abcd") + _s.pack(">I4sQ", 1, b"mdat", 1 << 30)   # largesize ends the head
+        assert cc.sniff_container(self._write(tmp_path, large)) == ("ISO-BMFF", "first box 'abcd'")
+        assert cc._loose_first_box(_s.pack(">I4s", 7, b"abcd") + bytes(8)) == ""
+
+    def test_unreadable_and_unknown_files_are_not_verified_with_the_reason(self, tmp_path):
+        missing = str(tmp_path / "gone.mp4")
+        status, detail = cc.container_format_verdict(missing, ".mp4", None)
+        assert status == "NOT_VERIFIED" and "could not be read" in detail
+        junk = self._write(tmp_path, bytes(range(256)) * 4)
+        status, detail = cc.container_format_verdict(junk, ".mp4", None)
+        assert status == "NOT_VERIFIED" and "FFprobe could not read" in detail, detail
+        status, detail = cc.container_format_verdict(junk, ".mp4", {"format": {"format_name": "mov,mp4"}})
+        assert status == "NOT_VERIFIED" and "container structure is unconfirmed" in detail, detail
+
+    def test_compatible_brands_are_listed_exactly(self, tmp_path):
+        import struct as _s
+        ftyp = _s.pack(">I4s", 24, b"ftyp") + b"qt  " + bytes(4) + b"qt  " + b"isom"
+        path = self._write(tmp_path, ftyp + _s.pack(">I4s", 8, b"free"), "q.mov")
+        structure = cc.read_structure(path)
+        assert structure.brand == "qt" and structure.compatible_brands == ["qt", "isom"], structure.compatible_brands
+
+
+class TestReaderUnits:
+    def test_starts_box_rules(self):
+        import struct as _s
+        payload = bytes(28) + _s.pack(">I4s", 8, b"free")
+        assert cc._starts_box(payload, 28) is True
+        assert cc._starts_box(payload, 30) is False                       # not a header
+        assert cc._starts_box(bytes(28) + _s.pack(">I4s", 9, b"free"), 28) is False   # overruns
+        assert cc._starts_box(bytes(28) + _s.pack(">I4s", 8, b"\x01\x02\x03\x04"), 28) is False
+        assert cc._starts_box(b"1234", 0) is False
+        assert cc.Box(b"free", 0, 8, 8).payload == b""
+
+    def test_child_offsets_are_file_offsets(self, media):
+        structure = cc.read_structure(_clean(media))
+        moov = next(b for b in structure.top if b.type == b"moov")
+        with open(_clean(media), "rb") as handle:
+            for child in moov.children:
+                handle.seek(child.offset + 4)
+                assert handle.read(4) == child.type, child.type
+
+    def test_empty_tables_are_empty_not_problems(self):
+        import struct as _s
+        from container_fixtures import full_box
+        zero = _s.pack(">I", 0)
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stts", 0, 0, zero),
+                                                             full_box(b"stsc", 0, 0, zero),
+                                                             full_box(b"stco", 0, 0, zero)))
+        assert not track.table_problem, track.table_problem
+        assert len(track.stts) == 0 and len(track._stsc) == 0 and len(track._chunk_offsets) == 0
+
+    def test_time_to_sample_runs_are_kept(self):
+        import struct as _s
+        from container_fixtures import full_box
+        track = cc.TrackInfo(timescale=30000)
+        cc._read_sample_tables(track, TestTableUnits()._stbl(
+            full_box(b"stts", 0, 0, _s.pack(">IIIII", 2, 10, 1001, 5, 2002))))
+        assert list(track.stts) == [(10, 1001), (5, 2002)]
+        assert track.sample_time(11) == pytest.approx((10 * 1001 + 2002) / 30000)
+
+    def test_table_cap_is_inclusive(self, monkeypatch):
+        import struct as _s
+        from container_fixtures import full_box
+        monkeypatch.setattr(cc, "MAX_TABLE_ENTRIES", 3)
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stsz", 0, 0, _s.pack(">IIIII", 0, 3, 1, 2, 3))))
+        assert list(track._sizes) == [1, 2, 3] and not track.tables_skipped
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stsz", 0, 0, _s.pack(">IIIIII", 0, 4, 1, 2, 3, 4))))
+        assert "4 entries" in track.tables_skipped and len(track._sizes) == 0
+
+    def test_edit_cap(self, monkeypatch):
+        import struct as _s
+        from container_fixtures import full_box
+        monkeypatch.setattr(cc, "MAX_EDITS", 3)
+        structure = cc.Structure()
+        body = _s.pack(">I", 4) + _s.pack(">IihH", 100, 0, 1, 0) * 4
+        data = full_box(b"elst", 0, 0, body)
+        box = cc.Box(b"elst", 0, len(data), 8, memoryview(data), 8)
+        assert len(cc._read_edits(box, structure)) == 3 and "first 3" in structure.notes[-1]
+        structure = cc.Structure()
+        body = _s.pack(">I", 3) + _s.pack(">IihH", 100, 0, 1, 0) * 3
+        data = full_box(b"elst", 0, 0, body)
+        box = cc.Box(b"elst", 0, len(data), 8, memoryview(data), 8)
+        assert len(cc._read_edits(box, structure)) == 3 and not structure.notes
+
+    def test_first_sample_past_the_end_for_constant_sizes(self):
+        track = cc.TrackInfo(_constant_size=100)
+        assert cc._first_sample_past(0, 10, 10, 450, track) == 14
+        assert cc._first_sample_past(500, 0, 10, 450, track) == 0
+
+    def test_v1_xml_is_read_up_to_64_kib(self):
+        from container_fixtures import box
+        xml = b"<x>" + b"a" * 70000
+        trak = box(b"trak", box(b"uuid", cc.SPHERICAL_V1_UUID + xml))
+        parsed = cc.Box(b"trak", 0, len(trak), 8, memoryview(trak), 8)
+        parsed.children = cc._parse_children(memoryview(trak), 8, len(trak), 0, 1, b"trak", "", cc.Structure())
+        assert len(cc._read_track(parsed, cc.Structure()).v1_xml) == 65536
+
+    def test_padded_rows_wrap_one_row(self):
+        assert cc._padded_rows([0, 1, 2, 3, 4, 5, 6, 7], 4, 0, 1, 1) == [[3, 0, 1, 2, 3, 0]]
+        assert cc._padded_rows([0, 1, 2, 3, 4, 5, 6, 7], 4, 1, 1, 0) == [[4, 5, 6, 7]]
+
+    def test_median(self):
+        assert cc._median([3.0, 1.0]) == 2.0 and cc._median([5.0, 1.0, 3.0]) == 3.0
+
+    def test_majority_needs_more_than_half_the_frames(self):
+        import stereo_fixtures as sf
+        scene = sf.Scene(384, 192, 61, 6)
+        tb, mono = sf.top_bottom(scene, eye_height=96), sf.mono(scene)
+        assert cc.stereo_layout_evidence([tb, tb, mono])[0] is True
+        assert cc.stereo_layout_evidence([tb, mono])[0] is False
+
+    def test_mirror_rotation_wraps_to_plus_minus_180(self):
+        assert cc.display_transform(_matrix_stream(65526, 1144, 1144, -65526, 0)) == (-179, True)
+
+
+class TestTimecodeUnits:
+    def test_timecode_is_seen_in_a_tmcd_stream_or_a_tag(self):
+        assert cc._probe_shows_timecode({"streams": [{"codec_tag_string": "tmcd"}]}) is True
+        assert cc._probe_shows_timecode({"streams": [{"codec_tag_string": "avc1"}]}) is False
+        assert cc._probe_shows_timecode({"streams": [{"tags": {"timecode": "01:00:00:00"}}]}) is True
+        assert cc._probe_shows_timecode({"format": {"tags": {"timecode": "01:00:00:00"}}, "streams": []}) is True
+        assert cc._probe_shows_timecode({"format": {}, "streams": []}) is False
+
+    def test_unread_reason_is_text(self):
+        assert cc.unread_reason(cc.Structure(family="ISO-BMFF", parsed=True)) == ""
+        assert cc.unread_reason(None) == ""
+
+
+class TestAudioV1Brand:
+    def test_the_brand_decides_when_both_layouts_look_like_boxes(self, tmp_path):
+        """An ISO v1 entry whose SA3D bytes at offset 44 happen to form a box
+        header: the 'isom' brand must still pick the 28-byte layout."""
+        import struct as _s
+        from container_fixtures import box, full_box
+        sa3d_body = _s.pack(">BBIBBI", 0, 0, 1, 0, 0, 8) + _s.pack(">4s", b"free") + bytes(28)
+        head = bytes(6) + _s.pack(">H", 1) + _s.pack(">H", 1) + bytes(6) + _s.pack(">HH", 4, 16) + bytes(4) \
+            + _s.pack(">I", 48000 << 16)
+        entry = box(b"mp4a", head + box(b"SA3D", sa3d_body))
+        stsd = full_box(b"stsd", 0, 0, _s.pack(">I", 1) + entry)
+        hdlr = full_box(b"hdlr", 0, 0, bytes(4) + b"soun" + bytes(13))
+        mdhd = full_box(b"mdhd", 0, 0, _s.pack(">IIII", 0, 0, 48000, 48000) + bytes(4))
+        tkhd = full_box(b"tkhd", 0, 0, _s.pack(">III", 0, 0, 1) + bytes(68))
+        trak = box(b"trak", tkhd + box(b"mdia", mdhd + hdlr + box(b"minf", box(b"stbl", stsd))))
+        mvhd = full_box(b"mvhd", 0, 0, _s.pack(">IIII", 0, 0, 1000, 1000) + bytes(80))
+        path = tmp_path / "iso.mp4"
+        path.write_bytes(box(b"ftyp", b"isom" + bytes(4) + b"isom") + box(b"moov", mvhd + trak))
+        sa3d = cc.read_structure(str(path)).tracks[0].entries[0].sa3d
+        assert sa3d is not None and sa3d["num_channels"] == 8, sa3d
+
+
+class TestAvSyncDefaults:
+    def test_missing_limits_fall_back_to_r37(self):
+        cfg = {k: v for k, v in _cfg().items() if k not in ("av_offset_max_early_ms", "av_offset_max_late_ms")}
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(-0.045, padding=1024), rows, cfg)
+        assert rows.checks[0][1] == "FAIL", rows.checks
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(0.065, padding=1024), rows, cfg)
+        assert rows.checks[0][1] == "FAIL", rows.checks
+
+
+class TestCoreUnits:
+    def test_container_pass_shows_the_file_size(self, media):
+        from frameguard import core
+        check = _row(_scan(_clean(media)), "Container Format")
+        size = core._format_size(os.path.getsize(_clean(media)) / (1024 * 1024))
+        assert check[2].startswith(f"{size}, container: .mp4"), (check, size)
+
+    def test_unread_moov_note_rides_on_hard_problems_too(self, media, tmp_path, monkeypatch):
+        from container_fixtures import add_to_sample_entry, st3d, sv3d
+        clip = media.get("eq320.mp4", lambda p: make_clip(p, duration=2, size="320x160") or p)
+        path = add_to_sample_entry(_copy(clip, tmp_path / "tb_req.mp4"), b"vide", st3d(0), sv3d())
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        check = _row(_scan(path, target_width=320, target_height=160, required_projection="equirectangular",
+                           required_stereo_mode="top_bottom", audio_required=False), "XR Metadata")
+        assert check[1] == "FAIL" and "box-level spherical metadata not verified" in check[2], check
+
+    def test_flat_file_with_an_unread_moov_keeps_its_xr_pass(self, media, monkeypatch):
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        check = _row(_scan(_clean(media)), "XR Metadata")
+        assert check[1] == "PASS", check
+
+    @needs_posix
+    def test_gate_reads_the_tools_itself_when_the_result_has_none(self, media, tmp_path, monkeypatch):
+        from frameguard import core
+        fake = _fake_ffmpeg(tmp_path, "8.0.1")
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
+        monkeypatch.setattr(core, "_tool_version_cache", {})
+        result = core.QAResult(_clean(media))
+        core.run_deep_scan(_clean(media), result, _cfg())
+        integrity = _row(result, "File Integrity")
+        assert _not_verified(integrity) and "8.0.1" in integrity[2], integrity
+
+
+class TestPresetUnits:
+    def test_boundaries_are_not_contradictions(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_warn_ms": 40, "av_offset_max_early_ms": 40,
+                                              "max_frame_pixels": 3840 * 2160, "target_width": 3840,
+                                              "target_height": 2160, "max_pixel_rate": 3840 * 2160 * 30,
+                                              "target_fps": 30})
+        assert "preset_adjustments" not in out, out
+
+    def test_rate_ceiling_tolerance_is_only_rounding(self):
+        from frameguard import presets
+        near = presets.validate_preset_config({"target_width": 1920, "target_height": 1080, "target_fps": 30000 / 1001 * 1.001,
+                                               "max_pixel_rate": 1920 * 1080 * 30})
+        assert "preset_adjustments" not in near, near
+        over = presets.validate_preset_config({"target_width": 1920, "target_height": 1080, "target_fps": 33,
+                                               "max_pixel_rate": 1920 * 1080 * 30})
+        notes = over["preset_adjustments"][0]
+        assert "max_pixel_rate kept" in notes and "68,428,800 pixels/s" in notes, notes
+
+    def test_rate_contradiction_matches_the_engine_at_the_tolerance_edge(self):
+        """A target exactly at max_pixel_rate x 1.0005 passes Codec Profile, so
+        the preset check must not call it a contradiction either."""
+        from frameguard import presets
+        edge = {"target_width": 2001, "target_height": 1000, "target_fps": 1, "max_pixel_rate": 2_000_000}
+        assert "preset_adjustments" not in presets.validate_preset_config(edge)
+        rows = _Rows()
+        cc.check_codec_profile(_video_probe("hevc", "Main", 2001, 1000, fps="1/1"), rows,
+                               dict(DEFAULT_CONFIG, max_pixel_rate=2_000_000))
+        assert rows.checks[0][1] != "FAIL", rows.checks
+
+    def test_frame_ceiling_notice_counts_pixels(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"target_width": 3840, "target_height": 2160, "max_frame_pixels": 1000})
+        assert "8,294,400 pixels" in out["preset_adjustments"][0], out
+
+    def test_zero_ms_fail_thresholds_are_valid(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_warn_ms": 0, "av_offset_max_early_ms": 0,
+                                              "av_offset_max_late_ms": 0})
+        assert out == {"av_offset_warn_ms": 0, "av_offset_max_early_ms": 0, "av_offset_max_late_ms": 0}, out
+
+    def test_av_cap_is_1000_ms_both_sides(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_max_early_ms": 1200, "av_offset_max_late_ms": 1000})
+        assert out["av_offset_max_early_ms"] == 1000 and out["av_offset_max_late_ms"] == 1000, out
+        assert len(out["preset_adjustments"]) == 1, out
+
+    def test_freeze_hold_allowance_range(self):
+        from frameguard import presets
+        assert presets.validate_preset_config({"freeze_hold_allowance": 600}) == {"freeze_hold_allowance": 600}
+        assert presets.validate_preset_config({"freeze_hold_allowance": 0}) == {"freeze_hold_allowance": 0}
+        with pytest.raises(presets.PresetValidationError):
+            presets.validate_preset_config({"freeze_hold_allowance": 700})
+
+
+class TestToolsUnits:
+    def test_override_directory_entries_must_be_executable_files(self, tmp_path, monkeypatch):
+        from frameguard import tools
+        (tmp_path / "ffmpeg").mkdir()                       # a directory, not an executable
+        monkeypatch.setenv(tools.TOOLS_DIR_ENV, str(tmp_path))
+        assert tools._find_executable("ffmpeg") != str(tmp_path / "ffmpeg")
+
+    @needs_posix
+    def test_override_directory_is_used_first(self, tmp_path, monkeypatch):
+        from frameguard import tools
+        exe = tmp_path / "ffprobe"
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        monkeypatch.setenv(tools.TOOLS_DIR_ENV, str(tmp_path))
+        assert tools._find_executable("ffprobe") == str(exe)
+
+    def test_release_message_names_the_found_version(self):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem("ffmpeg version 8.0.1 Copyright\nlibavfilter    11.  4.100 / 11.  4.100")
+        assert problem.startswith("FFmpeg 8.0.1 is older than 8.1.2"), problem
+
+
+class TestMoreUnits:
+    def test_size_shown_in_mebibytes(self, tmp_path):
+        """104 860 bytes is 0.1000 MiB: shown as 0.1 MB, not 102 KB."""
+        import struct as _s
+        from frameguard import core
+        data = _s.pack(">I4s", 16, b"ftyp") + b"isom" + bytes(4)
+        data += _s.pack(">I4s", 104860 - len(data), b"free") + bytes(104860 - len(data) - 8)
+        path = tmp_path / "sized.mp4"
+        path.write_bytes(data)
+        result = core.QAResult(str(path))
+        core.confirm_container_format(str(path), {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}}, result)
+        assert result.checks[0][1:3] == ("PASS", "0.1 MB, container: .mp4 (brand 'isom')"), result.checks
+
+    def test_edit_cap_is_4096(self):
+        import struct as _s
+        from container_fixtures import full_box
+        structure = cc.Structure()
+        body = _s.pack(">I", 4097) + _s.pack(">IihH", 1, 0, 1, 0) * 4097
+        data = full_box(b"elst", 0, 0, body)
+        box = cc.Box(b"elst", 0, len(data), 8, memoryview(data), 8)
+        assert cc.MAX_EDITS == 4096 and len(cc._read_edits(box, structure)) == 4096
+
+    def test_aac_without_a_sample_rate_is_judged_on_its_raw_start(self):
+        probe = _sync_probe(0.002)
+        probe["streams"][1]["sample_rate"] = "0"
+        check, _ = _sync_row(probe)
+        assert check[1] == "PASS" and "priming" not in check[2], check
+
+
+
+class TestMeasuredFloor:
+    """0.9.2 matrix (FRAMEGUARD_TOOLS_DIR, 581 engine/audio/video/container/XR
+    tests): 8.1.2, 9.0.0 and 9.0.1 (conda-forge) fail only the two HEVC
+    fixture tests, whose Signal Levels verdict follows the x265 build that
+    encoded the fixture, not the analysing FFmpeg; 8.0.1 adds an
+    analyser-side loudness and Matroska start difference; 7.x abort."""
+
+    @pytest.mark.parametrize("banner,ok", [
+        ("ffmpeg version 8.1.2 Copyright", True), ("ffmpeg version 9.0 Copyright", True),
+        ("ffmpeg version 9.0.1 Copyright", True), ("ffmpeg version 9.0.2-https://www.martin-riedl.de", True),
+        ("ffmpeg version 8.1.1 Copyright", False), ("ffmpeg version 8.0.1 Copyright", False),
+    ])
+    def test_tested_builds(self, banner, ok):
+        from frameguard import tools
+        assert (tools.ffmpeg_banner_problem(banner) is None) == ok
+
+
+class TestRound2Units:
+    """Pins round-2 rules that a fresh mutant sample on the round-2 lines changed."""
+
+    def test_a_v_confidences(self):
+        assert _sync_row(_sync_probe(0.0, padding=1024))[0][3] == 100
+        assert _sync_row(_sync_probe(0.020, padding=1024))[0][3] == 60
+        assert _sync_row(_sync_probe(0.070, padding=1024))[0][3] == 85
+
+    def test_lead_tolerance_is_one_sample_plus_one_pts_tick(self):
+        tolerance = 1 / 48000 + 1 / 90000
+        inside = _sync_row(_sync_probe(-(1024 / 48000) - tolerance + 5e-11))[0]
+        assert inside[1] == "PASS" and "inferred" in inside[2], inside
+        one_sample = _sync_row(_sync_probe(-(1025 / 48000)))[0]
+        assert "inferred" in one_sample[2], one_sample
+
+    def test_no_negative_zero_in_the_start_together_text(self):
+        check, _ = _sync_row(_sync_probe(-0.00004, padding=1024))
+        assert "(+0.0 ms" in check[2], check
+
+    def test_inferred_text_shows_the_raw_lead(self):
+        probe = _sync_probe(-2 * 2624 / 8000, profile="HE-AAC")
+        probe["streams"][1]["sample_rate"] = "8000"
+        check, _ = _sync_row(probe)
+        assert "starts 656 ms before it, exactly the 2624-sample" in check[2], check
+
+    def test_values_at_the_0_9_1_maximum_are_clamped(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_max_late_ms": 10000})
+        assert out["av_offset_max_late_ms"] == 1000, out
+
+    def test_helpers_return_lists(self):
+        from frameguard import presets
+        assert presets.migrate_retired_defaults({"silence_noise_db": -50}, 3) == []
+        config = {"av_offset_warn_ms": 50, "av_offset_max_early_ms": 40}
+        assert presets._lenient_adjustments(config) == config["preset_adjustments"] != []
+
+    def test_reimporting_the_stored_copy_raises_no_new_notices(self, tmp_path):
+        from frameguard import presets
+        stored = presets.save_imported_preset(_write_091_preset(tmp_path / "o.fg", {"av_offset_max_early_ms": 2000}))
+        assert stored["notices"]
+        again = presets.import_preset(stored["path"], raise_errors=True)
+        assert again["notices"] == [] and again["config"]["preset_adjustments"], again
+
+    def test_adjustment_record_is_bounded(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"preset_adjustments": [f"note {n}" for n in range(40)]})
+        assert len(out["preset_adjustments"]) == 32 and out["preset_adjustments"][0] == "note 8", out
+
+    def test_two_part_release_is_padded_with_zero(self, monkeypatch):
+        from frameguard import tools
+        monkeypatch.setattr(tools, "FFMPEG_MIN_VERSION", (9, 0, 1))
+        assert tools.ffmpeg_banner_problem("ffmpeg version 9.0 Copyright")
+
+    def test_git_build_message_names_its_libavfilter(self):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem("ffmpeg version N-1-gabc Copyright\nlibavfilter    10.  4.100 / 10.  4.100")
+        assert "has libavfilter 10.4" in problem, problem
+
+    def test_libavfilter_line(self):
+        from frameguard import tools
+        text = "ffmpeg version 9.0.2\nlibavutil      61.  1.102 / 61.  1.102\nlibavfilter    12.  1.102 / 12.  1.102\n"
+        assert tools.libavfilter_line(text) == "libavfilter    12.  1.102 / 12.  1.102"
+        assert tools.libavfilter_line("ffmpeg version 9.0.2") == ""
+
+
+class TestGenericDefaultMigration:
+    """Integrator follow-up: migrate exactly the keys whose default changed
+    since 0.9.1, derived from DEFAULT_CONFIG, so the table cannot drift."""
+
+    def _expected(self):
+        from frameguard import presets
+        return {k: DEFAULT_CONFIG[k] for k, old in presets.DEFAULTS_0_9_1.items()
+                if k in DEFAULT_CONFIG and DEFAULT_CONFIG[k] != old}
+
+    def test_a_full_0_9_1_export_imports_as_today_s_defaults(self, tmp_path):
+        from frameguard import presets
+        old = _write_091_preset(tmp_path / "all.fg", dict(presets.DEFAULTS_0_9_1))
+        preset = presets.import_preset(old, raise_errors=True)
+        expected = self._expected()
+        for key in presets.DEFAULTS_0_9_1:
+            assert preset["config"][key] == DEFAULT_CONFIG[key], key
+        migrated = {n.split(" ", 1)[0] for n in preset["notices"]}
+        assert migrated == set(expected), (migrated, set(expected))
+
+    def test_an_unchanged_default_never_migrates(self, tmp_path, monkeypatch):
+        """The video fixer restores black_detect_picture_threshold to 0.98: a
+        0.9.1 file holding 0.98 must then keep it, with no notice."""
+        from frameguard import presets
+        from frameguard import core
+        monkeypatch.setitem(core.DEFAULT_CONFIG, "black_detect_picture_threshold", 0.98)
+        old = _write_091_preset(tmp_path / "b.fg", {"black_detect_picture_threshold": 0.98})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["black_detect_picture_threshold"] == 0.98 and preset["notices"] == [], preset
+
+    def test_any_changed_default_migrates_including_non_numbers(self, tmp_path, monkeypatch):
+        from frameguard import presets
+        from frameguard import core
+        monkeypatch.setitem(core.DEFAULT_CONFIG, "loudness_mode", "advisory")
+        monkeypatch.setitem(core.DEFAULT_CONFIG, "accepted_containers", [".mp4", ".mov"])
+        old = _write_091_preset(tmp_path / "c.fg", {"loudness_mode": "report",
+                                                    "accepted_containers": [".mp4", ".mov", ".mkv", ".mxf"]})
+        preset = presets.import_preset(old, raise_errors=True)
+        assert preset["config"]["loudness_mode"] == "advisory"
+        assert preset["config"]["accepted_containers"] == [".mp4", ".mov"]
+        assert any(n.startswith("loudness_mode report -> advisory") for n in preset["notices"]), preset["notices"]
+
+    def test_the_table_holds_only_preset_keys_and_no_machine_dependent_ones(self):
+        from frameguard import presets
+        from frameguard.core import COMPAT_ONLY_CONFIG_KEYS
+        assert set(presets.DEFAULTS_0_9_1) <= set(presets.PRESET_CONFIG_KEYS)
+        assert not set(presets.DEFAULTS_0_9_1) & COMPAT_ONLY_CONFIG_KEYS
+        assert len(presets.DEFAULTS_0_9_1) == 69

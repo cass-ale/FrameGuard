@@ -95,6 +95,7 @@ try:
         get_ffmpeg_path, get_ffprobe_path, get_mediainfo_path,
     )
     from frameguard.tools import banner_version as tools_banner_version
+    from frameguard.tools import libavfilter_line as tools_libavfilter_line
     from frameguard.tools import ffmpeg_banner_problem as _ffmpeg_banner_problem
     from frameguard.tools import _ffmpeg_cache_key as _tool_identity
     _HAS_TOOLS_MODULE = True
@@ -103,6 +104,9 @@ except ImportError:
 
     def tools_banner_version(banner):
         return None
+
+    def tools_libavfilter_line(text):
+        return ""
 
     def _ffmpeg_banner_problem(banner):
         return None
@@ -398,6 +402,9 @@ DEFAULT_CONFIG = {
     "max_audio_tracks": 0,
     # Optional container/XR checks a spec may switch off by name.
     "disabled_checks": [],
+    # What FrameGuard changed when it loaded the preset (a record for the PDF,
+    # never read by a check).
+    "preset_adjustments": [],
 
     # File integrity (full software decode)
     "max_decode_errors": 0,
@@ -613,7 +620,8 @@ class QAResult:
         with self._lock:
             self.checks.append((check_name, "SKIP", detail, confidence))
 
-    def add_not_verified(self, check_name: str, reason: str, by_choice: bool = False):
+    def add_not_verified(self, check_name: str, reason: str, by_choice: bool = False,
+                         inherent: bool = False):
         """Record an analysis that did not run.
 
         SKIP is ignored by the verdict, so an unrun integrity scan used to read
@@ -622,13 +630,15 @@ class QAResult:
 
         ``by_choice`` marks analysis the operator chose not to run (a quick
         scan). Strict Mode escalates genuine failures to analyse, but not a
-        choice: otherwise every quick + strict scan was a FAIL.
+        choice: otherwise every quick + strict scan was a FAIL. ``inherent``
+        marks a measurement the file format itself cannot support (AAC
+        priming an MPEG-TS cannot signal); Strict does not escalate it either.
         """
         with self._lock:
             detail = f"{NOT_VERIFIED_PREFIX}{reason}"
             self.checks.append((check_name, "WARN", detail, 100))
             self.warnings.append(f"{check_name}: {detail}")
-            key = "not_run_by_choice" if by_choice else "not_verified"
+            key = "not_run_by_choice" if by_choice else "not_verifiable" if inherent else "not_verified"
             self.metadata.setdefault(key, [])
             if check_name not in self.metadata[key]:
                 self.metadata[key].append(check_name)
@@ -726,7 +736,7 @@ class QAResult:
         """
         strict = strict or bool(getattr(self, "strict", False))
         flagged = False
-        by_choice = set(self.metadata.get("not_run_by_choice") or ())
+        by_choice = set(self.metadata.get("not_run_by_choice") or ()) | set(self.metadata.get("not_verifiable") or ())
 
         for check_tuple in self.checks:
             name, status = check_tuple[0], check_tuple[1]
@@ -1009,16 +1019,20 @@ def get_tool_versions() -> Dict[str, Dict[str, Optional[str]]]:
             return dict(_tool_version_cache[key])
     versions = {}
     for name, path in paths:
-        version = None
+        version, libavfilter = None, ""
         if path:
             try:
                 proc = subprocess.run([path, "-version"], capture_output=True, text=True,
                                       timeout=10, env=_get_clean_env(), **_subprocess_kwargs())
                 if proc.returncode == 0 and proc.stdout:
                     version = proc.stdout.splitlines()[0].strip()
+                    # Places a git build (no release number) for the version gate.
+                    libavfilter = tools_libavfilter_line(proc.stdout)
             except (subprocess.TimeoutExpired, OSError, TypeError) as exc:
                 version = f"unavailable ({type(exc).__name__})"
         versions[name] = {"path": path, "version": version}
+        if version and libavfilter:
+            versions[name]["libavfilter"] = libavfilter
     with _tool_version_lock:
         _tool_version_cache[key] = versions
     return dict(versions)
@@ -3491,8 +3505,9 @@ def run_deep_scan(filepath: str, result: QAResult, cfg: dict,
         return
     # The banner this scan recorded (get_tool_versions re-probes a binary
     # whose identity changed), judged against tools.FFMPEG_MIN_VERSION.
-    banner = ((result.tool_versions or get_tool_versions()).get("ffmpeg") or {}).get("version")
-    too_old = _ffmpeg_banner_problem(banner)
+    recorded = (result.tool_versions or get_tool_versions()).get("ffmpeg") or {}
+    banner = recorded.get("version")
+    too_old = _ffmpeg_banner_problem("\n".join(filter(None, (banner, recorded.get("libavfilter")))))
     if too_old:
         result.set_metadata("ffmpeg_below_minimum", tools_banner_version(banner) or "unknown")
         _mark_not_verified(result, plan.frame_check_names(), too_old + ".")
