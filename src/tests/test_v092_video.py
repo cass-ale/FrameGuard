@@ -1381,6 +1381,25 @@ def test_hdr_flash_is_not_verified(tmp_path):
     assert row[1] not in ("SKIP", "PASS") and "not" in row[2].lower(), row
 
 
+@needs_ffmpeg
+def test_hdr_flash_not_verified_is_not_escalated_by_strict(tmp_path):
+    """Review round 5 (N5): the Flash Risk Not verified is inherent to PQ/HLG
+    content; Strict Mode must not turn every HDR file into a MISMATCH."""
+    path = str(tmp_path / "pq.mp4")
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
+           "-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv",
+           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-an", path)
+    cfg = dict(DEFAULT_CONFIG, target_width=640, target_height=360, target_fps=30.0, min_bitrate_mbps=0,
+               audio_required=False, loudness_mode="off", accepted_containers=[".mp4"])
+    result = run_qa_checks(path, cfg=cfg, strict=True)
+    result.finalize()
+    row = _row(result, "Flash Risk")
+    assert "not" in row[2].lower() and "Flash Risk" in result.metadata.get("not_verifiable", []), row
+    exempt = set(result.metadata.get("not_verifiable", [])) | set(result.metadata.get("not_run_by_choice", []))
+    escalating = [c[:3] for c in result.checks if c[1] in ("WARN", "FAIL") and c[0] not in exempt]
+    assert result.status != "MISMATCH" or escalating, (result.status, escalating)
+
+
 def test_new_setting_has_no_helper_text():
     """AGENTS.md: cut helper text and secondary labels; new 0.9.2 settings
     get none, and 0.9.1 settings keep their copy."""

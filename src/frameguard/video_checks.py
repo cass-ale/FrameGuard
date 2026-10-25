@@ -3025,8 +3025,12 @@ def _report_flash(result, config, series, analysis, fps, decoded, reason,
     if analysis is not None and analysis.info.hdr:
         # Switched on but not measurable here: never a SKIP that reads as
         # "not asked for" (review round 3, bug 14).
+        # Inherent to the content type, not a failure to measure: visible and
+        # recorded, but Strict Mode does not turn every HDR file into a
+        # MISMATCH (review round 5, N5).
         result.add_not_verified(FLASH, "PQ/HLG video: the BT.1702-3 thresholds used here "
-                                       "assume an SDR display, so flashes were not screened.")
+                                       "assume an SDR display, so flashes were not screened.",
+                                inherent=True)
         return
     if analysis is not None and not analysis.info.analysable:
         result.add_skip(FLASH, "Picture too small to analyse.")
