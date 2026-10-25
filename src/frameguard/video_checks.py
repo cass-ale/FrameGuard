@@ -488,6 +488,11 @@ class PictureInfo:
                    chroma_420=_is_420(str(video.get("pix_fmt") or "")))
 
     @property
+    def interlaced(self) -> bool:
+        """Signalled as interlaced (field_order tt/bb/tb/bt)."""
+        return self.field_order in ("tt", "bb", "tb", "bt")
+
+    @property
     def gamut_matrices(self) -> Tuple[str, ...]:
         """Matrices the RGB gamut is judged under: the signalled one, or, when
         none is signalled, the size-based guess first and then the other
@@ -1108,8 +1113,12 @@ class VideoAnalysis:
         matrices = info.gamut_matrices
         uses = ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
         labels = "".join(f"[ar_{u}]" for u in uses)
+        # R 103: the filter is "applied intra field for interlace signals":
+        # an interlaced picture is filtered with its fields stacked (il), so
+        # no tap reaches into the other field.
+        fields = "il=l=d:c=d:a=d," if info.interlaced else ""
         if info.chroma_420:
-            chains = [f"[0:{self.index}]extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
+            chains = [f"[0:{self.index}]{fields}extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
             chains += _r103_lattice("lv_luma", "lv_yl", "gray16", "gray")
             chains.append("[lv_yl]crop=w=iw:h=ih-1:x=0:y=1[lv_y]")
             chains += _r103_chroma_420("lv_cb", "lv_u")
@@ -1118,7 +1127,7 @@ class VideoAnalysis:
                           f":format=yuv444p,split={len(uses)}{labels}")
         else:
             # 4:4:4 first, so the odd column phases crop exact pixels.
-            chains = [f"[0:{self.index}]scale=in_range={rng}:out_range={rng},format=yuv444p16[lv_src]"]
+            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng},format=yuv444p16[lv_src]"]
             chains += _r103_lattice("lv_src", "lv_all", "yuv444p16", "yuv444p")
             chains.append(f"[lv_all]split={len(uses)}{labels}")
         # Masks are area-reduced 4:1 before signalstats: a 0/255 mask's mean

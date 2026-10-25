@@ -443,6 +443,21 @@ class TestR103Filter:
         assert row[1] == "WARN", row
         assert share == pytest.approx(expected * 100, rel=0.1)
 
+    def test_interlaced_signal_is_filtered_intra_field(self, tmp_path):
+        """Round 3 bug 4: R 103's vertical filter is "applied intra field for
+        interlace signals". A block whose top field is super-white (250) and
+        bottom field black: within a field it stays at 250 (> 246); a
+        frame-based 1-2-1 filter would average it to ~133."""
+        path = str(tmp_path / "fields.mp4")
+        lum = "if(between(X,100,299)*between(Y,100,199),if(mod(Y,2),16,250),60)"
+        ffmpeg("-f", "lavfi", "-i", "color=black:s=640x360:r=30:d=0.2,format=yuv420p,"
+               "setparams=range=tv:colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+               "-vf", f"geq=lum='{lum}':cb=128:cr=128,setparams=field_mode=tff",
+               "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-flags", "+ildct+ilme",
+               "-color_range", "tv", "-colorspace", "bt709", "-an", path)
+        row, share = _levels(path, 640, 360)
+        assert row[1] == "WARN" and "Luma" in row[2], row
+
     def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
         """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
         expected = _r103_share(_SMALL)
