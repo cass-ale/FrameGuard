@@ -1118,3 +1118,328 @@ class TestEmptySyncTable:
             track.sync_samples = None
             cc._gop_report(__file__, track, 30)
         assert asked == [[], list(range(50))], asked
+
+
+class TestSniffUnits:
+    def _write(self, tmp_path, data, name="x.mp4"):
+        path = tmp_path / name
+        path.write_bytes(data)
+        return str(path)
+
+    def test_flv_program_stream_and_ts_offsets(self, media, tmp_path):
+        flv = tmp_path / "a.flv"
+        ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "flv", str(flv))
+        assert cc.sniff_container(str(flv)) == ("FLV", "")
+        vob = tmp_path / "a.vob"
+        ffmpeg("-i", _clean(media), "-c:v", "mpeg2video", "-c:a", "mp2", "-f", "vob", str(vob))
+        assert cc.sniff_container(str(vob)) == ("MPEG-PS", "")
+        family, detail = cc.sniff_container(self._write(tmp_path, _ts_packets(188, 5)))
+        assert detail == "188-byte packets, 5 junk byte(s) before the first packet", detail
+        family, detail = cc.sniff_container(self._write(tmp_path, _ts_packets(192, 9)))
+        assert detail == "192-byte (M2TS) packets, 9 junk byte(s) before the first packet", detail
+
+    def test_flv_version_byte_and_program_stream_pack_markers(self, tmp_path):
+        assert cc.sniff_container(self._write(tmp_path, b"FLV\x01\x05" + bytes(64)))[0] == "FLV"
+        assert cc.sniff_container(self._write(tmp_path, b"FLV\x02\x01" + bytes(64)))[0] == "unknown"
+        pack2 = b"\x00\x00\x01\xba\x44" + bytes(9)                    # MPEG-2 pack, exactly 14 bytes
+        assert cc.sniff_container(self._write(tmp_path, pack2))[0] == "MPEG-PS"
+        pack1 = b"\x00\x00\x01\xba\x21" + bytes(9)                    # MPEG-1 pack ('0010')
+        assert cc.sniff_container(self._write(tmp_path, pack1))[0] == "MPEG-PS"
+        assert cc.sniff_container(self._write(tmp_path, b"\x00\x00\x01\xba\x00" + bytes(9)))[0] == "unknown"
+        assert cc.sniff_container(self._write(tmp_path, b"\x00\x00\x01\xba\x44" + bytes(8)))[0] == "unknown"
+
+    def test_quicktime_with_an_unlisted_first_atom(self, tmp_path):
+        import struct as _s
+        eight = _s.pack(">I4s", 8, b"abcd") + _s.pack(">I4s", 1000, b"mdat")         # second header at the end
+        assert cc.sniff_container(self._write(tmp_path, eight)) == ("ISO-BMFF", "first box 'abcd'")
+        big = _s.pack(">I4s", 16, b"abcd") + bytes(8) + _s.pack(">I4s", 8, b"free")
+        assert cc.sniff_container(self._write(tmp_path, big))[0] == "ISO-BMFF"
+        large = _s.pack(">I4s", 8, b"abcd") + _s.pack(">I4sQ", 1, b"mdat", 1 << 30)   # largesize ends the head
+        assert cc.sniff_container(self._write(tmp_path, large)) == ("ISO-BMFF", "first box 'abcd'")
+        assert cc._loose_first_box(_s.pack(">I4s", 7, b"abcd") + bytes(8)) == ""
+
+    def test_unreadable_and_unknown_files_are_not_verified_with_the_reason(self, tmp_path):
+        missing = str(tmp_path / "gone.mp4")
+        status, detail = cc.container_format_verdict(missing, ".mp4", None)
+        assert status == "NOT_VERIFIED" and "could not be read" in detail
+        junk = self._write(tmp_path, bytes(range(256)) * 4)
+        status, detail = cc.container_format_verdict(junk, ".mp4", None)
+        assert status == "NOT_VERIFIED" and "FFprobe could not read" in detail, detail
+        status, detail = cc.container_format_verdict(junk, ".mp4", {"format": {"format_name": "mov,mp4"}})
+        assert status == "NOT_VERIFIED" and "container structure is unconfirmed" in detail, detail
+
+    def test_compatible_brands_are_listed_exactly(self, tmp_path):
+        import struct as _s
+        ftyp = _s.pack(">I4s", 24, b"ftyp") + b"qt  " + bytes(4) + b"qt  " + b"isom"
+        path = self._write(tmp_path, ftyp + _s.pack(">I4s", 8, b"free"), "q.mov")
+        structure = cc.read_structure(path)
+        assert structure.brand == "qt" and structure.compatible_brands == ["qt", "isom"], structure.compatible_brands
+
+
+class TestReaderUnits:
+    def test_starts_box_rules(self):
+        import struct as _s
+        payload = bytes(28) + _s.pack(">I4s", 8, b"free")
+        assert cc._starts_box(payload, 28) is True
+        assert cc._starts_box(payload, 30) is False                       # not a header
+        assert cc._starts_box(bytes(28) + _s.pack(">I4s", 9, b"free"), 28) is False   # overruns
+        assert cc._starts_box(bytes(28) + _s.pack(">I4s", 8, b"\x01\x02\x03\x04"), 28) is False
+        assert cc._starts_box(b"1234", 0) is False
+        assert cc.Box(b"free", 0, 8, 8).payload == b""
+
+    def test_child_offsets_are_file_offsets(self, media):
+        structure = cc.read_structure(_clean(media))
+        moov = next(b for b in structure.top if b.type == b"moov")
+        with open(_clean(media), "rb") as handle:
+            for child in moov.children:
+                handle.seek(child.offset + 4)
+                assert handle.read(4) == child.type, child.type
+
+    def test_empty_tables_are_empty_not_problems(self):
+        import struct as _s
+        from container_fixtures import full_box
+        zero = _s.pack(">I", 0)
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stts", 0, 0, zero),
+                                                             full_box(b"stsc", 0, 0, zero),
+                                                             full_box(b"stco", 0, 0, zero)))
+        assert not track.table_problem, track.table_problem
+        assert len(track.stts) == 0 and len(track._stsc) == 0 and len(track._chunk_offsets) == 0
+
+    def test_time_to_sample_runs_are_kept(self):
+        import struct as _s
+        from container_fixtures import full_box
+        track = cc.TrackInfo(timescale=30000)
+        cc._read_sample_tables(track, TestTableUnits()._stbl(
+            full_box(b"stts", 0, 0, _s.pack(">IIIII", 2, 10, 1001, 5, 2002))))
+        assert list(track.stts) == [(10, 1001), (5, 2002)]
+        assert track.sample_time(11) == pytest.approx((10 * 1001 + 2002) / 30000)
+
+    def test_table_cap_is_inclusive(self, monkeypatch):
+        import struct as _s
+        from container_fixtures import full_box
+        monkeypatch.setattr(cc, "MAX_TABLE_ENTRIES", 3)
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stsz", 0, 0, _s.pack(">IIIII", 0, 3, 1, 2, 3))))
+        assert list(track._sizes) == [1, 2, 3] and not track.tables_skipped
+        track = cc.TrackInfo()
+        cc._read_sample_tables(track, TestTableUnits()._stbl(full_box(b"stsz", 0, 0, _s.pack(">IIIIII", 0, 4, 1, 2, 3, 4))))
+        assert "4 entries" in track.tables_skipped and len(track._sizes) == 0
+
+    def test_edit_cap(self, monkeypatch):
+        import struct as _s
+        from container_fixtures import full_box
+        monkeypatch.setattr(cc, "MAX_EDITS", 3)
+        structure = cc.Structure()
+        body = _s.pack(">I", 4) + _s.pack(">IihH", 100, 0, 1, 0) * 4
+        data = full_box(b"elst", 0, 0, body)
+        box = cc.Box(b"elst", 0, len(data), 8, memoryview(data), 8)
+        assert len(cc._read_edits(box, structure)) == 3 and "first 3" in structure.notes[-1]
+        structure = cc.Structure()
+        body = _s.pack(">I", 3) + _s.pack(">IihH", 100, 0, 1, 0) * 3
+        data = full_box(b"elst", 0, 0, body)
+        box = cc.Box(b"elst", 0, len(data), 8, memoryview(data), 8)
+        assert len(cc._read_edits(box, structure)) == 3 and not structure.notes
+
+    def test_first_sample_past_the_end_for_constant_sizes(self):
+        track = cc.TrackInfo(_constant_size=100)
+        assert cc._first_sample_past(0, 10, 10, 450, track) == 14
+        assert cc._first_sample_past(500, 0, 10, 450, track) == 0
+
+    def test_v1_xml_is_read_up_to_64_kib(self):
+        from container_fixtures import box
+        xml = b"<x>" + b"a" * 70000
+        trak = box(b"trak", box(b"uuid", cc.SPHERICAL_V1_UUID + xml))
+        parsed = cc.Box(b"trak", 0, len(trak), 8, memoryview(trak), 8)
+        parsed.children = cc._parse_children(memoryview(trak), 8, len(trak), 0, 1, b"trak", "", cc.Structure())
+        assert len(cc._read_track(parsed, cc.Structure()).v1_xml) == 65536
+
+    def test_padded_rows_wrap_one_row(self):
+        assert cc._padded_rows([0, 1, 2, 3, 4, 5, 6, 7], 4, 0, 1, 1) == [[3, 0, 1, 2, 3, 0]]
+        assert cc._padded_rows([0, 1, 2, 3, 4, 5, 6, 7], 4, 1, 1, 0) == [[4, 5, 6, 7]]
+
+    def test_median(self):
+        assert cc._median([3.0, 1.0]) == 2.0 and cc._median([5.0, 1.0, 3.0]) == 3.0
+
+    def test_majority_needs_more_than_half_the_frames(self):
+        import stereo_fixtures as sf
+        scene = sf.Scene(384, 192, 61, 6)
+        tb, mono = sf.top_bottom(scene, eye_height=96), sf.mono(scene)
+        assert cc.stereo_layout_evidence([tb, tb, mono])[0] is True
+        assert cc.stereo_layout_evidence([tb, mono])[0] is False
+
+    def test_mirror_rotation_wraps_to_plus_minus_180(self):
+        assert cc.display_transform(_matrix_stream(65526, 1144, 1144, -65526, 0)) == (-179, True)
+
+
+class TestTimecodeUnits:
+    def test_timecode_is_seen_in_a_tmcd_stream_or_a_tag(self):
+        assert cc._probe_shows_timecode({"streams": [{"codec_tag_string": "tmcd"}]}) is True
+        assert cc._probe_shows_timecode({"streams": [{"codec_tag_string": "avc1"}]}) is False
+        assert cc._probe_shows_timecode({"streams": [{"tags": {"timecode": "01:00:00:00"}}]}) is True
+        assert cc._probe_shows_timecode({"format": {"tags": {"timecode": "01:00:00:00"}}, "streams": []}) is True
+        assert cc._probe_shows_timecode({"format": {}, "streams": []}) is False
+
+    def test_unread_reason_is_text(self):
+        assert cc.unread_reason(cc.Structure(family="ISO-BMFF", parsed=True)) == ""
+        assert cc.unread_reason(None) == ""
+
+
+class TestAudioV1Brand:
+    def test_the_brand_decides_when_both_layouts_look_like_boxes(self, tmp_path):
+        """An ISO v1 entry whose SA3D bytes at offset 44 happen to form a box
+        header: the 'isom' brand must still pick the 28-byte layout."""
+        import struct as _s
+        from container_fixtures import box, full_box
+        sa3d_body = _s.pack(">BBIBBI", 0, 0, 1, 0, 0, 8) + _s.pack(">4s", b"free") + bytes(28)
+        head = bytes(6) + _s.pack(">H", 1) + _s.pack(">H", 1) + bytes(6) + _s.pack(">HH", 4, 16) + bytes(4) \
+            + _s.pack(">I", 48000 << 16)
+        entry = box(b"mp4a", head + box(b"SA3D", sa3d_body))
+        stsd = full_box(b"stsd", 0, 0, _s.pack(">I", 1) + entry)
+        hdlr = full_box(b"hdlr", 0, 0, bytes(4) + b"soun" + bytes(13))
+        mdhd = full_box(b"mdhd", 0, 0, _s.pack(">IIII", 0, 0, 48000, 48000) + bytes(4))
+        tkhd = full_box(b"tkhd", 0, 0, _s.pack(">III", 0, 0, 1) + bytes(68))
+        trak = box(b"trak", tkhd + box(b"mdia", mdhd + hdlr + box(b"minf", box(b"stbl", stsd))))
+        mvhd = full_box(b"mvhd", 0, 0, _s.pack(">IIII", 0, 0, 1000, 1000) + bytes(80))
+        path = tmp_path / "iso.mp4"
+        path.write_bytes(box(b"ftyp", b"isom" + bytes(4) + b"isom") + box(b"moov", mvhd + trak))
+        sa3d = cc.read_structure(str(path)).tracks[0].entries[0].sa3d
+        assert sa3d is not None and sa3d["num_channels"] == 8, sa3d
+
+
+class TestAvSyncDefaults:
+    def test_missing_limits_fall_back_to_r37(self):
+        cfg = {k: v for k, v in _cfg().items() if k not in ("av_offset_max_early_ms", "av_offset_max_late_ms")}
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(-0.045, padding=1024), rows, cfg)
+        assert rows.checks[0][1] == "FAIL", rows.checks
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(0.065, padding=1024), rows, cfg)
+        assert rows.checks[0][1] == "FAIL", rows.checks
+
+
+class TestCoreUnits:
+    def test_container_pass_shows_the_file_size(self, media):
+        from frameguard import core
+        check = _row(_scan(_clean(media)), "Container Format")
+        size = core._format_size(os.path.getsize(_clean(media)) / (1024 * 1024))
+        assert check[2].startswith(f"{size}, container: .mp4"), (check, size)
+
+    def test_unread_moov_note_rides_on_hard_problems_too(self, media, tmp_path, monkeypatch):
+        from container_fixtures import add_to_sample_entry, st3d, sv3d
+        clip = media.get("eq320.mp4", lambda p: make_clip(p, duration=2, size="320x160") or p)
+        path = add_to_sample_entry(_copy(clip, tmp_path / "tb_req.mp4"), b"vide", st3d(0), sv3d())
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        check = _row(_scan(path, target_width=320, target_height=160, required_projection="equirectangular",
+                           required_stereo_mode="top_bottom", audio_required=False), "XR Metadata")
+        assert check[1] == "FAIL" and "box-level spherical metadata not verified" in check[2], check
+
+    def test_flat_file_with_an_unread_moov_keeps_its_xr_pass(self, media, monkeypatch):
+        monkeypatch.setattr(cc, "MAX_MOOV_BYTES", 64)
+        check = _row(_scan(_clean(media)), "XR Metadata")
+        assert check[1] == "PASS", check
+
+    @needs_posix
+    def test_gate_reads_the_tools_itself_when_the_result_has_none(self, media, tmp_path, monkeypatch):
+        from frameguard import core
+        fake = _fake_ffmpeg(tmp_path, "8.0.1")
+        monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
+        monkeypatch.setattr(core, "_tool_version_cache", {})
+        result = core.QAResult(_clean(media))
+        core.run_deep_scan(_clean(media), result, _cfg())
+        integrity = _row(result, "File Integrity")
+        assert _not_verified(integrity) and "8.0.1" in integrity[2], integrity
+
+
+class TestPresetUnits:
+    def test_boundaries_are_not_contradictions(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_warn_ms": 40, "av_offset_max_early_ms": 40,
+                                              "max_frame_pixels": 3840 * 2160, "target_width": 3840,
+                                              "target_height": 2160, "max_pixel_rate": 3840 * 2160 * 30,
+                                              "target_fps": 30})
+        assert "preset_adjustments" not in out, out
+
+    def test_rate_ceiling_tolerance_is_only_rounding(self):
+        from frameguard import presets
+        near = presets.validate_preset_config({"target_width": 1920, "target_height": 1080, "target_fps": 30000 / 1001 * 1.001,
+                                               "max_pixel_rate": 1920 * 1080 * 30})
+        assert "preset_adjustments" not in near, near
+        over = presets.validate_preset_config({"target_width": 1920, "target_height": 1080, "target_fps": 33,
+                                               "max_pixel_rate": 1920 * 1080 * 30})
+        notes = over["preset_adjustments"][0]
+        assert "max_pixel_rate kept" in notes and "68,428,800 pixels/s" in notes, notes
+
+    def test_frame_ceiling_notice_counts_pixels(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"target_width": 3840, "target_height": 2160, "max_frame_pixels": 1000})
+        assert "8,294,400 pixels" in out["preset_adjustments"][0], out
+
+    def test_zero_ms_fail_thresholds_are_valid(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_warn_ms": 0, "av_offset_max_early_ms": 0,
+                                              "av_offset_max_late_ms": 0})
+        assert out == {"av_offset_warn_ms": 0, "av_offset_max_early_ms": 0, "av_offset_max_late_ms": 0}, out
+
+    def test_av_cap_is_1000_ms_both_sides(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_max_early_ms": 1200, "av_offset_max_late_ms": 1000})
+        assert out["av_offset_max_early_ms"] == 1000 and out["av_offset_max_late_ms"] == 1000, out
+        assert len(out["preset_adjustments"]) == 1, out
+
+    def test_freeze_hold_allowance_range(self):
+        from frameguard import presets
+        assert presets.validate_preset_config({"freeze_hold_allowance": 600}) == {"freeze_hold_allowance": 600}
+        with pytest.raises(presets.PresetValidationError):
+            presets.validate_preset_config({"freeze_hold_allowance": 700})
+
+
+class TestToolsUnits:
+    def test_override_directory_entries_must_be_executable_files(self, tmp_path, monkeypatch):
+        from frameguard import tools
+        (tmp_path / "ffmpeg").mkdir()                       # a directory, not an executable
+        monkeypatch.setenv(tools.TOOLS_DIR_ENV, str(tmp_path))
+        assert tools._find_executable("ffmpeg") != str(tmp_path / "ffmpeg")
+
+    @needs_posix
+    def test_override_directory_is_used_first(self, tmp_path, monkeypatch):
+        from frameguard import tools
+        exe = tmp_path / "ffprobe"
+        exe.write_text("#!/bin/sh\n")
+        exe.chmod(0o755)
+        monkeypatch.setenv(tools.TOOLS_DIR_ENV, str(tmp_path))
+        assert tools._find_executable("ffprobe") == str(exe)
+
+    def test_release_message_names_the_found_version(self):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem("ffmpeg version 8.1.2 Copyright\nlibavfilter    11. 14.102 / 11. 14.102")
+        assert problem.startswith("FFmpeg 8.1.2 is older than 9.0.2"), problem
+
+
+class TestMoreUnits:
+    def test_size_shown_in_mebibytes(self, tmp_path):
+        """104 860 bytes is 0.1000 MiB: shown as 0.1 MB, not 102 KB."""
+        import struct as _s
+        from frameguard import core
+        data = _s.pack(">I4s", 16, b"ftyp") + b"isom" + bytes(4)
+        data += _s.pack(">I4s", 104860 - len(data), b"free") + bytes(104860 - len(data) - 8)
+        path = tmp_path / "sized.mp4"
+        path.write_bytes(data)
+        result = core.QAResult(str(path))
+        core.confirm_container_format(str(path), {"format": {"format_name": "mov,mp4,m4a,3gp,3g2,mj2"}}, result)
+        assert result.checks[0][1:3] == ("PASS", "0.1 MB, container: .mp4 (brand 'isom')"), result.checks
+
+    def test_edit_cap_is_4096(self):
+        import struct as _s
+        from container_fixtures import full_box
+        structure = cc.Structure()
+        body = _s.pack(">I", 4097) + _s.pack(">IihH", 1, 0, 1, 0) * 4097
+        data = full_box(b"elst", 0, 0, body)
+        box = cc.Box(b"elst", 0, len(data), 8, memoryview(data), 8)
+        assert cc.MAX_EDITS == 4096 and len(cc._read_edits(box, structure)) == 4096
+
+    def test_aac_without_a_sample_rate_is_judged_on_its_raw_start(self):
+        probe = _sync_probe(0.002)
+        probe["streams"][1]["sample_rate"] = "0"
+        check, _ = _sync_row(probe)
+        assert check[1] == "PASS" and "priming" not in check[2], check
