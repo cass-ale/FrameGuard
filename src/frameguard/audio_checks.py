@@ -58,6 +58,7 @@ PHASE = "Audio Phase"
 DUAL_MONO = "Dual Mono"
 DC_OFFSET = "DC Offset"
 HUM = "Audio Hum"
+LOW_LEVEL = "Low-Level Audio"
 
 # True peak and clipping follow the delivery-profile enforcement in
 # ``loudness_mode``: "report" (the default) measures and shows them, because
@@ -66,7 +67,7 @@ HUM = "Audio Hum"
 # as file-delivery QC rejects full-scale clipping (Qualify AQ-105, DPP).
 # Everything else is content-dependent and therefore advisory.
 ESSENTIAL_CHECKS = frozenset({TRUE_PEAK, CLIPPING})
-ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM})
+ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM, LOW_LEVEL})
 
 # Severity weights (core.check_severity: weight x confidence, WARN at half)
 # rank a row by the risk that the defect gets the delivery rejected, on
@@ -87,6 +88,9 @@ ADVISORY_CHECKS = frozenset({DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM})
 #   makes dual mono a per-specification limit); reported, rarely rejected.
 # * DC offset 15: inaudible and removed by any high-pass; no delivery
 #   specification rejects it on its own.
+# * Low-level audio 30: dead air with a noise floor is rejected like silence
+#   when it is real, so Audio Silence's weight; judged from content, so
+#   advisory (confidence 60).
 SEVERITY_WEIGHTS = {
     LOUDNESS: 70,
     TRUE_PEAK: 65,
@@ -96,6 +100,7 @@ SEVERITY_WEIGHTS = {
     DUAL_MONO: 20,
     HUM: 20,
     DC_OFFSET: 15,
+    LOW_LEVEL: 30,
 }
 
 PLAIN_SUMMARIES = {
@@ -106,7 +111,11 @@ PLAIN_SUMMARIES = {
     DUAL_MONO: "stereo track is dual mono",
     DC_OFFSET: "audio has a DC offset",
     HUM: "mains hum detected in the audio",
+    LOW_LEVEL: "audio drops to a low level inside the programme",
 }
+
+# The per-track signal rows, in report order.
+SIGNAL_CHECKS = (CLIPPING, DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM, LOW_LEVEL)
 
 # Per-check switches (Settings toggles). Loudness and true peak are governed
 # by ``loudness_mode`` instead.
@@ -117,6 +126,7 @@ CHECK_SWITCHES = {
     DUAL_MONO: "audio_dual_mono_check",
     DC_OFFSET: "audio_dc_offset_check",
     HUM: "audio_hum_check",
+    LOW_LEVEL: "audio_low_level_check",
 }
 
 LOUDNESS_PROFILE_CHOICES = (
@@ -155,6 +165,12 @@ DEFAULT_CONFIG = {
     "phase_min_duration": 1.0,
     "dc_offset_max_db": -50.0,
     "hum_min_db": -65.0,
+    # Advisory low-level tier (low_level_row): segments of at least
+    # silence_duration whose peak stays at or below this level (above the
+    # silence level) and 20 dB or more under the track's own gated level.
+    # -40 dBFS is the silence level of EBU QC item 0078B's worked example.
+    "audio_low_level_check": True,
+    "low_level_noise_db": -40.0,
 }
 
 # Validation ranges for presets (values are interpolated into filter graphs).
@@ -167,6 +183,7 @@ VALUE_RANGES = {
     "phase_min_duration": (0.1, 600.0),
     "dc_offset_max_db": (-120.0, 0.0),
     "hum_min_db": (-120.0, 0.0),
+    "low_level_noise_db": (-90.0, 0.0),
 }
 INTEGER_KEYS = frozenset({"clipping_min_events"})
 ENUM_CHOICES = {"loudness_profile": LOUDNESS_PROFILE_CHOICES,
@@ -181,10 +198,12 @@ CUSTOM_LOUDNESS_KEYS = ("target_loudness_lufs", "loudness_tolerance_lu", "true_p
 # own error band cannot be called a violation with confidence.
 METER_TOLERANCE_LU = 0.1
 METER_TOLERANCE_TP_DB = 0.2
-# The loudnorm fallback, measured on the darwin-arm64 build with EBU Tech
-# 3341 cases 1-6 (fg092_work/audio_ebu): -0.05 LU on steady tones, -0.07 on
-# cases 3-4 and -0.14 on case 5, i.e. outside Tech 3341's +-0.1 on the
-# gating case. Its readings get a 0.2 LU band.
+# The loudnorm fallback's meter reads EBU Tech 3341 cases 1-6 (generated
+# with the Table 1 10 ms fades) -0.05 LU on steady tones, -0.07 on cases 3-4
+# and -0.14 on case 5, identically on FFmpeg 7.0.2, 7.1.1, 8.0.1 and 9.0.2
+# and in stereo without any remap: a property of loudnorm's meter, not of a
+# build, and outside Tech 3341's +-0.1 on the gating case. Its readings get
+# a 0.2 LU band (the worst measured error, rounded up to the next 0.1).
 METER_TOLERANCE_LOUDNORM_LU = 0.2
 LOW_CONFIDENCE = 60
 
@@ -212,22 +231,36 @@ PHASE_INVERTED_SHARE = 0.5    # out of phase for half the active programme
 # +0.37 inverted reads -0.37, a 2.0 LU loss. The value is a setting
 # (phase_correlation_min).
 HUM_FREQUENCIES = (50, 60)
-HUM_HARMONICS = (2, 3)        # at least one must stand out with the fundamental
+HUM_HARMONICS = (2, 3)        # reported as corroboration when they stand out too
 HUM_RATE = 1000               # 180 Hz (3 x 60) is well inside its 500 Hz Nyquist
 # EN 50160 (supply voltage characteristics) holds the mains frequency of an
 # interconnected system to 50 Hz +-1 % (99.5 % of a year); 60 Hz grids are
 # held tighter still. Each band (at the fundamental and at each harmonic,
 # whose tolerance scales with it) is three cascaded biquads with a
 # half-power width of HUM_BAND_SHARE of the band frequency, judged against
-# near bands 2 widths either side: a tone at the band frequency stands out
-# from both, and a tone x widths off ties with the near band at x = 1, so
-# the 6 dB prominence rule accepts tones within 0.86 widths (+-1.03 % of
-# the frequency) and rejects anything further off: a 58.27 Hz bass note
-# (2.9 % below 60 Hz) falls in the near band, not the mains band.
-HUM_BAND_SHARE = 0.012
+# near bands HUM_NEAR_WIDTHS widths away on a log-frequency axis (the
+# biquads are symmetric in log frequency, so the rule treats -1 % and +1 %
+# alike). A tone x widths off ties with a near band at x = 1, and the 6 dB
+# prominence rule accepts tones within 0.86 widths: +-1.3 % of the
+# frequency, so the whole EN 50160 range is inside with margin, while a
+# 58.27 Hz bass note (2.9 % below 60 Hz) falls in the near band.
+HUM_BAND_SHARE = 0.015
 HUM_NEAR_WIDTHS = 2
 HUM_PROMINENCE_DB = 6.0       # mains band at least 6 dB above both near bands
-HUM_STATIONARY_DB = 6.0       # 1 s RMS trough within 6 dB of the mean
+# Mains hum is continuous: it is induced by the supply (its magnetic field,
+# ground-loop currents) for as long as the equipment is powered, at the
+# grid's frequency and at a level fixed by the coupling. A played note,
+# however sustained, has an attack, a decay and an end. So a tone counts as
+# hum when it is in the band, above the floor and at a constant level in at
+# least HUM_CONTINUOUS_SHARE of the 1 s windows; harmonics, when present,
+# are reported as corroboration (the supply waveform and rectifier currents
+# carry them, but filtering or magnetic pickup can leave a near-pure sine).
+# Constant level: with the 6 dB prominence rule, programme leaking into the
+# band adds at most 10*log10(1 + 10^-0.6) = 1.0 dB to a window, so
+# HUM_LEVEL_SPREAD_DB = 2 dB around the median allows that plus the filters'
+# settling; the 10 % of windows spared cover programme that masks the band.
+HUM_CONTINUOUS_SHARE = 0.9
+HUM_LEVEL_SPREAD_DB = 2.0
 EDGE_MARGIN_S = 0.05          # dropouts this close to either end are fades
 # Line-up idents interrupt a steady tone on purpose: GLITS (BBC; also the
 # stereo part of EBU Tech 3304's BLITS) cuts L once and R twice for 250 ms
@@ -237,6 +270,8 @@ EDGE_MARGIN_S = 0.05          # dropouts this close to either end are fades
 # line-up. BLITS' per-channel 5.1 sequence is not recognised.
 LINEUP_GAP_S = (0.20, 0.30)
 GLITS_STEP_S = 0.5            # L gap -> first R gap -> second R gap
+# The detectors place a gap edge to within their averaging (10 ms and 40 ms
+# one-pole tone detector, 5 ms dropout joins): 60 ms covers both edges.
 GLITS_STEP_TOLERANCE_S = 0.06
 LINEUP_TONE_MIN_S = 0.08      # shortest steady-tone stretch the detector reports
 LINEUP_BEFORE_S = 0.15        # the tone must end within this of the gap start
@@ -269,8 +304,7 @@ def check_enabled(cfg: dict, name: str) -> bool:
 
 
 def enabled_signal_checks(cfg: dict) -> List[str]:
-    return [name for name in (CLIPPING, DROPOUTS, PHASE, DUAL_MONO, DC_OFFSET, HUM)
-            if check_enabled(cfg, name)]
+    return [name for name in SIGNAL_CHECKS if check_enabled(cfg, name)]
 
 
 def frame_check_names(cfg: dict, loudness: bool) -> List[str]:
@@ -322,7 +356,9 @@ _PROFILES = {
     # (dialogue_gated_loudness).
     "netflix": LoudnessProfile("netflix", "Netflix", -27.0, 2.0, -2.0, True, 48000,
                                "Netflix Sound Mix Specifications"),
-    # Spotify for Artists (-14 LUFS, -1 dBTP); tolerance +-1 LU inferred.
+    # Spotify for Artists (-14 LUFS, -1 dBTP). Spotify publishes no tolerance
+    # (it re-gains playback to -14); +-1 LU is EBU R 128's widest permitted
+    # deviation, the same band as Apple Podcasts / AES TD1006 below.
     "streaming": LoudnessProfile("streaming", "Streaming -14", -14.0, 1.0, -1.0, False, None,
                                  "Spotify for Artists"),
     # Apple Podcasts / AES TD1006 Annex D: -16 LUFS +-1 LU, -1 dBTP.
@@ -799,9 +835,9 @@ def _hum_bands() -> List[Tuple[str, float, float]]:
         for harmonic in (1,) + HUM_HARMONICS:
             centre = freq * harmonic
             width = HUM_BAND_SHARE * centre
-            near = HUM_NEAR_WIDTHS * width
-            for tag, offset in (("c", 0.0), ("l", -near), ("u", near)):
-                bands.append((_hum_band_name(freq, harmonic, tag), centre + offset, width))
+            ratio = 1 + HUM_NEAR_WIDTHS * HUM_BAND_SHARE   # log-symmetric near bands
+            for tag, factor in (("c", 1.0), ("l", 1 / ratio), ("u", ratio)):
+                bands.append((_hum_band_name(freq, harmonic, tag), centre * factor, width * factor))
     return bands
 
 
@@ -918,9 +954,13 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
                 f"pan=stereo|c0=c{left}+c{right}|c1=c{left}-c{right},aformat=sample_fmts=dblp,"
                 f"astats@a{i}p{j}=measure_perchannel={_PAIR_STATS}:measure_overall=none")))
     if loudness and ambisonic:
-        # W only: BS.1770-5 defines no scene-based method; summing B-format
-        # components over-reads by ~3.5 LU (benchmark F13). Head-locked
-        # stereo is an ordinary stereo programme and is measured as one.
+        # W only: BS.1770-5 defines no scene-based method. W is the
+        # omnidirectional pressure; X, Y and Z describe the same field by
+        # direction, and in SN3D their energies sum to W's for any plane
+        # wave (sin^2 + cos^2 = 1), so measuring the four as loudspeaker feeds
+        # counts the field twice: +3.0 dB, more where a component lands on a
+        # channel weighted as a surround (1.41). Head-locked stereo is an ordinary
+        # stereo programme and is measured as one.
         branches.append((f"a{i}w", f"pan=mono|c0=c0,ebur128@a{i}w=peak=true:framelog=quiet"))
         if names[-2:] == ["HL-L", "HL-R"]:
             left, right = len(names) - 2, len(names) - 1
@@ -949,7 +989,28 @@ def track_graphs(position: int, track: dict, names: Sequence[str], cfg: dict,
     hum = _hum_chains(i, names, cfg, ambisonic, files, lfe)
     if hum:
         units.append(MeasurementUnit(source, f"[a{i}h]", hum))
+    if check_enabled(cfg, LOW_LEVEL):
+        units.append(MeasurementUnit(source, f"[a{i}v]", [_level_chain(i, track, files)]))
     return TrackGraphs(summary, units)
+
+
+# BS.1770's gating block: the level series of the low-level tier uses the
+# same 400 ms blocks the loudness gate does.
+LOW_LEVEL_BLOCK_S = 0.4
+# EBU Tech 3342 (loudness range) treats short-term loudness more than 20 LU
+# below the programme's gated level as not programme (its relative gate):
+# a stretch that far under the track's own gated level is not quiet
+# programme but a drop out of it.
+LOW_LEVEL_MARGIN_DB = 20.0
+
+
+def _level_chain(i: int, track: dict, files: Optional[MeasurementFiles]) -> str:
+    """``[a<N>v]``: per-channel RMS and peak of every 400 ms block, to a file."""
+    rate = _whole(track.get("sample_rate"), 48000) or 48000
+    block = max(1, int(round(LOW_LEVEL_BLOCK_S * rate)))
+    return (f"[a{i}v]asetnsamples=n={block}:p=0,astats@a{i}v=metadata=1:reset=1"
+            f":measure_perchannel=RMS_level+Peak_level:measure_overall=none"
+            + _record(f"astats@a{i}v", files) + ",anullsink")
 
 
 def track_filter_chains(position: int, track: dict, names: Sequence[str], cfg: dict,
@@ -1020,11 +1081,16 @@ def loudness_meter(track: dict, count: int, multichannel_meter: str,
 class MeterSelfTest:
     """What a known-answer run says about this FFmpeg's meters (see
     meter_self_test_command): the >2-channel ebur128 loudness, the remapped
-    loudnorm fallback, and the true-peak error in dB (positive: over-reads)."""
+    loudnorm fallback, and the true-peak error in dB (positive: reads high)."""
 
     ebur128_multichannel: bool
     loudnorm: bool
     true_peak_error_db: float = 0.0
+
+    @property
+    def true_peak_ok(self) -> bool:
+        """Within EBU Tech 3341's true-peak tolerance, +0.2 / -0.4 dB."""
+        return -TRUE_PEAK_ALLOWED_UNDER_DB <= self.true_peak_error_db <= TRUE_PEAK_ALLOWED_OVER_DB
 
 
 # EBU Tech 3341 V4 case 6 (5.0: L, R -28 dBFS, C -24, Ls, Rs -30; 1 kHz) reads
@@ -1033,9 +1099,12 @@ class MeterSelfTest:
 # surround weighting, the LFE exclusion and the channel order.
 _SELF_TEST_CASE6 = {"FL": -28.0, "FR": -28.0, "FC": -24.0, "BL": -30.0, "BR": -30.0}
 SELF_TEST_TOLERANCE_LU = 0.1          # Tech 3341 table 1
-# True peak: continuous sines at 0.5 FS (true peak -6.02 dBTP) at 12 kHz,
-# 45 degrees (Tech 3341 case 16's shape) and 16 kHz, 0 degrees - where
-# interpolation errors are largest. Tech 3341 allows +0.2 / -0.4 dB.
+# True peak: sines at 0.5 FS (true peak -6.02 dBTP) at 12 kHz, 45 degrees
+# (Tech 3341 case 16's shape) and 16 kHz, 0 degrees - where interpolation
+# errors are largest - with Tech 3341's 10 ms fade-in and fade-out (Table 1).
+# Without the fade, the onset and end transients are real inter-sample peaks
+# above the steady sine (every build reads them about +1 dB), so the test
+# would measure the signal, not the meter. Tech 3341 allows +0.2 / -0.4 dB.
 _SELF_TEST_PEAK_DBTP = 20 * math.log10(0.5)
 TRUE_PEAK_ALLOWED_OVER_DB, TRUE_PEAK_ALLOWED_UNDER_DB = 0.2, 0.4
 
@@ -1051,9 +1120,12 @@ def meter_self_test_command(ffmpeg: str, seconds: float = 3.0) -> List[str]:
         else:
             exprs.append(f"{10 ** (_SELF_TEST_CASE6[name] / 20):.9f}*sin(2*PI*1000*t)")
     mapping = loudnorm_mapping({"channel_layout": "5.1"}, names)
-    graph = (f"[0:a]asplit[m][f];[m]ebur128@a0=framelog=quiet[o0];"
+    # Raised-cosine (hsin) 10 ms fades on both inputs, as Tech 3341 requires.
+    fade = (f"afade=t=in:d=0.01:curve=hsin,"
+            f"afade=t=out:st={seconds - 0.01:g}:d=0.01:curve=hsin")
+    graph = (f"[0:a]{fade},asplit[m][f];[m]ebur128@a0=framelog=quiet[o0];"
              f"[f]{mapping},loudnorm@a0=print_format=json[o1];"
-             f"[1:a]ebur128@a1=peak=true:framelog=quiet[o2]")
+             f"[1:a]{fade},ebur128@a1=peak=true:framelog=quiet[o2]")
     return [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-filter_complex_threads", "1",
             "-f", "lavfi", "-i", f"aevalsrc=exprs='{'|'.join(exprs)}':s=48000:d={seconds:g}:c=5.1",
             "-f", "lavfi", "-i", f"aevalsrc=exprs='0.5*sin(2*PI*12000*t+PI/4)|0.5*sin(2*PI*16000*t)'"
@@ -1082,7 +1154,7 @@ _EVIDENCE_RE = re.compile(r"\[astats@a\d+[sp]\d* @ |\[loudnorm@a\d+ @ "
 # are diagnostics, not evidence (with thousands of dropouts they would
 # otherwise crowd the summaries out of the bounded capture).
 _FILE_ROUTED_RE = re.compile(r"\[(?:silencedetect@a\d+[a-z]?\d*|aphasemeter@a\d+p\d+"
-                             r"|astats@a\d+h\d+(?:x\d)?[clu]) @ ")
+                             r"|astats@a\d+h\d+(?:x\d)?[clu]|astats@a\d+v) @ ")
 
 
 def is_file_routed_line(line: str) -> bool:
@@ -1517,26 +1589,6 @@ def _programme_row(measured: dict, ctx: TrackContext, cfg: dict,
     return status, _with_label(ctx.label, text), confidence
 
 
-def _true_peak_tolerance(ctx: TrackContext) -> Tuple[float, str]:
-    """(dB band within which an over is low-confidence, note for the row).
-    Tech 3341's +0.2 dB, widened by what this binary's self-test over-read
-    beyond it (the darwin-arm64 9.0.2 build reads 12-16 kHz about 1 dB
-    high). An under-read beyond Tech 3341's -0.4 is named in the row."""
-    test = ctx.meter_self_test
-    if test is None:
-        return METER_TOLERANCE_TP_DB, ""
-    error = test.true_peak_error_db
-    if error > TRUE_PEAK_ALLOWED_OVER_DB:
-        return (error + METER_TOLERANCE_TP_DB,
-                f" (this FFmpeg build's true-peak meter over-reads high frequencies by up to "
-                f"{error:.1f} dB in its self-test)")
-    if error < -TRUE_PEAK_ALLOWED_UNDER_DB:
-        return (METER_TOLERANCE_TP_DB,
-                f" (this FFmpeg build's true-peak meter under-reads high frequencies by up to "
-                f"{-error:.1f} dB in its self-test)")
-    return METER_TOLERANCE_TP_DB, ""
-
-
 def true_peak_row(measured: Optional[dict], ctx: TrackContext, cfg: dict,
                   sample_peak: Optional[float] = None) -> Row:
     """True peak against the profile maximum (``sample_peak`` from astats
@@ -1551,17 +1603,39 @@ def true_peak_row(measured: Optional[dict], ctx: TrackContext, cfg: dict,
         return "PASS", _with_label(ctx.label, "No signal (true peak -inf dBTP)."), 100
     sample_text = (f", sample peak {sample:.1f} dBFS" if sample is not None and math.isfinite(sample)
                    else "")
-    tolerance, meter_note = _true_peak_tolerance(ctx)
-    measured_text = f"true peak {peak:+.1f} dBTP{sample_text}{meter_note}"
+    measured_text = f"true peak {peak:+.1f} dBTP{sample_text}"
+    test = ctx.meter_self_test
+    if test is not None and not test.true_peak_ok:
+        return _true_peak_unverified(test, sample, ctx, cfg, profile)
     limit_text = f"{profile.label} max {profile.true_peak_max:g} dBTP"
     if mode == "report":
         return "PASS", _with_label(ctx.label, f"{measured_text}; not enforced ({limit_text})"), 100
     margin = peak - profile.true_peak_max
     if margin <= 0:
         return "PASS", _with_label(ctx.label, f"{measured_text}, within {limit_text}"), 100
-    confidence = _violation_confidence(margin, tolerance)
+    confidence = _violation_confidence(margin, METER_TOLERANCE_TP_DB)
+    if sample is not None and math.isfinite(sample) and sample > profile.true_peak_max:
+        # The true peak is never below the sample peak: the samples alone prove it.
+        confidence = 95
     status = "FAIL" if mode == "essential" else "WARN"
     return status, _with_label(ctx.label, f"{measured_text} exceeds the {limit_text} by {margin:.1f} dB"), confidence
+
+
+def _true_peak_unverified(test: "MeterSelfTest", sample: Optional[float], ctx: TrackContext,
+                          cfg: dict, profile: LoudnessProfile) -> Row:
+    """This binary's true peak missed its Tech 3341 self-test: its reading
+    vouches for nothing, but a sample peak over the limit still proves an
+    over (the true peak is never below the sample peak)."""
+    mode = cfg.get("loudness_mode", "report")
+    limit_text = f"{profile.label} max {profile.true_peak_max:g} dBTP"
+    if (mode in ("advisory", "essential") and sample is not None and math.isfinite(sample)
+            and sample > profile.true_peak_max):
+        status = "FAIL" if mode == "essential" else "WARN"
+        return status, _with_label(ctx.label, f"sample peak {sample:.1f} dBFS exceeds the {limit_text}, "
+                                              f"so the true peak does too"), 95
+    return "WARN", _with_label(ctx.label, f"Not verified: this FFmpeg build's true-peak meter missed its "
+                                          f"EBU Tech 3341 self-test by {test.true_peak_error_db:+.1f} dB "
+                                          f"(allowed +0.2 / -0.4)."), 100
 
 
 # ---------------------------------------------------------------------------
@@ -2005,10 +2079,17 @@ def channel_silence_entries(evidence: ScanEvidence, ctx: TrackContext, cfg: dict
     return texts
 
 
+# The bands' start-up transient: each biquad pole pair decays with
+# tau = 1 / (pi * width), 0.42 s for the narrowest band (0.75 Hz at 50 Hz),
+# and three cascaded stages take about 2 s to come within 1 dB, longer for
+# a tone off the band centre (it beats with the decaying transient).
+HUM_SETTLE_WINDOWS = 2
+
+
 def _band_windows(evidence: ScanEvidence, instance: str) -> List[float]:
-    """1 s RMS levels (dBFS) of a hum band, from its file. The first window
-    is dropped when there are three or more: the 2 Hz filters ring up over
-    about half a second."""
+    """1 s RMS levels (dBFS) of a hum band, from its file, without the
+    windows the filters are still settling in (HUM_SETTLE_WINDOWS; one
+    window is always kept)."""
     text = evidence.files.read(instance) if evidence.files else None
     if text is None:
         raise EvidenceMissing(instance)
@@ -2016,7 +2097,7 @@ def _band_windows(evidence: ScanEvidence, instance: str) -> List[float]:
     for match in re.finditer(r"RMS_level=(\S+)", text):
         value = _to_float(match.group(1))
         levels.append(value if value is not None else -math.inf)
-    return levels[1:] if len(levels) >= 3 else levels
+    return levels[min(HUM_SETTLE_WINDOWS, max(0, len(levels) - 1)):]
 
 
 def _mean_level(levels: Sequence[float]) -> Optional[float]:
@@ -2026,69 +2107,187 @@ def _mean_level(levels: Sequence[float]) -> Optional[float]:
     return 10 * math.log10(power) if power > 0 else -math.inf
 
 
+def _band_series(evidence: ScanEvidence, ctx: TrackContext, freq: int, harmonic: int
+                 ) -> Dict[str, List[float]]:
+    return {tag: _band_windows(evidence, f"astats@a{ctx.position}h{_hum_band_name(freq, harmonic, tag)}")
+            for tag in ("c", "l", "u")}
+
+
+def _prominence(level: float, near: Sequence[float]) -> float:
+    return level - max(n if math.isfinite(n) else -math.inf for n in near)
+
+
 def _band_prominence(evidence: ScanEvidence, ctx: TrackContext, freq: int, harmonic: int
-                     ) -> Tuple[Optional[float], Optional[float], List[float]]:
-    """(level dBFS, prominence over the near bands dB, 1 s windows) of one band."""
-    windows = {tag: _band_windows(evidence, f"astats@a{ctx.position}h{_hum_band_name(freq, harmonic, tag)}")
-               for tag in ("c", "l", "u")}
-    level = _mean_level(windows["c"])
-    near = [_mean_level(windows[t]) for t in ("l", "u")]
+                     ) -> Tuple[Optional[float], Optional[float]]:
+    """(mean level dBFS, prominence over the near bands dB) of one band."""
+    series = _band_series(evidence, ctx, freq, harmonic)
+    level = _mean_level(series["c"])
+    near = [_mean_level(series[t]) for t in ("l", "u")]
     if level is None or any(n is None for n in near):
-        return None, None, []
+        return None, None
     if not math.isfinite(level):
-        return level, None, windows["c"]
-    return level, level - max(n if math.isfinite(n) else -math.inf for n in near), windows["c"]
+        return level, None
+    return level, _prominence(level, near)
+
+
+def _continuity(series: Dict[str, List[float]], floor: float) -> Tuple[int, int, Optional[float]]:
+    """(windows holding the tone at a constant level, windows, median level):
+    a window holds it when the band is above the floor, stands
+    HUM_PROMINENCE_DB above both near bands and lies within
+    HUM_LEVEL_SPREAD_DB of the median of such windows."""
+    windows = list(zip(series["c"], series["l"], series["u"]))
+    present = [c for c, lo, up in windows
+               if math.isfinite(c) and c >= floor and _prominence(c, (lo, up)) >= HUM_PROMINENCE_DB]
+    if not present:
+        return 0, len(windows), None
+    median = sorted(present)[len(present) // 2]
+    steady = sum(1 for c in present if abs(c - median) <= HUM_LEVEL_SPREAD_DB)
+    return steady, len(windows), median
 
 
 def hum_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
-    """Mains hum: a steady tone at 50 or 60 Hz, within the mains tolerance,
-    with its harmonic series.
-
-    The fundamental band must stand ``HUM_PROMINENCE_DB`` above both near
-    bands (broadband programme fills all three alike; a tone off the mains
-    frequency fills a near band; see HUM_BAND_SHARE), sit above
-    ``hum_min_db``, and be steady: its quietest 1 s window within 6 dB of
-    its mean, which a bass line or a passing note is not. At least one of
-    the 2nd and 3rd harmonics must stand out the same way: hum is induced
-    by the supply and by transformer and rectifier currents, whose waveform
-    is never a pure sine (EN 50160 itself bounds the supply's 3rd harmonic
-    at 5 %), whereas a lone sine at 50/60 Hz is a test tone or a synth note.
-    The -65 dBFS floor is inferred, so the result is advisory (confidence
+    """Mains hum: a tone within the mains tolerance of 50 or 60 Hz
+    (HUM_BAND_SHARE) that is continuous at a constant level for most of the
+    track (HUM_CONTINUOUS_SHARE). The 2nd and 3rd harmonics, when they stand
+    out too, are reported as corroboration. A tone in the band that comes
+    and goes or changes level is a note, not hum. The floor (hum_min_db,
+    -65 dBFS) is where hum stops being audible: at the SMPTE RP 200
+    monitoring calibration (-20 dBFS = 85 dB SPL) -65 dBFS is 40 dB SPL,
+    at the ISO 226 threshold of hearing for 50-63 Hz (about 37-44 dB SPL).
+    Content can mask or mimic hum, so the result is advisory (confidence
     below 70).
     """
     floor = _number(cfg, "hum_min_db")
-    found, measured, lone = [], [], []
+    found, measured, notes = [], [], []
     for freq in HUM_FREQUENCIES:
-        level, prominence, windows = _band_prominence(evidence, ctx, freq, 1)
-        if level is None:
+        series = _band_series(evidence, ctx, freq, 1)
+        level = _mean_level(series["c"])
+        if level is None or any(_mean_level(series[t]) is None for t in ("l", "u")):
             continue
         if not math.isfinite(level):
             measured.append(f"{freq} Hz silent")
             continue
         measured.append(f"{freq} Hz {level:.1f} dBFS")
-        trough = min(windows)
-        steady = math.isfinite(trough) and level - trough <= HUM_STATIONARY_DB
-        if not (level >= floor and prominence >= HUM_PROMINENCE_DB and steady):
+        steady, total, median = _continuity(series, floor)
+        if median is None:
+            continue
+        if steady < HUM_CONTINUOUS_SHARE * total:
+            notes.append(f"a {freq} Hz tone at a constant level in only {steady} of {total} s "
+                         f"(a note, not mains hum)")
             continue
         harmonics = []
         for harmonic in HUM_HARMONICS:
-            h_level, h_prominence, _ = _band_prominence(evidence, ctx, freq, harmonic)
+            h_level, h_prominence = _band_prominence(evidence, ctx, freq, harmonic)
             if h_prominence is not None and h_prominence >= HUM_PROMINENCE_DB:
                 harmonics.append(f"{freq * harmonic} Hz at {h_level:.1f} dBFS")
-        if harmonics:
-            found.append(f"{freq} Hz tone at {level:.1f} dBFS, {prominence:.1f} dB above the bands "
-                         f"±{HUM_NEAR_WIDTHS * HUM_BAND_SHARE * 100:.1f} % away, steady throughout, "
-                         f"with harmonic(s) {', '.join(harmonics)}")
-        else:
-            lone.append(f"{freq} Hz")
+        corroboration = f", with harmonic(s) {', '.join(harmonics)}" if harmonics else ", no harmonics"
+        found.append(f"{freq} Hz tone at {median:.1f} dBFS in the mains band (EN 50160 ±1 %), "
+                     f"constant in {steady} of {total} s{corroboration}")
     if not measured:
         return "WARN", _with_label(ctx.label, "Not verified: hum bands were not measured."), 100
     if found:
         return "WARN", _with_label(ctx.label, "Possible mains hum: " + "; ".join(found) + "."), LOW_CONFIDENCE
-    lone_text = (f"; steady {' and '.join(lone)} tone without a 2nd or 3rd harmonic (a test tone or "
-                 f"note, not mains hum)" if lone else "")
+    note_text = "; " + "; ".join(notes) if notes else ""
     return "PASS", _with_label(ctx.label, f"No mains hum ({', '.join(measured)}; floor {floor:g} "
-                                          f"dBFS){lone_text}."), 100
+                                          f"dBFS){note_text}."), 100
+
+
+_BLOCK_RE = re.compile(r"pts_time:(\S+)")
+_CHANNEL_STAT_RE = re.compile(r"lavfi\.astats\.(\d+)\.(RMS_level|Peak_level)=(\S+)")
+
+
+def _level_blocks(evidence: ScanEvidence, ctx: TrackContext) -> List[Tuple[float, Dict[int, Dict[str, float]]]]:
+    """(start s, {channel: {"RMS_level", "Peak_level"}}) per 400 ms block."""
+    instance = f"astats@a{ctx.position}v"
+    text = evidence.files.read(instance) if evidence.files else None
+    if text is None:
+        raise EvidenceMissing(instance)
+    blocks: List[Tuple[float, Dict[int, Dict[str, float]]]] = []
+    for line in text.splitlines():
+        start = _BLOCK_RE.search(line)
+        if start:
+            blocks.append((_to_float(start.group(1)) or 0.0, {}))
+            continue
+        stat = _CHANNEL_STAT_RE.search(line)
+        if stat and blocks:
+            value = _to_float(stat.group(3))
+            blocks[-1][1].setdefault(int(stat.group(1)) - 1, {})[stat.group(2)] = (
+                value if value is not None else -math.inf)
+    return blocks
+
+
+def _gated_level(powers: Sequence[float]) -> Optional[float]:
+    """BS.1770's two-stage gate on block powers (absolute -70, relative -10 dB),
+    in dB; None when no block passes."""
+    def mean_db(values):
+        return 10 * math.log10(sum(values) / len(values)) if values else None
+    absolute = [p for p in powers if p > 10 ** -7]
+    first = mean_db(absolute)
+    if first is None:
+        return None
+    relative = [p for p in absolute if 10 * math.log10(p) > first - 10.0]
+    return mean_db(relative)
+
+
+def low_level_row(evidence: ScanEvidence, ctx: TrackContext, cfg: dict) -> Row:
+    """Advisory tier below Audio Silence: dead air with a noise floor.
+
+    Silence (essential) is everything at or below ``silence_noise_db``. A
+    stretch above it but with every peak at or below ``low_level_noise_db``
+    (-40 dBFS, EBU QC 0078B's worked example) for at least
+    ``silence_duration`` is reported when it also sits LOW_LEVEL_MARGIN_DB
+    under the track's own gated level and has programme on both sides: a
+    drop out of the programme. Level alone cannot tell dead air from quiet
+    room tone, so a track that is quiet throughout (its gated level is its
+    own floor), a lead-in or a run-out is not flagged. Levels are the
+    unweighted power sum of the non-LFE channels (W for ambisonics), gated
+    like BS.1770, so the reference and the stretch share one scale.
+    """
+    blocks = _level_blocks(evidence, ctx)
+    channels = [0] if ctx.ambisonic else [k for k in range(len(ctx.names)) if k not in ctx.lfe]
+    ceiling = _number(cfg, "low_level_noise_db")
+    floor = float(cfg.get("silence_noise_db", -70.0))
+    longest = float(cfg["silence_duration"])
+    series = []
+    for start, stats in blocks:
+        rms = [stats.get(k, {}).get("RMS_level", -math.inf) for k in channels]
+        peak = max((stats.get(k, {}).get("Peak_level", -math.inf) for k in channels), default=-math.inf)
+        power = sum(10 ** (r / 10.0) for r in rms if math.isfinite(r))
+        series.append((start, power, peak))
+    if not series:
+        return "WARN", _with_label(ctx.label, "Not verified: no level blocks were measured."), 100
+    reference = _gated_level([p for _, p, _ in series])
+    limit_text = (f"peak ≤ {ceiling:g} dBFS and {LOW_LEVEL_MARGIN_DB:g} dB or more under the "
+                  f"programme")
+    if reference is None:
+        return "PASS", _with_label(ctx.label, f"No programme level to compare against ({limit_text})."), 100
+    low = [floor < peak <= ceiling and power > 0 and 10 * math.log10(power) <= reference - LOW_LEVEL_MARGIN_DB
+           for _, power, peak in series]
+    segments = []
+    k = 0
+    while k < len(series):
+        if not low[k]:
+            k += 1
+            continue
+        end = k
+        while end + 1 < len(series) and low[end + 1]:
+            end += 1
+        inside = k > 0 and end < len(series) - 1          # programme on both sides
+        duration = (series[end + 1][0] if end + 1 < len(series) else series[end][0] + LOW_LEVEL_BLOCK_S) \
+            - series[k][0]
+        if inside and duration >= longest:
+            level = 10 * math.log10(sum(p for _, p, _ in series[k:end + 1]) / (end + 1 - k))
+            segments.append((series[k][0], duration, level))
+        k = end + 1
+    if not segments:
+        return "PASS", _with_label(ctx.label, f"No low-level stretch inside the programme ({limit_text}, "
+                                              f"gated level {reference:.1f} dBFS)."), 100
+    shown = ", ".join(f"{_timecode(s)} ({d:.1f}s at {lvl:.1f} dBFS)" for s, d, lvl in segments[:5])
+    if len(segments) > 5:
+        shown += f", +{len(segments) - 5} more"
+    return "WARN", _with_label(ctx.label, f"{len(segments)} low-level stretch(es) inside the programme "
+                                          f"({limit_text}, gated level {reference:.1f} dBFS): {shown}. "
+                                          f"Dead air or an intended pause?"), LOW_CONFIDENCE
 
 
 # ---------------------------------------------------------------------------
@@ -2128,6 +2327,7 @@ def signal_rows(evidence: ScanEvidence, contexts: List[TrackContext], cfg: dict)
             PHASE: lambda: phase_row(evidence, ctx, cfg),
             DUAL_MONO: lambda: dual_mono_row(evidence, ctx, cfg),
             HUM: lambda: hum_row(evidence, ctx, cfg),
+            LOW_LEVEL: lambda: low_level_row(evidence, ctx, cfg),
         }
         for name in rows:
             if name in LOG_DERIVED and not evidence.log_complete:

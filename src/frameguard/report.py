@@ -1084,9 +1084,13 @@ def _audio_signal_spec(c: dict) -> str:
         parts.append(f"phase below {float(c.get('phase_correlation_min', -0.2)):g} correlation")
     if on("audio_dual_mono_check"):
         parts.append("dual mono allowed" if c.get("dual_mono_allowed") else "dual mono warns")
+    if on("audio_low_level_check"):
+        parts.append(f"low-level below {float(c.get('low_level_noise_db', -40.0)):g} dBFS and "
+                     f"20 dB under the programme")
     off = [label for key, label in (("audio_clipping_check", "clipping"), ("audio_dropout_check", "dropouts"),
                                     ("audio_phase_check", "phase"), ("audio_dual_mono_check", "dual mono"),
-                                    ("audio_dc_offset_check", "DC offset"), ("audio_hum_check", "hum"))
+                                    ("audio_dc_offset_check", "DC offset"), ("audio_hum_check", "hum"),
+                                    ("audio_low_level_check", "low-level audio"))
            if not on(key)]
     if off:
         parts.append("off: " + ", ".join(off))
