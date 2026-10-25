@@ -1511,6 +1511,15 @@ def _trim_window_edges(window_gaps: list) -> list:
 CFR_TICK_SLACK = 1.5
 CFR_MIN_SLACK_S = 0.0001
 CFR_INTERVAL_TOLERANCE = 0.25
+# Timestamps can carry an earlier container's rounding too: a -c copy remux
+# of a Matroska file (1 ms grid) to MP4 re-expresses 33/34 ms gaps in a
+# 1/16000 time base. The grid actually used is measured as the largest step
+# every presented timestamp is a whole multiple of (in ticks), and rounding
+# to it moves a gap by at most one step. Only grids up to CFR_MAX_GRID_S
+# count: Matroska's default 1 ms TimestampScale is the coarsest in common
+# use (MP4/MOV, MPEG-TS and MXF time bases are finer), so gaps that happen
+# to share a coarser step are cadence, not rounding.
+CFR_MAX_GRID_S = 0.001
 
 
 def _nominal_interval(video: Optional[dict]) -> Optional[float]:
@@ -1536,34 +1545,95 @@ def _time_base_tick(video: Optional[dict]) -> Optional[float]:
     return tick if tick > 0 else None
 
 
+def _timestamp_grid(timing: FrameTiming, tick: Optional[float]) -> float:
+    """The rounding step of the presented timestamps, in seconds (see CFR_MAX_GRID_S).
+
+    The largest whole number of ticks that divides every timestamp's offset
+    from its window's first one; 0 when no such step up to CFR_MAX_GRID_S
+    exists (or the time base is unknown).
+    """
+    if not tick:
+        return 0.0
+    limit = int(CFR_MAX_GRID_S / tick + 1e-9)
+    if limit < 1:
+        return 0.0
+    step = 0
+    for window in timing.windows:
+        if not window:
+            continue
+        first = window[0]
+        for t in window[1:]:
+            step = math.gcd(step, abs(int(round((t - first) / tick))))
+            if step == 1:
+                return tick
+    if step == 0:
+        return 0.0
+    # The largest divisor of the common step that is still a plausible grid.
+    best = 1
+    for d in range(1, int(math.isqrt(step)) + 1):
+        if step % d == 0:
+            for c in (d, step // d):
+                if c <= limit and c > best:
+                    best = c
+    return best * tick
+
+
 def _interval_stats(timing: FrameTiming, nominal: Optional[float] = None,
                     tick: Optional[float] = None
-                    ) -> Tuple[Optional[float], int, int, List[Tuple[float, float]]]:
-    """(reference interval, total intervals, irregular count, irregular samples).
+                    ) -> Tuple[Optional[float], int, int, List[Tuple[float, float]],
+                               List[Tuple[float, float]], List[Tuple[float, float]]]:
+    """(reference interval, total intervals, irregular count, irregular samples,
+    dropped-frame gaps, duplicated-frame gaps).
 
     The reference is the stream's nominal interval (1 / its declared rational
     rate) when that matches how the frames are actually spaced (the mean
-    interval within the tolerance), else the measured mean interval. A gap
-    more than the timestamp resolution allows away from it (see
-    CFR_TICK_SLACK) is irregular: jitter, a dropped/held frame or a rate
-    change. (0.9.1 took the
-    mode of 0.1 ms-rounded gaps, which jitter scatters: +-0.2-frame jitter
-    then read as a constant "24.4 fps".)
+    interval within the tolerance), else the median interval. A gap is
+    regular when it is within the slack of the reference: one rounding step
+    of the timestamps (the larger of the time base tick x CFR_TICK_SLACK and
+    the measured timestamp grid plus a tick), never less than
+    CFR_MIN_SLACK_S nor more than CFR_INTERVAL_TOLERANCE of the interval. A
+    gap within the same slack of a whole number k >= 2 of intervals is k - 1
+    dropped frames, and a gap of (about) zero a duplicated frame, when the
+    gaps on both sides are regular (several in a row are a new cadence).
+    Anything else is irregular: jitter or a rate change. (0.9.1 took the mode of
+    0.1 ms-rounded gaps, which jitter scatters: +-0.2-frame jitter then read
+    as a constant "24.4 fps".)
     """
     gaps = []
     for window in timing.windows:
         gaps.extend(_trim_window_edges([(b, b - a) for a, b in zip(window, window[1:])]))
-    positive = [d for _, d in gaps if d > 0]
+    positive = sorted(d for _, d in gaps if d > 0)
     if not positive:
-        return None, len(gaps), len(gaps), gaps[:6]
+        return None, len(gaps), len(gaps), gaps[:6], [], []
     mean = sum(positive) / len(positive)
-    reference = mean
+    reference = positive[len(positive) // 2]
     if nominal and abs(mean - nominal) <= nominal * CFR_INTERVAL_TOLERANCE:
         reference = nominal
-    slack = min(reference * CFR_INTERVAL_TOLERANCE,
-                max(CFR_MIN_SLACK_S, CFR_TICK_SLACK * tick if tick else CFR_MIN_SLACK_S))
-    irregular = [(t, d) for t, d in gaps if abs(d - reference) > slack]
-    return reference, len(gaps), len(irregular), irregular
+    tick_slack = CFR_TICK_SLACK * tick if tick else 0.0
+    grid = _timestamp_grid(timing, tick)
+    rounding = max(tick_slack, grid + (tick or 0.0)) if grid else tick_slack
+    slack = min(reference * CFR_INTERVAL_TOLERANCE, max(CFR_MIN_SLACK_S, rounding))
+    kinds = []
+    for t, d in gaps:
+        whole = int(round(d / reference)) if reference else 0
+        if abs(d - reference) <= slack:
+            kinds.append("regular")
+        elif abs(d) <= slack:
+            kinds.append("duplicated")
+        elif whole >= 2 and abs(d - whole * reference) <= slack:
+            kinds.append("dropped")
+        else:
+            kinds.append("irregular")
+    # A drop or a repeat interrupts the cadence once; whole-frame gaps in a
+    # row are a different cadence (a rate change), i.e. irregular.
+    for k, kind in enumerate(kinds):
+        if kind in ("dropped", "duplicated") and any(
+                0 <= j < len(kinds) and kinds[j] != "regular" for j in (k - 1, k + 1)):
+            kinds[k] = "run"
+    irregular = [g for g, kind in zip(gaps, kinds) if kind in ("irregular", "run")]
+    dropped = [g for g, kind in zip(gaps, kinds) if kind == "dropped"]
+    duplicated = [g for g, kind in zip(gaps, kinds) if kind == "duplicated"]
+    return reference, len(gaps), len(irregular), irregular, dropped, duplicated
 
 
 def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
@@ -1583,7 +1653,7 @@ def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
         result.add_not_verified("CFR Check", "packet timestamps could not be read.")
         return
     video = _primary_video_stream(probe_data)
-    dominant, total, irregular, samples = _interval_stats(
+    dominant, total, irregular, samples, dropped, duplicated = _interval_stats(
         timing, _nominal_interval(video), _time_base_tick(video))
     if dominant is None or total < 2:
         result.add_not_verified("CFR Check", f"too few frames to measure timing ({timing.packet_count} packets).")
@@ -1596,6 +1666,30 @@ def check_cfr(probe_data: dict, result: QAResult, cfg: dict,
     result.set_metadata("fps_deviation", round(ratio, 4))
     scope = f"; {timing.description}" if timing.sampled else ""
     where = ", ".join(f"{_timecode(t)} ({d * 1000:.0f} ms)" for t, d in samples[:6])
+    lost = sum(int(round(d / dominant)) - 1 for _, d in dropped)
+    if dropped or duplicated:
+        result.set_metadata("dropped_frames", lost)
+        result.set_metadata("duplicated_frames", len(duplicated))
+    if irregular == 0 and (dropped or duplicated):
+        # Whole-frame gaps or repeated timestamps on an otherwise constant
+        # cadence: frames lost or doubled, not a variable rate. Judged like
+        # irregular intervals: one is a warning, more than vfr_threshold of
+        # the intervals fails (when the spec requires a constant rate).
+        parts = []
+        if dropped:
+            parts.append(f"{lost} dropped frame(s) (timestamp gaps of whole frames)")
+        if duplicated:
+            parts.append(f"{len(duplicated)} duplicated frame(s) (repeated timestamps)")
+        events = sorted(dropped + duplicated)
+        where = ", ".join(f"{_timecode(t)} ({d * 1000:.0f} ms)" for t, d in events[:6])
+        detail = (f"{' and '.join(parts)} in a constant {measured_fps:.3f} fps cadence. "
+                  f"First at: {where}{scope}")
+        share = len(events) / total
+        if len(events) > 1 and share > float(cfg.get("vfr_threshold", 0.01)) and cfg.get("require_cfr", True):
+            result.add_fail("CFR Check", detail[0].upper() + detail[1:])
+        else:
+            result.add_warn("CFR Check", detail[0].upper() + detail[1:], confidence=85)
+        return
     if irregular == 0:
         result.add_pass("CFR Check", f"Constant frame rate: {total} intervals of "
                                      f"{dominant * 1000:.2f} ms ({measured_fps:.3f} fps){scope}")

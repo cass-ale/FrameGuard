@@ -967,6 +967,76 @@ class TestCfrNominalRate:
         assert row[1] == "PASS" and "29.970" in row[2], row
 
 
+class TestCfrTimestampRounding:
+    """Round 4: timestamps rounded to an earlier container's grid, then
+    re-expressed in a finer time base (MKV 1 ms -> MP4 1/16000), are CFR."""
+
+    def test_millisecond_grid_in_a_finer_time_base(self):
+        times = [round(k * 1001 / 30000, 3) for k in range(300)]          # MKV 1 ms
+        row, _ = _cfr([round(t * 16000) / 16000 for t in times], "30000/1001", "1/16000")
+        assert row[1] == "PASS", row
+        times = [round(k * 1001 / 24000, 3) for k in range(300)]
+        row, _ = _cfr([round(t * 24000) / 24000 for t in times], "24000/1001", "1/24000")
+        assert row[1] == "PASS", row
+
+    def test_jitter_on_a_fine_time_base_is_still_caught(self):
+        row, _ = _cfr([round((k + 0.2 * math.sin(k)) / 30 * 15360) / 15360 for k in range(300)],
+                      "30/1", "1/15360")
+        assert row[1] != "PASS", row
+
+    def test_alternating_jitter_is_not_a_coarse_grid(self):
+        """Gaps alternating 0.8 / 1.2 frames lie on a 13 ms grid; no container
+        rounds that coarsely."""
+        times, t = [], 0.0
+        for k in range(300):
+            times.append(t)
+            t += (0.8 if k % 2 else 1.2) / 30
+        row, _ = _cfr([round(x * 30000) / 30000 for x in times], "30/1", "1/30000")
+        assert row[1] != "PASS", row
+
+    def test_whole_frame_gap_is_a_dropped_frame(self):
+        times = [k / 30 for k in range(300) if k != 150]
+        row, meta = _cfr(times)
+        assert row[1] == "WARN" and "dropped" in row[2] and "Variable" not in row[2], row
+        assert meta.get("dropped_frames") == 1
+
+    def test_dropped_frames_are_not_variable_frame_rate(self):
+        times = [k / 30 for k in range(300) if k not in (50, 100, 101, 200, 250)]
+        row, meta = _cfr(times)
+        # 4 gaps in 295 intervals (> vfr_threshold 1 %): a FAIL, named as drops
+        assert row[1] == "FAIL" and "5 dropped" in row[2] and "Variable" not in row[2], row
+        assert meta.get("dropped_frames") == 5
+
+    def test_repeated_timestamp_is_a_duplicated_frame(self):
+        times = [k / 30 for k in range(300)]
+        times.insert(150, times[150])
+        row, meta = _cfr(times)
+        assert row[1] == "WARN" and "duplicated" in row[2], row
+
+
+@needs_ffmpeg
+class TestCfrRemux:
+    """Round 4 (sealed corpus): a plain -c copy remux of a clean 29.97 /
+    23.976 clip between MKV and MP4 must stay CFR."""
+
+    @pytest.mark.parametrize("rate", ["30000/1001", "24000/1001"])
+    @pytest.mark.parametrize("first,second", [("mkv", "mp4"), ("mp4", "mkv")])
+    def test_remux_stays_constant(self, tmp_path, rate, first, second):
+        source = tmp_path / f"src.{first}"
+        ffmpeg("-f", "lavfi", "-i", f"testsrc2=s=320x240:r={rate}:d=6", *X264, "-an", str(source))
+        remux = tmp_path / f"remux.{second}"
+        ffmpeg("-i", str(source), "-c", "copy", str(remux))
+        row = _row(_scan(str(remux), target_width=320, target_height=240), "CFR Check")
+        assert row[1] == "PASS", row
+
+    def test_one_dropped_frame_is_reported_as_dropped(self, tmp_path):
+        path = tmp_path / "drop.mkv"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=6", "-vf", "select='not(eq(n,90))'",
+               "-fps_mode", "passthrough", *X264, "-an", str(path))
+        row = _row(_scan(str(path), target_width=320, target_height=240), "CFR Check")
+        assert row[1] == "WARN" and "dropped" in row[2] and "Variable" not in row[2], row
+
+
 # ---------------------------------------------------------------------------
 # No FFmpeg summary -> Not verified, never PASS
 # ---------------------------------------------------------------------------
@@ -1230,10 +1300,10 @@ class TestCfrNominalRateUnits:
         the reference (regular), not the declared one (every gap irregular)."""
         from frameguard import core
         timing = core.FrameTiming([[k / 15 for k in range(60)]], False, "test")
-        reference, total, irregular, _ = core._interval_stats(timing, nominal=1 / 30, tick=1 / 15360)
+        reference, total, irregular, *_ = core._interval_stats(timing, nominal=1 / 30, tick=1 / 15360)
         assert reference == pytest.approx(1 / 15, rel=1e-3) and irregular == 0
         # within the tolerance, the declared interval is the reference
-        reference, _, _, _ = core._interval_stats(core.FrameTiming([[k * 0.0335 for k in range(60)]], False, "t"),
+        reference, *_ = core._interval_stats(core.FrameTiming([[k * 0.0335 for k in range(60)]], False, "t"),
                                                    nominal=1 / 30, tick=1 / 15360)
         assert reference == pytest.approx(1 / 30)
 
