@@ -295,6 +295,22 @@ class TestAmbisonicPeaksAndHeadLocked:
         assert "HL-L/HL-R" in _row(result, "Audio Phase")[2]
         assert "HL-L/HL-R" in _row(result, "Dual Mono")[2]
 
+    def test_quiet_head_locked_pair_is_reported_not_judged(self, media):
+        """Round 4: a clean FOA + head-locked file under R 128 enforcement.
+        W reads -23.0 LUFS (on target); the head-locked narration sits 15 LU
+        under the target on its own, as it does in a real mix. 0.9.2-rc
+        judged the pair alone: "15.3 LU quieter", WARN."""
+        w_on_target = tone(1000, MINUS_23 * 10 ** (3 / 20))          # mono -20 dBFS reads -23.0
+        quiet = tone(1000, MINUS_23 * 10 ** (-15 / 20))             # stereo -38 LUFS
+        clip = media.get("foa_hl_quiet", lambda p: _foa_with_head_locked(
+            p, [w_on_target, "0", "0", "0", quiet, quiet]))
+        result = _scan(clip, loudness_mode="essential", loudness_profile="ebu_r128")
+        loudness = _row(result, "Audio Loudness")
+        assert loudness[1] == "PASS", loudness
+        assert "head-locked stereo" in loudness[2] and "-38.0 LUFS" in loudness[2], loudness
+        assert "quieter" not in loudness[2] and "not judged" in loudness[2], loudness
+        assert result.status != "MISMATCH"
+
     def test_head_locked_over_fails_true_peak(self, media):
         clip = media.get("foa_hl_over_tapered", lambda p: _foa_with_head_locked(
             p, [TONE_23, "0", "0", "0", INTERSAMPLE_OVER, tone(1000, MINUS_23)]))
@@ -783,7 +799,7 @@ class TestMissingSummariesAreNotVerified:
                                         duration=60.0, ambisonic=True)
         row = audio_checks.loudness_row({"integrated": -26.0, "true_peak": -10.0}, ctx,
                                         dict(DEFAULT_CONFIG, loudness_mode="essential"))
-        assert row[0] == "WARN" and "head-locked stereo" in row[1] and "Not verified" in row[1], row
+        assert row[0] == "WARN" and "head-locked stereo" in row[1] and "not reported" in row[1], row
 
 
 # ---------------------------------------------------------------------------
