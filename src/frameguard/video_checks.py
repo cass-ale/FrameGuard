@@ -261,6 +261,20 @@ YAVG_ABSENT = 255.0
 BLACK_ISOLATION_SECONDS = 1.0
 BLACK_STEP_CODES = 2.0
 BLACK_EDGE_ALLOWANCE = 1.0
+# A burnt-in timecode or a channel logo keeps a black picture under the
+# picture threshold (Telestream VQ-101 documents 100 % of the frame; FFmpeg's
+# blackdetect default is 98 %). Such an overlay is small and does not move:
+# frames whose non-black pixels (above the black pixel level, on the
+# analysis copy) are at most BLACK_OVERLAY_MAX of the picture and stay in
+# place - non-black in both frames BLACK_OVERLAY_STEP apart - while the rest
+# meets the picture threshold, are black too. Credits or a dark scene move
+# or exceed the share, and stay picture. The mask is averaged over
+# BLACK_OVERLAY_BLOCK px blocks and compared BLACK_OVERLAY_STEP seconds apart:
+# credits roll at one or more pixels per frame (>= 25 px/s), so in 0.5 s
+# their text has left its 8 px blocks.
+BLACK_OVERLAY_MAX = 0.05
+BLACK_OVERLAY_BLOCK = 8
+BLACK_OVERLAY_STEP = 0.5
 
 # Interlace (see assess_interlace). idet runs with FFmpeg's documented
 # defaults (intl_thres 1.04, prog_thres 1.5, rep_thres 3.0; FFmpeg filters
@@ -504,7 +518,7 @@ class VideoCheckConfig:
     black: bool = True
     black_duration: float = 0.3
     black_pix_th: float = 0.02
-    black_pic_th: float = 0.90
+    black_pic_th: float = 0.98
     black_short_frames: int = 3
     freeze: bool = True
     freeze_duration: float = 1.0
@@ -520,7 +534,7 @@ class VideoCheckConfig:
             black=bool(cfg.get("black_frames_enabled", True)),
             black_duration=float(cfg.get("black_detect_duration", 0.3)),
             black_pix_th=float(cfg.get("black_detect_pix_threshold", 0.02)),
-            black_pic_th=float(cfg.get("black_detect_picture_threshold", 0.90)),
+            black_pic_th=float(cfg.get("black_detect_picture_threshold", 0.98)),
             black_short_frames=int(cfg.get("black_short_min_frames", 3)),
             freeze=bool(cfg.get("freeze_frames_enabled", True)),
             freeze_duration=float(cfg.get("freeze_detect_duration", 1.0)),
@@ -864,7 +878,7 @@ class VideoAnalysis:
         before close() is reached.
         """
         self.directory = tempfile.mkdtemp(prefix="frameguard-video-")
-        names = ("mafd", "struct", "struct_step", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
+        names = ("mafd", "struct", "struct_step", "blk_n", "blk_s", "black_start", "black_end", "idet", "idet1", "rep_top", "rep_bottom", "luma", "band1", "band2",
                  "yavg", "gam_r", "gam_g", "gam_b", "ft_same", "ft_top", "ft_bot", "ft_move", "colmo", "rowmo") + tuple(
                      _disp_name(d) for d in INTERLACE_DISPLACEMENTS) + tuple(
                      _shift_name(k) for k in range(-INTERLACE_SCROLL_RANGE, INTERLACE_SCROLL_RANGE + 1))
@@ -898,6 +912,12 @@ class VideoAnalysis:
         width = self.info.width
         copy = max(2, min(ANALYSIS_MAX_WIDTH, (width // (2 * ANALYSIS_MIN_FACTOR)) * 2))
         return width / max(1, copy // FREEZE_COPY_FACTOR)
+
+    @property
+    def overlay_step_frames(self) -> int:
+        """Frames between the static-overlay samples (BLACK_OVERLAY_STEP)."""
+        fps = self.info.fps if self.info.fps > 0 else 25.0
+        return max(1, int(fps * BLACK_OVERLAY_STEP + 1e-9))
 
     @property
     def freeze_step_frames(self) -> int:
@@ -1138,6 +1158,24 @@ class VideoAnalysis:
             chains.append(
                 f"[ar_mean]scale=w='max(1,trunc(iw/{FREEZE_COPY_FACTOR}))':"
                 f"h='max(1,trunc(ih/{FREEZE_COPY_FACTOR}))':flags=area,split=2[ar_mean_y][ar_mean_d]")
+            if c.black:
+                # Non-black share per frame, and the share non-black in both
+                # this frame and the one overlay_step_frames earlier (every
+                # that many frames): a static overlay (BLACK_OVERLAY_MAX).
+                # The mask is taken at full resolution (as blackdetect sees
+                # the picture) and area-averaged: each copy sample holds the
+                # exact non-black share of its block.
+                level = black_pixel_level(c.black_pix_th, rng == "pc")
+                chains += [
+                    f"[0:{self.index}]extractplanes=y,format=gray,"
+                    f"lut=c0='if(gt(val,{level}),255,0)',"
+                    f"scale=w='max(1,trunc(iw/{BLACK_OVERLAY_BLOCK}))':"
+                    f"h='max(1,trunc(ih/{BLACK_OVERLAY_BLOCK}))':flags=area,"
+                    "split=2[bk_n][bk_s]",
+                    f"[bk_n]signalstats,{_print('lavfi.signalstats.YAVG', self.paths['blk_n'])},nullsink",
+                    f"[bk_s]select='not(mod(n,{self.overlay_step_frames}))',tblend=all_expr='min(A,B)',"
+                    f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['blk_s'])},nullsink",
+                ]
             # And to the frame freeze_step_frames earlier (every that many
             # frames): accumulated change, which a slow pan shows.
             step = self.freeze_step_frames
@@ -1317,6 +1355,11 @@ class VideoAnalysis:
                           zip(fraction("gam_r"), fraction("gam_g"), fraction("gam_b"))]
         if self.needs_area_branch and (self.config.black or self.config.levels or self.config.freeze):
             series.yavg = sparse("yavg", YAVG_ABSENT, _to_float)
+            if self.config.black:
+                share = lambda v: _to_float(v, 0.0) / 255.0
+                series.nonblack = sparse("blk_n", None, share, by_pts, 1)
+                series.nonblack_static = sparse("blk_s", None, share, by_pts, 1)
+                series.overlay_step = self.overlay_step_frames
             # tblend's frame k (k >= 1) carries frame k's pts: matched by pts,
             # in % of full scale like scdet's MAFD.
             series.structural = sparse("struct", None, lambda v: _to_float(v, 0.0) / 2.55, by_pts, 1)
@@ -1415,6 +1458,11 @@ class VideoSeries:
     band1: List[float] = field(default_factory=list)
     band2: List[float] = field(default_factory=list)
     yavg: List[float] = field(default_factory=list)
+    # black: non-black share per frame, and the share non-black in both the
+    # frame and the one overlay_step frames earlier (on those frames)
+    nonblack: List[Optional[float]] = field(default_factory=list)
+    nonblack_static: List[Optional[float]] = field(default_factory=list)
+    overlay_step: int = 0
     structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
     # freeze: averaged-copy change to the frame freeze_step_frames earlier (on those frames)
     structural_step: List[Optional[float]] = field(default_factory=list)
@@ -1435,7 +1483,8 @@ class VideoSeries:
         common prefix is the part every branch measured.
         """
         names = ("times", "mafd", "idet", "idet_single", "repeated", "displacement", "luma",
-                 "gam", "band1", "band2", "yavg", "structural", "structural_step", "flash")
+                 "gam", "band1", "band2", "yavg", "structural", "structural_step", "nonblack",
+                 "nonblack_static", "flash")
         lengths = [len(getattr(self, n)) for n in names if getattr(self, n)]
         if not lengths:
             return
@@ -1540,6 +1589,58 @@ def _hard_side(inside: float, near: Optional[float], far: Optional[float]) -> bo
     if step < BLACK_STEP_CODES:
         return False
     return far is None or abs(near - far) <= step / 2
+
+
+def black_pixel_level(pix_th: float, full_range: bool) -> int:
+    """8-bit code at and below which a pixel is black (blackdetect's scaling)."""
+    return int(pix_th * 255) if full_range else int(16 + pix_th * (235 - 16))
+
+
+def overlay_black_runs(nonblack: Sequence[Optional[float]], static: Sequence[Optional[float]],
+                       times: Sequence[float], step: int, pic_th: float,
+                       period: float) -> List[Tuple[float, float]]:
+    """(start, end) runs that are black apart from a static overlay.
+
+    A frame qualifies when its non-black share is at most BLACK_OVERLAY_MAX
+    plus the picture threshold's allowance; a run of such frames counts when
+    every pair of frames ``step`` apart inside it shows the overlay in place:
+    the share non-black in both (``static``) is at most BLACK_OVERLAY_MAX
+    and what is non-black beyond it fits the picture threshold's allowance
+    of the rest of the picture. A run too short to hold one pair cannot show
+    that and does not count.
+    """
+    allowance = 1.0 - pic_th
+    count = min(len(nonblack), len(times))
+    candidate = [nonblack[i] is not None and nonblack[i] <= BLACK_OVERLAY_MAX + allowance
+                 for i in range(count)]
+    runs = []
+    i = 0
+    while i < count:
+        if not candidate[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < count and candidate[j + 1]:
+            j += 1
+        pairs = [k for k in range(i + step, j + 1) if k < len(static) and static[k] is not None]
+        if step > 0 and pairs and all(
+                static[k] <= BLACK_OVERLAY_MAX
+                and max(nonblack[k], nonblack[k - step]) - static[k] <= allowance * (1.0 - static[k])
+                for k in pairs):
+            runs.append((times[i], times[j] + period))
+        i = j + 1
+    return runs
+
+
+def merge_runs(*groups: Sequence[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    """Union of (start, end) runs."""
+    merged: List[List[float]] = []
+    for start, end in sorted(r for group in groups for r in group):
+        if merged and start <= merged[-1][1] + 1e-6:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(a, b) for a, b in merged]
 
 
 def classify_black(events: Sequence[Tuple[float, float]], duration: float, fps: float,
@@ -2757,6 +2858,11 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
         result.add_not_verified(BLACK, "FFmpeg's black-frame report is missing or incomplete "
                                        "(its log overflowed or used an unrecognised form).")
         return []
+    if series.nonblack and series.overlay_step:
+        overlay = overlay_black_runs(series.nonblack, series.nonblack_static, series.times,
+                                     series.overlay_step, config.black_pic_th,
+                                     _frame_period(fps, series.times))
+        events = merge_runs(events, overlay)
     findings = classify_black(events, duration, fps, config, series.times, series.yavg)
     if findings.segments:
         result.set_metadata("black_frame_sequences", len(findings.segments))

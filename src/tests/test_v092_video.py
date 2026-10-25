@@ -497,13 +497,30 @@ class TestTruncationTolerance:
 
 
 # ---------------------------------------------------------------------------
-# Black Frames: 90 % area, both FFmpeg log forms, never PASS unmeasured
+# Black Frames: 98 % area plus a static overlay, both log forms, never PASS unmeasured
 # ---------------------------------------------------------------------------
 
 class TestBlackEvidence:
-    def test_default_area_is_ninety_percent(self):
-        assert DEFAULT_CONFIG["black_detect_picture_threshold"] == 0.90
-        assert vc.VideoCheckConfig.from_cfg({}).black_pic_th == 0.90
+    def test_default_area_is_ninety_eight_percent(self):
+        """Round 2: FFmpeg's default; Telestream VQ-101 documents 100 %."""
+        assert DEFAULT_CONFIG["black_detect_picture_threshold"] == 0.98
+        assert vc.VideoCheckConfig.from_cfg({}).black_pic_th == 0.98
+
+    def test_overlay_rule(self):
+        times = [i / 30 for i in range(30)]
+        logo = [0.04] * 30                       # 4 % non-black, in place
+        runs = vc.overlay_black_runs(logo, [0.04 if i % 9 == 0 else None for i in range(30)],
+                                     times, 9, 0.98, 1 / 30)
+        assert runs and runs[0][0] == 0.0
+        # moving text: little stays non-black in both frames
+        assert not vc.overlay_black_runs(logo, [0.005 if i % 9 == 0 else None for i in range(30)],
+                                         times, 9, 0.98, 1 / 30)
+        # too large to be an overlay
+        assert not vc.overlay_black_runs([0.09] * 30, [0.09 if i % 9 == 0 else None for i in range(30)],
+                                         times, 9, 0.98, 1 / 30)
+        # too short to show it stays in place
+        assert not vc.overlay_black_runs([0.04] * 8, [0.04] + [None] * 7, times[:8], 9, 0.98, 1 / 30)
+        assert vc.merge_runs([(0, 1), (2, 3)], [(0.5, 2.1)]) == [(0, 3)]
 
     @pytest.mark.parametrize("context", ["blackdetect@v", "blackdetect"])
     def test_both_log_forms_are_parsed(self, context):
@@ -1031,3 +1048,37 @@ class TestNoFalseFreezes:
     def test_slow_pan_with_light_grain(self, tmp_path, dark):
         graph = _camera_pan(10, 4, 3) + (",eq=brightness=-0.25:contrast=0.5" if dark else "")
         assert _row(_scan(_graph_clip(tmp_path / f"pan{dark}.mp4", graph)), "Freeze Frames")[1] == "PASS"
+
+
+@needs_ffmpeg
+class TestBlackArea:
+    """Round 2 class 3: 0.90 flagged clean dark content; a small static
+    overlay (timecode, logo) is excluded instead."""
+
+    def test_dark_grade_with_practical_lights(self, tmp_path):
+        """Mean Y about 19 with grain (some 5 % of the scene above the black
+        level) and two small lamps: at 0.90 this read as black."""
+        graph = (f"{_camera_pan(4, 20, 0)},lutyuv=y='17+val*2/255',noise=c0s=4:c0f=t,"
+                 "drawbox=x=100:y=80:w=40:h=30:c=white:t=fill,"
+                 "drawbox=x=420:y=200:w=36:h=28:c=0xFFE0A0:t=fill")
+        fine = [e if e != "18" else "6" for e in X264]
+        row = _row(_scan(_graph_clip(tmp_path / "dark.mp4", graph, fine)), "Black Frames")
+        assert row[1] == "PASS", row
+
+    def test_end_credits_on_black(self, tmp_path):
+        """About 6 % white text bars rolling up over black at 1 px/frame."""
+        bars = "".join(f"drawbox=x={170 + 37 * (k % 3)}:y={60 * k}:w={220 - 30 * (k % 3)}:h=9:"
+                       "c=white:t=fill," for k in range(14))
+        graph = (f"color=black:s=640x840:d=1,{bars}format=yuv420p,loop=-1:1,fps=30,"
+                 "trim=duration=6,setpts=PTS-STARTPTS[roll];"
+                 "color=black:s=640x360:r=30:d=6[bg];[bg][roll]overlay=x=0:y='-30*t',format=yuv420p")
+        row = _row(_scan(_graph_clip(tmp_path / "credits.mp4", graph)), "Black Frames")
+        assert row[1] == "PASS", row
+
+    def test_black_with_burnt_in_timecode_and_logo(self, tmp_path):
+        graph = ("testsrc2=s=640x360:r=30:d=6,drawbox=c=black:t=fill:enable='between(t,2,4)',"
+                 "drawbox=x=500:y=20:w=120:h=75:c=white@0.8:t=fill,"
+                 "drawtext=timecode='00\\:00\\:00\\:00':rate=30:x=250:y=330:fontsize=20:fontcolor=white,"
+                 "format=yuv420p")
+        row = _row(_scan(_graph_clip(tmp_path / "tc.mp4", graph)), "Black Frames")
+        assert row[1] in ("WARN", "FAIL") and "00:00:02" in row[2], row
