@@ -800,7 +800,7 @@ def run_ffprobe(filepath: str, process_owner=None,
     if not ffprobe:
         return None
     cmd = [ffprobe, "-v", "quiet", "-print_format", "json",
-           "-show_format", "-show_streams", filepath]
+           "-show_format", "-show_streams", "-show_programs", filepath]
     try:
         result = _run_owned_subprocess(cmd, 120, process_owner, cancel_event)
         if result is None or result.returncode != 0:

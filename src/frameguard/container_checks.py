@@ -1292,13 +1292,51 @@ AAC_HE_BOUND_SAMPLES = AAC_HE_CORE_SCALE * AAC_MAX_PRIMING_SAMPLES + AAC_MAX_PRI
 # decoded sample of its access unit, and the first decoded samples are the
 # priming. An encoder that keeps sound and picture aligned therefore stamps
 # its first audio access unit exactly its priming ahead of the picture, as
-# FFmpeg does. A lead equal to a priming in use, to within one audio sample
-# plus one 90 kHz PTS tick of rounding, is read as that priming.
+# FFmpeg does. A lead equals a priming to within one audio sample plus one
+# 90 kHz PTS tick of rounding.
+#
+# A lead alone cannot tell a priming from a sync slip: FFmpeg's 1024-sample
+# priming plus one AAC frame (1024 samples) early is a 2048-sample lead,
+# exactly FDK's priming, and a whole-frame slip is the commonest muxing sync
+# error. So a lead is read as a priming only when the file identifies its
+# encoder (_aac_encoder_identity):
+#   * the audio stream names its encoder (Matroska ENCODER tag "Lavc.. aac",
+#     "libfdk_aac", "aac_at", Nero): that priming is exact, and any further
+#     lead is a slip, judged as an offset;
+#   * only the muxer is identified (TS service provider "FFmpeg", container
+#     encoder "Lavf..."): FFmpeg muxes its own AAC encoder unless the audio
+#     was stream-copied, so a lead equal to 1024 is read as that priming,
+#     and a lead equal to another priming in use has two explanations
+#     (FFmpeg + a slip, or a copied stream from that encoder): Not verified;
+#   * nothing identified: no inference; the whole range is judged.
 PTS_TICK_S = 1 / 90000
-# ``aac_priming``: what a spec knows about its encoder. "unknown" infers the
-# priming from the PTS lead when it can, else judges the whole range; a
-# sample count (the deliverer's encoder) makes unsignalled priming exact.
-AAC_PRIMING_CHOICES = ("unknown", 1024, 2112)
+# (pattern on the stream's encoder tag, priming samples, encoder name)
+_AAC_ENCODER_PRIMINGS = (
+    (re.compile(r"libfdk|\bfdk", re.I), 2048, "Fraunhofer FDK AAC"),
+    (re.compile(r"aac_at|apple|core ?audio", re.I), 2112, "Apple AAC"),
+    (re.compile(r"\bnero", re.I), 2624, "Nero AAC"),
+    (re.compile(r"\blavc[\d.]*\s+aac\b", re.I), 1024, "FFmpeg's AAC encoder"),
+)
+FFMPEG_AAC_PRIMING = 1024
+# ``aac_priming``: what a spec knows about its encoder. "unknown" uses the
+# file's encoder identification, else judges the whole range; a sample count
+# (the deliverer's encoder) makes unsignalled priming exact.
+AAC_PRIMING_CHOICES = ("unknown",) + AAC_PRIMINGS_IN_USE
+
+
+def _aac_encoder_identity(probe_data: Optional[dict], track: dict) -> Tuple[Optional[int], str, str]:
+    """(priming samples, "encoder" | "muxer" | "", name) the file identifies for one AAC track."""
+    tags = {str(k).lower(): str(v) for k, v in (track.get("tags") or {}).items()}
+    named = tags.get("encoder", "")
+    for pattern, samples, encoder in _AAC_ENCODER_PRIMINGS:
+        if named and pattern.search(named):
+            return samples, "encoder", encoder
+    fmt_encoder = str(((probe_data or {}).get("format") or {}).get("tags", {}).get("encoder") or "")
+    providers = [str((p.get("tags") or {}).get("service_provider") or "")
+                 for p in (probe_data or {}).get("programs") or [] if isinstance(p, dict)]
+    if fmt_encoder.lower().startswith("lavf") or any(p.strip().lower() == "ffmpeg" for p in providers):
+        return FFMPEG_AAC_PRIMING, "muxer", "FFmpeg"
+    return None, "", ""
 
 
 def _edit_list_priming(structure: Optional["Structure"], track: dict) -> Optional[float]:
@@ -1327,14 +1365,17 @@ def _edit_list_priming(structure: Optional["Structure"], track: dict) -> Optiona
 
 
 def _unsignalled_priming(track: dict, structure: Optional["Structure"] = None,
-                         cfg_priming="unknown", raw: Optional[float] = None) -> Tuple[float, bool, str]:
+                         cfg_priming="unknown", raw: Optional[float] = None,
+                         identity: Tuple[Optional[int], str, str] = (None, "", "")) -> Tuple[float, bool, str]:
     """(priming seconds the container does not signal, exact?, how known) for one audio track.
 
     (0, True, "") when nothing is unsignalled; (the spec's ``aac_priming``,
-    True, "spec") when it is set; (the priming the audio's PTS lead equals,
-    True, "lead") when ``raw`` (audio start minus picture start) is exactly
-    minus a priming in use; else (upper bound, False, "") for an unknown
-    encoder.
+    True, "spec") when it is set; (the identified encoder's priming, True,
+    "encoder") when the stream names its encoder; (FFmpeg's priming, True,
+    "lead") when only the muxer is identified and ``raw`` (audio start minus
+    picture start) is exactly minus that priming; (the identified priming,
+    False, "ambiguous:<samples>") when such a lead instead equals another
+    priming in use; else (upper bound, False, "") for an unknown encoder.
 
     An MP4/MOV edit list (or a Matroska CodecDelay, an iTunSMPB tag) tells
     the player to drop the priming; ffprobe then reports it as
@@ -1359,16 +1400,23 @@ def _unsignalled_priming(track: dict, structure: Optional["Structure"] = None,
     known = cfg_priming if isinstance(cfg_priming, int) and not isinstance(cfg_priming, bool) else None
     if known:
         return known * scale / rate, True, "spec"
-    if raw is not None and raw < 0:
-        for samples in AAC_PRIMINGS_IN_USE:
-            priming = samples * scale / rate
-            if abs(raw + priming) <= 1 / rate + PTS_TICK_S:
-                return priming, True, "lead"
+    identified, level, _ = identity
+    if identified and level == "encoder":
+        return identified * scale / rate, True, "encoder"
+    if identified and raw is not None and raw < 0:
+        def matches(samples):
+            return abs(raw + samples * scale / rate) <= 1 / rate + PTS_TICK_S
+        if matches(identified):
+            return identified * scale / rate, True, "lead"
+        other = next((n for n in AAC_PRIMINGS_IN_USE if n != identified and matches(n)), None)
+        if other is not None:
+            return identified * scale / rate, False, f"ambiguous:{other}"
     return (AAC_HE_BOUND_SAMPLES if he else AAC_MAX_PRIMING_SAMPLES) / rate, False, ""
 
 
 def _offset_range(track: dict, video_start: float, structure: Optional["Structure"] = None,
-                  cfg_priming="unknown") -> Tuple[float, float, float, float, bool, str]:
+                  cfg_priming="unknown", identity: Tuple[Optional[int], str, str] = (None, "", "")
+                  ) -> Tuple[float, float, float, float, bool, str]:
     """(lowest, highest possible programme offset, raw start difference,
     unsignalled priming, priming known?, how known) in seconds.
 
@@ -1380,9 +1428,13 @@ def _offset_range(track: dict, video_start: float, structure: Optional["Structur
     core = _core()
     start = core._safe_float(track.get("start_time"), 0.0) or 0.0
     raw = start - video_start
-    priming, exact, source = _unsignalled_priming(track, structure, cfg_priming, raw)
+    priming, exact, source = _unsignalled_priming(track, structure, cfg_priming, raw, identity)
     if exact:
         return raw + priming, raw + priming, raw, priming, True, source
+    if source.startswith("ambiguous:"):
+        # Two explanations: the identified priming plus a slip, or the other
+        # encoder's priming exactly (offset 0).
+        return raw + priming, 0.0, raw, priming, False, source
     return raw, raw + priming, raw, priming, False, source
 
 
@@ -1531,8 +1583,9 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
     entries, worst, worst_range = [], 0.0, None
     for position, track in enumerate(tracks):
         label = core._track_label(position, track, len(tracks))
+        identity = _aac_encoder_identity(probe_data, track)
         low, high, raw, priming, exact, source = _offset_range(track, v_start, structure,
-                                                               cfg.get("aac_priming", "unknown"))
+                                                               cfg.get("aac_priming", "unknown"), identity)
         low_ms, high_ms = low * 1000, high * 1000
         # The offset nearest zero that the range allows (0 when it straddles).
         nearest = 0.0 if low_ms <= 0 <= high_ms else (low_ms if abs(low_ms) < abs(high_ms) else high_ms)
@@ -1546,11 +1599,21 @@ def check_av_sync_offset(structure: Optional[Structure], probe_data: dict, resul
                                          else 1)) if rate else 0
         known = ""
         if priming and exact and source == "lead":
-            known = (f"; the track starts {_signed_ms_text(raw * 1000)}, exactly the {samples}-sample AAC "
-                     f"encoder priming (inferred from the audio's PTS lead)")
+            known = (f"; the track starts {_signed_ms_text(raw * 1000)}, exactly the {samples}-sample priming "
+                     f"of {identity[2]}'s AAC encoder (the file is muxed by {identity[2]})")
+        elif priming and exact and source == "encoder":
+            known = (f"; the track starts {_signed_ms_text(raw * 1000)}, then plays the {samples}-sample "
+                     f"priming of {identity[2]} (named by the stream)")
         elif priming and exact:
             known = (f"; the track starts {_signed_ms_text(raw * 1000)}, then plays this spec's "
                      f"{samples}-sample AAC encoder priming")
+        if source.startswith("ambiguous:"):
+            entries.append(("NOT_VERIFIED", core._with_track(label, (
+                f"The track starts {_signed_ms_text(raw * 1000)}{cause}: that equals {identity[2]}'s "
+                f"{samples}-sample AAC priming with the sound {abs(low_ms):.0f} ms early, or a "
+                f"{source.split(':')[1]}-sample priming from another encoder in sync; the file cannot tell "
+                f"which (priming not signalled)"))))
+            continue
         if priming and not exact:
             text = (f"Sound starts {_range_text(low_ms, high_ms)} the picture{cause}: the track starts "
                     f"{_signed_ms_text(raw * 1000)} and its AAC encoder priming (up to {priming * 1000:.0f} ms) "

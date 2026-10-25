@@ -775,16 +775,19 @@ class TestAacPrimingDefault:
         ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "mpegts", str(ts))
         result = _scan(ts, strict=True, accepted_containers=[".ts"])
         check = _row(result, "A/V Sync Offset")
-        assert check[1] == "PASS" and "inferred" in check[2] and "1024" in check[2], check
+        assert check[1] == "PASS" and "FFmpeg" in check[2] and "1024" in check[2], check
 
-    @pytest.mark.parametrize("samples", [1024, 2048, 2112, 2624])
-    def test_every_priming_in_use_is_inferred_from_an_exact_lead(self, samples):
-        check, meta = _sync_row(_sync_probe(-samples / 48000))
+    # Round 5 (N2): a lead is read as a priming only when the encoder is
+    # identified (TestPrimingNeedsIdentification); these use that identity.
+    @pytest.mark.parametrize("samples,encoder", [(1024, "Lavc61 aac"), (2048, "Lavc61 libfdk_aac"),
+                                                 (2112, "Lavc61 aac_at"), (2624, "Nero AAC codec")])
+    def test_every_priming_in_use_is_inferred_from_an_exact_lead(self, samples, encoder):
+        check, meta = _sync_row(_identified_probe(samples, stream_encoder=encoder))
         assert check[1] == "PASS" and str(samples) in check[2], check
         assert meta["av_start_offset_range_ms"] == [0.0, 0.0], meta
 
     def test_he_aac_lead_is_inferred_at_twice_the_core_priming(self):
-        check, _ = _sync_row(_sync_probe(-2 * 2112 / 48000, profile="HE-AAC"))
+        check, _ = _sync_row(_identified_probe(2 * 2112, stream_encoder="Lavc61 aac_at", profile="HE-AAC"))
         assert check[1] == "PASS", check
 
     def test_a_lead_that_is_no_priming_in_use_is_not_inferred(self):
@@ -1490,10 +1493,15 @@ class TestRound2Units:
 
     def test_lead_tolerance_is_one_sample_plus_one_pts_tick(self):
         tolerance = 1 / 48000 + 1 / 90000
-        inside = _sync_row(_sync_probe(-(1024 / 48000) - tolerance + 5e-11))[0]
-        assert inside[1] == "PASS" and "inferred" in inside[2], inside
-        one_sample = _sync_row(_sync_probe(-(1025 / 48000)))[0]
-        assert "inferred" in one_sample[2], one_sample
+        probe = _identified_probe(0, provider="FFmpeg")
+        probe["streams"][1]["start_time"] = str(-(1024 / 48000) - tolerance + 5e-11)
+        inside = _sync_row(probe)[0]
+        assert inside[1] == "PASS" and "1024-sample priming" in inside[2], inside
+        one_sample = _sync_row(_identified_probe(1025, provider="FFmpeg"))[0]
+        assert "1024-sample priming" in one_sample[2], one_sample
+        outside = _identified_probe(0, provider="FFmpeg")
+        outside["streams"][1]["start_time"] = str(-(1024 / 48000) - tolerance - 1e-6)
+        assert "1024-sample priming" not in _sync_row(outside)[0][2]
 
     def test_no_negative_zero_in_the_start_together_text(self):
         check, _ = _sync_row(_sync_probe(-0.00004, padding=1024))
@@ -1502,8 +1510,9 @@ class TestRound2Units:
     def test_inferred_text_shows_the_raw_lead(self):
         probe = _sync_probe(-2 * 2624 / 8000, profile="HE-AAC")
         probe["streams"][1]["sample_rate"] = "8000"
+        probe["streams"][1]["tags"] = {"encoder": "Nero AAC codec"}
         check, _ = _sync_row(probe)
-        assert "starts 656 ms before it, exactly the 2624-sample" in check[2], check
+        assert "starts 656 ms before it, then plays the 2624-sample" in check[2], check
 
     def test_values_at_the_0_9_1_maximum_are_clamped(self):
         from frameguard import presets
@@ -1592,3 +1601,78 @@ class TestGenericDefaultMigration:
         assert set(presets.DEFAULTS_0_9_1) <= set(presets.PRESET_CONFIG_KEYS)
         assert not set(presets.DEFAULTS_0_9_1) & COMPAT_ONLY_CONFIG_KEYS
         assert len(presets.DEFAULTS_0_9_1) == 69
+
+
+# ---------------------------------------------------------------------------
+# Round 5, N2: a PTS lead is read as a priming only with encoder identification
+# ---------------------------------------------------------------------------
+
+def _identified_probe(lead_samples, *, provider=None, stream_encoder=None, format_encoder=None, profile="LC"):
+    probe = _sync_probe(-lead_samples / 48000, profile=profile)
+    if provider:
+        probe["programs"] = [{"tags": {"service_provider": provider, "service_name": "Service01"}}]
+    if stream_encoder:
+        probe["streams"][1]["tags"] = {"ENCODER": stream_encoder}
+    if format_encoder:
+        probe["format"]["tags"] = {"encoder": format_encoder}
+    return probe
+
+
+class TestPrimingNeedsIdentification:
+    def test_one_frame_slip_on_ffmpeg_priming_is_not_a_pass(self, media, tmp_path):
+        """Reviewer N2 (scants2): FFmpeg's 1024-sample priming plus one AAC
+        frame early is a 2048-sample lead; it was read as FDK priming and passed."""
+        slip = tmp_path / "slip.ts"
+        ffmpeg("-i", _clean(media), "-itsoffset", f"{-1024 / 48000:.6f}", "-i", _clean(media), "-map", "0:v",
+               "-map", "1:a", "-c", "copy", "-f", "mpegts", str(slip))
+        for strict in (False, True):
+            result = _scan(slip, strict=strict, accepted_containers=[".ts"])
+            check = _row(result, "A/V Sync Offset")
+            assert _not_verified(check) and "2048" in check[2] and "1024" in check[2], check
+            assert "A/V Sync Offset" in result.metadata["not_verifiable"], result.metadata
+
+    def test_ffmpeg_transport_stream_in_sync_still_passes(self, media, tmp_path):
+        ts = tmp_path / "cam.ts"
+        ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "mpegts", str(ts))
+        check = _row(_scan(ts, strict=True, accepted_containers=[".ts"]), "A/V Sync Offset")
+        assert check[1] == "PASS" and "FFmpeg" in check[2] and "1024" in check[2], check
+
+    @pytest.mark.parametrize("lead", [1024, 2048, 2112, 2624])
+    def test_unidentified_encoder_infers_nothing(self, lead):
+        check, _ = _sync_row(_identified_probe(lead))
+        assert _not_verified(check) and "inferred" not in check[2], check
+
+    @pytest.mark.parametrize("lead", [2048, 2112, 2624])
+    def test_muxer_identified_lead_equal_to_another_priming_is_ambiguous(self, lead):
+        check, _ = _sync_row(_identified_probe(lead, provider="FFmpeg"))
+        assert _not_verified(check) and str(lead) in check[2] and "1024" in check[2], check
+
+    def test_muxer_identified_lead_matching_its_priming_passes(self):
+        for probe in (_identified_probe(1024, provider="FFmpeg"),
+                      _identified_probe(1024, format_encoder="Lavf61.7.100")):
+            check, _ = _sync_row(probe)
+            assert check[1] == "PASS" and "1024-sample" in check[2], check
+
+    @pytest.mark.parametrize("encoder,priming", [("Lavc61.19.101 aac", 1024), ("Lavc61.19.101 libfdk_aac", 2048),
+                                                 ("Lavc61.19.101 aac_at", 2112), ("Nero AAC codec 1.5.4", 2624)])
+    def test_encoder_identified_priming_is_exact_and_slips_are_judged(self, encoder, priming):
+        check, _ = _sync_row(_identified_probe(priming, stream_encoder=encoder))
+        assert check[1] == "PASS" and f"{priming}-sample" in check[2], check
+        slipped, meta = _sync_row(_identified_probe(priming + 1024, stream_encoder=encoder))
+        assert slipped[1] == "WARN" and "21 ms before" in slipped[2], slipped      # one AAC frame early
+        assert meta["av_start_offset_range_ms"] == [-21.3, -21.3], meta
+
+    def test_spec_priming_still_overrides(self):
+        check, _ = _sync_row(_identified_probe(2048, provider="FFmpeg"), aac_priming=2048)
+        assert check[1] == "PASS", check
+
+    def test_he_aac_identified_lead_is_twice_the_core_priming(self):
+        check, _ = _sync_row(_identified_probe(2048, provider="FFmpeg", profile="HE-AAC"))
+        assert check[1] == "PASS", check
+
+    def test_probe_includes_programs(self, media, tmp_path):
+        from frameguard.core import run_ffprobe
+        ts = tmp_path / "p.ts"
+        ffmpeg("-i", _clean(media), "-c", "copy", "-f", "mpegts", str(ts))
+        programs = run_ffprobe(str(ts)).get("programs") or []
+        assert any((p.get("tags") or {}).get("service_provider") == "FFmpeg" for p in programs), programs
