@@ -599,7 +599,8 @@ needs_posix = pytest.mark.skipif(os.name == "nt", reason="shell-script FFmpeg st
 class TestFFmpegVersionGate:
     def test_minimum_is_the_oldest_build_the_suite_passes_on(self):
         from frameguard import tools
-        assert tools.MIN_VERSIONS["ffmpeg"] == tools.MIN_VERSIONS["ffprobe"] == (9, 0, 2)
+        assert tools.MIN_VERSIONS["ffmpeg"] == tools.MIN_VERSIONS["ffprobe"] == (8, 1, 2)
+        assert tools.FFMPEG_MIN_LIBAVFILTER == (11, 14)
 
     @pytest.mark.parametrize("banner,ok", [
         ("ffmpeg version 4.4.2-0ubuntu0.22.04.1 Copyright", False),
@@ -620,7 +621,7 @@ class TestFFmpegVersionGate:
         monkeypatch.setattr(core, "get_ffmpeg_path", lambda: fake)
         result = _scan(_clean(media), quick=False)
         integrity = _row(result, "File Integrity")
-        assert _not_verified(integrity) and "7.1.1" in integrity[2] and "9.0.2" in integrity[2], integrity
+        assert _not_verified(integrity) and "7.1.1" in integrity[2] and "8.1.2" in integrity[2], integrity
         for name in ("Black Frames", "Audio Silence", "Audio Hum"):
             assert _not_verified(_row(result, name)), _row(result, name)
         assert result.status == "PASS_WITH_WARNINGS"
@@ -643,7 +644,7 @@ class TestFFmpegVersionGate:
                                 "ffprobe": {"version": "ffprobe version 7.1.1 Copyright (c) 2000-2025"}}
         result.set_metadata("ffmpeg_below_minimum", "7.1.1")
         line = _tools_line([result])
-        assert "ffmpeg version 7.1.1" in line and "below the 9.0.2 minimum" in line, line
+        assert "ffmpeg version 7.1.1" in line and "below the 8.1.2 minimum" in line, line
 
 
 # ---------------------------------------------------------------------------
@@ -929,6 +930,8 @@ class TestVersionGateRound2:
          "libavfilter    10.  6.101 / 10.  6.101", False),
         ("ffmpeg version 2026-09-30-git-0123456789-full_build-www.gyan.dev Copyright\n"
          "libavfilter    12.  1.100 / 12.  1.100", True),
+        ("ffmpeg version N-119500-g0abc123 Copyright\nlibavfilter    11. 14.100 / 11. 14.100", True),
+        ("ffmpeg version N-119000-g0abc123 Copyright\nlibavfilter    11. 13.100 / 11. 13.100", False),
         ("ffmpeg version N-118000-g1234abcd Copyright", False),     # no version to compare: not passed
         ("Usage: wrapper", True),                                   # not an FFmpeg banner: nothing to judge
     ])
@@ -946,8 +949,8 @@ class TestVersionGateRound2:
 
     def test_below_the_floor_says_it_is_the_tested_floor(self):
         from frameguard import tools
-        problem = tools.ffmpeg_banner_problem("ffmpeg version 9.0.1 Copyright")
-        assert "9.0.1" in problem and "tested" in problem, problem
+        problem = tools.ffmpeg_banner_problem("ffmpeg version 8.1.1 Copyright")
+        assert "8.1.1" in problem and "tested" in problem, problem
 
     def test_the_cached_gate_answers_without_reprobing(self, monkeypatch, tmp_path):
         from frameguard import tools
@@ -1412,8 +1415,8 @@ class TestToolsUnits:
 
     def test_release_message_names_the_found_version(self):
         from frameguard import tools
-        problem = tools.ffmpeg_banner_problem("ffmpeg version 8.1.2 Copyright\nlibavfilter    11. 14.102 / 11. 14.102")
-        assert problem.startswith("FFmpeg 8.1.2 is older than 9.0.2"), problem
+        problem = tools.ffmpeg_banner_problem("ffmpeg version 8.0.1 Copyright\nlibavfilter    11.  4.100 / 11.  4.100")
+        assert problem.startswith("FFmpeg 8.0.1 is older than 8.1.2"), problem
 
 
 class TestMoreUnits:
@@ -1443,3 +1446,21 @@ class TestMoreUnits:
         probe["streams"][1]["sample_rate"] = "0"
         check, _ = _sync_row(probe)
         assert check[1] == "PASS" and "priming" not in check[2], check
+
+
+
+class TestMeasuredFloor:
+    """0.9.2 matrix (FRAMEGUARD_TOOLS_DIR, 581 engine/audio/video/container/XR
+    tests): 8.1.2, 9.0.0 and 9.0.1 (conda-forge) fail only the two HEVC
+    fixture tests, whose Signal Levels verdict follows the x265 build that
+    encoded the fixture, not the analysing FFmpeg; 8.0.1 adds an
+    analyser-side loudness and Matroska start difference; 7.x abort."""
+
+    @pytest.mark.parametrize("banner,ok", [
+        ("ffmpeg version 8.1.2 Copyright", True), ("ffmpeg version 9.0 Copyright", True),
+        ("ffmpeg version 9.0.1 Copyright", True), ("ffmpeg version 9.0.2-https://www.martin-riedl.de", True),
+        ("ffmpeg version 8.1.1 Copyright", False), ("ffmpeg version 8.0.1 Copyright", False),
+    ])
+    def test_tested_builds(self, banner, ok):
+        from frameguard import tools
+        assert (tools.ffmpeg_banner_problem(banner) is None) == ok

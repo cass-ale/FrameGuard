@@ -101,27 +101,29 @@ DOWNLOAD_URLS = {
 # Directory searched before the bundled tools (see _find_executable).
 TOOLS_DIR_ENV = "FRAMEGUARD_TOOLS_DIR"
 
-# Oldest FFmpeg the engine test suite passes on (0.9.2 version matrix: the
-# 525 engine, audio, video, container and XR tests run against conda-forge
-# 7.0.2, 7.1.1 and 8.0.1 and the bundled martin-riedl 9.0.2):
+# Oldest FFmpeg the engine test suite passes on. 0.9.2 version matrix (the
+# 581 engine, audio, video, container and XR tests, run with
+# FRAMEGUARD_TOOLS_DIR against conda-forge builds and the bundled
+# martin-riedl 9.0.2):
 #   * 7.0.2 and 7.1.1 abort the one-pass scan's multi-graph command
-#     ("Assertion best_input >= 0 failed", fftools/ffmpeg_filter.c), so every
-#     frame-level check is unmeasured (80+ failures);
-#   * 8.0.1 runs it but reports no black segments where there are some and
-#     counts decode errors in clean Matroska files (11 failures, several of
-#     them silent false PASSes);
+#     ("Assertion best_input >= 0 failed", fftools/ffmpeg_filter.c);
+#   * 8.0.1 runs it but differs on the analyser side: loudness and the AAC
+#     start in Matroska come out differently (and, in round 1, black
+#     segments went unreported);
+#   * 8.1.2, 9.0.0 and 9.0.1 fail only two HEVC fixture tests, whose Signal
+#     Levels verdict follows the x265 build that ENCODED the fixture (the
+#     same file analysed by 9.0.2 and by 9.0.1 gives the same verdict);
 #   * 9.0.2 passes all of them.
-# This is a TESTED floor, not a measured one: 9.0.0 and 9.0.1 (and 8.1.x)
-# have not been run through the matrix, so they are refused rather than
-# assumed to work. Below the floor the deep scan is refused (Not verified),
-# never run on a build whose output FrameGuard cannot vouch for.
-FFMPEG_MIN_VERSION = (9, 0, 2)
+# This is a TESTED floor: 8.1.0 and 8.1.1 have not been run and are refused
+# rather than assumed to work. Below it the deep scan is refused (Not
+# verified), never run on a build whose output FrameGuard cannot vouch for.
+FFMPEG_MIN_VERSION = (8, 1, 2)
 # Git builds carry no release number ("N-118000-g1234abcd",
 # "2026-09-30-git-0123456789-..."); their libavfilter version places them on
 # the release line instead. Filters are what the deep scan's parsing depends
-# on. 12.1 is the libavfilter of the 9.0 release branch (9.0.2 reports
-# 12.1.102); master builds after the branch point report 12.1 or later.
-FFMPEG_MIN_LIBAVFILTER = (12, 1)
+# on. 11.14 is 8.1.2's libavfilter (11.14.102); later master builds report
+# 11.14 or above.
+FFMPEG_MIN_LIBAVFILTER = (11, 14)
 
 # Minimum versions (semver-style, compared as tuples)
 MIN_VERSIONS = {
