@@ -1373,6 +1373,17 @@ class TestPresetUnits:
         notes = over["preset_adjustments"][0]
         assert "max_pixel_rate kept" in notes and "68,428,800 pixels/s" in notes, notes
 
+    def test_rate_contradiction_matches_the_engine_at_the_tolerance_edge(self):
+        """A target exactly at max_pixel_rate x 1.0005 passes Codec Profile, so
+        the preset check must not call it a contradiction either."""
+        from frameguard import presets
+        edge = {"target_width": 2001, "target_height": 1000, "target_fps": 1, "max_pixel_rate": 2_000_000}
+        assert "preset_adjustments" not in presets.validate_preset_config(edge)
+        rows = _Rows()
+        cc.check_codec_profile(_video_probe("hevc", "Main", 2001, 1000, fps="1/1"), rows,
+                               dict(DEFAULT_CONFIG, max_pixel_rate=2_000_000))
+        assert rows.checks[0][1] != "FAIL", rows.checks
+
     def test_frame_ceiling_notice_counts_pixels(self):
         from frameguard import presets
         out = presets.validate_preset_config({"target_width": 3840, "target_height": 2160, "max_frame_pixels": 1000})
@@ -1393,6 +1404,7 @@ class TestPresetUnits:
     def test_freeze_hold_allowance_range(self):
         from frameguard import presets
         assert presets.validate_preset_config({"freeze_hold_allowance": 600}) == {"freeze_hold_allowance": 600}
+        assert presets.validate_preset_config({"freeze_hold_allowance": 0}) == {"freeze_hold_allowance": 0}
         with pytest.raises(presets.PresetValidationError):
             presets.validate_preset_config({"freeze_hold_allowance": 700})
 
