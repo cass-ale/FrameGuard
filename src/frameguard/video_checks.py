@@ -129,16 +129,18 @@ ANALYSIS_MIN_FACTOR = 4
 # levels are judged on the native picture filtered exactly so, at every
 # resolution (0.9.1 approximated it with box averaging that grew with the
 # resolution and missed UHD/8K violations).
-# The filtered luma is evaluated on a lattice of every 4th column and 2nd
-# line (see VideoAnalysis._levels_chains for why that is exact there).
-R103_LATTICE = (4, 2)
-# The lattice alone samples one filtered pixel in eight; the violating share
-# it gives is unbiased only for regions much larger than its cell (thin or
-# small violations read about a quarter low in review). R103_EXACT evaluates
-# all eight phases of the cell - every native pixel, filtered exactly - from
-# the same four column reductions (see _r103_exact); the lattice-only graph
-# remains for the speed comparison (fix_video.md).
-R103_EXACT = True
+# The filter is evaluated at every native pixel (see _r103_exact), in 4 x 2
+# phases: R103_PHASES columns and lines.
+R103_PHASES = (4, 2)
+# Subsampled chroma is brought to the luma grid by linear interpolation at
+# the stream's signalled chroma sample location (ITU-T H.273
+# chroma_sample_loc_type; FFmpeg's chroma_location). When it is not
+# signalled, the codec's default applies: H.273 / H.264 / HEVC / VVC and
+# MPEG-2 site 4:2:0 chroma "left" (co-sited horizontally with even luma
+# columns, midway vertically); MPEG-1 and JPEG-family codecs site it in the
+# centre (_CENTRE_SITED_CODECS).
+_CHROMA_LOCATIONS = ("left", "center", "topleft", "top", "bottomleft", "bottom")
+_CENTRE_SITED_CODECS = {"mpeg1video", "mjpeg", "jpeg2000", "jpegls", "mjpegb", "ljpeg"}
 # Interlace analysis keeps every line (fields must stay separate) but
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
@@ -470,10 +472,13 @@ def is_full_range(video: dict) -> bool:
     return str(video.get("pix_fmt") or "").lower().startswith("yuvj")
 
 
-def _is_420(pix_fmt: str) -> bool:
-    """4:2:0 chroma (yuv420p*, yuvj420p, nv12/nv21, p010/p016); unknown counts as 4:2:0."""
-    name = pix_fmt.lower()
-    return not name or "420" in name or name.startswith(("nv12", "nv21", "p010", "p012", "p016"))
+def chroma_location(video: dict) -> str:
+    """The stream's chroma sample location for the scaler (see _CHROMA_LOCATIONS)."""
+    tag = str(video.get("chroma_location") or "").lower()
+    if tag in _CHROMA_LOCATIONS:
+        return tag
+    codec = str(video.get("codec_name") or "").lower()
+    return "center" if codec in _CENTRE_SITED_CODECS else "left"
 
 
 def _rate(text) -> float:
@@ -496,7 +501,7 @@ class PictureInfo:
     field_order: str
     hdr: bool
     matrix_assumed: bool = False    # no colour-matrix tag: guessed from the size
-    chroma_420: bool = True         # 4:2:0 chroma (half width, half height)
+    chroma_loc: str = "left"        # chroma sample location (see chroma_location)
 
     @classmethod
     def from_stream(cls, video: dict) -> "PictureInfo":
@@ -508,7 +513,7 @@ class PictureInfo:
                    hdr=str(video.get("color_transfer") or "").lower() in _HDR_TRANSFERS,
                    matrix_assumed=str(video.get("color_space") or "").lower()
                    in ("", "unknown", "unspecified", "reserved"),
-                   chroma_420=_is_420(str(video.get("pix_fmt") or "")))
+                   chroma_loc=chroma_location(video))
 
     @property
     def interlaced(self) -> bool:
@@ -620,41 +625,27 @@ def _select(key: str, value: str, function: str) -> str:
     return f"metadata=mode=select:key={key}:value={value}:function={function}"
 
 
-# 8-bit codes widen to 16 bits as v x 257 and narrow by dropping the low
-# byte, so a 16-bit mean is first rounded to the nearest v x 257: the 8-bit
-# result is then the rounded filter output, as an 8-bit filter would store.
-_ROUND_TO_8BIT = "lutyuv=y='round(val/257)*257':u='round(val/257)*257':v='round(val/257)*257'"
-
-
-def _r103_lattice(source: str, out: str, work: str, final: str) -> List[str]:
-    """``[source]`` R 103-filtered on the 4 x 2 lattice -> ``[out]`` (see _levels_chains).
-
-    Lattice column m is source column 4m + 3, line n is source line 2n + 1.
-    """
-    columns, lines = R103_LATTICE
-    width = f"trunc((iw-{columns - 1})/{columns})*{columns}"
-    height = f"trunc((ih-{lines - 1})/{lines})*{lines}"
-    chains = [f"[{source}]split={columns}" + "".join(f"[{out}_c{p}]" for p in range(columns))]
-    for p in range(columns):
-        chains.append(f"[{out}_c{p}]crop=w='{width}':h=ih:x={p}:y=0,"
-                      f"scale=w=iw/{columns}:h=ih:flags=area,format={work}[{out}_h{p}]")
-    chains += _mean_tree([f"{out}_h{p}" for p in range(columns)], f"{out}_hm",
-                         f",split={lines}" + "".join(f"[{out}_r{q}]" for q in range(lines)))
-    for q in range(lines):
-        chains.append(f"[{out}_r{q}]crop=w=iw:h='{height}':x=0:y={q},"
-                      f"scale=w=iw:h=ih/{lines}:flags=area[{out}_v{q}]")
-    # format= pins the 16-bit averages (negotiation could otherwise move the
-    # 8-bit conversion ahead of them).
-    chains += _mean_tree([f"{out}_v{q}" for q in range(lines)], f"{out}_vm",
-                         f",format={work},{_ROUND_TO_8BIT},format={final}[{out}]")
-    return chains
+# The planes are widened and narrowed with swscale treating them as limited
+# range (in = out, so no level conversion happens): every plane then scales
+# by a power of two (8-bit v -> v x 256, 10-bit v -> v x 64; measured on the
+# bundled build - full-range luma would scale by 257 and convert back
+# inexactly). A 16-bit filter output is rounded to the nearest v x 256 and
+# narrowed without dithering (swscale dithers 16 -> 8-bit by default, which
+# moved about 8 % of a uniform 247 to 246): the 8-bit result is exactly the
+# rounded filter output, as an 8-bit filter would store.
+_ROUND_TO_8BIT = "lutyuv=y='round(val/256)*256':u='round(val/256)*256':v='round(val/256)*256'"
+_TO_8BIT = "scale=in_range=tv:out_range=tv:sws_dither=none:flags=accurate_rnd"
+_WIDEN = "setparams=range=tv,scale=in_range=tv:out_range=tv"
 
 
 def _r103_exact(source: str, out: str, work: str, final: str) -> List[str]:
     """``[source]`` R 103-filtered at every native pixel -> ``[out]``.
 
-    With h_p the 4:1 column area reductions starting at column p (as in
-    _r103_lattice), the horizontally filtered value at column 4m + 3 + s is
+    The R 103 kernels factor into boxes - 1-2-3-4-3-2-1/16 is a 4-pixel box
+    applied twice, 1-2-1/4 a 2-line box applied twice - and an area
+    reduction by an integer factor is an exact box mean. With h_p the 4:1
+    column area reductions starting at column p, the horizontally filtered
+    value at column 4m + 3 + s is
     the mean of h_s..h_3 at m and h_0..h_(s-1) at m + 1. The four offsets s
     are laid side by side (hstack), then the same is done for the two line
     offsets of the 2:1 line reductions (vstack): the tiles hold every native
@@ -662,7 +653,7 @@ def _r103_exact(source: str, out: str, work: str, final: str) -> List[str]:
     a share does not see), except the outermost 3 columns and 1 line the
     kernels cannot reach.
     """
-    columns, lines = R103_LATTICE
+    columns, lines = R103_PHASES
     width = f"trunc((iw-{columns - 1})/{columns})*{columns}"
     height = f"trunc((ih-{lines - 1})/{lines})*{lines}"
     chains = [f"[{source}]split={columns}" + "".join(f"[{out}_c{p}]" for p in range(columns))]
@@ -690,47 +681,8 @@ def _r103_exact(source: str, out: str, work: str, final: str) -> List[str]:
         chains += _mean_tree([f"{out}_w{t}q{q}" for q in range(lines)], f"{out}_vt{t}",
                              f"[{out}_vs{t}]")
     chains.append("".join(f"[{out}_vs{t}]" for t in range(lines))
-                  + f"vstack=inputs={lines},format={work},{_ROUND_TO_8BIT},format={final}[{out}]")
+                  + f"vstack=inputs={lines},format={work},{_ROUND_TO_8BIT},{_TO_8BIT},format={final}[{out}]")
     return chains
-
-
-def _r103_chroma_420(source: str, out: str) -> List[str]:
-    """A 4:2:0 chroma plane R 103-filtered at the luma lattice -> ``[out]``.
-
-    The chroma is taken as linearly interpolated to the luma grid with
-    H.264/HEVC default siting (chroma sample k at luma column 2k, chroma row
-    n midway between luma lines 2n and 2n+1). The R 103 kernels at lattice
-    point (luma column 4m+3, line 2n+1) then reduce to
-    * horizontally 1-3-3-1/8 over chroma samples 2m..2m+3: with A the 2:1
-      area reduction from sample 0 and B the one from sample 1, that is
-      mean(mean(A[m], B[m]), mean(B[m], A[m+1]));
-    * vertically 1-10-5/16 over chroma rows n-1, n, n+1, i.e.
-      1/4 C[n] + 3/4 (5/6 P + 1/6 Q) with P = mean(C[n], C[n+1]) and
-      Q = mean(C[n-1], C[n]).
-    Lattice line 0 has no chroma row above it, so the lattice starts at
-    line 1 (the luma lattice drops its first line to match).
-    """
-    lattice_w = "trunc((iw*2-3)/4)"          # luma lattice width, in chroma samples
-    return [
-        f"[{source}]split=2[{out}_a][{out}_b]",
-        f"[{out}_a]crop=w='2*{lattice_w}+2':h=ih:x=0:y=0,scale=w=iw/2:h=ih:flags=area,"
-        f"format=gray16,split=2[{out}_a0][{out}_a1]",
-        f"[{out}_b]crop=w='2*{lattice_w}':h=ih:x=1:y=0,scale=w=iw/2:h=ih:flags=area,"
-        f"format=gray16,split=2[{out}_b0][{out}_b1]",
-        f"[{out}_a0]crop=w=iw-1:h=ih:x=0:y=0[{out}_l]",
-        f"[{out}_a1]crop=w=iw-1:h=ih:x=1:y=0[{out}_r]",
-        f"[{out}_l][{out}_b0]blend=all_mode=average[{out}_lb]",
-        f"[{out}_b1][{out}_r]blend=all_mode=average[{out}_br]",
-        f"[{out}_lb][{out}_br]blend=all_mode=average,split=3[{out}_m][{out}_0][{out}_p]",
-        f"[{out}_m]crop=w=iw:h=ih-2:x=0:y=0[{out}_cm]",
-        f"[{out}_0]crop=w=iw:h=ih-2:x=0:y=1,split=3[{out}_c0a][{out}_c0b][{out}_c0c]",
-        f"[{out}_p]crop=w=iw:h=ih-2:x=0:y=2[{out}_cp]",
-        f"[{out}_c0a][{out}_cp]blend=all_mode=average[{out}_pp]",
-        f"[{out}_cm][{out}_c0b]blend=all_mode=average[{out}_qq]",
-        f"[{out}_qq][{out}_pp]blend=all_mode=normal:all_opacity={1 / 6:.10f}[{out}_x]",
-        f"[{out}_c0c][{out}_x]blend=all_mode=normal:all_opacity=0.25,format=gray16,{_ROUND_TO_8BIT},"
-        f"format=gray[{out}]",
-    ]
 
 
 def _mean_tree(labels: List[str], prefix: str, tail: str) -> List[str]:
@@ -1159,32 +1111,20 @@ class VideoAnalysis:
     def _levels_chains(self) -> List[str]:
         """EBU R 103 luma and RGB gamut masks of the R 103-filtered picture.
 
-        The R 103 kernels factor into boxes - 1-2-3-4-3-2-1/16 is a 4-pixel
-        box applied twice, 1-2-1/4 a 2-line box applied twice - and an area
-        reduction by an integer factor is an exact box mean. The filtered
-        value at every 4th column and 2nd line (the lattice) is therefore the
-        mean of the four column phases' 4:1 area reductions, then of the two
-        line phases' 2:1 area reductions: the R 103 output itself there,
-        computed in 16 bits and rounded once, for a few reads of the plane.
-        Each lattice point stands for its 4 x 2 cell, so the violating share
-        is an unbiased lattice estimate of the native share (it differs only
-        where a region's edge cuts a cell; the tests hold it to 10 % of the
-        exact share at HD, UHD and 8K).
+        Every native pixel is filtered exactly (_r103_exact), in 16 bits and
+        rounded once. Subsampled chroma is first interpolated to the luma
+        grid, linearly and at the stream's chroma sample location (swscale
+        bilinear with full chroma interpolation and accurate rounding, see
+        _CHROMA_LOCATIONS): R 103 filters the 4:4:4 picture the display
+        reconstructs, and mis-sited chroma would misplace every colour edge
+        against its luma edge (reading gamut about 2x low on 4:2:0 edges).
 
-        Chroma gets the same filter at the same points. R 103 does not say
-        how subsampled chroma reaches the luma grid; with linear
-        interpolation of 4:2:0 chroma the horizontal kernel becomes
-        fixed short kernels on the chroma samples (see _r103_chroma_420),
-        computed from 2:1 area reductions and 16-bit averages. Other
-        subsamplings are brought to 4:4:4 and filtered exactly like luma.
-
-        The planes are merged on the lattice, reordered with single-input
-        mergeplanes and processed three at a time by lutyuv/lut2; each
-        packed mask frame gives three area fractions from one signalstats
-        call. The graph ends in ``[vs_lv]``.
+        The planes are reordered with single-input mergeplanes and processed
+        three at a time by lutyuv/lut2; each packed mask frame gives three
+        area fractions from one signalstats call. The graph ends in
+        ``[vs_lv]``.
         """
         info = self.info
-        rng = info.range_name
         matrices = info.gamut_matrices
         uses = ["luma"] + [f"gamut{k}" for k in range(len(matrices))]
         labels = "".join(f"[ar_{u}]" for u in uses)
@@ -1192,27 +1132,10 @@ class VideoAnalysis:
         # an interlaced picture is filtered with its fields stacked (il), so
         # no tap reaches into the other field.
         fields = "il=l=d:c=d:a=d," if info.interlaced else ""
-        if R103_EXACT:
-            # Chroma is interpolated to 4:4:4 (bilinear, the linear
-            # interpolation _r103_chroma_420 assumes), then every pixel is
-            # filtered exactly like luma.
-            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng}:flags=bilinear"
-                      ",format=yuv444p16[lv_src]"]
-            chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
-            chains.append(f"[lv_all]split={len(uses)}{labels}")
-        elif info.chroma_420:
-            chains = [f"[0:{self.index}]{fields}extractplanes=y+u+v[lv_luma][lv_cb][lv_cr]"]
-            chains += _r103_lattice("lv_luma", "lv_yl", "gray16", "gray")
-            chains.append("[lv_yl]crop=w=iw:h=ih-1:x=0:y=1[lv_y]")
-            chains += _r103_chroma_420("lv_cb", "lv_u")
-            chains += _r103_chroma_420("lv_cr", "lv_v")
-            chains.append("[lv_y][lv_u][lv_v]mergeplanes=map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0"
-                          f":format=yuv444p,split={len(uses)}{labels}")
-        else:
-            # 4:4:4 first, so the odd column phases crop exact pixels.
-            chains = [f"[0:{self.index}]{fields}scale=in_range={rng}:out_range={rng},format=yuv444p16[lv_src]"]
-            chains += _r103_lattice("lv_src", "lv_all", "yuv444p16", "yuv444p")
-            chains.append(f"[lv_all]split={len(uses)}{labels}")
+        chains = [f"[0:{self.index}]{fields}{_WIDEN}:in_chroma_loc={info.chroma_loc}:"
+                  "flags=bilinear+full_chroma_int+accurate_rnd,format=yuv444p16[lv_src]"]
+        chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
+        chains.append(f"[lv_all]split={len(uses)}{labels}")
         # Masks are area-reduced 4:1 before signalstats: a 0/255 mask's mean
         # (the violating share) is preserved exactly.
         reduce4 = "scale=w='max(1,trunc(iw/4))':h='max(1,trunc(ih/4))':flags=area"
@@ -3102,8 +3025,12 @@ def _report_flash(result, config, series, analysis, fps, decoded, reason,
     if analysis is not None and analysis.info.hdr:
         # Switched on but not measurable here: never a SKIP that reads as
         # "not asked for" (review round 3, bug 14).
+        # Inherent to the content type, not a failure to measure: visible and
+        # recorded, but Strict Mode does not turn every HDR file into a
+        # MISMATCH (review round 5, N5).
         result.add_not_verified(FLASH, "PQ/HLG video: the BT.1702-3 thresholds used here "
-                                       "assume an SDR display, so flashes were not screened.")
+                                       "assume an SDR display, so flashes were not screened.",
+                                inherent=True)
         return
     if analysis is not None and not analysis.info.analysable:
         result.add_skip(FLASH, "Picture too small to analyse.")

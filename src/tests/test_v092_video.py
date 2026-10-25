@@ -211,6 +211,9 @@ class TestFlashScan:
         lum = "if(gte(T,1)*lt(T,4),if(eq(lt(X,W/2),lt(mod(N,6),3)),235,16),16)"
         row = _row(_scan(self._geq(tmp_path, "anti.mp4", lum)), "Flash Risk")
         assert row[1] == "WARN", row
+        # The first transition is frame 29 -> 30: the event starts at 1.000 s
+        # (the streamed grid starts one frame late, FLASH_GRID_OFFSET).
+        assert "at 00:00:01.000-" in row[2], row
 
     def test_inverting_checkerboard(self, tmp_path):
         lum = ("if(gte(T,1)*lt(T,4),if(eq(mod(floor(X/80)+floor(Y/90),2),lt(mod(N,6),3)),235,16),16)")
@@ -369,6 +372,71 @@ def _r103_share(tile, high=246, low=5):
     return outside / (tw * th)
 
 
+def _r103_gamut_reference(raw, width, height, siting):
+    """Per-frame largest R, G or B share (%) outside -5..105 % after R 103.
+
+    Independent of FFmpeg's scaler: 4:2:0 chroma is interpolated linearly
+    with its samples at the signalled siting (left: x = 2k, y = 2n + 0.5;
+    center: x = 2k + 0.5, y = 2n + 0.5, in luma pixels), Y, Cb and Cr are
+    filtered with the R 103 kernels (edges replicated) and rounded to 8 bits,
+    and BT.709 limited-range R'G'B' is tested per channel.
+    """
+    W, H = width, height
+    w2, h2 = W // 2, H // 2
+    ox = 0.0 if siting in ("left", "topleft") else 0.5
+    oy = 0.0 if siting == "topleft" else 0.5
+    frame = W * H * 3 // 2
+
+    def clamp(v, n):
+        return min(max(v, 0), n - 1)
+
+    def filt(p):
+        hor = [[sum(k * row[clamp(x + i - 3, W)] for i, k in enumerate(_R103_H)) / 16.0
+                for x in range(W)] for row in p]
+        return [[(hor[clamp(y - 1, H)][x] + 2 * hor[y][x] + hor[clamp(y + 1, H)][x]) / 4.0
+                 for x in range(W)] for y in range(H)]
+
+    def up(c):
+        out = []
+        for y in range(H):
+            fy = (y - oy) / 2.0
+            y0 = math.floor(fy)
+            ty = fy - y0
+            r0, r1 = c[clamp(y0, h2)], c[clamp(y0 + 1, h2)]
+            row = []
+            for x in range(W):
+                fx = (x - ox) / 2.0
+                x0 = math.floor(fx)
+                tx = fx - x0
+                a0, a1 = clamp(x0, w2), clamp(x0 + 1, w2)
+                row.append((r0[a0] * (1 - tx) + r0[a1] * tx) * (1 - ty)
+                           + (r1[a0] * (1 - tx) + r1[a1] * tx) * ty)
+            out.append(row)
+        return out
+
+    shares = []
+    for k in range(len(raw) // frame):
+        f = raw[k * frame:(k + 1) * frame]
+        Y = [list(f[y * W:(y + 1) * W]) for y in range(H)]
+        U = [list(f[W * H + y * w2:W * H + (y + 1) * w2]) for y in range(h2)]
+        V = [list(f[W * H + w2 * h2 + y * w2:W * H + w2 * h2 + (y + 1) * w2]) for y in range(h2)]
+        Yf, Uf, Vf = filt(Y), filt(up(U)), filt(up(V))
+        # The pixels FrameGuard measures: whole 4 x 2 phase cells from column
+        # 3 and line 1 (the kernels' full support; see _r103_exact).
+        xs = range(3, 3 + ((W - 3) // 4 - 1) * 4)
+        ys = range(1, 1 + ((H - 1) // 2 - 1) * 2)
+        counts = [0, 0, 0]
+        for y in ys:
+            for x in xs:
+                l = (int(Yf[y][x] + 0.5) - 16) / 219.0
+                cb = (int(Uf[y][x] + 0.5) - 128) / 224.0
+                cr = (int(Vf[y][x] + 0.5) - 128) / 224.0
+                for c, v in enumerate((l + 1.5748 * cr, l - 0.1873 * cb - 0.4681 * cr, l + 1.8556 * cb)):
+                    counts[c] += v < -0.05 or v > 1.05
+        shares.append(100.0 * max(counts) / (len(xs) * len(ys)))
+    return shares
+
+
 class _Tile:
     """Rectangles of super-white on black repeated over the picture."""
 
@@ -468,6 +536,49 @@ class TestR103Filter:
                "-color_range", "tv", "-colorspace", "bt709", "-an", path)
         row, share = _levels(path, 640, 360)
         assert row[1] == "WARN" and "Luma" in row[2], row
+
+    @pytest.mark.parametrize("level", [247, 246])
+    def test_one_code_over_the_limit_is_exact(self, tmp_path, level):
+        """A flat 247 is outside R 103 luma (5-246) on every pixel; 246 on
+        none. The 16 -> 8-bit narrowing used to dither and mis-scale (v x 257
+        rounding against swscale's v x 256), reading part of 247 as 246.
+        (Grey 246 is still outside the RGB range: 105.02 %.)"""
+        tile = _Tile(128, 96, [(20, 20, 60, 50)], level=level, background=128)
+        expected = _r103_share(tile)
+        path = _tiled_clip(tmp_path / f"flat{level}.mp4", tile, 1280, 720, frames=3)
+        row, share = _levels(path, 1280, 720)
+        # 2 %: the 3 edge columns and 1 edge line the kernels cannot reach
+        assert (share or 0.0) == pytest.approx(expected * 100, rel=0.02, abs=1e-9), (row, expected)
+
+    @pytest.mark.parametrize("siting", ["left", "center"])
+    def test_gamut_honours_the_chroma_siting(self, tmp_path, siting):
+        """Review C1: the exact path upsampled 4:2:0 chroma with swscale's
+        default centre siting, reading gamut about 2x low on the left-sited
+        H.264/HEVC default (reviewer's clean_hevc repro: 0.74 % PASS against
+        1.6-1.8 % with > 1 % on most frames). Checked against an independent
+        pure-Python R 103 reference that interpolates chroma at the signalled
+        siting; the clip's siting is set in the bitstream."""
+        import subprocess
+        from frameguard.tools import get_ffmpeg_path, get_ffprobe_path
+        clean = tmp_path / "x265.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=0.34", "-c:v", "libx265",
+               "-x265-params", "log-level=error", "-pix_fmt", "yuv420p", "-color_range", "tv",
+               "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", str(clean))
+        path = tmp_path / f"{siting}.mp4"
+        loc = {"left": 0, "center": 1}[siting]
+        ffmpeg("-i", str(clean), "-c", "copy", "-bsf:v", f"hevc_metadata=chroma_sample_loc_type={loc}",
+               str(path))
+        probed = subprocess.run([get_ffprobe_path(), "-v", "error", "-show_entries", "stream=chroma_location",
+                                 "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout
+        assert probed.strip().splitlines()[0] == siting
+        raw = subprocess.run([get_ffmpeg_path(), "-v", "error", "-i", str(path), "-f", "rawvideo",
+                              "-pix_fmt", "yuv420p", "-"], capture_output=True).stdout
+        expected = max(_r103_gamut_reference(raw, 320, 240, siting))
+        result = _scan(str(path), target_width=320, target_height=240)
+        measured = result.metadata.get("levels_max_gamut_pct")
+        assert measured == pytest.approx(expected, rel=0.03), (measured, expected)
+        if siting == "left":
+            assert expected > 1.0 and result.metadata.get("levels_max_gamut_pct") > 1.0
 
     def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
         """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
@@ -859,6 +970,15 @@ class TestFreezeScan:
                   "[a][b]freezeframes=first=60:last=135:replace=60,noise=alls=10:allf=t")
         path = _clip(tmp_path / "grainfreeze.mp4", source=source)
         row = _row(_scan(path), "Freeze Frames")
+        assert row[1] == "WARN" and "00:00:02.000" in row[2], row
+
+    def test_freeze_is_found_with_signal_levels_off(self, tmp_path):
+        """The structural series comes from the area branch, which must run
+        for the freeze check alone."""
+        source = (f"testsrc2=s={SIZE}:r=30:d=6,split[a][b];"
+                  "[a][b]freezeframes=first=60:last=135:replace=60,noise=alls=10:allf=t")
+        path = _clip(tmp_path / "freeze_nolevels.mp4", source=source)
+        row = _row(_scan(path, signal_levels_mode="off", black_frames_enabled=False), "Freeze Frames")
         assert row[1] == "WARN" and "00:00:02.000" in row[2], row
 
     def test_freeze_at_the_very_end(self, tmp_path):
@@ -1271,6 +1391,25 @@ def test_hdr_flash_is_not_verified(tmp_path):
            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-an", path)
     row = _row(_scan(path), "Flash Risk")
     assert row[1] not in ("SKIP", "PASS") and "not" in row[2].lower(), row
+
+
+@needs_ffmpeg
+def test_hdr_flash_not_verified_is_not_escalated_by_strict(tmp_path):
+    """Review round 5 (N5): the Flash Risk Not verified is inherent to PQ/HLG
+    content; Strict Mode must not turn every HDR file into a MISMATCH."""
+    path = str(tmp_path / "pq.mp4")
+    ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
+           "-vf", "setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc:range=tv",
+           "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-an", path)
+    cfg = dict(DEFAULT_CONFIG, target_width=640, target_height=360, target_fps=30.0, min_bitrate_mbps=0,
+               audio_required=False, loudness_mode="off", accepted_containers=[".mp4"])
+    result = run_qa_checks(path, cfg=cfg, strict=True)
+    result.finalize()
+    row = _row(result, "Flash Risk")
+    assert "not" in row[2].lower() and "Flash Risk" in result.metadata.get("not_verifiable", []), row
+    exempt = set(result.metadata.get("not_verifiable", [])) | set(result.metadata.get("not_run_by_choice", []))
+    escalating = [c[:3] for c in result.checks if c[1] in ("WARN", "FAIL") and c[0] not in exempt]
+    assert result.status != "MISMATCH" or escalating, (result.status, escalating)
 
 
 def test_new_setting_has_no_helper_text():
@@ -1740,10 +1879,15 @@ class TestAnalysisGeometryExact:
         assert self._analysis(640, 360).needs_levels_branch
         assert not self._analysis(640, 360, signal_levels_mode="off").needs_levels_branch
 
-    def test_chroma_siting_names(self):
-        for name, expected in (("", True), ("yuv420p", True), ("yuvj420p", True), ("nv12", True),
-                               ("p010le", True), ("yuv422p10le", False), ("yuv444p", False)):
-            assert vc._is_420(name) is expected, name
+    def test_chroma_location_defaults(self):
+        """H.273: signalled siting wins; unsignalled 4:2:0 is left except for
+        MPEG-1 / JPEG-family codecs (centre)."""
+        assert vc.chroma_location({"chroma_location": "topleft", "codec_name": "hevc"}) == "topleft"
+        assert vc.chroma_location({"chroma_location": "unspecified", "codec_name": "h264"}) == "left"
+        assert vc.chroma_location({"codec_name": "hevc"}) == "left"
+        assert vc.chroma_location({"codec_name": "mjpeg"}) == "center"
+        assert vc.chroma_location({"codec_name": "mpeg1video", "chroma_location": "center"}) == "center"
+        assert vc.chroma_location({}) == "left"
 
     def test_black_switched_off_runs_no_detector(self):
         with self._analysis(640, 360, black_frames_enabled=False) as off:
@@ -1751,10 +1895,7 @@ class TestAnalysisGeometryExact:
         with self._analysis(640, 360) as on:
             assert "blackdetect" in on._black_chain()
 
-    def test_lattice_graph_builds(self):
-        """The lattice-only R 103 graph (R103_EXACT = False) is a valid chain list."""
-        chains = vc._r103_lattice("src", "out", "gray16", "gray")
-        assert chains and chains[-1].endswith("[out]")
+    def test_mean_tree_pairs_inputs(self):
         assert vc._mean_tree(["a", "b", "c", "d"], "m", "[o]")[-1].startswith("[m0_0][m0_1]")
 
     def test_hold_allowance_default(self):
@@ -1763,3 +1904,131 @@ class TestAnalysisGeometryExact:
     def test_partial_tags_only_when_some_are_set(self):
         assert any("partly" in s for s in vc.colour_tag_advisories("bt709", "unknown", "unknown"))
         assert not any("partly" in s for s in vc.colour_tag_advisories("unknown", "unknown", "unknown"))
+
+
+# ---------------------------------------------------------------------------
+# Mutation gate, round 5: the reviewer's seed-92 survivors
+# ---------------------------------------------------------------------------
+
+class TestReviewerSurvivors:
+    def test_flash_luminance_uses_all_three_primaries(self):
+        """BT.709 luminance of linear light: Y = 0.2126 R + 0.7152 G + 0.0722 B."""
+        assert vc._rule_value("general", 0, 0, 255) == pytest.approx(200 * 0.0722)
+        assert vc._rule_value("general", 255, 255, 255) == pytest.approx(200.0)
+        assert vc._rule_value("red", 255, 0, 0) == pytest.approx(320.0)
+
+    def test_hard_side_needs_a_neighbour_and_a_two_code_step(self):
+        assert vc._hard_side(16, None, None) is False
+        assert vc._hard_side(16, 18, None) is True          # exactly BLACK_STEP_CODES
+        assert vc._hard_side(16, 17.99, None) is False
+
+    def test_coverage_weights_below_one_candela(self):
+        weights = vc.FlashAccumulator(FPS)._coverage_weights({0: 0.25, 1: 0.5})
+        assert weights == {0: 0.5, 1: 1.0}
+
+    def test_vertical_scroll_needs_both_profiles(self):
+        assert vc.is_vertical_scroll(None, 1.0) is False
+        assert vc.is_vertical_scroll(1.0, None) is False
+
+    def test_interlaced_signal_orders(self):
+        info = vc.PictureInfo.from_stream({"width": 720, "height": 576, "field_order": "tt"})
+        assert info.interlaced is True
+        assert vc.PictureInfo.from_stream({"width": 720, "height": 576, "field_order": "bt"}).interlaced
+        assert not vc.PictureInfo.from_stream({"width": 720, "height": 576,
+                                               "field_order": "progressive"}).interlaced
+
+    def test_short_closing_black_is_listed(self):
+        """Black covering the last 0.6 frame of a 10 s file is a run-out."""
+        cfg = vc.VideoCheckConfig.from_cfg({})
+        found = vc.classify_black([(10.0 - 0.6 / 30, 10.0)], 10.0, FPS, cfg, _times(300))
+        assert found.edge_segments == [(pytest.approx(10.0 - 0.6 / 30), pytest.approx(0.6 / 30))]
+
+    def test_sections_half_a_second_apart_merge(self):
+        times = _times(150)
+        flags = [True] * 45 + [False] * 15 + [True] * 45 + [False] * 45
+        sections = vc._dense_sections(flags, times, 1 / 30, 30, 0.5)
+        assert len(sections) == 1 and sections[0] == (0.0, pytest.approx(3.5))
+
+    def test_pq_with_unsignalled_primaries_is_not_a_contradiction(self):
+        assert not any("BT.2100 defines" in s for s in
+                       vc.colour_tag_advisories("unknown", "smpte2084", "bt2020nc", report_partial=False))
+        assert any("BT.2100 defines" in s for s in
+                   vc.colour_tag_advisories("bt709", "smpte2084", "bt2020nc", report_partial=False))
+
+    def test_freeze_area_branch_runs_for_each_check_alone(self):
+        for only in ("black_frames_enabled", "freeze_frames_enabled"):
+            cfg = dict(DEFAULT_CONFIG, black_frames_enabled=False, freeze_frames_enabled=False,
+                       signal_levels_mode="off", flash_check_enabled=False)
+            cfg[only] = True
+            with vc.VideoAnalysis({"index": 0, "width": 640, "height": 360, "avg_frame_rate": "30/1"},
+                                  cfg) as analysis:
+                chains = analysis._area_chains()
+            assert chains[0].endswith("split=1[ar_mean]"), (only, chains[0])
+
+
+def test_overlay_samples_on_a_square_grid():
+    """The black-overlay mask samples every BLACK_OVERLAY_BLOCK pixels in
+    both directions (an overlay is judged by area)."""
+    with vc.VideoAnalysis({"index": 0, "width": 1920, "height": 1080, "avg_frame_rate": "30/1"},
+                          dict(DEFAULT_CONFIG)) as analysis:
+        graph = ";".join(analysis._area_chains())
+    block = 8 * vc.BLACK_OVERLAY_BLOCK
+    assert f"w='max(8,trunc(iw/{block})*8)':h='max(8,trunc(ih/{block})*8)'" in graph
+
+
+class TestFlashEventPeaks:
+    def test_two_events_in_one_candidate_run_keep_their_own_peaks(self):
+        """Every block flashes at 10 transitions a second throughout; the
+        flashing share of each block is 30 %, then 20 % (below the 25 % rule),
+        then 50 %: two events, 0.3 and 0.5."""
+        plane = vc.FlashAccumulator.PLANE
+        acc = vc.FlashAccumulator(FPS, planes=4)
+        shares = [77] * 10 + [51] * 14 + [128] * 10
+        data, mark = b"", 0
+        for f in range(240):
+            alpha = 0
+            if f % 3 == 0 and f >= 90 and mark < len(shares):
+                alpha, mark = shares[mark], mark + 1
+            data += bytes([60]) * plane * 3 + bytes([alpha]) * plane
+        acc.feed(data)
+        acc.finish()
+        events = acc.events(_times(240), FPS)
+        assert [round(e.area, 3) for e in events] == [round(77 / 255, 3), round(128 / 255, 3)]
+
+
+class TestFreezeEdges:
+    @staticmethod
+    def _found(rows, **kw):
+        return vc.detect_freezes([r[0] for r in rows], _times(len(rows)), FPS, 1.0, len(rows) / 30,
+                                 structural=[r[1] for r in rows], **kw)
+
+    def test_eight_refinement_frames_are_still_the_head(self):
+        """Frames 1-8 change below a refresh blip but above grain: still at the head."""
+        rows = [(0.0, 0.0)] + [(0.5, 0.2)] * 8 + [(0.0, 0.0)] * 60 + [(2.6, 2.0)] * 120
+        found = self._found(rows)
+        assert found.edge_holds and not found.holds
+
+    def test_motion_on_frame_one_is_not_a_head_slate(self):
+        rows = [(0.0, 0.0), (20.0, 5.0)] + [(0.0, 0.0)] * 60 + [(2.6, 2.0)] * 120
+        found = self._found(rows)
+        assert found.holds and not found.edge_holds
+
+    def test_exactly_three_moving_lead_frames_stop_dead(self):
+        rows = [(2.6, 2.0)] * 60 + [(0.15, 0.003)] + [(2.6, 2.0)] * 3 + [(0.15, 0.003)] * 60
+        rows += [(2.6, 2.0)] * 30
+        assert self._found(rows).holds
+
+    def test_steady_motion_boundary_is_inclusive(self):
+        """Lead motion exactly half the motion half a second earlier, between
+        one and two grain margins above the frozen frames' noise (0)."""
+        rows = [(0.05, 0.06)] * 60 + [(0.05, 0.03)] * 3 + [(0.01, 0.0)] * 60 + [(2.6, 2.0)] * 30
+        assert self._found(rows).holds
+
+    def test_accumulated_change_equal_to_the_refresh_limit_is_static(self):
+        rows = [(2.6, 2.0)] * 60 + [(0.15, 0.003)] * 60 + [(2.6, 2.0)] * 30
+        step = [None] * len(rows)
+        refresh = vc.structural_limit(vc.FREEZE_BLIP_MAFD, 16.0)
+        for j in range(15, len(rows), 15):
+            step[j] = refresh if 60 <= j - 15 and j <= 119 else 2.0
+        found = self._found(rows, structural_step=step, step=15)
+        assert found.holds and found.holds[0][1] == pytest.approx(61 / 30)
