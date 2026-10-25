@@ -3848,7 +3848,8 @@ class SettingsPanel(QWidget):
          "Require an ambisonic track with valid spatial (SA3D) metadata for 360 deliverables",
          (("any", "Not required"), ("required", "Required"))),
         ("delivery", "aac_priming", "choice", "AAC Encoder Priming", "",
-         (("unknown", "Unknown"), (1024, "1024 samples"), (2112, "2112 samples"))),
+         (("unknown", "Unknown"), (1024, "1024 samples"), (2048, "2048 samples"), (2112, "2112 samples"),
+          (2624, "2624 samples"))),
         ("delivery", "warn_untagged_color", "bool", "Warn on Untagged Colour",
          "Warn when a file carries no colour primaries, transfer or matrix tags, so players "
          "have to guess", None),

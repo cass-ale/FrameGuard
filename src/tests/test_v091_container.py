@@ -222,7 +222,7 @@ class TestAVSyncOffset:
         # Encoder unknown: FFmpeg's TS lead of exactly 1024 samples is read as its
         # priming (ISO/IEC 13818-1 PTS semantics; 0.9.2 round 2, bug 6).
         unknown = _row(_scan(ts, accepted_containers=[".ts"]), "A/V Sync Offset")
-        assert unknown[1] == "PASS" and "inferred" in unknown[2], unknown
+        assert unknown[1] == "PASS" and "FFmpeg" in unknown[2], unknown
 
     def _bframe_encode(self, path, *extra, audio=("-c:a", "aac")):
         ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=3", "-f", "lavfi",

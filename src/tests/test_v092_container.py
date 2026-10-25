@@ -775,16 +775,19 @@ class TestAacPrimingDefault:
         ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "mpegts", str(ts))
         result = _scan(ts, strict=True, accepted_containers=[".ts"])
         check = _row(result, "A/V Sync Offset")
-        assert check[1] == "PASS" and "inferred" in check[2] and "1024" in check[2], check
+        assert check[1] == "PASS" and "FFmpeg" in check[2] and "1024" in check[2], check
 
-    @pytest.mark.parametrize("samples", [1024, 2048, 2112, 2624])
-    def test_every_priming_in_use_is_inferred_from_an_exact_lead(self, samples):
-        check, meta = _sync_row(_sync_probe(-samples / 48000))
+    # Round 5 (N2): a lead is read as a priming only when the encoder is
+    # identified (TestPrimingNeedsIdentification); these use that identity.
+    @pytest.mark.parametrize("samples,encoder", [(1024, "Lavc61 aac"), (2048, "Lavc61 libfdk_aac"),
+                                                 (2112, "Lavc61 aac_at"), (2624, "Nero AAC codec")])
+    def test_every_priming_in_use_is_inferred_from_an_exact_lead(self, samples, encoder):
+        check, meta = _sync_row(_identified_probe(samples, stream_encoder=encoder))
         assert check[1] == "PASS" and str(samples) in check[2], check
         assert meta["av_start_offset_range_ms"] == [0.0, 0.0], meta
 
     def test_he_aac_lead_is_inferred_at_twice_the_core_priming(self):
-        check, _ = _sync_row(_sync_probe(-2 * 2112 / 48000, profile="HE-AAC"))
+        check, _ = _sync_row(_identified_probe(2 * 2112, stream_encoder="Lavc61 aac_at", profile="HE-AAC"))
         assert check[1] == "PASS", check
 
     def test_a_lead_that_is_no_priming_in_use_is_not_inferred(self):
@@ -988,7 +991,10 @@ class TestUiCopy:
         from frameguard import gui
         panel = gui.SettingsPanel()
         combo = panel._rule_controls["aac_priming"]
-        assert [combo.itemText(i) for i in range(combo.count())] == ["Unknown", "1024 samples", "2112 samples"]
+        # Round 5: every priming in use is offered, with no secondary text.
+        assert [combo.itemText(i) for i in range(combo.count())] == [
+            "Unknown", "1024 samples", "2048 samples", "2112 samples", "2624 samples"]
+        assert [combo.itemData(i) for i in range(combo.count())] == list(cc.AAC_PRIMING_CHOICES)
         row = next(r for r in panel._setting_rows if r[1].text() == "AAC Encoder Priming")
         assert row[4].text() == "" and row[4].isHidden(), row[4].text()
 
@@ -1490,10 +1496,15 @@ class TestRound2Units:
 
     def test_lead_tolerance_is_one_sample_plus_one_pts_tick(self):
         tolerance = 1 / 48000 + 1 / 90000
-        inside = _sync_row(_sync_probe(-(1024 / 48000) - tolerance + 5e-11))[0]
-        assert inside[1] == "PASS" and "inferred" in inside[2], inside
-        one_sample = _sync_row(_sync_probe(-(1025 / 48000)))[0]
-        assert "inferred" in one_sample[2], one_sample
+        probe = _identified_probe(0, provider="FFmpeg")
+        probe["streams"][1]["start_time"] = str(-(1024 / 48000) - tolerance + 5e-11)
+        inside = _sync_row(probe)[0]
+        assert inside[1] == "PASS" and "1024-sample priming" in inside[2], inside
+        one_sample = _sync_row(_identified_probe(1025, provider="FFmpeg"))[0]
+        assert "1024-sample priming" in one_sample[2], one_sample
+        outside = _identified_probe(0, provider="FFmpeg")
+        outside["streams"][1]["start_time"] = str(-(1024 / 48000) - tolerance - 1e-6)
+        assert "1024-sample priming" not in _sync_row(outside)[0][2]
 
     def test_no_negative_zero_in_the_start_together_text(self):
         check, _ = _sync_row(_sync_probe(-0.00004, padding=1024))
@@ -1502,8 +1513,9 @@ class TestRound2Units:
     def test_inferred_text_shows_the_raw_lead(self):
         probe = _sync_probe(-2 * 2624 / 8000, profile="HE-AAC")
         probe["streams"][1]["sample_rate"] = "8000"
+        probe["streams"][1]["tags"] = {"encoder": "Nero AAC codec"}
         check, _ = _sync_row(probe)
-        assert "starts 656 ms before it, exactly the 2624-sample" in check[2], check
+        assert "starts 656 ms before it, then plays the 2624-sample" in check[2], check
 
     def test_values_at_the_0_9_1_maximum_are_clamped(self):
         from frameguard import presets
@@ -1592,3 +1604,215 @@ class TestGenericDefaultMigration:
         assert set(presets.DEFAULTS_0_9_1) <= set(presets.PRESET_CONFIG_KEYS)
         assert not set(presets.DEFAULTS_0_9_1) & COMPAT_ONLY_CONFIG_KEYS
         assert len(presets.DEFAULTS_0_9_1) == 69
+
+
+# ---------------------------------------------------------------------------
+# Round 5, N2: a PTS lead is read as a priming only with encoder identification
+# ---------------------------------------------------------------------------
+
+def _identified_probe(lead_samples, *, provider=None, stream_encoder=None, format_encoder=None, profile="LC"):
+    probe = _sync_probe(-lead_samples / 48000, profile=profile)
+    if provider:
+        probe["programs"] = [{"tags": {"service_provider": provider, "service_name": "Service01"}}]
+    if stream_encoder:
+        probe["streams"][1]["tags"] = {"ENCODER": stream_encoder}
+    if format_encoder:
+        probe["format"]["tags"] = {"encoder": format_encoder}
+    return probe
+
+
+class TestPrimingNeedsIdentification:
+    def test_one_frame_slip_on_ffmpeg_priming_is_not_a_pass(self, media, tmp_path):
+        """Reviewer N2 (scants2): FFmpeg's 1024-sample priming plus one AAC
+        frame early is a 2048-sample lead; it was read as FDK priming and passed."""
+        slip = tmp_path / "slip.ts"
+        ffmpeg("-i", _clean(media), "-itsoffset", f"{-1024 / 48000:.6f}", "-i", _clean(media), "-map", "0:v",
+               "-map", "1:a", "-c", "copy", "-f", "mpegts", str(slip))
+        for strict in (False, True):
+            result = _scan(slip, strict=strict, accepted_containers=[".ts"])
+            check = _row(result, "A/V Sync Offset")
+            assert _not_verified(check) and "2048" in check[2] and "1024" in check[2], check
+            assert "A/V Sync Offset" in result.metadata["not_verifiable"], result.metadata
+
+    def test_ffmpeg_transport_stream_in_sync_still_passes(self, media, tmp_path):
+        ts = tmp_path / "cam.ts"
+        ffmpeg("-i", _clean(media), "-c:v", "copy", "-c:a", "aac", "-f", "mpegts", str(ts))
+        check = _row(_scan(ts, strict=True, accepted_containers=[".ts"]), "A/V Sync Offset")
+        assert check[1] == "PASS" and "FFmpeg" in check[2] and "1024" in check[2], check
+
+    @pytest.mark.parametrize("lead", [1024, 2048, 2112, 2624])
+    def test_unidentified_encoder_infers_nothing(self, lead):
+        check, _ = _sync_row(_identified_probe(lead))
+        assert _not_verified(check) and "inferred" not in check[2], check
+
+    @pytest.mark.parametrize("lead", [2048, 2112, 2624])
+    def test_muxer_identified_lead_equal_to_another_priming_is_ambiguous(self, lead):
+        check, _ = _sync_row(_identified_probe(lead, provider="FFmpeg"))
+        assert _not_verified(check) and str(lead) in check[2] and "1024" in check[2], check
+
+    def test_muxer_identified_lead_matching_its_priming_passes(self):
+        for probe in (_identified_probe(1024, provider="FFmpeg"),
+                      _identified_probe(1024, format_encoder="Lavf61.7.100")):
+            check, _ = _sync_row(probe)
+            assert check[1] == "PASS" and "1024-sample" in check[2], check
+
+    @pytest.mark.parametrize("encoder,priming", [("Lavc61.19.101 aac", 1024), ("Lavc61.19.101 libfdk_aac", 2048),
+                                                 ("Lavc61.19.101 aac_at", 2112), ("Nero AAC codec 1.5.4", 2624)])
+    def test_encoder_identified_priming_is_exact_and_slips_are_judged(self, encoder, priming):
+        check, _ = _sync_row(_identified_probe(priming, stream_encoder=encoder))
+        assert check[1] == "PASS" and f"{priming}-sample" in check[2], check
+        slipped, meta = _sync_row(_identified_probe(priming + 1024, stream_encoder=encoder))
+        assert slipped[1] == "WARN" and "21 ms before" in slipped[2], slipped      # one AAC frame early
+        assert meta["av_start_offset_range_ms"] == [-21.3, -21.3], meta
+
+    def test_spec_priming_still_overrides(self):
+        check, _ = _sync_row(_identified_probe(2048, provider="FFmpeg"), aac_priming=2048)
+        assert check[1] == "PASS", check
+
+    def test_he_aac_identified_lead_is_twice_the_core_priming(self):
+        check, _ = _sync_row(_identified_probe(2048, provider="FFmpeg", profile="HE-AAC"))
+        assert check[1] == "PASS", check
+
+    def test_probe_includes_programs(self, media, tmp_path):
+        from frameguard.core import run_ffprobe
+        ts = tmp_path / "p.ts"
+        ffmpeg("-i", _clean(media), "-c", "copy", "-f", "mpegts", str(ts))
+        programs = run_ffprobe(str(ts)).get("programs") or []
+        assert any((p.get("tags") or {}).get("service_provider") == "FFmpeg" for p in programs), programs
+
+
+# ---------------------------------------------------------------------------
+# Round 5: DEFAULTS_0_9_1 is pinned to the released v0.9.1
+# ---------------------------------------------------------------------------
+
+class TestDefaults091Pinned:
+    """tests/fixtures/defaults_v0.9.1.json is v0.9.1's DEFAULT_CONFIG for every
+    preset key it knew, generated from the release tag (v0.9.1 = f0bed77; its
+    src/frameguard is identical to 0c4d0c3), from the repository root:
+
+        rm -rf /tmp/v091 && mkdir /tmp/v091 && git archive v0.9.1 src/frameguard | tar -x -C /tmp/v091
+        FRAMEGUARD_TEST_MODE=1 python -c "import sys, json; sys.path.insert(0, '/tmp/v091/src');
+          from frameguard import core, presets;
+          print(json.dumps({k: (sorted(v) if isinstance(v, (set, frozenset, tuple)) else v)
+                for k in presets.PRESET_CONFIG_KEYS if k in core.DEFAULT_CONFIG
+                and k not in core.COMPAT_ONLY_CONFIG_KEYS
+                for v in [core.DEFAULT_CONFIG[k]]}, indent=1, sort_keys=True))" \\
+          > src/tests/fixtures/defaults_v0.9.1.json
+    """
+
+    def _fixture(self):
+        import json
+        path = os.path.join(os.path.dirname(__file__), "fixtures", "defaults_v0.9.1.json")
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_the_table_equals_the_released_defaults(self):
+        from frameguard import presets
+        fixture = self._fixture()
+        assert set(presets.DEFAULTS_0_9_1) == set(fixture)
+        for key, value in fixture.items():
+            frozen = presets.DEFAULTS_0_9_1[key]
+            assert frozen == value and type(frozen) is type(value), (key, frozen, value)
+
+    def test_the_fixture_is_the_release_not_today(self):
+        """Guards against regenerating the fixture from the current tree."""
+        fixture = self._fixture()
+        assert fixture["silence_noise_db"] == -50 and "aac_priming" not in fixture
+        assert len(fixture) == 69
+
+
+# ---------------------------------------------------------------------------
+# Round 5 mutation gate (reviewer's seed-92 set and fresh seed 4242)
+# ---------------------------------------------------------------------------
+
+class TestRound5Units:
+    def test_inferred_lead_text_names_the_raw_start(self):
+        check, _ = _sync_row(_identified_probe(1024, provider="FFmpeg"))
+        assert "the track starts 21 ms before it, exactly the 1024-sample priming of FFmpeg" in check[2], check
+        probe = _identified_probe(0, provider="FFmpeg")             # 7038 Hz: 145.496 ms, rounds to 145
+        probe["streams"][1].update(sample_rate="7038", start_time=str(-1024 / 7038))
+        check, _ = _sync_row(probe)
+        assert "the track starts 145 ms before it" in check[2], check
+
+    def test_not_verified_detail_keeps_its_last_character(self):
+        rows = _Rows()
+        cc.check_av_sync_offset(None, _sync_probe(-0.050), rows, _cfg())
+        assert rows.checks[0][2].endswith("for a whole broadcast chain)."), rows.checks[0][2]
+
+    def test_range_bound_text_shows_the_largest_priming(self):
+        check, _ = _sync_row(_sync_probe(-0.050))
+        assert "up to 55 ms" in check[2], check
+
+    def test_exactly_at_tolerance_still_starts_together(self):
+        check, _ = _sync_row(_sync_probe(0.005, padding=1024))
+        assert check[1] == "PASS" and "Audio and video start together (+5.0 ms" in check[2], check
+
+    def test_range_text_at_half_a_millisecond(self):
+        assert cc._range_text(-0.5, 44.0) == "between 0 ms before and 44 ms after"
+
+    def test_quicktime_v1_entry_in_an_iso_branded_file_falls_back(self, tmp_path):
+        """The brand picks 28 bytes, but only the 44-byte QuickTime offset starts a box."""
+        structure = cc.read_structure(_iso_audio_v1_file(tmp_path / "qt_in_iso.mp4", b"isom", True))
+        assert structure.tracks[0].entries[0].sa3d is not None, structure.tracks[0].entries
+
+    def test_sa3d_in_a_version_2_sound_description(self):
+        import struct as _s
+        from container_fixtures import sa3d
+        head = bytearray(64)
+        head[8:10] = _s.pack(">H", 2)
+        entry = cc.Box(b"mp4a", 0, 8 + 64 + 40, 8, bytes(head) + sa3d(4), 0)
+        assert cc._entry_header_size("soun", entry.payload) == 64
+        assert cc._starts_box(entry.payload, 64)
+
+    def test_loose_first_box_with_three_boxes(self):
+        import struct as _s
+        three = _s.pack(">I4s", 8, b"abcd") + _s.pack(">I4s", 8, b"free") + _s.pack(">I4s", 8, b"free") + bytes(64)
+        assert cc._loose_first_box(three) == "abcd"
+
+    def test_first_sample_past_with_variable_sizes(self):
+        track = cc.TrackInfo()
+        track._sizes = [10, 20, 30, 40, 50]
+        assert cc._first_sample_past(100, 1, 4, 145, track) == 2      # 100+20 fits, +30 = 150 does not
+        assert cc._first_sample_past(100, 0, 5, 1000, track) == 5
+
+    def test_chunk_layout_with_several_runs(self):
+        track = cc.TrackInfo()
+        track._chunk_offsets = [100, 200, 300, 400]
+        track._stsc = [(1, 2, 1), (3, 1, 1)]
+        assert list(cc._chunk_layout(track)) == [(100, 0, 2), (200, 2, 2), (300, 4, 1), (400, 5, 1)]
+
+    def test_short_missing_media_span(self):
+        track = cc.TrackInfo(track_id=1, handler="vide", timescale=1000, duration=3300, sample_count=100,
+                             first_missing_sample=90)
+        track.stts = [(100, 33)]
+        text = cc._missing_media_text(cc.Structure(family="ISO-BMFF", tracks=[track]))[0]
+        assert "0.33 s) lie beyond" in text, text
+
+    def test_identical_halves_correlate_at_one(self):
+        import random as _r
+        rng = _r.Random(9)
+        half = [rng.uniform(0, 255) for _ in range(384 * 96)]
+        match, control, _ = cc.stereo_layout_scores(half + half)
+        assert abs(match - 1.0) < 1e-9 and control < 0.5, (match, control)
+
+    def test_version_probe_timeout_is_ten_seconds(self, monkeypatch):
+        from frameguard import tools
+        seen = {}
+
+        def run(cmd, **kwargs):
+            seen.update(kwargs)
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+        import subprocess
+        monkeypatch.setattr(tools.subprocess, "run", run)
+        assert tools._ffmpeg_version_text("/x/ffmpeg") is None and seen["timeout"] == 10
+
+    def test_saved_settings_clamp_a_0_9_1_value(self):
+        from frameguard import presets
+        out = presets.normalize_preset_config({"av_offset_max_early_ms": 2000})
+        assert out["av_offset_max_early_ms"] == 1000 and out["preset_adjustments"], out
+
+    def test_migration_returns_its_notes(self):
+        from frameguard import presets
+        config = {"silence_noise_db": -50}
+        notes = presets.migrate_retired_defaults(config, 2)
+        assert notes == config["preset_adjustments"] and "silence_noise_db" in notes[0], notes
