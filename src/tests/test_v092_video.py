@@ -369,6 +369,71 @@ def _r103_share(tile, high=246, low=5):
     return outside / (tw * th)
 
 
+def _r103_gamut_reference(raw, width, height, siting):
+    """Per-frame largest R, G or B share (%) outside -5..105 % after R 103.
+
+    Independent of FFmpeg's scaler: 4:2:0 chroma is interpolated linearly
+    with its samples at the signalled siting (left: x = 2k, y = 2n + 0.5;
+    center: x = 2k + 0.5, y = 2n + 0.5, in luma pixels), Y, Cb and Cr are
+    filtered with the R 103 kernels (edges replicated) and rounded to 8 bits,
+    and BT.709 limited-range R'G'B' is tested per channel.
+    """
+    W, H = width, height
+    w2, h2 = W // 2, H // 2
+    ox = 0.0 if siting in ("left", "topleft") else 0.5
+    oy = 0.0 if siting == "topleft" else 0.5
+    frame = W * H * 3 // 2
+
+    def clamp(v, n):
+        return min(max(v, 0), n - 1)
+
+    def filt(p):
+        hor = [[sum(k * row[clamp(x + i - 3, W)] for i, k in enumerate(_R103_H)) / 16.0
+                for x in range(W)] for row in p]
+        return [[(hor[clamp(y - 1, H)][x] + 2 * hor[y][x] + hor[clamp(y + 1, H)][x]) / 4.0
+                 for x in range(W)] for y in range(H)]
+
+    def up(c):
+        out = []
+        for y in range(H):
+            fy = (y - oy) / 2.0
+            y0 = math.floor(fy)
+            ty = fy - y0
+            r0, r1 = c[clamp(y0, h2)], c[clamp(y0 + 1, h2)]
+            row = []
+            for x in range(W):
+                fx = (x - ox) / 2.0
+                x0 = math.floor(fx)
+                tx = fx - x0
+                a0, a1 = clamp(x0, w2), clamp(x0 + 1, w2)
+                row.append((r0[a0] * (1 - tx) + r0[a1] * tx) * (1 - ty)
+                           + (r1[a0] * (1 - tx) + r1[a1] * tx) * ty)
+            out.append(row)
+        return out
+
+    shares = []
+    for k in range(len(raw) // frame):
+        f = raw[k * frame:(k + 1) * frame]
+        Y = [list(f[y * W:(y + 1) * W]) for y in range(H)]
+        U = [list(f[W * H + y * w2:W * H + (y + 1) * w2]) for y in range(h2)]
+        V = [list(f[W * H + w2 * h2 + y * w2:W * H + w2 * h2 + (y + 1) * w2]) for y in range(h2)]
+        Yf, Uf, Vf = filt(Y), filt(up(U)), filt(up(V))
+        # The pixels FrameGuard measures: whole 4 x 2 phase cells from column
+        # 3 and line 1 (the kernels' full support; see _r103_exact).
+        xs = range(3, 3 + ((W - 3) // 4 - 1) * 4)
+        ys = range(1, 1 + ((H - 1) // 2 - 1) * 2)
+        counts = [0, 0, 0]
+        for y in ys:
+            for x in xs:
+                l = (int(Yf[y][x] + 0.5) - 16) / 219.0
+                cb = (int(Uf[y][x] + 0.5) - 128) / 224.0
+                cr = (int(Vf[y][x] + 0.5) - 128) / 224.0
+                for c, v in enumerate((l + 1.5748 * cr, l - 0.1873 * cb - 0.4681 * cr, l + 1.8556 * cb)):
+                    counts[c] += v < -0.05 or v > 1.05
+        shares.append(100.0 * max(counts) / (len(xs) * len(ys)))
+    return shares
+
+
 class _Tile:
     """Rectangles of super-white on black repeated over the picture."""
 
@@ -481,6 +546,36 @@ class TestR103Filter:
         row, share = _levels(path, 1280, 720)
         # 2 %: the 3 edge columns and 1 edge line the kernels cannot reach
         assert (share or 0.0) == pytest.approx(expected * 100, rel=0.02, abs=1e-9), (row, expected)
+
+    @pytest.mark.parametrize("siting", ["left", "center"])
+    def test_gamut_honours_the_chroma_siting(self, tmp_path, siting):
+        """Review C1: the exact path upsampled 4:2:0 chroma with swscale's
+        default centre siting, reading gamut about 2x low on the left-sited
+        H.264/HEVC default (reviewer's clean_hevc repro: 0.74 % PASS against
+        1.6-1.8 % with > 1 % on most frames). Checked against an independent
+        pure-Python R 103 reference that interpolates chroma at the signalled
+        siting; the clip's siting is set in the bitstream."""
+        import subprocess
+        from frameguard.tools import get_ffmpeg_path, get_ffprobe_path
+        clean = tmp_path / "x265.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=320x240:r=30:d=0.34", "-c:v", "libx265",
+               "-x265-params", "log-level=error", "-pix_fmt", "yuv420p", "-color_range", "tv",
+               "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", str(clean))
+        path = tmp_path / f"{siting}.mp4"
+        loc = {"left": 0, "center": 1}[siting]
+        ffmpeg("-i", str(clean), "-c", "copy", "-bsf:v", f"hevc_metadata=chroma_sample_loc_type={loc}",
+               str(path))
+        probed = subprocess.run([get_ffprobe_path(), "-v", "error", "-show_entries", "stream=chroma_location",
+                                 "-of", "csv=p=0", str(path)], capture_output=True, text=True).stdout
+        assert probed.strip().splitlines()[0] == siting
+        raw = subprocess.run([get_ffmpeg_path(), "-v", "error", "-i", str(path), "-f", "rawvideo",
+                              "-pix_fmt", "yuv420p", "-"], capture_output=True).stdout
+        expected = max(_r103_gamut_reference(raw, 320, 240, siting))
+        result = _scan(str(path), target_width=320, target_height=240)
+        measured = result.metadata.get("levels_max_gamut_pct")
+        assert measured == pytest.approx(expected, rel=0.03), (measured, expected)
+        if siting == "left":
+            assert expected > 1.0 and result.metadata.get("levels_max_gamut_pct") > 1.0
 
     def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
         """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
@@ -1753,10 +1848,15 @@ class TestAnalysisGeometryExact:
         assert self._analysis(640, 360).needs_levels_branch
         assert not self._analysis(640, 360, signal_levels_mode="off").needs_levels_branch
 
-    def test_chroma_siting_names(self):
-        for name, expected in (("", True), ("yuv420p", True), ("yuvj420p", True), ("nv12", True),
-                               ("p010le", True), ("yuv422p10le", False), ("yuv444p", False)):
-            assert vc._is_420(name) is expected, name
+    def test_chroma_location_defaults(self):
+        """H.273: signalled siting wins; unsignalled 4:2:0 is left except for
+        MPEG-1 / JPEG-family codecs (centre)."""
+        assert vc.chroma_location({"chroma_location": "topleft", "codec_name": "hevc"}) == "topleft"
+        assert vc.chroma_location({"chroma_location": "unspecified", "codec_name": "h264"}) == "left"
+        assert vc.chroma_location({"codec_name": "hevc"}) == "left"
+        assert vc.chroma_location({"codec_name": "mjpeg"}) == "center"
+        assert vc.chroma_location({"codec_name": "mpeg1video", "chroma_location": "center"}) == "center"
+        assert vc.chroma_location({}) == "left"
 
     def test_black_switched_off_runs_no_detector(self):
         with self._analysis(640, 360, black_frames_enabled=False) as off:
@@ -1764,10 +1864,7 @@ class TestAnalysisGeometryExact:
         with self._analysis(640, 360) as on:
             assert "blackdetect" in on._black_chain()
 
-    def test_lattice_graph_builds(self):
-        """The lattice-only R 103 graph (R103_EXACT = False) is a valid chain list."""
-        chains = vc._r103_lattice("src", "out", "gray16", "gray")
-        assert chains and chains[-1].endswith("[out]")
+    def test_mean_tree_pairs_inputs(self):
         assert vc._mean_tree(["a", "b", "c", "d"], "m", "[o]")[-1].startswith("[m0_0][m0_1]")
 
     def test_hold_allowance_default(self):
