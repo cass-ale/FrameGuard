@@ -286,13 +286,14 @@ BLACK_EDGE_ALLOWANCE = 1.0
 # analysis copy) are at most BLACK_OVERLAY_MAX of the picture and stay in
 # place - non-black in both frames BLACK_OVERLAY_STEP apart - while the rest
 # meets the picture threshold, are black too. Credits or a dark scene move
-# or exceed the share, and stay picture. The mask is averaged over
-# BLACK_OVERLAY_BLOCK px blocks and compared BLACK_OVERLAY_STEP seconds apart:
+# or exceed the share, and stay picture. The mask is sampled every
+# BLACK_OVERLAY_BLOCK px and compared BLACK_OVERLAY_STEP seconds apart:
 # credits roll at one or more pixels per frame (>= 25 px/s), so in 0.5 s
-# their text has left its 8 px blocks.
+# their text has moved off the sampled points it covered.
 BLACK_OVERLAY_MAX = 0.05
 BLACK_OVERLAY_BLOCK = 8
 BLACK_OVERLAY_STEP = 0.5
+BLACK_OVERLAY_SAMPLE = 0.1
 
 # Interlace (see assess_interlace). idet runs with FFmpeg's documented
 # defaults (intl_thres 1.04, prog_thres 1.5, rep_thres 3.0; FFmpeg filters
@@ -988,10 +989,18 @@ class VideoAnalysis:
         return width / max(1, copy // FREEZE_COPY_FACTOR)
 
     @property
-    def overlay_step_frames(self) -> int:
-        """Frames between the static-overlay samples (BLACK_OVERLAY_STEP)."""
+    def overlay_sample_frames(self) -> int:
+        """Frames between non-black measurements (BLACK_OVERLAY_SAMPLE)."""
         fps = self.info.fps if self.info.fps > 0 else 25.0
-        return max(1, int(fps * BLACK_OVERLAY_STEP + 1e-9))
+        return max(1, int(fps * BLACK_OVERLAY_SAMPLE + 1e-9))
+
+    @property
+    def overlay_step_frames(self) -> int:
+        """Frames between the static-overlay comparisons (BLACK_OVERLAY_STEP),
+        a multiple of overlay_sample_frames."""
+        fps = self.info.fps if self.info.fps > 0 else 25.0
+        sample = self.overlay_sample_frames
+        return sample * max(1, int(fps * BLACK_OVERLAY_STEP / sample + 1e-9))
 
     @property
     def freeze_step_frames(self) -> int:
@@ -1248,19 +1257,29 @@ class VideoAnalysis:
                 # Non-black share per frame, and the share non-black in both
                 # this frame and the one overlay_step_frames earlier (every
                 # that many frames): a static overlay (BLACK_OVERLAY_MAX).
-                # The mask is taken at full resolution (as blackdetect sees
-                # the picture) and area-averaged: each copy sample holds the
-                # exact non-black share of its block.
+                # The mask is taken on native pixels, as blackdetect sees
+                # them, point-sampled every BLACK_OVERLAY_BLOCK pixels: an
+                # unbiased sample of the shares (averaging would hide the
+                # grain that keeps a dark scene above black), at 1/64 of
+                # the work.
                 level = black_pixel_level(c.black_pix_th, rng == "pc")
                 chains += [
-                    f"[0:{self.index}]extractplanes=y,format=gray,"
-                    f"lut=c0='if(gt(val,{level}),255,0)',"
-                    f"scale=w='max(1,trunc(iw/{BLACK_OVERLAY_BLOCK}))':"
-                    f"h='max(1,trunc(ih/{BLACK_OVERLAY_BLOCK}))':flags=area,"
-                    "split=2[bk_n][bk_s]",
-                    f"[bk_n]signalstats,{_print('lavfi.signalstats.YAVG', self.paths['blk_n'])},nullsink",
-                    f"[bk_s]select='not(mod(n,{self.overlay_step_frames}))',tblend=all_expr='min(A,B)',"
-                    f"signalstats,{_print('lavfi.signalstats.YAVG', self.paths['blk_s'])},nullsink",
+                    # The sampled mask is then area-reduced by an exact 8:1
+                    # per side before signalstats (a mask's mean survives),
+                    # which keeps signalstats' per-frame cost negligible.
+                    # Only every overlay_sample_frames-th frame is measured
+                    # (a tenth of a second): the rule needs a run's extent,
+                    # not every frame, and filters cost per frame.
+                    f"[0:{self.index}]select='not(mod(n,{self.overlay_sample_frames}))',extractplanes=y,"
+                    f"scale=w='max(8,trunc(iw/{8 * BLACK_OVERLAY_BLOCK})*8)':"
+                    f"h='max(8,trunc(ih/{8 * BLACK_OVERLAY_BLOCK})*8)':flags=neighbor,"
+                    f"lut=c0='if(gt(val,{level}),255,0)',split=2[bk_n][bk_s]",
+                    f"[bk_n]scale=w=iw/8:h=ih/8:flags=area,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths['blk_n'])},nullsink",
+                    f"[bk_s]select='not(mod(n,{self.overlay_step_frames // self.overlay_sample_frames}))',"
+                    "tblend=all_expr='min(A,B)',"
+                    f"scale=w=iw/8:h=ih/8:flags=area,signalstats,"
+                    f"{_print('lavfi.signalstats.YAVG', self.paths['blk_s'])},nullsink",
                 ]
             # And to the frame freeze_step_frames earlier (every that many
             # frames): accumulated change, which a slow pan shows.
@@ -1299,11 +1318,11 @@ class VideoAnalysis:
             delta = FLASH_DELTA_CD * 255.0 / FLASH_PEAK_CD
             dark = FLASH_DARK_CD * 255.0 / FLASH_PEAK_CD
             chains.append(
-                f"[ar_flash]scale=w={cols * sub}:h={rows * sub}:flags=area,"
-                f"scale=in_color_matrix={info.matrix}:in_range={rng}:out_range=pc,"
+                f"[ar_flash]scale=w={cols * sub}:h={rows * sub}:flags=area:"
+                f"in_color_matrix={info.matrix}:in_range={rng}:out_range=pc,"
                 f"format=gbrap,lutrgb=r='{linear}':g='{linear}':b='{linear}',"
                 "colorchannelmixer=aa=0:ar=0.2126:ag=0.7152:ab=0.0722,"
-                "tblend=c0_expr='A':c1_expr='A':c2_expr='A':"
+                "tblend=c0_mode=normal:c1_mode=normal:c2_mode=normal:"
                 f"c3_expr='if(gte(abs(A-B),{delta:.4g})*lt(min(A,B),{dark:.4g}),255,0)',"
                 f"scale={cols}:{rows}:flags=area[vs_flash]")
         return chains
@@ -1459,6 +1478,7 @@ class VideoAnalysis:
                 series.nonblack = sparse("blk_n", None, share, by_pts, 1)
                 series.nonblack_static = sparse("blk_s", None, share, by_pts, 1)
                 series.overlay_step = self.overlay_step_frames
+                series.overlay_sample = self.overlay_sample_frames
             # tblend's frame k (k >= 1) carries frame k's pts: matched by pts,
             # in % of full scale like scdet's MAFD.
             series.structural = sparse("struct", None, lambda v: _to_float(v, 0.0) / 2.55, by_pts, 1)
@@ -1562,6 +1582,7 @@ class VideoSeries:
     nonblack: List[Optional[float]] = field(default_factory=list)
     nonblack_static: List[Optional[float]] = field(default_factory=list)
     overlay_step: int = 0
+    overlay_sample: int = 1
     structural: List[Optional[float]] = field(default_factory=list)  # freeze: averaged-copy change
     # freeze: averaged-copy change to the frame freeze_step_frames earlier (on those frames)
     structural_step: List[Optional[float]] = field(default_factory=list)
@@ -1697,37 +1718,42 @@ def black_pixel_level(pix_th: float, full_range: bool) -> int:
 
 def overlay_black_runs(nonblack: Sequence[Optional[float]], static: Sequence[Optional[float]],
                        times: Sequence[float], step: int, pic_th: float,
-                       period: float) -> List[Tuple[float, float]]:
+                       period: float, sample: int = 1) -> List[Tuple[float, float]]:
     """(start, end) runs that are black apart from a static overlay.
 
-    A frame qualifies when its non-black share is at most BLACK_OVERLAY_MAX
-    plus the picture threshold's allowance; a run of such frames counts when
-    every pair of frames ``step`` apart inside it shows the overlay in place:
-    the share non-black in both (``static``) is at most BLACK_OVERLAY_MAX
-    and what is non-black beyond it fits the picture threshold's allowance
-    of the rest of the picture. A run too short to hold one pair cannot show
-    that and does not count.
+    ``nonblack`` holds a value on every ``sample``-th frame (None between).
+    A measured frame qualifies when its non-black share is at most
+    BLACK_OVERLAY_MAX plus the picture threshold's allowance; consecutive
+    qualifying measurements form a run, which counts when every pair of
+    frames ``step`` apart inside it shows the overlay in place: the share
+    non-black in both (``static``) is at most BLACK_OVERLAY_MAX and what is
+    non-black beyond it fits the picture threshold's allowance of the rest
+    of the picture. A run too short to hold one pair cannot show that and
+    does not count. A run spans its first to its last measured frame (up to
+    a sample short at each end, never longer than the black).
     """
     allowance = 1.0 - pic_th
     count = min(len(nonblack), len(times))
-    candidate = [nonblack[i] is not None and nonblack[i] <= BLACK_OVERLAY_MAX + allowance
-                 for i in range(count)]
+    measured = [i for i in range(count) if nonblack[i] is not None]
     runs = []
-    i = 0
-    while i < count:
-        if not candidate[i]:
-            i += 1
+    k = 0
+    while k < len(measured):
+        if nonblack[measured[k]] > BLACK_OVERLAY_MAX + allowance:
+            k += 1
             continue
-        j = i
-        while j + 1 < count and candidate[j + 1]:
+        j = k
+        while (j + 1 < len(measured) and measured[j + 1] - measured[j] <= sample
+               and nonblack[measured[j + 1]] <= BLACK_OVERLAY_MAX + allowance):
             j += 1
-        pairs = [k for k in range(i + step, j + 1) if k < len(static) and static[k] is not None]
+        first, last = measured[k], measured[j]
+        pairs = [i for i in range(first + step, last + 1)
+                 if i < len(static) and static[i] is not None and nonblack[i - step] is not None]
         if step > 0 and pairs and all(
-                static[k] <= BLACK_OVERLAY_MAX
-                and max(nonblack[k], nonblack[k - step]) - static[k] <= allowance * (1.0 - static[k])
-                for k in pairs):
-            runs.append((times[i], times[j] + period))
-        i = j + 1
+                static[i] <= BLACK_OVERLAY_MAX
+                and max(nonblack[i], nonblack[i - step]) - static[i] <= allowance * (1.0 - static[i])
+                for i in pairs):
+            runs.append((times[first], times[last] + period))
+        k = j + 1
     return runs
 
 
@@ -3001,7 +3027,7 @@ def _report_black(result, config, events, duration, fps, series) -> List[Interva
     if series.nonblack and series.overlay_step:
         overlay = overlay_black_runs(series.nonblack, series.nonblack_static, series.times,
                                      series.overlay_step, config.black_pic_th,
-                                     _frame_period(fps, series.times))
+                                     _frame_period(fps, series.times), series.overlay_sample)
         events = merge_runs(events, overlay)
     findings = classify_black(events, duration, fps, config, series.times, series.yavg)
     if findings.segments:
