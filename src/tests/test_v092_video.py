@@ -580,6 +580,32 @@ class TestR103Filter:
         if siting == "left":
             assert expected > 1.0 and result.metadata.get("levels_max_gamut_pct") > 1.0
 
+    def test_limited_content_tagged_full_is_flagged(self, tmp_path):
+        """Round 7 (corpus gate): limited-range picture (16-235) tagged full
+        range read as plausible from 6c6f471 on - swscale converted the
+        yuvj420p planes to limited (235 -> 217) despite in_range. The tag is
+        set in the bitstream, so the codes are the encoded ones."""
+        clean = tmp_path / "tv.mp4"
+        # Limited-range mastering: black at 16, white at 235 over large areas,
+        # mid-tones between - the pile-up at the clip points the rule reads.
+        lum = "if(lt(X,W/3),16,if(lt(X,2*W/3),40+150*Y/H,235))"
+        ffmpeg("-f", "lavfi", "-i", "color=black:s=640x360:r=30:d=2,format=yuv420p,setparams=range=tv",
+               "-vf", f"geq=lum='{lum}':cb=128:cr=128", *X264, "-an", str(clean))
+        path = str(tmp_path / "tagged_pc.mp4")
+        ffmpeg("-i", str(clean), "-c", "copy", "-bsf:v", "h264_metadata=video_full_range_flag=1", path)
+        result = _scan(path)
+        assert result.metadata.get("range_mismatch_suspected") is True, _row(result, "Signal Levels")
+        assert "tagged full (pc)" in _row(result, "Signal Levels")[2]
+
+    def test_full_range_content_tagged_full_is_plausible(self, tmp_path):
+        path = str(tmp_path / "pc.mp4")
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=640x360:r=30:d=2",
+               "-vf", "scale=out_range=pc:out_color_matrix=bt709,format=yuvj420p",
+               "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", "-color_range", "pc",
+               "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-an", path)
+        result = _scan(path)
+        assert not result.metadata.get("range_mismatch_suspected"), _row(result, "Signal Levels")
+
     def test_hd_small_blobs_under_the_limit_pass(self, tmp_path):
         """0.9.1's 4x4 box over-reported these (1.5 %); R 103 keeps them under 1 %."""
         expected = _r103_share(_SMALL)

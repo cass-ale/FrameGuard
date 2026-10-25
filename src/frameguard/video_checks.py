@@ -530,6 +530,7 @@ class PictureInfo:
     hdr: bool
     matrix_assumed: bool = False    # no colour-matrix tag: guessed from the size
     chroma_loc: str = "left"        # chroma sample location (see chroma_location)
+    pix_fmt: str = ""
 
     @classmethod
     def from_stream(cls, video: dict) -> "PictureInfo":
@@ -541,7 +542,8 @@ class PictureInfo:
                    hdr=str(video.get("color_transfer") or "").lower() in _HDR_TRANSFERS,
                    matrix_assumed=str(video.get("color_space") or "").lower()
                    in ("", "unknown", "unspecified", "reserved"),
-                   chroma_loc=chroma_location(video))
+                   chroma_loc=chroma_location(video),
+                   pix_fmt=str(video.get("pix_fmt") or "").lower())
 
     @property
     def interlaced(self) -> bool:
@@ -1191,8 +1193,21 @@ class VideoAnalysis:
         # an interlaced picture is filtered with its fields stacked (il), so
         # no tap reaches into the other field.
         fields = "il=l=d:c=d:a=d," if info.interlaced else ""
-        chains = [f"[0:{self.index}]{fields}{_WIDEN}:in_chroma_loc={info.chroma_loc}:"
-                  "flags=bilinear+full_chroma_int+accurate_rnd,format=yuv444p16[lv_src]"]
+        source = f"[0:{self.index}]{fields}"
+        chains = []
+        if info.pix_fmt.startswith("yuvj"):
+            # The JPEG-range formats carry full range in the format itself,
+            # and swscale converts them to limited whatever in_range says
+            # (measured: Y 235 read as 217). Their planes are re-labelled
+            # as the plain format first - a copy, codes unchanged - so the
+            # masks see the coded values (range_plausibility needs them).
+            plain = info.pix_fmt.replace("yuvj", "yuv", 1)
+            chains += [f"{source}extractplanes=y+u+v[lv_jy][lv_ju][lv_jv]",
+                       "[lv_jy][lv_ju][lv_jv]mergeplanes=map0s=0:map0p=0:map1s=1:map1p=0:map2s=2:map2p=0:"
+                       f"format={plain}[lv_in]"]
+            source = "[lv_in]"
+        chains += [f"{source}{_WIDEN}:in_chroma_loc={info.chroma_loc}:"
+                   "flags=bilinear+full_chroma_int+accurate_rnd,format=yuv444p16[lv_src]"]
         chains += _r103_exact("lv_src", "lv_all", "yuv444p16", "yuv444p")
         # Masks are computed per plane (no plane re-packing at full size)
         # and area-reduced 4:1 before they are packed for one signalstats
