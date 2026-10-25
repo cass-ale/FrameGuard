@@ -143,7 +143,7 @@ R103_EXACT = True
 # point-samples columns: idet compares each line with the lines above and
 # below it, a purely vertical operation, so dropping columns only thins the
 # sample (320 columns still give idet >= 100,000 comparisons a frame at
-# 720 lines; natural woven and telecined pans read 97-100 % at 320 columns).
+# 720 lines, so its counts are not noise-limited).
 INTERLACE_MAX_WIDTH = 320
 # Pictures smaller than this are not analysed for levels/flash.
 MIN_ANALYSIS_DIMENSION = 32
@@ -218,10 +218,18 @@ FLASH_RED_DELTA = 20.0
 #   independent temporal grain shrinks by the side factor while moving
 #   picture structure, down to objects of ~1/30 of the picture, survives.
 FREEZE_COPY_FACTOR = 4
-FREEZE_STILL_MAFD = 0.20          # still, when no structural series exists
-FREEZE_BLIP_MAFD = 1.5            # long-GOP refresh of a frozen picture
+# Without the structural series, still is a MAFD under 0.2 % of full scale:
+# half an 8-bit code on average, below any visible change.
+FREEZE_STILL_MAFD = 0.20
+# A long-GOP encoder re-codes a held picture at every I-frame; the change is
+# requantisation noise, at most about one quantiser step of the residual
+# (1-1.5 % of full scale at broadcast QPs), far under real motion (5-50 %).
+# It lasts at most the encoder's lookahead/refinement, 8 frames.
+FREEZE_BLIP_MAFD = 1.5
 FREEZE_MAX_BLIP_FRAMES = 8
-FREEZE_IDENTICAL_MAFD = 0.004     # bit-identical up to encoder rounding
+# Identical: a mean change of 0.004 % of full scale - one code on one pixel
+# in a hundred - i.e. bit-identical up to encoder rounding.
+FREEZE_IDENTICAL_MAFD = 0.004
 # Structurally still: the change on the averaged copy is no more than grain
 # explains. White grain shrinks by the averaging side factor k; film grain
 # at HD is correlated over about 2 px (35 mm grain clumps of 5-15 um against
@@ -300,6 +308,10 @@ INTERLACE_MIN_SECONDS = 1.0
 # asymmetry between its two cross-field comparisons (it needs only 4 %), but
 # its sign then follows the content and flips; such a section is not combed.
 # The same majority decides the field order of declared-interlaced streams.
+# 0.8 is a chance bound, not a fitted value: a call whose sign is a coin
+# toss reaches 80 % agreement over 15 decided frames (half a second at
+# 30 frame/s) with probability 1.8 % (binomial, P[X >= 12 of 15]), while a
+# real field order agrees on every frame whose motion idet can see.
 FIELD_ORDER_MAJORITY = 0.8
 FIELD_ORDER_MIN_FRAMES = 30
 # Field timing (see field_timing()). In a progressive frame both fields
@@ -353,7 +365,10 @@ INTERLACE_SCROLL_RANGE = 4
 # a field of the frame before, top and bottom alternately, and idet's
 # repeated-field call recurs with a period of five frames.
 # A one-second window holding at least half of the expected repeats (two in
-# five) is a cadence window.
+# five) is a cadence window: idet can only call a repeat where the picture
+# moved between the film frames, so on slow film motion it sees one of the
+# two repeats per cycle, and the period-five recurrence is still
+# unambiguous at one in five.
 TELECINE_PERIOD = 5
 TELECINE_REPEAT_SHARE = 0.4
 
@@ -1841,8 +1856,8 @@ def _still_runs(still: Sequence[bool], mafd: Sequence[float]) -> List[Tuple[int,
     ``still[i]`` says frame i shows no change from frame i-1. A digitally
     frozen picture re-encoded by a long-GOP encoder is not bit identical:
     every I-frame re-codes it, which shows as one to three frames of small
-    change (measured up to 1.0 % MAFD on 10 Mbit/s CBR H.264 and HEVC), and a
-    starved CBR encoder spends the first few frames refining the picture.
+    change (requantisation noise, see FREEZE_BLIP_MAFD), and a starved CBR
+    encoder spends the first few frames refining the picture.
     Up to FREEZE_MAX_BLIP_FRAMES consecutive moderate-change frames (below
     FREEZE_BLIP_MAFD, far under real motion) do not end a run. Returns
     (first, last) indices; the frozen picture itself starts one frame earlier.

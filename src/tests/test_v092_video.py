@@ -1181,3 +1181,16 @@ def test_hdr_flash_is_not_verified(tmp_path):
            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-an", path)
     row = _row(_scan(path), "Flash Risk")
     assert row[1] not in ("SKIP", "PASS") and "not" in row[2].lower(), row
+
+
+def test_new_setting_has_no_helper_text():
+    """AGENTS.md: cut helper text and secondary labels; new 0.9.2 settings
+    get none, and 0.9.1 settings keep their copy."""
+    from frameguard.gui import SettingsPanel
+    rows = {key: (title, description, choices)
+            for _g, key, _k, title, description, choices in SettingsPanel._RULE_CONTROLS}
+    title, description, choices = rows["freeze_hold_allowance"]
+    assert description == ""
+    assert all(len(label.split()) <= 2 for _v, label in choices)
+    assert rows["interlace_check_enabled"][1] == (
+        "Warn on combing in video declared progressive and on a wrong field order")
