@@ -1194,3 +1194,25 @@ def test_new_setting_has_no_helper_text():
     assert all(len(label.split()) <= 2 for _v, label in choices)
     assert rows["interlace_check_enabled"][1] == (
         "Warn on combing in video declared progressive and on a wrong field order")
+
+
+class TestCfrNominalRateUnits:
+    """Review round 3 mutation survivors core_038 / core_044 (CFR functions)."""
+
+    def test_rate_without_a_denominator(self):
+        from frameguard import core
+        assert core._nominal_interval({"r_frame_rate": "25"}) == pytest.approx(0.04)
+        assert core._nominal_interval({"r_frame_rate": "30000/1001"}) == pytest.approx(1001 / 30000)
+        assert core._nominal_interval({"r_frame_rate": "0/0", "avg_frame_rate": "24/1"}) == pytest.approx(1 / 24)
+
+    def test_nominal_rate_is_used_only_when_the_frames_match_it(self):
+        """Declared 30 fps, frames really every 1/15 s: the measured spacing is
+        the reference (regular), not the declared one (every gap irregular)."""
+        from frameguard import core
+        timing = core.FrameTiming([[k / 15 for k in range(60)]], False, "test")
+        reference, total, irregular, _ = core._interval_stats(timing, nominal=1 / 30, tick=1 / 15360)
+        assert reference == pytest.approx(1 / 15, rel=1e-3) and irregular == 0
+        # within the tolerance, the declared interval is the reference
+        reference, _, _, _ = core._interval_stats(core.FrameTiming([[k * 0.0335 for k in range(60)]], False, "t"),
+                                                   nominal=1 / 30, tick=1 / 15360)
+        assert reference == pytest.approx(1 / 30)
