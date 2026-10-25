@@ -1476,3 +1476,68 @@ class TestMeasuredFloor:
     def test_tested_builds(self, banner, ok):
         from frameguard import tools
         assert (tools.ffmpeg_banner_problem(banner) is None) == ok
+
+
+class TestRound2Units:
+    """Pins round-2 rules that a fresh mutant sample on the round-2 lines changed."""
+
+    def test_a_v_confidences(self):
+        assert _sync_row(_sync_probe(0.0, padding=1024))[0][3] == 100
+        assert _sync_row(_sync_probe(0.020, padding=1024))[0][3] == 60
+        assert _sync_row(_sync_probe(0.070, padding=1024))[0][3] == 85
+
+    def test_lead_tolerance_is_one_sample_plus_one_pts_tick(self):
+        tolerance = 1 / 48000 + 1 / 90000
+        inside = _sync_row(_sync_probe(-(1024 / 48000) - tolerance + 5e-11))[0]
+        assert inside[1] == "PASS" and "inferred" in inside[2], inside
+        one_sample = _sync_row(_sync_probe(-(1025 / 48000)))[0]
+        assert "inferred" in one_sample[2], one_sample
+
+    def test_no_negative_zero_in_the_start_together_text(self):
+        check, _ = _sync_row(_sync_probe(-0.00004, padding=1024))
+        assert "(+0.0 ms" in check[2], check
+
+    def test_inferred_text_shows_the_raw_lead(self):
+        probe = _sync_probe(-2 * 2624 / 8000, profile="HE-AAC")
+        probe["streams"][1]["sample_rate"] = "8000"
+        check, _ = _sync_row(probe)
+        assert "starts 656 ms before it, exactly the 2624-sample" in check[2], check
+
+    def test_values_at_the_0_9_1_maximum_are_clamped(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"av_offset_max_late_ms": 10000})
+        assert out["av_offset_max_late_ms"] == 1000, out
+
+    def test_helpers_return_lists(self):
+        from frameguard import presets
+        assert presets.migrate_retired_defaults({"silence_noise_db": -50}, 3) == []
+        config = {"av_offset_warn_ms": 50, "av_offset_max_early_ms": 40}
+        assert presets._lenient_adjustments(config) == config["preset_adjustments"] != []
+
+    def test_reimporting_the_stored_copy_raises_no_new_notices(self, tmp_path):
+        from frameguard import presets
+        stored = presets.save_imported_preset(_write_091_preset(tmp_path / "o.fg", {"av_offset_max_early_ms": 2000}))
+        assert stored["notices"]
+        again = presets.import_preset(stored["path"], raise_errors=True)
+        assert again["notices"] == [] and again["config"]["preset_adjustments"], again
+
+    def test_adjustment_record_is_bounded(self):
+        from frameguard import presets
+        out = presets.validate_preset_config({"preset_adjustments": [f"note {n}" for n in range(40)]})
+        assert len(out["preset_adjustments"]) == 32 and out["preset_adjustments"][0] == "note 8", out
+
+    def test_two_part_release_is_padded_with_zero(self, monkeypatch):
+        from frameguard import tools
+        monkeypatch.setattr(tools, "FFMPEG_MIN_VERSION", (9, 0, 1))
+        assert tools.ffmpeg_banner_problem("ffmpeg version 9.0 Copyright")
+
+    def test_git_build_message_names_its_libavfilter(self):
+        from frameguard import tools
+        problem = tools.ffmpeg_banner_problem("ffmpeg version N-1-gabc Copyright\nlibavfilter    10.  4.100 / 10.  4.100")
+        assert "has libavfilter 10.4" in problem, problem
+
+    def test_libavfilter_line(self):
+        from frameguard import tools
+        text = "ffmpeg version 9.0.2\nlibavutil      61.  1.102 / 61.  1.102\nlibavfilter    12.  1.102 / 12.  1.102\n"
+        assert tools.libavfilter_line(text) == "libavfilter    12.  1.102 / 12.  1.102"
+        assert tools.libavfilter_line("ffmpeg version 9.0.2") == ""
