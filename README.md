@@ -145,19 +145,20 @@ a clean pass on the strength of a check that did not run.
 | Video | Frame Rate | Essential | Exact rational match; an NTSC rate against its integer target (23.976 for 24) warns unless NTSC matching is allowed, and fails in Strict Mode (optionally allow integer multiples) |
 | Video | CFR Check | Essential | Measured from real frame timestamps; fails when more than 1% of intervals are irregular |
 | Video | Scan Type | Essential | Interlaced content fails when the spec requires progressive (the default) |
-| Video | Color / HDR | Essential | Bit depth and transfer (SDR, PQ, HLG), untagged colour, BT.601 on HD, PQ without mastering metadata or MaxCLL 0; enforced when the spec sets them |
+| Video | Color / HDR | Essential | Bit depth and transfer (SDR, PQ, HLG), untagged colour, colour tags that contradict each other or are only partly set, BT.601 on HD, PQ without mastering metadata or MaxCLL 0; enforced when the spec sets them |
 | Video | XR Metadata | Essential | Spherical V2 (V1-only and conflicting tags flagged), projection, stereo layout, per-eye geometry, no rotation; required on 360 presets |
 | Video | Bitrate | Essential | Passes within 10% under the minimum, warns at 10–25% under, fails beyond |
 | Picture | Signal Levels | Advisory by default | EBU R 103: luma outside 5–246 or RGB outside −5…105% on more than 1% of the picture for 3+ frames; set to fail for broadcast |
-| Picture | Black Frames, Freeze Frames | Advisory | Black: ≤ Y 20 on 98% of the picture for 0.3 s, plus short black flashes; freezes ≥ 1 s, including long-GOP encodes. Head/tail fades and slates ignored |
+| Picture | Black Frames, Freeze Frames | Advisory | Black: ≤ Y 20 on 98% of the picture for 0.3 s, plus short black flashes; freezes ≥ 1 s, including long-GOP encodes, with title cards and still shots allowed to hold up to the Title Card Hold setting (default 3 s). Head/tail fades and slates ignored |
 | Picture | Flash Risk | Advisory | ITU-R BT.1702 general-flash screening (> 3 large flashes in a second). Not a photosensitivity certificate |
 | Picture | Interlace Detection | Advisory | Combing in video declared progressive, and wrong field order; rolling credits are recognised |
 | Picture | Frame Count | Advisory | Frames against duration × frame rate |
 | Audio | Audio Stream, Codec, Channels, Sample Rate | Essential | Checked on **every** audio track; broadcast loudness targets require 48 kHz when enforced |
-| Audio | A/V Duration, A/V Sync Offset | Essential | Audio more than 2 frames short warns, more than 0.5 s short fails; up to 2 s longer passes; start offset warns beyond ±5 ms and fails beyond 40 ms early / 60 ms late |
+| Audio | A/V Duration, A/V Sync Offset | Essential | Audio more than 2 frames short warns, more than 0.5 s short fails; up to 2 s longer passes; start offset warns beyond ±5 ms and fails beyond 40 ms early / 60 ms late. AAC encoder priming is read from the track's edit list or the identified encoder rather than counted as offset |
 | Audio | Audio Silence, Dead Channel | Essential | Sustained silence per track and per channel (−70 dBFS); a silent primary track or a dead stereo channel fails, a blank extra track warns |
-| Audio | Audio Loudness, Audio True Peak, Audio Clipping | Reported by default | EBU R 128, ATSC A/85, Netflix, Streaming −14/−16 or custom targets; set enforcement to warn or fail. Ambisonic tracks are measured on the W channel |
-| Audio | Audio Dropouts, Phase, Dual Mono, DC Offset, Hum | Advisory | Short drops to digital silence (line-up idents ignored), out-of-phase L/R, identical channels, DC offset, 50/60 Hz hum |
+| Audio | Audio Loudness, Audio True Peak, Audio Clipping | Reported by default | EBU R 128, ATSC A/85, Netflix, Streaming −14/−16 or custom targets; set enforcement to warn or fail. Dialogue-gated loudness is reported alongside where the spec calls for it. Ambisonic tracks are measured on the W channel |
+| Audio | Audio Dropouts, Phase, Dual Mono, DC Offset, Hum | Advisory | Short drops to digital silence (line-up idents ignored), out-of-phase L/R judged against the Phase Threshold setting, identical channels (Dual Mono can be set to allowed), DC offset, 50/60 Hz hum |
+| Audio | Low-Level Audio | Advisory | Stretches of programme running 20 dB under the surrounding level, between −70 and −40 dBFS, are noted in the report without changing the verdict |
 | Audio | Spatial Audio | Essential when required | SA3D metadata present and matching the ambisonic channel count |
 
 Deep scans decode every frame once, in software, so damaged files get the same
