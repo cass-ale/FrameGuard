@@ -1,8 +1,8 @@
 # Development / CI dependencies (not needed to run FrameGuard)
 -r requirements.txt
 
-pytest>=8.0
+pytest>=9.2.0
 pytest-timeout>=2.3
-pyflakes>=3.0
-hypothesis>=6.100
+pyflakes>=4.1.0
+hypothesis>=6.170.15
 pyinstaller>=6.0,<7.0
